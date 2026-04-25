@@ -1,4 +1,3 @@
-import { useEffect, useState } from "react";
 import {
   Area,
   AreaChart,
@@ -25,7 +24,7 @@ import {
 import { AppLayout } from "@/components/AppLayout";
 import { Card } from "@/components/ui/card";
 import { KpiCard } from "@/components/KpiCard";
-import { getTransactions } from "@/services/sheets";
+import { useTransactions } from "@/services/sheets";
 import {
   computeKpis,
   formatCurrency,
@@ -35,7 +34,6 @@ import {
   revenueByType,
   trialFunnel,
 } from "@/services/analytics";
-import type { Transaction } from "@/services/types";
 
 const TYPE_LABEL: Record<string, string> = {
   trial: "Trial",
@@ -47,11 +45,7 @@ const TYPE_LABEL: Record<string, string> = {
 };
 
 export default function Dashboard() {
-  const [txs, setTxs] = useState<Transaction[]>([]);
-
-  useEffect(() => {
-    getTransactions().then(setTxs);
-  }, []);
+  const txs = useTransactions();
 
   const kpis = computeKpis(txs);
   const daily = revenueByDay(txs);
