@@ -1,4 +1,4 @@
-import { BarChart3, LayoutDashboard, Receipt, Users, Layers } from "lucide-react";
+import { BarChart3, LayoutDashboard, Receipt, Users, Layers, Upload } from "lucide-react";
 import { NavLink } from "@/components/NavLink";
 import {
   Sidebar,
@@ -18,6 +18,7 @@ const items = [
   { title: "Transactions", url: "/transactions", icon: Receipt, end: false },
   { title: "Users", url: "/users", icon: Users, end: false },
   { title: "Cohorts", url: "/cohorts", icon: Layers, end: false },
+  { title: "Import data", url: "/import", icon: Upload, end: false },
 ];
 
 export function AppSidebar() {

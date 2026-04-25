@@ -1,20 +1,22 @@
 /**
  * Sheets data service.
  *
- * This is the single seam between the app and the Google Sheets data source.
- * Today it returns mock rows. To switch to a live Google Sheet later, replace
- * the body of these functions with a `fetch` against the Sheets API and map
- * the returned rows to the same `Transaction` shape — every caller stays the same.
+ * The app reads transactions from the in-memory data store, which is hydrated
+ * either from bundled mock data, an uploaded CSV file, or a public Google
+ * Sheet imported by the user from the /import page.
+ *
+ * Components prefer the `useTransactions` hook (reactive). `getTransactions`
+ * is kept as an async helper for non-component callers.
  */
-import { MOCK_TRANSACTIONS } from "./mockTransactions";
+import { useDataStore } from "@/store/dataStore";
 import type { Transaction } from "./types";
 
-function delay<T>(value: T, ms = 0): Promise<T> {
-  return new Promise((resolve) => setTimeout(() => resolve(value), ms));
+export async function getTransactions(): Promise<Transaction[]> {
+  return useDataStore.getState().transactions;
 }
 
-export async function getTransactions(): Promise<Transaction[]> {
-  return delay(MOCK_TRANSACTIONS);
+export function useTransactions(): Transaction[] {
+  return useDataStore((s) => s.transactions);
 }
 
 export type { Transaction } from "./types";
