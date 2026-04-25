@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo } from "react";
 import { AppLayout } from "@/components/AppLayout";
 import { Card } from "@/components/ui/card";
 import {
@@ -9,9 +9,8 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { getTransactions } from "@/services/sheets";
+import { useTransactions } from "@/services/sheets";
 import { computeCohorts, formatCurrency, formatPct } from "@/services/analytics";
-import type { Transaction } from "@/services/types";
 
 function heatStyle(value: number, max: number): React.CSSProperties {
   if (max <= 0) return {};
@@ -23,11 +22,7 @@ function heatStyle(value: number, max: number): React.CSSProperties {
 }
 
 export default function CohortsPage() {
-  const [txs, setTxs] = useState<Transaction[]>([]);
-
-  useEffect(() => {
-    getTransactions().then(setTxs);
-  }, []);
+  const txs = useTransactions();
 
   const cohorts = useMemo(() => computeCohorts(txs), [txs]);
 

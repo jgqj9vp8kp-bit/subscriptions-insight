@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { ArrowDown, ArrowUp, ArrowUpDown, Search, X } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { Card } from "@/components/ui/card";
@@ -20,9 +20,9 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { FunnelBadge, StatusBadge, TypeBadge } from "@/components/StatusBadges";
-import { getTransactions } from "@/services/sheets";
+import { useTransactions } from "@/services/sheets";
 import { formatCurrency } from "@/services/analytics";
-import type { Transaction, TransactionStatus, TransactionType } from "@/services/types";
+import type { TransactionStatus, TransactionType } from "@/services/types";
 
 type SortKey = "event_time" | "amount_usd";
 type SortDir = "asc" | "desc";
@@ -34,7 +34,7 @@ const FUNNELS = ["past_life", "soulmate", "starseed"] as const;
 const PAGE_SIZE = 25;
 
 export default function TransactionsPage() {
-  const [txs, setTxs] = useState<Transaction[]>([]);
+  const txs = useTransactions();
   const [search, setSearch] = useState("");
   const [typeFilter, setTypeFilter] = useState<string>("all");
   const [funnelFilter, setFunnelFilter] = useState<string>("all");
@@ -42,10 +42,6 @@ export default function TransactionsPage() {
   const [sortKey, setSortKey] = useState<SortKey>("event_time");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
   const [page, setPage] = useState(1);
-
-  useEffect(() => {
-    getTransactions().then(setTxs);
-  }, []);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();

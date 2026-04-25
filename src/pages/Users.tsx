@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { ArrowDown, ArrowUp, ArrowUpDown, Check, Search, X } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { Card } from "@/components/ui/card";
@@ -19,22 +19,18 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { FunnelBadge } from "@/components/StatusBadges";
-import { getTransactions } from "@/services/sheets";
+import { useTransactions } from "@/services/sheets";
 import { computeUsers, formatCurrency } from "@/services/analytics";
-import type { Transaction, UserAggregate } from "@/services/types";
+import type { UserAggregate } from "@/services/types";
 
 type SortKey = "total_revenue" | "user_ltv" | "renewal_count";
 
 export default function UsersPage() {
-  const [txs, setTxs] = useState<Transaction[]>([]);
+  const txs = useTransactions();
   const [search, setSearch] = useState("");
   const [funnel, setFunnel] = useState("all");
   const [sortKey, setSortKey] = useState<SortKey>("total_revenue");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
-
-  useEffect(() => {
-    getTransactions().then(setTxs);
-  }, []);
 
   const users: UserAggregate[] = useMemo(() => computeUsers(txs), [txs]);
 
