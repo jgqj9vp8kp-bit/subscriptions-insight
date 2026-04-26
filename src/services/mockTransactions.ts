@@ -55,6 +55,7 @@ function makeTx(
     status,
     transaction_type: type,
     funnel: user.funnel,
+    campaign_path: user.campaign,
     product,
     traffic_source: user.source,
     campaign_id: user.campaign,

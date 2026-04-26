@@ -75,7 +75,9 @@ CHARGEBACK -> chargeback
 
 - first successful `$1` payment is `trial`
 - successful `$14.98` payment within 60 minutes after trial is `upsell`
-- first successful `$29.99` payment at least 7 days after trial is `first_subscription`
+- first successful `$29.99` payment around 5-10 days after trial is `first_subscription`
+- `$29.99` payment 25-40 days after first_subscription is `renewal_2`
+- `$29.99` payment 25-40 days after renewal_2 is `renewal_3`
 - later successful `$29.99` payments are `renewal`
 
 Each row receives `transaction_type` and `classification_reason`.
@@ -85,7 +87,8 @@ Each row receives `transaction_type` and `classification_reason`.
 `addCohortFields` finds each user's successful trial and assigns:
 
 - `cohort_date`: date of the trial timestamp
-- `cohort_id`: `{funnel}_{cohort_date}`
+- `campaign_path`: exact landing path from `ff_campaign_path`, or `unknown`
+- `cohort_id`: `{campaign_path}_{cohort_date}`
 - `transaction_day`: days since trial timestamp
 
 Example:
@@ -97,6 +100,13 @@ transaction_day: 0
 ```
 
 The example is still D0 because it happened within the first 24 hours after trial.
+
+Different campaign paths inside the same funnel stay separate:
+
+```text
+/soulmate-marriage + 2026-04-26 -> soulmate-marriage_2026-04-26
+/soulmate-reading + 2026-04-26 -> soulmate-reading_2026-04-26
+```
 
 ## 7. Aggregation
 

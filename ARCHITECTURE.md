@@ -17,7 +17,7 @@ Raw Palmer export
 -> `normalizePalmerRows`
 -> `classifyUserTransactions`
 -> `transactions_clean`
--> cohort aggregation
+-> cohort aggregation by campaign_path + cohort_date
 -> UI
 
 The import page can still accept a clean template CSV. In that mode, `applyMapping` maps user-provided columns into the shared `Transaction` shape. In Palmer mode, raw rows are preserved and transformed through the Palmer pipeline before they enter analytics.
@@ -30,8 +30,10 @@ The import page can still accept a clean template CSV. In that mode, `applyMappi
 
 - `trial`: first successful $1 payment for a user.
 - `upsell`: successful $14.98 payment within 60 minutes after trial.
-- `first_subscription`: first successful $29.99 payment at least 7 days after trial.
-- `renewal`: later successful $29.99 payments after the first subscription.
+- `first_subscription`: first successful $29.99 payment around 5-10 days after trial.
+- `renewal_2`: first renewal after first_subscription.
+- `renewal_3`: second renewal after first_subscription.
+- `renewal`: all later renewals.
 - `failed_payment`, `refund`, `chargeback`, `unknown`: non-standard or non-success states.
 
 ### cohort_date
@@ -40,17 +42,27 @@ The import page can still accept a clean template CSV. In that mode, `applyMappi
 
 ### cohort_id
 
-`cohort_id` combines funnel and cohort date:
+`cohort_id` combines exact campaign path and cohort date. It does not use the broad funnel because multiple landing paths can belong to the same funnel.
 
 ```text
-{funnel}_{cohort_date}
+{campaign_path}_{cohort_date}
 ```
 
 Example:
 
 ```text
-soulmate_2026-01-01
+soulmate-marriage_2026-01-01
 ```
+
+### campaign_path
+
+`campaign_path` is the exact landing path from `ff_campaign_path`, normalized for grouping.
+Examples:
+
+- `/soulmate-marriage` -> `soulmate-marriage`
+- `/soulmate-reading` -> `soulmate-reading`
+
+If no path is available, `campaign_path` is `unknown`.
 
 ### transaction_day
 

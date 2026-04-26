@@ -17,6 +17,18 @@ export interface PalmerMetadata {
   [key: string]: unknown;
 }
 
+export interface PalmerImportDiagnostics {
+  totalRows: number;
+  rowsWithAmountUsd: number;
+  successRows: number;
+  trialRows: number;
+  upsellRows: number;
+  firstSubscriptionRows: number;
+  rowsWithCohortId: number;
+  unknownFunnelRows: number;
+  unclassifiedSuccessfulSubscriptionRows: number;
+}
+
 const DAY = 24 * 60 * 60 * 1000;
 const HOUR = 60 * 60 * 1000;
 const AMOUNTS = {
@@ -28,13 +40,13 @@ const AMOUNTS = {
 // Palmer exports can use slightly different header names depending on source.
 // These aliases keep import tolerant without changing the normalized schema.
 const FIELD_ALIASES = {
-  transaction_id: ["transaction_id", "transactionid", "transaction id", "id", "payment_id", "charge_id"],
-  user_id: ["user_id", "userid", "user id", "customer_id", "customerid", "client_id", "member_id"],
-  email: ["email", "user_email", "customer_email", "customer email"],
-  event_time: ["event_time", "event time", "created_at", "createdat", "created", "timestamp", "paid_at"],
-  amount: ["amount", "amount_cents", "amount in cents", "amount_in_cents", "price", "total"],
-  currency: ["currency", "ccy"],
-  status: ["status", "state", "result"],
+  transaction_id: ["transaction_id", "transactionid", "transaction id", "id", "payment_id", "charge_id", "order_id"],
+  user_id: ["user_id", "userid", "user id", "customer_id", "customerid", "client_id", "member_id", "account_id"],
+  email: ["email", "user_email", "customer_email", "customer email", "customer.email", "billing_email"],
+  event_time: ["event_time", "event time", "created_at", "createdat", "created", "timestamp", "paid_at", "settled_at", "date"],
+  amount: ["amount", "amount_usd", "amountusd", "amount_cents", "amount in cents", "amount_in_cents", "price", "total", "gross_amount"],
+  currency: ["currency", "ccy", "currency_code"],
+  status: ["status", "state", "result", "payment_status", "transaction_status"],
   product: ["product", "product_name", "product name", "plan", "sku"],
   metadata: ["metadata", "meta", "custom_fields", "custom fields", "payload"],
   campaign_id: ["campaign_id", "campaignid", "campaign id", "utm_campaign"],
@@ -73,24 +85,29 @@ function near(amount: number, target: number): boolean {
   return Math.abs(amount - target) < 0.01;
 }
 
+function between(value: number, min: number, max: number): boolean {
+  return value >= min && value <= max;
+}
+
 export function normalizeAmount(raw: unknown): number {
-  const cleaned = String(raw ?? "").replace(/[^0-9.-]/g, "");
-  const cents = Number(cleaned);
-  if (!Number.isFinite(cents)) return 0;
-  // Palmer exports monetary values in cents: 100 -> 1.00, 1498 -> 14.98.
-  return Math.round((cents / 100) * 100) / 100;
+  const source = String(raw ?? "").trim();
+  const cleaned = source.replace(/[^0-9.-]/g, "");
+  const amount = Number(cleaned);
+  if (!Number.isFinite(amount)) return 0;
+  // Palmer commonly exports integer cents, but some exports already contain
+  // decimal USD values. Decimal-looking values should not be divided again.
+  const normalized = cleaned.includes(".") ? amount : amount / 100;
+  return Math.round(normalized * 100) / 100;
 }
 
 export function normalizeStatus(raw: unknown): TransactionStatus {
-  const value = String(raw ?? "").trim().toUpperCase();
+  const value = String(raw ?? "").trim().toUpperCase().replace(/[\s-]+/g, "_");
   // Keep Palmer payment states explicit so failed/refund/chargeback analytics
   // do not get mixed into successful subscription revenue.
-  if (value === "SETTLED") return "success";
-  if (value === "DECLINED") return "failed";
+  if (["SETTLED", "SUCCEEDED", "PAID", "SUCCESS", "AUTHORIZED", "OK"].includes(value)) return "success";
+  if (["AUTHORIZATION_FAILED", "AUTHORIZATION_DECLINED", "DECLINED", "FAILED", "FAILURE", "ERROR"].includes(value)) return "failed";
   if (value === "REFUNDED") return "refunded";
-  if (value === "CHARGEBACK") return "chargeback";
-  if (["SUCCESS", "SUCCEEDED", "PAID", "OK"].includes(value)) return "success";
-  if (["FAILED", "FAILURE", "ERROR"].includes(value)) return "failed";
+  if (["DISPUTE", "DISPUTED", "CHARGEBACK"].includes(value)) return "chargeback";
   return "failed";
 }
 
@@ -142,6 +159,28 @@ function detectFunnel(metadata: PalmerMetadata): Funnel {
   return "unknown";
 }
 
+function normalizeCampaignPath(raw: unknown): string {
+  const value = String(raw ?? "").trim().toLowerCase();
+  if (!value) return "unknown";
+  try {
+    const parsed = value.startsWith("http://") || value.startsWith("https://") ? new URL(value).pathname : value;
+    const cleaned = parsed
+      .replace(/^https?:\/\/[^/]+/i, "")
+      .split(/[?#]/)[0]
+      .replace(/^\/+|\/+$/g, "")
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+    return cleaned || "unknown";
+  } catch {
+    const cleaned = value.replace(/^\/+|\/+$/g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+    return cleaned || "unknown";
+  }
+}
+
+function detectCampaignPath(metadata: PalmerMetadata): string {
+  return normalizeCampaignPath(metadata.ff_campaign_path);
+}
+
 function detectTrafficSource(row: RawPalmerRow, metadata: PalmerMetadata): TrafficSource {
   const raw = `${valueFrom(row, FIELD_ALIASES.traffic_source)} ${metadata.utm_source ?? ""}`.toLowerCase();
   if (raw.includes("facebook") || raw === "fb" || raw.includes("meta")) return "facebook";
@@ -178,6 +217,7 @@ export function normalizePalmerRows(rows: RawPalmerRow[]): Transaction[] {
       status,
       transaction_type: fallbackType ?? "unknown",
       funnel: detectFunnel(metadata),
+      campaign_path: detectCampaignPath(metadata),
       product: valueFrom(row, FIELD_ALIASES.product) || productFromAmount(amount),
       traffic_source: detectTrafficSource(row, metadata),
       campaign_id: valueFrom(row, FIELD_ALIASES.campaign_id) || String(metadata.utm_campaign ?? ""),
@@ -200,7 +240,9 @@ export function classifyUserTransactions(rows: Transaction[]): Transaction[] {
   byUser.forEach((list) => {
     const sorted = [...list].sort((a, b) => new Date(a.event_time).getTime() - new Date(b.event_time).getTime());
     let trialTs: number | null = null;
-    let firstSubscriptionSeen = false;
+    let firstSubscriptionTs: number | null = null;
+    let renewal2Ts: number | null = null;
+    let renewal3Ts: number | null = null;
 
     for (const tx of sorted) {
       const eventTs = new Date(tx.event_time).getTime();
@@ -230,18 +272,38 @@ export function classifyUserTransactions(rows: Transaction[]): Transaction[] {
       } else if (
         trialTs !== null &&
         near(tx.amount_usd, AMOUNTS.subscription) &&
-        eventTs - trialTs >= 7 * DAY &&
-        !firstSubscriptionSeen
+        between(eventTs - trialTs, 5 * DAY, 10 * DAY) &&
+        firstSubscriptionTs === null
       ) {
-        // The first $29.99 charge at least 7 days after trial is the conversion
+        // The first $29.99 charge around 5-10 days after trial is the conversion
         // from trial into paid subscription.
-        firstSubscriptionSeen = true;
+        firstSubscriptionTs = eventTs;
         transaction_type = "first_subscription";
-        classification_reason = "$29.99 first successful charge at least 7 days after trial";
-      } else if (trialTs !== null && near(tx.amount_usd, AMOUNTS.subscription) && firstSubscriptionSeen) {
-        // Later successful $29.99 charges are renewals after the first subscription.
+        classification_reason = "$29.99 first successful charge around 5-10 days after trial";
+      } else if (
+        firstSubscriptionTs !== null &&
+        near(tx.amount_usd, AMOUNTS.subscription) &&
+        between(eventTs - firstSubscriptionTs, 25 * DAY, 40 * DAY) &&
+        renewal2Ts === null
+      ) {
+        // Renewal 2 is the first monthly-ish renewal after first_subscription.
+        renewal2Ts = eventTs;
+        transaction_type = "renewal_2";
+        classification_reason = "$29.99 successful charge 25-40 days after first_subscription";
+      } else if (
+        renewal2Ts !== null &&
+        near(tx.amount_usd, AMOUNTS.subscription) &&
+        between(eventTs - renewal2Ts, 25 * DAY, 40 * DAY) &&
+        renewal3Ts === null
+      ) {
+        // Renewal 3 is the second monthly-ish renewal after first_subscription.
+        renewal3Ts = eventTs;
+        transaction_type = "renewal_3";
+        classification_reason = "$29.99 successful charge 25-40 days after renewal_2";
+      } else if (firstSubscriptionTs !== null && near(tx.amount_usd, AMOUNTS.subscription)) {
+        // Later successful $29.99 charges remain grouped as total later renewals.
         transaction_type = "renewal";
-        classification_reason = "$29.99 successful charge after first subscription";
+        classification_reason = "$29.99 successful charge after renewal_3 window or outside staged renewal windows";
       } else {
         transaction_type = "unknown";
         classification_reason = "no explicit Palmer classification rule matched";
@@ -276,10 +338,11 @@ export function addCohortFields(rows: Transaction[]): Transaction[] {
     // Whole days since trial support lifecycle analysis and cohort windows.
     const transactionDay = Math.floor((eventTs - trialTs) / DAY);
     const cohortDate = trial.event_time.slice(0, 10);
+    const campaignPath = trial.campaign_path || "unknown";
     return {
       ...tx,
       cohort_date: cohortDate,
-      cohort_id: `${trial.funnel}_${cohortDate}`,
+      cohort_id: `${campaignPath}_${cohortDate}`,
       transaction_day: transactionDay,
     };
   });
@@ -287,6 +350,22 @@ export function addCohortFields(rows: Transaction[]): Transaction[] {
 
 export function transformPalmerRows(rows: RawPalmerRow[]): Transaction[] {
   return classifyUserTransactions(normalizePalmerRows(rows));
+}
+
+export function getPalmerImportDiagnostics(rows: Transaction[], totalRows = rows.length): PalmerImportDiagnostics {
+  return {
+    totalRows,
+    rowsWithAmountUsd: rows.filter((row) => Number.isFinite(row.amount_usd) && row.amount_usd !== 0).length,
+    successRows: rows.filter((row) => row.status === "success").length,
+    trialRows: rows.filter((row) => row.transaction_type === "trial").length,
+    upsellRows: rows.filter((row) => row.transaction_type === "upsell").length,
+    firstSubscriptionRows: rows.filter((row) => row.transaction_type === "first_subscription").length,
+    rowsWithCohortId: rows.filter((row) => Boolean(row.cohort_id)).length,
+    unknownFunnelRows: rows.filter((row) => row.funnel === "unknown").length,
+    unclassifiedSuccessfulSubscriptionRows: rows.filter(
+      (row) => row.status === "success" && near(row.amount_usd, AMOUNTS.subscription) && row.transaction_type === "unknown"
+    ).length,
+  };
 }
 
 function productFromAmount(amount: number): string {

@@ -14,14 +14,18 @@
 - upsell = `$14.98`
 - subscription = `$29.99`
 - upsell must occur within 60 minutes after trial
-- first_subscription must occur at least 7 days after trial
-- renewal means a later successful `$29.99` payment after first_subscription
+- first_subscription must occur around 5-10 days after trial
+- renewal_2 must occur 25-40 days after first_subscription
+- renewal_3 must occur 25-40 days after renewal_2
+- renewal means later successful `$29.99` payments after staged renewals
 - cohort_date is based on the user's successful trial timestamp
-- cohort_id is `{funnel}_{cohort_date}`
+- cohort_id is `{campaign_path}_{cohort_date}`
+- funnel is broad and campaign_path is exact; do not group cohorts by funnel
 
 ## Edge Cases
 
 - Missing metadata: funnel becomes `unknown`.
+- Missing campaign path: campaign_path becomes `unknown`.
 - Unknown funnels: stay `unknown`; do not default to `past_life`.
 - Users without email: the importer uses `unknown@example.com`.
 - Users without a successful trial: cohort fields are incomplete and `transaction_day` is `null`.
@@ -35,6 +39,8 @@ Use these exact transaction names across services, tests, and UI:
 - `trial`
 - `upsell`
 - `first_subscription`
+- `renewal_2`
+- `renewal_3`
 - `renewal`
 - `failed_payment`
 - `refund`

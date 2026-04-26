@@ -1,3 +1,4 @@
+import { useMemo, useState } from "react";
 import {
   Area,
   AreaChart,
@@ -24,6 +25,13 @@ import {
 import { AppLayout } from "@/components/AppLayout";
 import { Card } from "@/components/ui/card";
 import { KpiCard } from "@/components/KpiCard";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { useTransactions } from "@/services/sheets";
 import {
   computeKpis,
@@ -39,6 +47,8 @@ const TYPE_LABEL: Record<string, string> = {
   trial: "Trial",
   upsell: "Upsell",
   first_subscription: "First Sub",
+  renewal_2: "Renewal 2",
+  renewal_3: "Renewal 3",
   renewal: "Renewal",
   refund: "Refund",
   chargeback: "Chargeback",
@@ -46,15 +56,54 @@ const TYPE_LABEL: Record<string, string> = {
 
 export default function Dashboard() {
   const txs = useTransactions();
+  const [funnelFilter, setFunnelFilter] = useState("all");
+  const [campaignPathFilter, setCampaignPathFilter] = useState("all");
 
-  const kpis = computeKpis(txs);
-  const daily = revenueByDay(txs);
-  const byType = revenueByType(txs).map((d) => ({ ...d, label: TYPE_LABEL[d.type] ?? d.type }));
-  const byFunnel = revenueByFunnel(txs);
-  const funnel = trialFunnel(txs);
+  const funnelOptions = useMemo(() => Array.from(new Set(txs.map((t) => t.funnel))).sort(), [txs]);
+  const campaignPathOptions = useMemo(() => Array.from(new Set(txs.map((t) => t.campaign_path || "unknown"))).sort(), [txs]);
+  const filteredTxs = useMemo(
+    () =>
+      txs.filter((t) => {
+        if (funnelFilter !== "all" && t.funnel !== funnelFilter) return false;
+        if (campaignPathFilter !== "all" && (t.campaign_path || "unknown") !== campaignPathFilter) return false;
+        return true;
+      }),
+    [txs, funnelFilter, campaignPathFilter]
+  );
+
+  const kpis = computeKpis(filteredTxs);
+  const daily = revenueByDay(filteredTxs);
+  const byType = revenueByType(filteredTxs).map((d) => ({ ...d, label: TYPE_LABEL[d.type] ?? d.type }));
+  const byFunnel = revenueByFunnel(filteredTxs);
+  const funnel = trialFunnel(filteredTxs);
 
   return (
     <AppLayout title="Dashboard" description="Subscription performance overview">
+      <Card className="mb-4 p-3 shadow-card">
+        <div className="flex flex-wrap items-center gap-2">
+          <Select value={funnelFilter} onValueChange={setFunnelFilter}>
+            <SelectTrigger className="h-9 w-[160px]"><SelectValue placeholder="Funnel" /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All funnels</SelectItem>
+              {funnelOptions.map((f) => (
+                <SelectItem key={f} value={f}>{f.replace("_", " ")}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Select value={campaignPathFilter} onValueChange={setCampaignPathFilter}>
+            <SelectTrigger className="h-9 w-[220px]"><SelectValue placeholder="Campaign path" /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All campaign paths</SelectItem>
+              {campaignPathOptions.map((path) => (
+                <SelectItem key={path} value={path}>{path}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <span className="text-xs text-muted-foreground">
+            {filteredTxs.length} of {txs.length} transactions
+          </span>
+        </div>
+      </Card>
       <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-4">
         <KpiCard label="Total Revenue" value={formatCurrency(kpis.totalRevenue)} icon={<DollarSign className="h-4 w-4" />} accent="primary" />
         <KpiCard label="Trial Payments" value={formatCurrency(kpis.trialPayments)} icon={<Sparkles className="h-4 w-4" />} accent="accent" />
@@ -136,6 +185,8 @@ export default function Dashboard() {
                 <Bar dataKey="trial" stackId="a" fill="hsl(var(--chart-1))" name="Trial" />
                 <Bar dataKey="upsell" stackId="a" fill="hsl(var(--chart-2))" name="Upsell" />
                 <Bar dataKey="first_subscription" stackId="a" fill="hsl(var(--chart-3))" name="First Sub" />
+                <Bar dataKey="renewal_2" stackId="a" fill="hsl(var(--chart-4))" name="Renewal 2" />
+                <Bar dataKey="renewal_3" stackId="a" fill="hsl(var(--chart-5))" name="Renewal 3" />
                 <Bar dataKey="renewal" stackId="a" fill="hsl(var(--chart-5))" name="Renewal" radius={[6, 6, 0, 0]} />
               </BarChart>
             </ResponsiveContainer>

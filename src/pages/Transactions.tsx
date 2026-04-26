@@ -27,7 +27,7 @@ import type { TransactionStatus, TransactionType } from "@/services/types";
 type SortKey = "event_time" | "amount_usd";
 type SortDir = "asc" | "desc";
 
-const TYPES: TransactionType[] = ["trial", "upsell", "first_subscription", "renewal", "failed_payment", "refund", "chargeback", "unknown"];
+const TYPES: TransactionType[] = ["trial", "upsell", "first_subscription", "renewal_2", "renewal_3", "renewal", "failed_payment", "refund", "chargeback", "unknown"];
 const STATUSES: TransactionStatus[] = ["success", "failed", "refunded", "chargeback"];
 const FUNNELS = ["past_life", "soulmate", "starseed", "unknown"] as const;
 
@@ -38,10 +38,13 @@ export default function TransactionsPage() {
   const [search, setSearch] = useState("");
   const [typeFilter, setTypeFilter] = useState<string>("all");
   const [funnelFilter, setFunnelFilter] = useState<string>("all");
+  const [campaignPathFilter, setCampaignPathFilter] = useState<string>("all");
   const [statusFilter, setStatusFilter] = useState<string>("all");
   const [sortKey, setSortKey] = useState<SortKey>("event_time");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
   const [page, setPage] = useState(1);
+
+  const campaignPathOptions = useMemo(() => Array.from(new Set(txs.map((t) => t.campaign_path || "unknown"))).sort(), [txs]);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -49,6 +52,7 @@ export default function TransactionsPage() {
       if (q && !t.email.toLowerCase().includes(q)) return false;
       if (typeFilter !== "all" && t.transaction_type !== typeFilter) return false;
       if (funnelFilter !== "all" && t.funnel !== funnelFilter) return false;
+      if (campaignPathFilter !== "all" && (t.campaign_path || "unknown") !== campaignPathFilter) return false;
       if (statusFilter !== "all" && t.status !== statusFilter) return false;
       return true;
     });
@@ -59,7 +63,7 @@ export default function TransactionsPage() {
       return sortDir === "asc" ? cmp : -cmp;
     });
     return list;
-  }, [txs, search, typeFilter, funnelFilter, statusFilter, sortKey, sortDir]);
+  }, [txs, search, typeFilter, funnelFilter, campaignPathFilter, statusFilter, sortKey, sortDir]);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
@@ -82,11 +86,12 @@ export default function TransactionsPage() {
     setSearch("");
     setTypeFilter("all");
     setFunnelFilter("all");
+    setCampaignPathFilter("all");
     setStatusFilter("all");
     setPage(1);
   };
 
-  const hasFilters = search || typeFilter !== "all" || funnelFilter !== "all" || statusFilter !== "all";
+  const hasFilters = search || typeFilter !== "all" || funnelFilter !== "all" || campaignPathFilter !== "all" || statusFilter !== "all";
 
   return (
     <AppLayout title="Transactions" description={`${filtered.length} of ${txs.length} transactions`}>
@@ -119,6 +124,15 @@ export default function TransactionsPage() {
               <SelectItem value="all">All funnels</SelectItem>
               {FUNNELS.map((f) => (
                 <SelectItem key={f} value={f}>{f.replace("_", " ")}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Select value={campaignPathFilter} onValueChange={(v) => { setCampaignPathFilter(v); setPage(1); }}>
+            <SelectTrigger className="h-9 w-[190px]"><SelectValue placeholder="Campaign path" /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All campaign paths</SelectItem>
+              {campaignPathOptions.map((path) => (
+                <SelectItem key={path} value={path}>{path}</SelectItem>
               ))}
             </SelectContent>
           </Select>

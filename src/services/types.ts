@@ -5,6 +5,8 @@ export type TransactionType =
   | "trial"
   | "upsell"
   | "first_subscription"
+  | "renewal_2"
+  | "renewal_3"
   | "renewal"
   | "failed_payment"
   | "refund"
@@ -26,6 +28,7 @@ export interface Transaction {
   status: TransactionStatus;
   transaction_type: TransactionType;
   funnel: Funnel;
+  campaign_path: string;
   product: string;
   traffic_source: TrafficSource;
   campaign_id: string;
@@ -51,16 +54,24 @@ export interface CohortRow {
   cohort_id: string;
   cohort_date: string;
   funnel: Funnel;
+  campaign_path: string;
   trial_users: number;
   upsell_users: number;
   first_subscription_users: number;
+  renewal_2_users: number;
+  renewal_3_users: number;
   renewal_users: number;
   trial_to_upsell_cr: number;
   trial_to_first_subscription_cr: number;
+  first_subscription_to_renewal_2_cr: number;
+  renewal_2_to_renewal_3_cr: number;
   revenue_d0: number;
   revenue_d7: number;
   revenue_d14: number;
   revenue_d30: number;
+  revenue_d37: number;
+  revenue_d67: number;
+  revenue_total: number;
   ltv_d7: number;
   ltv_d14: number;
   ltv_d30: number;

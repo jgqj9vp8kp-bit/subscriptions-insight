@@ -2,7 +2,7 @@ import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { MOCK_TRANSACTIONS } from "@/services/mockTransactions";
 import type { Transaction } from "@/services/types";
-import type { RawPalmerRow } from "@/services/palmerTransform";
+import type { PalmerImportDiagnostics, RawPalmerRow } from "@/services/palmerTransform";
 
 export type DataSource = "mock" | "csv" | "google_sheet" | "palmer_raw";
 export type ImportMode = "clean_template" | "palmer_raw";
@@ -15,6 +15,7 @@ interface ImportMeta {
   sheetUrl?: string;
   rowCount: number;
   rawRowCount?: number;
+  diagnostics?: PalmerImportDiagnostics;
 }
 
 interface DataState {

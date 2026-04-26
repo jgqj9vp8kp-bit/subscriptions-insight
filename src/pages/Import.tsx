@@ -41,10 +41,27 @@ import {
   type ColumnMapping,
   type ParsedSheet,
 } from "@/services/import";
-import { transformPalmerRows, type RawPalmerRow } from "@/services/palmerTransform";
+import {
+  getPalmerImportDiagnostics,
+  transformPalmerRows,
+  type PalmerImportDiagnostics,
+  type RawPalmerRow,
+} from "@/services/palmerTransform";
 import type { Transaction } from "@/services/types";
 
 const NONE = "__none__";
+
+const DIAGNOSTIC_LABELS: { key: keyof PalmerImportDiagnostics; label: string }[] = [
+  { key: "totalRows", label: "Total rows" },
+  { key: "rowsWithAmountUsd", label: "Rows with amount_usd" },
+  { key: "successRows", label: "Status = success" },
+  { key: "trialRows", label: "Type = trial" },
+  { key: "upsellRows", label: "Type = upsell" },
+  { key: "firstSubscriptionRows", label: "Type = first_subscription" },
+  { key: "rowsWithCohortId", label: "Rows with cohort_id" },
+  { key: "unknownFunnelRows", label: "Funnel = unknown" },
+  { key: "unclassifiedSuccessfulSubscriptionRows", label: "Unclassified success $29.99" },
+];
 
 export default function ImportPage() {
   const { toast } = useToast();
@@ -134,17 +151,18 @@ export default function ImportPage() {
       });
       return;
     }
-    const rows =
-      importMode === "palmer_raw"
-        ? transformPalmerRows(parsed.rows as RawPalmerRow[])
-        : applyMapping(parsed, mapping).rows;
+    const rawRows = parsed.rows as RawPalmerRow[];
+    const rows = importMode === "palmer_raw" ? transformPalmerRows(rawRows) : applyMapping(parsed, mapping).rows;
+    const diagnostics =
+      importMode === "palmer_raw" ? getPalmerImportDiagnostics(rows, rawRows.length) : undefined;
 
     setImported(rows, {
       source: importMode === "palmer_raw" ? "palmer_raw" : sourceKind,
       importMode,
       fileName: sourceKind === "csv" ? sourceLabel : undefined,
       sheetUrl: sourceKind === "google_sheet" ? sourceLabel : undefined,
-    }, importMode === "palmer_raw" ? (parsed.rows as RawPalmerRow[]) : undefined);
+      diagnostics,
+    }, importMode === "palmer_raw" ? rawRows : undefined);
     toast({
       title: "Import complete",
       description: `Loaded ${rows.length} transactions from ${
@@ -413,6 +431,24 @@ export default function ImportPage() {
               </div>
             )}
           </dl>
+
+          {meta.diagnostics && (
+            <div className="mt-4 border-t border-border pt-3">
+              <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                Palmer diagnostics
+              </h4>
+              <dl className="space-y-2 text-xs">
+                {DIAGNOSTIC_LABELS.map((item) => (
+                  <div key={item.key} className="flex items-center justify-between gap-2">
+                    <dt className="text-muted-foreground">{item.label}</dt>
+                    <dd className="font-medium tabular-nums text-foreground">
+                      {meta.diagnostics?.[item.key]}
+                    </dd>
+                  </div>
+                ))}
+              </dl>
+            </div>
+          )}
 
           <Button
             variant="outline"
