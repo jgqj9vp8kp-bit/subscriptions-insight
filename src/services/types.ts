@@ -13,8 +13,8 @@ export type TransactionType =
 
 export type TransactionStatus = "success" | "failed" | "refunded" | "chargeback";
 
-export type Funnel = "past_life" | "soulmate" | "starseed";
-export type TrafficSource = "facebook" | "tiktok" | "google";
+export type Funnel = "past_life" | "soulmate" | "starseed" | "unknown";
+export type TrafficSource = "facebook" | "tiktok" | "google" | "unknown";
 
 export interface Transaction {
   transaction_id: string;
@@ -30,6 +30,9 @@ export interface Transaction {
   traffic_source: TrafficSource;
   campaign_id: string;
   classification_reason: string;
+  cohort_date?: string;
+  cohort_id?: string;
+  transaction_day?: number | null;
 }
 
 export interface UserAggregate {
@@ -45,7 +48,9 @@ export interface UserAggregate {
 }
 
 export interface CohortRow {
+  cohort_id: string;
   cohort_date: string;
+  funnel: Funnel;
   trial_users: number;
   upsell_users: number;
   first_subscription_users: number;

@@ -27,9 +27,9 @@ import type { TransactionStatus, TransactionType } from "@/services/types";
 type SortKey = "event_time" | "amount_usd";
 type SortDir = "asc" | "desc";
 
-const TYPES: TransactionType[] = ["trial", "upsell", "first_subscription", "renewal", "failed_payment", "refund", "chargeback"];
+const TYPES: TransactionType[] = ["trial", "upsell", "first_subscription", "renewal", "failed_payment", "refund", "chargeback", "unknown"];
 const STATUSES: TransactionStatus[] = ["success", "failed", "refunded", "chargeback"];
-const FUNNELS = ["past_life", "soulmate", "starseed"] as const;
+const FUNNELS = ["past_life", "soulmate", "starseed", "unknown"] as const;
 
 const PAGE_SIZE = 25;
 

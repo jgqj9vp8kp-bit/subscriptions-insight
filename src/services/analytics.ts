@@ -17,6 +17,8 @@ export interface Kpis {
 }
 
 export function computeKpis(txs: Transaction[]): Kpis {
+  // KPI revenue is calculated from normalized/classified transactions.
+  // Failed payments are excluded because no money was collected.
   const money = txs.filter(isMoneyMoving);
   const sumByType = (type: string) =>
     money.filter((t) => t.transaction_type === type).reduce((s, t) => s + t.amount_usd, 0);
@@ -64,6 +66,8 @@ export interface DailyRevenuePoint {
 }
 
 export function revenueByDay(txs: Transaction[]): DailyRevenuePoint[] {
+  // Calendar revenue chart still groups by transaction event date, unlike
+  // cohorts which group by trial timestamp.
   const map = new Map<string, number>();
   for (const t of txs) {
     if (!isMoneyMoving(t)) continue;
@@ -140,6 +144,8 @@ export function trialFunnel(txs: Transaction[]): FunnelStep[] {
 }
 
 export function computeUsers(txs: Transaction[]): UserAggregate[] {
+  // User aggregates are derived from the same transaction_type names used by
+  // the classifier: trial, upsell, first_subscription, renewal.
   const byUser = new Map<string, Transaction[]>();
   for (const t of txs) {
     const list = byUser.get(t.user_id) ?? [];
@@ -169,18 +175,27 @@ export function computeUsers(txs: Transaction[]): UserAggregate[] {
 }
 
 export function computeCohorts(txs: Transaction[]): CohortRow[] {
-  // Cohort = trial date (YYYY-MM-DD)
+  // Cohort membership is anchored to the exact trial timestamp; the displayed
+  // date is only a label. This keeps D0/D7/D30 windows aligned per user.
   const trials = txs.filter((t) => t.transaction_type === "trial" && t.status === "success");
-  const cohortByUser = new Map<string, { date: string; ts: number }>();
-  for (const t of trials) {
-    cohortByUser.set(t.user_id, { date: t.event_time.slice(0, 10), ts: new Date(t.event_time).getTime() });
+  const cohortByUser = new Map<string, { id: string; date: string; funnel: Transaction["funnel"]; ts: number }>();
+  for (const t of [...trials].sort((a, b) => (a.event_time < b.event_time ? -1 : 1))) {
+    if (cohortByUser.has(t.user_id)) continue;
+    const date = t.cohort_date ?? t.event_time.slice(0, 10);
+    const funnel = t.funnel;
+    cohortByUser.set(t.user_id, {
+      id: t.cohort_id ?? `${funnel}_${date}`,
+      date,
+      funnel,
+      ts: new Date(t.event_time).getTime(),
+    });
   }
 
-  const groups = new Map<string, string[]>(); // cohort_date -> user_ids
+  const groups = new Map<string, { date: string; funnel: Transaction["funnel"]; userIds: string[] }>();
   cohortByUser.forEach((c, user_id) => {
-    const list = groups.get(c.date) ?? [];
-    list.push(user_id);
-    groups.set(c.date, list);
+    const group = groups.get(c.id) ?? { date: c.date, funnel: c.funnel, userIds: [] };
+    group.userIds.push(user_id);
+    groups.set(c.id, group);
   });
 
   const userTxs = new Map<string, Transaction[]>();
@@ -191,8 +206,8 @@ export function computeCohorts(txs: Transaction[]): CohortRow[] {
   }
 
   const rows: CohortRow[] = [];
-  groups.forEach((userIds, cohort_date) => {
-    const cohortTs = new Date(cohort_date + "T00:00:00Z").getTime();
+  groups.forEach((group, cohort_id) => {
+    const { date: cohort_date, funnel, userIds } = group;
     const trial_users = userIds.length;
     let upsell_users = 0;
     let first_subscription_users = 0;
@@ -202,13 +217,17 @@ export function computeCohorts(txs: Transaction[]): CohortRow[] {
     for (const uid of userIds) {
       const list = userTxs.get(uid) ?? [];
       let hasUpsell = false, hasSub = false, hasRenewal = false;
+      const userCohort = cohortByUser.get(uid);
+      if (!userCohort) continue;
       for (const t of list) {
         if (!isMoneyMoving(t)) continue;
-        const dt = (new Date(t.event_time).getTime() - cohortTs) / DAY;
-        if (dt <= 0) revenue_d0 += t.amount_usd;
-        if (dt <= 7) revenue_d7 += t.amount_usd;
-        if (dt <= 14) revenue_d14 += t.amount_usd;
-        if (dt <= 30) revenue_d30 += t.amount_usd;
+        const dt = (new Date(t.event_time).getTime() - userCohort.ts) / DAY;
+        // D0/D7/D14/D30 are rolling windows from the user's trial timestamp.
+        // D0 means first 24 hours, not same calendar date.
+        if (dt >= 0 && dt < 1) revenue_d0 += t.amount_usd;
+        if (dt >= 0 && dt < 7) revenue_d7 += t.amount_usd;
+        if (dt >= 0 && dt < 14) revenue_d14 += t.amount_usd;
+        if (dt >= 0 && dt < 30) revenue_d30 += t.amount_usd;
         if (t.transaction_type === "upsell" && t.status === "success") hasUpsell = true;
         if (t.transaction_type === "first_subscription" && t.status === "success") hasSub = true;
         if (t.transaction_type === "renewal" && t.status === "success") hasRenewal = true;
@@ -219,7 +238,9 @@ export function computeCohorts(txs: Transaction[]): CohortRow[] {
     }
 
     rows.push({
+      cohort_id,
       cohort_date,
+      funnel,
       trial_users,
       upsell_users,
       first_subscription_users,

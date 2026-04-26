@@ -41,6 +41,7 @@ import {
   type ColumnMapping,
   type ParsedSheet,
 } from "@/services/import";
+import { transformPalmerRows, type RawPalmerRow } from "@/services/palmerTransform";
 import type { Transaction } from "@/services/types";
 
 const NONE = "__none__";
@@ -53,6 +54,7 @@ export default function ImportPage() {
   const resetToMock = useDataStore((s) => s.resetToMock);
 
   const [tab, setTab] = useState<"csv" | "google">("csv");
+  const [importMode, setImportMode] = useState<"clean_template" | "palmer_raw">("clean_template");
   const [parsed, setParsed] = useState<ParsedSheet | null>(null);
   const [mapping, setMapping] = useState<ColumnMapping>({});
   const [sourceLabel, setSourceLabel] = useState<string>("");
@@ -61,14 +63,18 @@ export default function ImportPage() {
   const [loading, setLoading] = useState(false);
 
   const requiredMissing = useMemo(
-    () => TARGET_FIELDS.filter((f) => f.required && !mapping[f.key]),
-    [mapping]
+    () =>
+      importMode === "palmer_raw"
+        ? []
+        : TARGET_FIELDS.filter((f) => f.required && !mapping[f.key]),
+    [importMode, mapping]
   );
 
   const previewRows: Transaction[] = useMemo(() => {
     if (!parsed) return [];
+    if (importMode === "palmer_raw") return transformPalmerRows(parsed.rows as RawPalmerRow[]).slice(0, 5);
     return applyMapping({ headers: parsed.headers, rows: parsed.rows.slice(0, 5) }, mapping).rows;
-  }, [parsed, mapping]);
+  }, [parsed, importMode, mapping]);
 
   function handleParsed(p: ParsedSheet, label: string, kind: "csv" | "google_sheet") {
     if (!p.headers.length || !p.rows.length) {
@@ -128,15 +134,22 @@ export default function ImportPage() {
       });
       return;
     }
-    const result = applyMapping(parsed, mapping);
-    setImported(result.rows, {
-      source: sourceKind,
+    const rows =
+      importMode === "palmer_raw"
+        ? transformPalmerRows(parsed.rows as RawPalmerRow[])
+        : applyMapping(parsed, mapping).rows;
+
+    setImported(rows, {
+      source: importMode === "palmer_raw" ? "palmer_raw" : sourceKind,
+      importMode,
       fileName: sourceKind === "csv" ? sourceLabel : undefined,
       sheetUrl: sourceKind === "google_sheet" ? sourceLabel : undefined,
-    });
+    }, importMode === "palmer_raw" ? (parsed.rows as RawPalmerRow[]) : undefined);
     toast({
       title: "Import complete",
-      description: `Loaded ${result.rows.length} transactions from ${sourceKind === "csv" ? "CSV" : "Google Sheet"}.`,
+      description: `Loaded ${rows.length} transactions from ${
+        importMode === "palmer_raw" ? "Palmer raw export" : sourceKind === "csv" ? "CSV" : "Google Sheet"
+      }.`,
     });
     setParsed(null);
     setMapping({});
@@ -220,46 +233,75 @@ export default function ImportPage() {
             </TabsContent>
           </Tabs>
 
+          <div className="mt-4 flex flex-wrap items-end gap-3 border-t border-border pt-4">
+            <div className="space-y-1.5">
+              <Label className="text-xs">Import mode</Label>
+              <Select
+                value={importMode}
+                onValueChange={(v) => {
+                  setImportMode(v as "clean_template" | "palmer_raw");
+                  if (parsed && v === "clean_template") setMapping(autoMap(parsed.headers));
+                }}
+              >
+                <SelectTrigger className="h-9 w-[220px]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="clean_template">Clean template</SelectItem>
+                  <SelectItem value="palmer_raw">Palmer raw export</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <p className="max-w-xl text-xs text-muted-foreground">
+              Palmer mode preserves the raw rows, converts cents to dollars, maps Palmer statuses, detects funnel metadata,
+              and classifies each user's transactions before analytics run.
+            </p>
+          </div>
+
           {parsed && (
             <div className="mt-4 space-y-4">
               <div className="flex items-baseline justify-between border-t border-border pt-4">
-                <h3 className="text-sm font-semibold text-foreground">Map columns</h3>
+                <h3 className="text-sm font-semibold text-foreground">
+                  {importMode === "clean_template" ? "Map columns" : "Preview Palmer transform"}
+                </h3>
                 <span className="text-xs text-muted-foreground">
                   {parsed.rows.length} rows · {parsed.headers.length} columns detected
                 </span>
               </div>
 
-              <div className="grid gap-2 sm:grid-cols-2">
-                {TARGET_FIELDS.map((f) => (
-                  <div key={f.key} className="flex items-center justify-between gap-2 rounded-md border border-border p-2">
-                    <div className="min-w-0">
-                      <div className="truncate text-sm text-foreground">
-                        {f.label}
-                        {f.required && <span className="ml-1 text-destructive">*</span>}
+              {importMode === "clean_template" && (
+                <div className="grid gap-2 sm:grid-cols-2">
+                  {TARGET_FIELDS.map((f) => (
+                    <div key={f.key} className="flex items-center justify-between gap-2 rounded-md border border-border p-2">
+                      <div className="min-w-0">
+                        <div className="truncate text-sm text-foreground">
+                          {f.label}
+                          {f.required && <span className="ml-1 text-destructive">*</span>}
+                        </div>
+                        <div className="truncate text-[10px] uppercase tracking-wide text-muted-foreground">
+                          {String(f.key)}
+                        </div>
                       </div>
-                      <div className="truncate text-[10px] uppercase tracking-wide text-muted-foreground">
-                        {String(f.key)}
-                      </div>
+                      <Select
+                        value={mapping[f.key] ?? NONE}
+                        onValueChange={(v) =>
+                          setMapping((m) => ({ ...m, [f.key]: v === NONE ? undefined : v }))
+                        }
+                      >
+                        <SelectTrigger className="h-8 w-[160px]">
+                          <SelectValue placeholder="—" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value={NONE}>— skip —</SelectItem>
+                          {parsed.headers.map((h) => (
+                            <SelectItem key={h} value={h}>{h}</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
                     </div>
-                    <Select
-                      value={mapping[f.key] ?? NONE}
-                      onValueChange={(v) =>
-                        setMapping((m) => ({ ...m, [f.key]: v === NONE ? undefined : v }))
-                      }
-                    >
-                      <SelectTrigger className="h-8 w-[160px]">
-                        <SelectValue placeholder="—" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value={NONE}>— skip —</SelectItem>
-                        {parsed.headers.map((h) => (
-                          <SelectItem key={h} value={h}>{h}</SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                ))}
-              </div>
+                  ))}
+                </div>
+              )}
 
               {requiredMissing.length > 0 && (
                 <div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 p-2 text-xs text-destructive">
@@ -348,6 +390,12 @@ export default function ImportPage() {
                 <dd className="truncate font-medium text-foreground" title={meta.fileName}>
                   {meta.fileName}
                 </dd>
+              </div>
+            )}
+            {meta.rawRowCount !== undefined && (
+              <div className="flex items-center justify-between">
+                <dt className="text-muted-foreground">Raw rows</dt>
+                <dd className="font-medium tabular-nums text-foreground">{meta.rawRowCount}</dd>
               </div>
             )}
             {meta.sheetUrl && (

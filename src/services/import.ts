@@ -14,6 +14,7 @@ import type {
   TransactionStatus,
   TransactionType,
 } from "./types";
+import { addCohortFields } from "./palmerTransform";
 
 export const TARGET_FIELDS: { key: keyof Transaction; label: string; required: boolean }[] = [
   { key: "transaction_id", label: "Transaction ID", required: true },
@@ -66,6 +67,8 @@ const SYNONYMS: Record<keyof Transaction, string[]> = {
 };
 
 export function autoMap(headers: string[]): ColumnMapping {
+  // Clean-template imports still go through user-controlled column mapping.
+  // Palmer raw imports bypass this and use palmerTransform.ts instead.
   const mapping: ColumnMapping = {};
   const used = new Set<string>();
   const headerByNorm = new Map<string, string>();
@@ -96,8 +99,8 @@ const VALID_TYPES: TransactionType[] = [
   "unknown",
 ];
 const VALID_STATUSES: TransactionStatus[] = ["success", "failed", "refunded", "chargeback"];
-const VALID_FUNNELS: Funnel[] = ["past_life", "soulmate", "starseed"];
-const VALID_SOURCES: TrafficSource[] = ["facebook", "tiktok", "google"];
+const VALID_FUNNELS: Funnel[] = ["past_life", "soulmate", "starseed", "unknown"];
+const VALID_SOURCES: TrafficSource[] = ["facebook", "tiktok", "google", "unknown"];
 
 function coerceType(raw: string): TransactionType {
   const v = raw.toLowerCase().trim().replace(/[\s-]+/g, "_");
@@ -112,11 +115,13 @@ function coerceStatus(raw: string): TransactionStatus {
 }
 function coerceFunnel(raw: string): Funnel {
   const v = raw.toLowerCase().trim().replace(/[\s-]+/g, "_");
-  return (VALID_FUNNELS as string[]).includes(v) ? (v as Funnel) : "past_life";
+  // Unknown must remain unknown so analytics do not silently attribute rows
+  // to a real funnel.
+  return (VALID_FUNNELS as string[]).includes(v) ? (v as Funnel) : "unknown";
 }
 function coerceSource(raw: string): TrafficSource {
   const v = raw.toLowerCase().trim();
-  return (VALID_SOURCES as string[]).includes(v) ? (v as TrafficSource) : "facebook";
+  return (VALID_SOURCES as string[]).includes(v) ? (v as TrafficSource) : "unknown";
 }
 function coerceISO(raw: string): string {
   if (!raw) return new Date().toISOString();
@@ -132,12 +137,14 @@ function coerceISO(raw: string): string {
 }
 function coerceAmount(raw: string): number {
   if (raw == null) return 0;
-  const cleaned = String(raw).replace(/[^0-9.\-]/g, "");
+  const cleaned = String(raw).replace(/[^0-9.-]/g, "");
   const n = Number(cleaned);
   return Number.isFinite(n) ? n : 0;
 }
 
 export function applyMapping(parsed: ParsedSheet, mapping: ColumnMapping): MapResult {
+  // Applies the clean-template mapping and then adds cohort fields so the UI
+  // can use one Transaction shape regardless of import mode.
   const errors: MapResult["errors"] = [];
   const rows: Transaction[] = [];
 
@@ -171,7 +178,7 @@ export function applyMapping(parsed: ParsedSheet, mapping: ColumnMapping): MapRe
     rows.push(tx);
   });
 
-  return { rows, errors };
+  return { rows: addCohortFields(rows), errors };
 }
 
 export function parseCSVText(text: string): ParsedSheet {

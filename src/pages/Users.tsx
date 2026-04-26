@@ -79,6 +79,7 @@ export default function UsersPage() {
               <SelectItem value="past_life">past life</SelectItem>
               <SelectItem value="soulmate">soulmate</SelectItem>
               <SelectItem value="starseed">starseed</SelectItem>
+              <SelectItem value="unknown">unknown</SelectItem>
             </SelectContent>
           </Select>
         </div>

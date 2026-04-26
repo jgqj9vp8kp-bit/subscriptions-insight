@@ -54,9 +54,9 @@ export default function CohortsPage() {
             </TableHeader>
             <TableBody>
               {cohorts.map((c) => (
-                <TableRow key={c.cohort_date}>
+                <TableRow key={c.cohort_id}>
                   <TableCell className="sticky left-0 bg-card z-10 font-medium text-sm whitespace-nowrap">
-                    {c.cohort_date}
+                    {c.cohort_id}
                   </TableCell>
                   <TableCell className="text-right tabular-nums text-sm">{c.trial_users}</TableCell>
                   <TableCell className="text-right tabular-nums text-sm">{c.upsell_users}</TableCell>
