@@ -66,6 +66,7 @@ const SYNONYMS: Record<keyof Transaction, string[]> = {
   traffic_source: ["trafficsource", "source", "channel", "utmsource"],
   campaign_id: ["campaignid", "campaign", "utmcampaign"],
   classification_reason: ["classificationreason", "reason", "note", "comment"],
+  billing_reason: ["billingreason", "ffbillingreason"],
 };
 
 export function autoMap(headers: string[]): ColumnMapping {

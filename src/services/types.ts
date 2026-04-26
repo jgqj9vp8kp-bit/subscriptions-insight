@@ -33,6 +33,7 @@ export interface Transaction {
   traffic_source: TrafficSource;
   campaign_id: string;
   classification_reason: string;
+  billing_reason?: string;
   cohort_date?: string;
   cohort_id?: string;
   transaction_day?: number | null;

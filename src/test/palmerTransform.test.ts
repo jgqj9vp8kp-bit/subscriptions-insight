@@ -75,7 +75,7 @@ describe("Palmer transformation", () => {
         user_id: "u_1",
         email: "one@example.com",
         created_at: "2026-01-01T10:00:00Z",
-        amount: "100",
+        amount: "3499",
         status: "SETTLED",
         metadata: JSON.stringify({ utm_campaign: "past_life_a" }),
       },
@@ -84,9 +84,9 @@ describe("Palmer transformation", () => {
         user_id: "u_1",
         email: "one@example.com",
         created_at: "2026-01-01T10:45:00Z",
-        amount: "1498",
+        amount: "4999",
         status: "SETTLED",
-        metadata: JSON.stringify({ utm_campaign: "past_life_a" }),
+        metadata: JSON.stringify({ utm_campaign: "past_life_a", ff_billing_reason: "post_purchase_upsell" }),
       },
       {
         id: "sub",
@@ -129,10 +129,40 @@ describe("Palmer transformation", () => {
     expect(rows.find((row) => row.transaction_id === "trial")?.transaction_type).toBe("trial");
     expect(rows.find((row) => row.transaction_id === "upsell")?.transaction_type).toBe("upsell");
     expect(rows.find((row) => row.transaction_id === "sub")?.transaction_type).toBe("first_subscription");
-    expect(rows.find((row) => row.transaction_id === "renewal_2")?.transaction_type).toBe("renewal_2");
-    expect(rows.find((row) => row.transaction_id === "renewal_3")?.transaction_type).toBe("renewal_3");
+    expect(rows.find((row) => row.transaction_id === "renewal_2")?.transaction_type).toBe("renewal");
+    expect(rows.find((row) => row.transaction_id === "renewal_3")?.transaction_type).toBe("renewal");
     expect(rows.find((row) => row.transaction_id === "renewal")?.transaction_type).toBe("renewal");
     expect(rows.every((row) => row.cohort_id === "unknown_2026-01-01")).toBe(true);
+    expect(rows.find((row) => row.transaction_id === "trial")?.classification_reason).toBe("First successful non-upsell payment → trial");
+    expect(rows.find((row) => row.transaction_id === "upsell")?.classification_reason).toBe("Metadata ff_billing_reason contains upsell");
+    expect(rows.find((row) => row.transaction_id === "sub")?.classification_reason).toBe("Next successful non-upsell payment after trial → first_subscription");
+  });
+
+  it("allows an upsell before the first non-upsell trial", () => {
+    const rows = transformPalmerRows([
+      {
+        id: "first_upsell",
+        user_id: "u_upsell_first",
+        email: "upsell-first@example.com",
+        created_at: "2026-01-01T10:00:00Z",
+        amount: "1498",
+        status: "SETTLED",
+        metadata: JSON.stringify({ ff_billing_reason: "upsell" }),
+      },
+      {
+        id: "intro_trial",
+        user_id: "u_upsell_first",
+        email: "upsell-first@example.com",
+        created_at: "2026-01-01T10:05:00Z",
+        amount: "4999",
+        status: "SETTLED",
+        metadata: JSON.stringify({ ff_campaign_path: "/soulmate-reading" }),
+      },
+    ]);
+
+    expect(rows.find((row) => row.transaction_id === "first_upsell")?.transaction_type).toBe("upsell");
+    expect(rows.find((row) => row.transaction_id === "intro_trial")?.transaction_type).toBe("trial");
+    expect(rows.find((row) => row.transaction_id === "intro_trial")?.cohort_id).toBe("soulmate-reading_2026-01-01");
   });
 
   it("groups cohorts by exact campaign_path instead of broad funnel", () => {
@@ -222,7 +252,7 @@ describe("Palmer transformation", () => {
       },
     ]);
 
-    expect(getPalmerImportDiagnostics(rows).unclassifiedSuccessfulSubscriptionRows).toBe(1);
+    expect(getPalmerImportDiagnostics(rows).unclassifiedSuccessfulSubscriptionRows).toBe(0);
   });
 
   it("calculates cohort windows from trial timestamp, not calendar midnight", () => {

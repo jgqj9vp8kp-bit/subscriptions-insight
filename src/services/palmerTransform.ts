@@ -11,6 +11,7 @@ export type RawPalmerRow = Record<string, unknown>;
 export interface PalmerMetadata {
   ff_funnel_id?: string;
   ff_campaign_path?: string;
+  ff_billing_reason?: string;
   utm_campaign?: string;
   utm_content?: string;
   utm_source?: string;
@@ -31,6 +32,7 @@ export interface PalmerImportDiagnostics {
 
 const DAY = 24 * 60 * 60 * 1000;
 const HOUR = 60 * 60 * 1000;
+const COMMON_UPSELL_AMOUNTS = [14.98];
 const AMOUNTS = {
   trial: 1,
   upsell: 14.98,
@@ -134,7 +136,7 @@ export function parseMetadata(rowOrMetadata: RawPalmerRow | unknown): PalmerMeta
   const merged: PalmerMetadata = { ...parsed };
   // Direct columns win alongside JSON metadata because Palmer exports may
   // flatten marketing fields instead of nesting them under `metadata`.
-  for (const key of ["ff_funnel_id", "ff_campaign_path", "utm_campaign", "utm_content", "utm_source"]) {
+  for (const key of ["ff_funnel_id", "ff_campaign_path", "ff_billing_reason", "utm_campaign", "utm_content", "utm_source"]) {
     const direct = valueFrom(source, [key]);
     if (direct) merged[key] = direct;
   }
@@ -189,6 +191,14 @@ function detectTrafficSource(row: RawPalmerRow, metadata: PalmerMetadata): Traff
   return "unknown";
 }
 
+function hasUpsellBillingReason(tx: Transaction): boolean {
+  return String(tx.billing_reason ?? "").toLowerCase().includes("upsell");
+}
+
+function isCommonUpsellAmount(amount: number): boolean {
+  return COMMON_UPSELL_AMOUNTS.some((upsellAmount) => near(amount, upsellAmount));
+}
+
 function failedType(status: TransactionStatus): TransactionType | null {
   if (status === "failed") return "failed_payment";
   if (status === "refunded") return "refund";
@@ -221,6 +231,7 @@ export function normalizePalmerRows(rows: RawPalmerRow[]): Transaction[] {
       product: valueFrom(row, FIELD_ALIASES.product) || productFromAmount(amount),
       traffic_source: detectTrafficSource(row, metadata),
       campaign_id: valueFrom(row, FIELD_ALIASES.campaign_id) || String(metadata.utm_campaign ?? ""),
+      billing_reason: String(metadata.ff_billing_reason ?? ""),
       classification_reason: fallbackType ? `${status} Palmer status` : "awaiting user-level classification",
     };
   });
@@ -241,72 +252,47 @@ export function classifyUserTransactions(rows: Transaction[]): Transaction[] {
     const sorted = [...list].sort((a, b) => new Date(a.event_time).getTime() - new Date(b.event_time).getTime());
     let trialTs: number | null = null;
     let firstSubscriptionTs: number | null = null;
-    let renewal2Ts: number | null = null;
-    let renewal3Ts: number | null = null;
 
     for (const tx of sorted) {
       const eventTs = new Date(tx.event_time).getTime();
       const statusType = failedType(tx.status);
+      const isUpsellByMetadata = hasUpsellBillingReason(tx);
+      const isUpsellByAmount = isCommonUpsellAmount(tx.amount_usd);
       let transaction_type: TransactionType = tx.transaction_type;
       let classification_reason = tx.classification_reason;
 
       if (statusType) {
         transaction_type = statusType;
         classification_reason = `${tx.status} Palmer status`;
-      } else if (near(tx.amount_usd, AMOUNTS.trial) && trialTs === null) {
-        // First successful $1 payment is considered trial.
-        // This is based on current product pricing logic.
+      } else if (trialTs === null && isUpsellByMetadata) {
+        transaction_type = "upsell";
+        classification_reason = "Metadata ff_billing_reason contains upsell";
+      } else if (trialTs === null) {
+        // Trial is based on the first successful non-upsell payment, not price.
+        // Intro/trial offers can be high-priced packages.
         trialTs = eventTs;
         transaction_type = "trial";
-        classification_reason = "$1 successful charge is the user's trial";
+        classification_reason = "First successful non-upsell payment → trial";
       } else if (
         trialTs !== null &&
-        near(tx.amount_usd, AMOUNTS.upsell) &&
         eventTs >= trialTs &&
-        eventTs - trialTs <= HOUR
+        eventTs - trialTs <= HOUR &&
+        (isUpsellByMetadata || isUpsellByAmount)
       ) {
-        // Upsell is detected by amount and timing:
-        // amount = 14.98 and within 60 minutes after trial.
         transaction_type = "upsell";
-        classification_reason = "$14.98 successful charge within 60 minutes of trial";
-      } else if (
-        trialTs !== null &&
-        near(tx.amount_usd, AMOUNTS.subscription) &&
-        between(eventTs - trialTs, 5 * DAY, 10 * DAY) &&
-        firstSubscriptionTs === null
-      ) {
-        // The first $29.99 charge around 5-10 days after trial is the conversion
-        // from trial into paid subscription.
+        classification_reason = isUpsellByMetadata
+          ? "Metadata ff_billing_reason contains upsell"
+          : "Common upsell amount within 0–60 minutes after trial";
+      } else if (firstSubscriptionTs === null && !isUpsellByMetadata) {
         firstSubscriptionTs = eventTs;
         transaction_type = "first_subscription";
-        classification_reason = "$29.99 first successful charge around 5-10 days after trial";
-      } else if (
-        firstSubscriptionTs !== null &&
-        near(tx.amount_usd, AMOUNTS.subscription) &&
-        between(eventTs - firstSubscriptionTs, 25 * DAY, 40 * DAY) &&
-        renewal2Ts === null
-      ) {
-        // Renewal 2 is the first monthly-ish renewal after first_subscription.
-        renewal2Ts = eventTs;
-        transaction_type = "renewal_2";
-        classification_reason = "$29.99 successful charge 25-40 days after first_subscription";
-      } else if (
-        renewal2Ts !== null &&
-        near(tx.amount_usd, AMOUNTS.subscription) &&
-        between(eventTs - renewal2Ts, 25 * DAY, 40 * DAY) &&
-        renewal3Ts === null
-      ) {
-        // Renewal 3 is the second monthly-ish renewal after first_subscription.
-        renewal3Ts = eventTs;
-        transaction_type = "renewal_3";
-        classification_reason = "$29.99 successful charge 25-40 days after renewal_2";
-      } else if (firstSubscriptionTs !== null && near(tx.amount_usd, AMOUNTS.subscription)) {
-        // Later successful $29.99 charges remain grouped as total later renewals.
+        classification_reason = "Next successful non-upsell payment after trial → first_subscription";
+      } else if (!isUpsellByMetadata) {
         transaction_type = "renewal";
-        classification_reason = "$29.99 successful charge after renewal_3 window or outside staged renewal windows";
+        classification_reason = "Later successful non-upsell payment → renewal";
       } else {
-        transaction_type = "unknown";
-        classification_reason = "no explicit Palmer classification rule matched";
+        transaction_type = "upsell";
+        classification_reason = "Metadata ff_billing_reason contains upsell";
       }
 
       classified.push({
