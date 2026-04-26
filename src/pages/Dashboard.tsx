@@ -24,6 +24,8 @@ import {
 } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { Card } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { KpiCard } from "@/components/KpiCard";
 import {
   Select,
@@ -58,6 +60,8 @@ export default function Dashboard() {
   const txs = useTransactions();
   const [funnelFilter, setFunnelFilter] = useState("all");
   const [campaignPathFilter, setCampaignPathFilter] = useState("all");
+  const [cohortDateFrom, setCohortDateFrom] = useState("");
+  const [cohortDateTo, setCohortDateTo] = useState("");
 
   const funnelOptions = useMemo(() => Array.from(new Set(txs.map((t) => t.funnel))).sort(), [txs]);
   const campaignPathOptions = useMemo(() => Array.from(new Set(txs.map((t) => t.campaign_path || "unknown"))).sort(), [txs]);
@@ -66,9 +70,11 @@ export default function Dashboard() {
       txs.filter((t) => {
         if (funnelFilter !== "all" && t.funnel !== funnelFilter) return false;
         if (campaignPathFilter !== "all" && (t.campaign_path || "unknown") !== campaignPathFilter) return false;
+        if (cohortDateFrom && (!t.cohort_date || t.cohort_date < cohortDateFrom)) return false;
+        if (cohortDateTo && (!t.cohort_date || t.cohort_date > cohortDateTo)) return false;
         return true;
       }),
-    [txs, funnelFilter, campaignPathFilter]
+    [txs, funnelFilter, campaignPathFilter, cohortDateFrom, cohortDateTo]
   );
 
   const kpis = computeKpis(filteredTxs);
@@ -99,6 +105,26 @@ export default function Dashboard() {
               ))}
             </SelectContent>
           </Select>
+          <div className="flex items-center gap-2">
+            <Label htmlFor="dashboard-cohort-date-from" className="text-xs text-muted-foreground">Cohort date from</Label>
+            <Input
+              id="dashboard-cohort-date-from"
+              type="date"
+              value={cohortDateFrom}
+              onChange={(e) => setCohortDateFrom(e.target.value)}
+              className="h-9 w-[150px]"
+            />
+          </div>
+          <div className="flex items-center gap-2">
+            <Label htmlFor="dashboard-cohort-date-to" className="text-xs text-muted-foreground">Cohort date to</Label>
+            <Input
+              id="dashboard-cohort-date-to"
+              type="date"
+              value={cohortDateTo}
+              onChange={(e) => setCohortDateTo(e.target.value)}
+              className="h-9 w-[150px]"
+            />
+          </div>
           <span className="text-xs text-muted-foreground">
             {filteredTxs.length} of {txs.length} transactions
           </span>

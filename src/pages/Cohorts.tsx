@@ -1,6 +1,9 @@
 import { useMemo, useState } from "react";
+import { ArrowDown, ArrowUp } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { Card } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import {
   Select,
   SelectContent,
@@ -32,8 +35,24 @@ export default function CohortsPage() {
   const txs = useTransactions();
   const [funnelFilter, setFunnelFilter] = useState("all");
   const [campaignPathFilter, setCampaignPathFilter] = useState("all");
+  const [trafficSourceFilter, setTrafficSourceFilter] = useState("all");
+  const [campaignIdFilter, setCampaignIdFilter] = useState("all");
+  const [cohortDateFrom, setCohortDateFrom] = useState("");
+  const [cohortDateTo, setCohortDateTo] = useState("");
+  const [dateSort, setDateSort] = useState<"desc" | "asc">("desc");
 
-  const allCohorts = useMemo(() => computeCohorts(txs), [txs]);
+  const trafficSourceOptions = useMemo(() => Array.from(new Set(txs.map((t) => t.traffic_source))).sort(), [txs]);
+  const campaignIdOptions = useMemo(() => Array.from(new Set(txs.map((t) => t.campaign_id || "unknown"))).sort(), [txs]);
+  const sourceFilteredTxs = useMemo(
+    () =>
+      txs.filter((t) => {
+        if (trafficSourceFilter !== "all" && t.traffic_source !== trafficSourceFilter) return false;
+        if (campaignIdFilter !== "all" && (t.campaign_id || "unknown") !== campaignIdFilter) return false;
+        return true;
+      }),
+    [txs, trafficSourceFilter, campaignIdFilter]
+  );
+  const allCohorts = useMemo(() => computeCohorts(sourceFilteredTxs), [sourceFilteredTxs]);
   const funnelOptions = useMemo(() => Array.from(new Set(allCohorts.map((c) => c.funnel))).sort(), [allCohorts]);
   const campaignPathOptions = useMemo(() => Array.from(new Set(allCohorts.map((c) => c.campaign_path))).sort(), [allCohorts]);
   const cohorts = useMemo(
@@ -41,9 +60,14 @@ export default function CohortsPage() {
       allCohorts.filter((c) => {
         if (funnelFilter !== "all" && c.funnel !== funnelFilter) return false;
         if (campaignPathFilter !== "all" && c.campaign_path !== campaignPathFilter) return false;
+        if (cohortDateFrom && c.cohort_date < cohortDateFrom) return false;
+        if (cohortDateTo && c.cohort_date > cohortDateTo) return false;
         return true;
+      }).sort((a, b) => {
+        const cmp = a.cohort_date < b.cohort_date ? -1 : a.cohort_date > b.cohort_date ? 1 : 0;
+        return dateSort === "asc" ? cmp : -cmp;
       }),
-    [allCohorts, funnelFilter, campaignPathFilter]
+    [allCohorts, funnelFilter, campaignPathFilter, cohortDateFrom, cohortDateTo, dateSort]
   );
   const hasUsers = useMemo(() => new Set(txs.map((t) => t.user_id)).size > 0, [txs]);
 
@@ -51,6 +75,47 @@ export default function CohortsPage() {
   const maxSubCR = Math.max(0, ...cohorts.map((c) => c.trial_to_first_subscription_cr));
   const maxRenewal2CR = Math.max(0, ...cohorts.map((c) => c.first_subscription_to_renewal_2_cr));
   const maxRenewal3CR = Math.max(0, ...cohorts.map((c) => c.renewal_2_to_renewal_3_cr));
+  const totals = useMemo(() => {
+    const sum = (pick: (c: (typeof cohorts)[number]) => number) =>
+      cohorts.reduce((total, cohort) => total + pick(cohort), 0);
+    const totalTrialUsers = sum((c) => c.trial_users);
+    const totalUpsellUsers = sum((c) => c.upsell_users);
+    const totalFirstSubscriptionUsers = sum((c) => c.first_subscription_users);
+    const totalRenewal2Users = sum((c) => c.renewal_2_users);
+    const totalRenewal3Users = sum((c) => c.renewal_3_users);
+    const totalRenewalUsers = sum((c) => c.renewal_users);
+    const totalRevenue = sum((c) => c.revenue_total);
+    const revenueD7 = sum((c) => c.revenue_d7);
+    const revenueD14 = sum((c) => c.revenue_d14);
+    const revenueD30 = sum((c) => c.revenue_d30);
+    return {
+      totalTrialUsers,
+      totalUpsellUsers,
+      totalFirstSubscriptionUsers,
+      totalRenewal2Users,
+      totalRenewal3Users,
+      totalRenewalUsers,
+      trialRevenue: sum((c) => c.trial_revenue),
+      upsellRevenue: sum((c) => c.upsell_revenue),
+      firstSubscriptionRevenue: sum((c) => c.first_subscription_revenue),
+      renewalRevenue: sum((c) => c.renewal_revenue),
+      revenueD0: sum((c) => c.revenue_d0),
+      revenueD7,
+      revenueD14,
+      revenueD30,
+      revenueD37: sum((c) => c.revenue_d37),
+      revenueD67: sum((c) => c.revenue_d67),
+      totalRevenue,
+      averageLtv: totalTrialUsers ? totalRevenue / totalTrialUsers : 0,
+      ltvD7: totalTrialUsers ? revenueD7 / totalTrialUsers : 0,
+      ltvD14: totalTrialUsers ? revenueD14 / totalTrialUsers : 0,
+      ltvD30: totalTrialUsers ? revenueD30 / totalTrialUsers : 0,
+      trialToUpsellCr: totalTrialUsers ? (totalUpsellUsers / totalTrialUsers) * 100 : 0,
+      trialToFirstSubscriptionCr: totalTrialUsers ? (totalFirstSubscriptionUsers / totalTrialUsers) * 100 : 0,
+      firstSubscriptionToRenewal2Cr: totalFirstSubscriptionUsers ? (totalRenewal2Users / totalFirstSubscriptionUsers) * 100 : 0,
+      renewal2ToRenewal3Cr: totalRenewal2Users ? (totalRenewal3Users / totalRenewal2Users) * 100 : 0,
+    };
+  }, [cohorts]);
 
   return (
     <AppLayout title="Cohorts" description="Grouped by trial date">
@@ -74,12 +139,59 @@ export default function CohortsPage() {
               ))}
             </SelectContent>
           </Select>
+          <Select value={trafficSourceFilter} onValueChange={setTrafficSourceFilter}>
+            <SelectTrigger className="h-9 w-[160px]"><SelectValue placeholder="Traffic source" /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All traffic</SelectItem>
+              {trafficSourceOptions.map((source) => (
+                <SelectItem key={source} value={source}>{source}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Select value={campaignIdFilter} onValueChange={setCampaignIdFilter}>
+            <SelectTrigger className="h-9 w-[190px]"><SelectValue placeholder="Campaign ID" /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All campaign IDs</SelectItem>
+              {campaignIdOptions.map((id) => (
+                <SelectItem key={id} value={id}>{id}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <div className="flex items-center gap-2">
+            <Label htmlFor="cohort-date-from" className="text-xs text-muted-foreground">Cohort date from</Label>
+            <Input
+              id="cohort-date-from"
+              type="date"
+              value={cohortDateFrom}
+              onChange={(e) => setCohortDateFrom(e.target.value)}
+              className="h-9 w-[150px]"
+            />
+          </div>
+          <div className="flex items-center gap-2">
+            <Label htmlFor="cohort-date-to" className="text-xs text-muted-foreground">Cohort date to</Label>
+            <Input
+              id="cohort-date-to"
+              type="date"
+              value={cohortDateTo}
+              onChange={(e) => setCohortDateTo(e.target.value)}
+              className="h-9 w-[150px]"
+            />
+          </div>
         </div>
+
         <div className="overflow-x-auto rounded-lg border border-border">
           <Table>
             <TableHeader>
               <TableRow>
                 <TableHead className="sticky left-0 bg-card z-10">Cohort</TableHead>
+                <TableHead className="whitespace-nowrap">
+                  <button
+                    onClick={() => setDateSort((s) => (s === "desc" ? "asc" : "desc"))}
+                    className="inline-flex items-center gap-1 hover:text-foreground"
+                  >
+                    Cohort date {dateSort === "asc" ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />}
+                  </button>
+                </TableHead>
                 <TableHead>Campaign path</TableHead>
                 <TableHead>Funnel</TableHead>
                 <TableHead className="text-right">Trial</TableHead>
@@ -102,6 +214,7 @@ export default function CohortsPage() {
                 <TableHead className="text-right">LTV D7</TableHead>
                 <TableHead className="text-right">LTV D14</TableHead>
                 <TableHead className="text-right">LTV D30</TableHead>
+                <TableHead className="text-right">LTV Total</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -110,6 +223,7 @@ export default function CohortsPage() {
                   <TableCell className="sticky left-0 bg-card z-10 font-medium text-sm whitespace-nowrap">
                     {c.cohort_id}
                   </TableCell>
+                  <TableCell className="text-xs text-muted-foreground tabular-nums whitespace-nowrap">{c.cohort_date}</TableCell>
                   <TableCell className="text-xs text-muted-foreground whitespace-nowrap">{c.campaign_path}</TableCell>
                   <TableCell className="text-xs text-muted-foreground capitalize whitespace-nowrap">{c.funnel.replace("_", " ")}</TableCell>
                   <TableCell className="text-right tabular-nums text-sm">{c.trial_users}</TableCell>
@@ -152,11 +266,41 @@ export default function CohortsPage() {
                   <TableCell className="text-right tabular-nums text-sm">{formatCurrency(c.ltv_d7)}</TableCell>
                   <TableCell className="text-right tabular-nums text-sm">{formatCurrency(c.ltv_d14)}</TableCell>
                   <TableCell className="text-right tabular-nums text-sm">{formatCurrency(c.ltv_d30)}</TableCell>
+                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(c.trial_users ? c.revenue_total / c.trial_users : 0)}</TableCell>
                 </TableRow>
               ))}
+              {cohorts.length > 0 && (
+                <TableRow className="border-t-2 border-border bg-muted/50 font-semibold">
+                  <TableCell className="sticky left-0 bg-muted z-10 text-sm whitespace-nowrap">Total</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">—</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">—</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">—</TableCell>
+                  <TableCell className="text-right tabular-nums text-sm">{totals.totalTrialUsers}</TableCell>
+                  <TableCell className="text-right tabular-nums text-sm">{totals.totalUpsellUsers}</TableCell>
+                  <TableCell className="text-right tabular-nums text-sm">{totals.totalFirstSubscriptionUsers}</TableCell>
+                  <TableCell className="text-right tabular-nums text-sm">{totals.totalRenewal2Users}</TableCell>
+                  <TableCell className="text-right tabular-nums text-sm">{totals.totalRenewal3Users}</TableCell>
+                  <TableCell className="text-right tabular-nums text-sm">{totals.totalRenewalUsers}</TableCell>
+                  <TableCell className="text-right tabular-nums text-sm">{formatPct(totals.trialToUpsellCr)}</TableCell>
+                  <TableCell className="text-right tabular-nums text-sm">{formatPct(totals.trialToFirstSubscriptionCr)}</TableCell>
+                  <TableCell className="text-right tabular-nums text-sm">{formatPct(totals.firstSubscriptionToRenewal2Cr)}</TableCell>
+                  <TableCell className="text-right tabular-nums text-sm">{formatPct(totals.renewal2ToRenewal3Cr)}</TableCell>
+                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(totals.revenueD0)}</TableCell>
+                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(totals.revenueD7)}</TableCell>
+                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(totals.revenueD14)}</TableCell>
+                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(totals.revenueD30)}</TableCell>
+                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(totals.revenueD37)}</TableCell>
+                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(totals.revenueD67)}</TableCell>
+                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(totals.totalRevenue)}</TableCell>
+                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(totals.ltvD7)}</TableCell>
+                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(totals.ltvD14)}</TableCell>
+                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(totals.ltvD30)}</TableCell>
+                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(totals.averageLtv)}</TableCell>
+                </TableRow>
+              )}
               {cohorts.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={23} className="text-center text-sm text-muted-foreground py-10">
+                  <TableCell colSpan={25} className="text-center text-sm text-muted-foreground py-10">
                     {hasUsers && allCohorts.length === 0
                       ? "No cohorts found. Check whether trial transactions were detected."
                       : "No cohorts to display."}

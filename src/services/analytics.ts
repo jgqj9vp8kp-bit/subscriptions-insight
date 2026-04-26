@@ -224,6 +224,7 @@ export function computeCohorts(txs: Transaction[]): CohortRow[] {
     let renewal_2_users = 0;
     let renewal_3_users = 0;
     let renewal_users = 0;
+    let trial_revenue = 0, upsell_revenue = 0, first_subscription_revenue = 0, renewal_revenue = 0;
     let revenue_d0 = 0, revenue_d7 = 0, revenue_d14 = 0, revenue_d30 = 0, revenue_d37 = 0, revenue_d67 = 0, revenue_total = 0;
 
     for (const uid of userIds) {
@@ -243,6 +244,10 @@ export function computeCohorts(txs: Transaction[]): CohortRow[] {
         if (dt >= 0 && dt < 37) revenue_d37 += t.amount_usd;
         if (dt >= 0 && dt < 67) revenue_d67 += t.amount_usd;
         if (dt >= 0) revenue_total += t.amount_usd;
+        if (t.transaction_type === "trial") trial_revenue += t.amount_usd;
+        if (t.transaction_type === "upsell") upsell_revenue += t.amount_usd;
+        if (t.transaction_type === "first_subscription") first_subscription_revenue += t.amount_usd;
+        if (isRenewalType(t)) renewal_revenue += t.amount_usd;
         if (t.transaction_type === "upsell" && t.status === "success") hasUpsell = true;
         if (t.transaction_type === "first_subscription" && t.status === "success") hasSub = true;
         if (t.transaction_type === "renewal_2" && t.status === "success") hasRenewal2 = true;
@@ -267,6 +272,10 @@ export function computeCohorts(txs: Transaction[]): CohortRow[] {
       renewal_2_users,
       renewal_3_users,
       renewal_users,
+      trial_revenue: round2(trial_revenue),
+      upsell_revenue: round2(upsell_revenue),
+      first_subscription_revenue: round2(first_subscription_revenue),
+      renewal_revenue: round2(renewal_revenue),
       trial_to_upsell_cr: (upsell_users / trial_users) * 100,
       trial_to_first_subscription_cr: (first_subscription_users / trial_users) * 100,
       first_subscription_to_renewal_2_cr: first_subscription_users ? (renewal_2_users / first_subscription_users) * 100 : 0,

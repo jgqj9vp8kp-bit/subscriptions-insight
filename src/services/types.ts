@@ -61,6 +61,10 @@ export interface CohortRow {
   renewal_2_users: number;
   renewal_3_users: number;
   renewal_users: number;
+  trial_revenue: number;
+  upsell_revenue: number;
+  first_subscription_revenue: number;
+  renewal_revenue: number;
   trial_to_upsell_cr: number;
   trial_to_first_subscription_cr: number;
   first_subscription_to_renewal_2_cr: number;
