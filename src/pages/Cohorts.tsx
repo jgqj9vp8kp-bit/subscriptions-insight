@@ -27,7 +27,8 @@ function heatStyle(value: number, max: number): React.CSSProperties {
   const intensity = Math.min(1, value / max);
   return {
     background: `hsl(var(--primary) / ${0.05 + intensity * 0.25})`,
-    color: intensity > 0.55 ? "hsl(var(--primary))" : undefined,
+    color: intensity > 0.5 ? "hsl(var(--primary))" : undefined,
+    fontVariantNumeric: "tabular-nums",
   };
 }
 
