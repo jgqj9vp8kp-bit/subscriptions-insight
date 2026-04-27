@@ -145,7 +145,7 @@ export default function CohortsPage() {
   return (
     <AppLayout title="Cohorts" description="Grouped by trial date">
       <Card className="p-4 shadow-card">
-        <div className="mb-4 flex flex-wrap items-center gap-2">
+        <div className="mb-3 flex flex-wrap items-center gap-2 pb-3 border-b border-border">
           <Select value={funnelFilter} onValueChange={setFunnelFilter}>
             <SelectTrigger className="h-9 w-[160px]"><SelectValue placeholder="Funnel" /></SelectTrigger>
             <SelectContent>
@@ -212,12 +212,17 @@ export default function CohortsPage() {
           </div>
         </div>
 
-        <div className="overflow-x-auto rounded-lg border border-border">
-          <Table>
+        <div className="rounded-lg border border-border [&>div]:max-h-[calc(100vh-280px)] [&>div]:overflow-auto [&>div]:rounded-lg">
+          <Table className="border-separate border-spacing-0">
             <TableHeader>
-              <TableRow>
-                <TableHead className="sticky left-0 bg-card z-10">Cohort</TableHead>
-                <TableHead className="whitespace-nowrap">
+              <TableRow className="hover:bg-transparent">
+                <TableHead
+                  className={`${HEAD_BASE} sticky left-0 z-30 shadow-[1px_0_0_0_hsl(var(--border))] text-left`}
+                  style={{ minWidth: 140 }}
+                >
+                  Cohort
+                </TableHead>
+                <TableHead className={`${HEAD_BASE} text-left`} style={{ minWidth: 120 }}>
                   <button
                     onClick={() => setDateSort((s) => (s === "desc" ? "asc" : "desc"))}
                     className="inline-flex items-center gap-1 hover:text-foreground"
@@ -225,36 +230,36 @@ export default function CohortsPage() {
                     Cohort date {dateSort === "asc" ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />}
                   </button>
                 </TableHead>
-                <TableHead>Campaign path</TableHead>
-                <TableHead>Funnel</TableHead>
-                <TableHead className="text-right">Trial</TableHead>
-                <TableHead className="text-right">Upsell</TableHead>
-                <TableHead className="text-right">First Sub</TableHead>
-                <TableHead className="text-right">→ Upsell CR</TableHead>
-                <TableHead className="text-right">→ Sub CR</TableHead>
-                <TableHead className="text-right">Sub → Renewal 2 CR</TableHead>
-                <TableHead className="text-right">Renewal 2 → 3 CR</TableHead>
-                <TableHead className="text-right">Renewal 2</TableHead>
-                <TableHead className="text-right">Renewal 3</TableHead>
-                <TableHead className="text-right">Total Renewals</TableHead>
-                <TableHead className="text-right">Refund Users</TableHead>
-                <TableHead className="text-right">Amount Refunded</TableHead>
-                <TableHead className="text-right">Refund Rate</TableHead>
-                <TableHead className="text-right">Gross Revenue</TableHead>
-                <TableHead className="text-right">Net Revenue</TableHead>
-                <TableHead className="text-right">Gross LTV</TableHead>
-                <TableHead className="text-right">Net LTV</TableHead>
-                <TableHead className="text-right">Rev D0</TableHead>
-                <TableHead className="text-right">Rev D7</TableHead>
-                <TableHead className="text-right">Rev D14</TableHead>
-                <TableHead className="text-right">Rev D30</TableHead>
-                <TableHead className="text-right">Rev D37</TableHead>
-                <TableHead className="text-right">Rev D67</TableHead>
-                <TableHead className="text-right">Rev Total</TableHead>
-                <TableHead className="text-right">LTV D7</TableHead>
-                <TableHead className="text-right">LTV D14</TableHead>
-                <TableHead className="text-right">LTV D30</TableHead>
-                <TableHead className="text-right">LTV Total</TableHead>
+                <TableHead className={`${HEAD_BASE} text-left`} style={{ minWidth: 160 }}>Campaign path</TableHead>
+                <TableHead className={`${HEAD_BASE} text-left`} style={{ minWidth: 110 }}>Funnel</TableHead>
+                <TableHead className={`${HEAD_NUM} ${SECTION_DIVIDER}`} style={{ minWidth: 76 }}>Trial</TableHead>
+                <TableHead className={HEAD_NUM} style={{ minWidth: 84 }}>Upsell</TableHead>
+                <TableHead className={HEAD_NUM} style={{ minWidth: 90 }}>First Sub</TableHead>
+                <TableHead className={`${HEAD_NUM} ${SECTION_DIVIDER}`} style={{ minWidth: 100 }}>→ Upsell CR</TableHead>
+                <TableHead className={HEAD_NUM} style={{ minWidth: 90 }}>→ Sub CR</TableHead>
+                <TableHead className={HEAD_NUM} style={{ minWidth: 140 }}>Sub → Renewal 2 CR</TableHead>
+                <TableHead className={HEAD_NUM} style={{ minWidth: 130 }}>Renewal 2 → 3 CR</TableHead>
+                <TableHead className={`${HEAD_NUM} ${SECTION_DIVIDER}`} style={{ minWidth: 90 }}>Renewal 2</TableHead>
+                <TableHead className={HEAD_NUM} style={{ minWidth: 90 }}>Renewal 3</TableHead>
+                <TableHead className={HEAD_NUM} style={{ minWidth: 110 }}>Total Renewals</TableHead>
+                <TableHead className={`${HEAD_NUM} ${SECTION_DIVIDER}`} style={{ minWidth: 100 }}>Refund Users</TableHead>
+                <TableHead className={HEAD_NUM} style={{ minWidth: 120 }}>Amount Refunded</TableHead>
+                <TableHead className={HEAD_NUM} style={{ minWidth: 100 }}>Refund Rate</TableHead>
+                <TableHead className={`${HEAD_NUM} ${SECTION_DIVIDER}`} style={{ minWidth: 110 }}>Gross Revenue</TableHead>
+                <TableHead className={HEAD_NUM} style={{ minWidth: 110 }}>Net Revenue</TableHead>
+                <TableHead className={HEAD_NUM} style={{ minWidth: 100 }}>Gross LTV</TableHead>
+                <TableHead className={HEAD_NUM} style={{ minWidth: 100 }}>Net LTV</TableHead>
+                <TableHead className={`${HEAD_NUM} ${SECTION_DIVIDER}`} style={{ minWidth: 90 }}>Rev D0</TableHead>
+                <TableHead className={HEAD_NUM} style={{ minWidth: 90 }}>Rev D7</TableHead>
+                <TableHead className={HEAD_NUM} style={{ minWidth: 90 }}>Rev D14</TableHead>
+                <TableHead className={HEAD_NUM} style={{ minWidth: 90 }}>Rev D30</TableHead>
+                <TableHead className={HEAD_NUM} style={{ minWidth: 90 }}>Rev D37</TableHead>
+                <TableHead className={HEAD_NUM} style={{ minWidth: 90 }}>Rev D67</TableHead>
+                <TableHead className={HEAD_NUM} style={{ minWidth: 100 }}>Rev Total</TableHead>
+                <TableHead className={`${HEAD_NUM} ${SECTION_DIVIDER}`} style={{ minWidth: 90 }}>LTV D7</TableHead>
+                <TableHead className={HEAD_NUM} style={{ minWidth: 90 }}>LTV D14</TableHead>
+                <TableHead className={HEAD_NUM} style={{ minWidth: 90 }}>LTV D30</TableHead>
+                <TableHead className={HEAD_NUM} style={{ minWidth: 100 }}>LTV Total</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
