@@ -22,6 +22,16 @@ import {
 import { useTransactions } from "@/services/sheets";
 import { computeCohorts, formatCurrency, formatPct } from "@/services/analytics";
 
+// Visual-only helpers — no data/logic impact.
+const HEAD_BASE =
+  "sticky top-0 z-20 bg-card h-10 px-3 whitespace-nowrap border-b border-border text-xs font-semibold text-muted-foreground";
+const HEAD_NUM = `${HEAD_BASE} text-right`;
+const CELL_BASE = "py-2 px-3 align-middle";
+const CELL_NUM = `${CELL_BASE} text-right tabular-nums whitespace-nowrap text-sm`;
+const CELL_TXT = `${CELL_BASE} text-xs text-muted-foreground whitespace-nowrap`;
+// Left border marks the start of a logical section (no column reorder).
+const SECTION_DIVIDER = "border-l border-border/60";
+
 function heatStyle(value: number, max: number): React.CSSProperties {
   if (max <= 0) return {};
   const intensity = Math.min(1, value / max);
