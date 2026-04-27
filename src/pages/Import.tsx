@@ -61,6 +61,10 @@ const DIAGNOSTIC_LABELS: { key: keyof PalmerImportDiagnostics; label: string }[]
   { key: "rowsWithCohortId", label: "Rows with cohort_id" },
   { key: "unknownFunnelRows", label: "Funnel = unknown" },
   { key: "unclassifiedSuccessfulSubscriptionRows", label: "Unclassified success $29.99" },
+  { key: "uniqueUserIdCount", label: "Unique user_id count" },
+  { key: "missingEmailCount", label: "Missing email count" },
+  { key: "missingCustomerIdCount", label: "Missing customerId count" },
+  { key: "fallbackUnknownUserCount", label: "Fallback unknown_user count" },
 ];
 
 export default function ImportPage() {
@@ -154,7 +158,7 @@ export default function ImportPage() {
     const rawRows = parsed.rows as RawPalmerRow[];
     const rows = importMode === "palmer_raw" ? transformPalmerRows(rawRows) : applyMapping(parsed, mapping).rows;
     const diagnostics =
-      importMode === "palmer_raw" ? getPalmerImportDiagnostics(rows, rawRows.length) : undefined;
+      importMode === "palmer_raw" ? getPalmerImportDiagnostics(rows, rawRows.length, rawRows) : undefined;
 
     setImported(rows, {
       source: importMode === "palmer_raw" ? "palmer_raw" : sourceKind,

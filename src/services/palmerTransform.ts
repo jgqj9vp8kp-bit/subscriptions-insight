@@ -12,6 +12,8 @@ export interface PalmerMetadata {
   ff_funnel_id?: string;
   ff_campaign_path?: string;
   ff_billing_reason?: string;
+  initialUrl?: string;
+  email?: string;
   utm_campaign?: string;
   utm_content?: string;
   utm_source?: string;
@@ -28,6 +30,10 @@ export interface PalmerImportDiagnostics {
   rowsWithCohortId: number;
   unknownFunnelRows: number;
   unclassifiedSuccessfulSubscriptionRows: number;
+  uniqueUserIdCount: number;
+  missingEmailCount: number;
+  missingCustomerIdCount: number;
+  fallbackUnknownUserCount: number;
 }
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -43,10 +49,11 @@ const AMOUNTS = {
 // These aliases keep import tolerant without changing the normalized schema.
 const FIELD_ALIASES = {
   transaction_id: ["transaction_id", "transactionid", "transaction id", "id", "payment_id", "charge_id", "order_id"],
-  user_id: ["user_id", "userid", "user id", "customer_id", "customerid", "client_id", "member_id", "account_id"],
-  email: ["email", "user_email", "customer_email", "customer email", "customer.email", "billing_email"],
+  user_id: ["customerId", "customer_id", "customerid", "user_id", "userid", "user id", "client_id", "member_id", "account_id"],
+  email: ["customerEmailAddress", "customer_email_address", "email", "user_email", "customer_email", "customer email", "customer.email", "billing_email"],
   event_time: ["event_time", "event time", "created_at", "createdat", "created", "timestamp", "paid_at", "settled_at", "date"],
   amount: ["amount", "amount_usd", "amountusd", "amount_cents", "amount in cents", "amount_in_cents", "price", "total", "gross_amount"],
+  amount_refunded: ["amountRefunded", "amount_refunded", "amountrefunded", "refunded_amount", "refund_amount", "amount refunded"],
   currency: ["currency", "ccy", "currency_code"],
   status: ["status", "state", "result", "payment_status", "transaction_status"],
   product: ["product", "product_name", "product name", "plan", "sku"],
@@ -102,6 +109,16 @@ export function normalizeAmount(raw: unknown): number {
   return Math.round(normalized * 100) / 100;
 }
 
+function normalizeRefundAmount(raw: unknown): number {
+  const source = String(raw ?? "").trim();
+  const cleaned = source.replace(/[^0-9.-]/g, "");
+  const amountInCents = Number(cleaned);
+  if (!Number.isFinite(amountInCents)) return 0;
+  // Palmer `amountRefunded` is exported in cents even when transaction status
+  // remains SETTLED, so refund analytics must use this field directly.
+  return Math.round((amountInCents / 100) * 100) / 100;
+}
+
 export function normalizeStatus(raw: unknown): TransactionStatus {
   const value = String(raw ?? "").trim().toUpperCase().replace(/[\s-]+/g, "_");
   // Keep Palmer payment states explicit so failed/refund/chargeback analytics
@@ -136,11 +153,32 @@ export function parseMetadata(rowOrMetadata: RawPalmerRow | unknown): PalmerMeta
   const merged: PalmerMetadata = { ...parsed };
   // Direct columns win alongside JSON metadata because Palmer exports may
   // flatten marketing fields instead of nesting them under `metadata`.
-  for (const key of ["ff_funnel_id", "ff_campaign_path", "ff_billing_reason", "utm_campaign", "utm_content", "utm_source"]) {
+  for (const key of ["ff_funnel_id", "ff_campaign_path", "ff_billing_reason", "initialUrl", "email", "utm_campaign", "utm_content", "utm_source"]) {
     const direct = valueFrom(source, [key]);
     if (direct) merged[key] = direct;
   }
   return merged;
+}
+
+function metadataString(metadata: PalmerMetadata, key: string): string {
+  const value = metadata[key];
+  return value == null ? "" : String(value).trim();
+}
+
+function customerIdFrom(row: RawPalmerRow): string {
+  return valueFrom(row, FIELD_ALIASES.user_id);
+}
+
+function emailFrom(row: RawPalmerRow, metadata: PalmerMetadata): string {
+  return valueFrom(row, FIELD_ALIASES.email) || metadataString(metadata, "email");
+}
+
+function userIdFrom(row: RawPalmerRow, metadata: PalmerMetadata, index: number): string {
+  const customerId = customerIdFrom(row);
+  if (customerId) return customerId;
+  const email = emailFrom(row, metadata);
+  if (email) return email;
+  return `unknown_user_${index + 1}`;
 }
 
 function detectFunnel(metadata: PalmerMetadata): Funnel {
@@ -180,7 +218,9 @@ function normalizeCampaignPath(raw: unknown): string {
 }
 
 function detectCampaignPath(metadata: PalmerMetadata): string {
-  return normalizeCampaignPath(metadata.ff_campaign_path);
+  const path = normalizeCampaignPath(metadata.ff_campaign_path);
+  if (path !== "unknown") return path;
+  return normalizeCampaignPath(metadata.initialUrl);
 }
 
 function detectTrafficSource(row: RawPalmerRow, metadata: PalmerMetadata): TrafficSource {
@@ -210,25 +250,27 @@ export function normalizePalmerRows(rows: RawPalmerRow[]): Transaction[] {
   return rows.map((row, index) => {
     const metadata = parseMetadata(row);
     const status = normalizeStatus(valueFrom(row, FIELD_ALIASES.status));
-    const normalizedAmount = normalizeAmount(valueFrom(row, FIELD_ALIASES.amount));
-    // Refunds and chargebacks reduce collected revenue, so store them as
-    // negative money movement after status normalization.
-    const amount =
-      status === "refunded" || status === "chargeback" ? -Math.abs(normalizedAmount) : normalizedAmount;
+    const grossAmount = Math.abs(normalizeAmount(valueFrom(row, FIELD_ALIASES.amount)));
+    const refundAmount = normalizeRefundAmount(valueFrom(row, FIELD_ALIASES.amount_refunded));
+    const netAmount = grossAmount - refundAmount;
     const fallbackType = failedType(status);
 
     return {
       transaction_id: valueFrom(row, FIELD_ALIASES.transaction_id) || `palmer-row-${index + 1}`,
-      user_id: valueFrom(row, FIELD_ALIASES.user_id) || `unknown-user-${index + 1}`,
-      email: valueFrom(row, FIELD_ALIASES.email) || "unknown@example.com",
+      user_id: userIdFrom(row, metadata, index),
+      email: emailFrom(row, metadata),
       event_time: parseEventTime(valueFrom(row, FIELD_ALIASES.event_time)),
-      amount_usd: amount,
+      amount_usd: grossAmount,
+      gross_amount_usd: grossAmount,
+      refund_amount_usd: refundAmount,
+      net_amount_usd: netAmount,
+      is_refunded: refundAmount > 0,
       currency: valueFrom(row, FIELD_ALIASES.currency) || "USD",
       status,
       transaction_type: fallbackType ?? "unknown",
       funnel: detectFunnel(metadata),
       campaign_path: detectCampaignPath(metadata),
-      product: valueFrom(row, FIELD_ALIASES.product) || productFromAmount(amount),
+      product: valueFrom(row, FIELD_ALIASES.product) || productFromAmount(grossAmount),
       traffic_source: detectTrafficSource(row, metadata),
       campaign_id: valueFrom(row, FIELD_ALIASES.campaign_id) || String(metadata.utm_campaign ?? ""),
       billing_reason: String(metadata.ff_billing_reason ?? ""),
@@ -338,7 +380,15 @@ export function transformPalmerRows(rows: RawPalmerRow[]): Transaction[] {
   return classifyUserTransactions(normalizePalmerRows(rows));
 }
 
-export function getPalmerImportDiagnostics(rows: Transaction[], totalRows = rows.length): PalmerImportDiagnostics {
+export function getPalmerImportDiagnostics(
+  rows: Transaction[],
+  totalRows = rows.length,
+  rawRows: RawPalmerRow[] = []
+): PalmerImportDiagnostics {
+  const rowsMissingCustomerId = rawRows.length
+    ? rawRows.filter((row) => !customerIdFrom(row)).length
+    : rows.filter((row) => row.user_id.includes("@") || row.user_id.startsWith("unknown_user_")).length;
+
   return {
     totalRows,
     rowsWithAmountUsd: rows.filter((row) => Number.isFinite(row.amount_usd) && row.amount_usd !== 0).length,
@@ -351,6 +401,10 @@ export function getPalmerImportDiagnostics(rows: Transaction[], totalRows = rows
     unclassifiedSuccessfulSubscriptionRows: rows.filter(
       (row) => row.status === "success" && near(row.amount_usd, AMOUNTS.subscription) && row.transaction_type === "unknown"
     ).length,
+    uniqueUserIdCount: new Set(rows.map((row) => row.user_id)).size,
+    missingEmailCount: rows.filter((row) => !row.email).length,
+    missingCustomerIdCount: rowsMissingCustomerId,
+    fallbackUnknownUserCount: rows.filter((row) => row.user_id.startsWith("unknown_user_")).length,
   };
 }
 

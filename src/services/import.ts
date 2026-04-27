@@ -22,6 +22,10 @@ export const TARGET_FIELDS: { key: keyof Transaction; label: string; required: b
   { key: "email", label: "Email", required: true },
   { key: "event_time", label: "Event time", required: true },
   { key: "amount_usd", label: "Amount (USD)", required: true },
+  { key: "gross_amount_usd", label: "Gross amount (USD)", required: false },
+  { key: "refund_amount_usd", label: "Refund amount (USD)", required: false },
+  { key: "net_amount_usd", label: "Net amount (USD)", required: false },
+  { key: "is_refunded", label: "Is refunded", required: false },
   { key: "currency", label: "Currency", required: false },
   { key: "status", label: "Status", required: true },
   { key: "transaction_type", label: "Transaction type", required: true },
@@ -57,6 +61,10 @@ const SYNONYMS: Record<keyof Transaction, string[]> = {
   email: ["email", "useremail", "customeremail"],
   event_time: ["eventtime", "createdat", "timestamp", "time", "date", "datetime", "occurredat"],
   amount_usd: ["amount", "amountusd", "total", "price", "value", "revenue"],
+  gross_amount_usd: ["grossamount", "grossamountusd"],
+  refund_amount_usd: ["refundamount", "refundedamount", "amountrefunded", "amountrefundedusd", "refundamountusd"],
+  net_amount_usd: ["netamount", "netamountusd"],
+  is_refunded: ["isrefunded", "refunded"],
   currency: ["currency", "ccy"],
   status: ["status", "state", "result"],
   transaction_type: ["transactiontype", "type", "eventtype", "kind"],
@@ -158,13 +166,23 @@ export function applyMapping(parsed: ParsedSheet, mapping: ColumnMapping): MapRe
       const col = mapping[k];
       return col ? (src[col] ?? "") : "";
     };
+    const amountUsd = coerceAmount(get("amount_usd"));
+    const mappedGrossAmountUsd = coerceAmount(get("gross_amount_usd"));
+    const refundAmountUsd = coerceAmount(get("refund_amount_usd"));
+    const mappedNetAmountUsd = coerceAmount(get("net_amount_usd"));
+    const grossAmountUsd = mappedGrossAmountUsd || amountUsd;
+    const netAmountUsd = mappedNetAmountUsd || grossAmountUsd - refundAmountUsd;
 
     const tx: Transaction = {
       transaction_id: get("transaction_id") || `row-${i + 1}`,
       user_id: get("user_id") || `unknown-${i + 1}`,
-      email: get("email") || "unknown@example.com",
+      email: get("email"),
       event_time: coerceISO(get("event_time")),
-      amount_usd: coerceAmount(get("amount_usd")),
+      amount_usd: amountUsd,
+      gross_amount_usd: grossAmountUsd,
+      refund_amount_usd: refundAmountUsd,
+      net_amount_usd: netAmountUsd,
+      is_refunded: refundAmountUsd > 0,
       currency: get("currency") || "USD",
       status: coerceStatus(get("status")),
       transaction_type: coerceType(get("transaction_type")),

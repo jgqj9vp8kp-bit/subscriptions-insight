@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { computeCohorts } from "@/services/analytics";
+import { computeCohorts, computeUsers } from "@/services/analytics";
 import {
   getPalmerImportDiagnostics,
   normalizeAmount,
@@ -197,8 +197,58 @@ describe("Palmer transformation", () => {
     ]);
   });
 
-  it("reports Palmer import diagnostics after transformation", () => {
+  it("uses initialUrl as campaign_path fallback when ff_campaign_path is missing", () => {
     const rows = transformPalmerRows([
+      {
+        id: "initial_url_trial",
+        user_id: "u_initial_url",
+        email: "initial-url@example.com",
+        created_at: "2026-04-26T10:00:00Z",
+        amount: "100",
+        status: "SETTLED",
+        metadata: JSON.stringify({ initialUrl: "https://example.com/soulmate-reading?utm=abc" }),
+      },
+    ]);
+
+    expect(rows[0].campaign_path).toBe("soulmate-reading");
+    expect(rows[0].cohort_id).toBe("soulmate-reading_2026-04-26");
+  });
+
+  it("aggregates refunded amount from amountRefunded cents regardless of status", () => {
+    const rows = transformPalmerRows([
+      {
+        id: "settled_refunded_tx",
+        customerId: "customer_refund",
+        customerEmailAddress: "refund@example.com",
+        created_at: "2026-04-26T10:00:00Z",
+        amount: "2999",
+        amountRefunded: "2099",
+        status: "SETTLED",
+        metadata: JSON.stringify({ ff_campaign_path: "/soulmate-reading" }),
+      },
+    ]);
+    const users = computeUsers(rows);
+
+    expect(rows[0].status).toBe("success");
+    expect(rows[0].gross_amount_usd).toBe(29.99);
+    expect(rows[0].refund_amount_usd).toBe(20.99);
+    expect(rows[0].net_amount_usd).toBe(9);
+    expect(rows[0].is_refunded).toBe(true);
+    expect(users[0].has_refund).toBe(true);
+    expect(users[0].total_refund_usd).toBe(20.99);
+
+    const cohorts = computeCohorts(rows);
+    expect(cohorts[0].refund_users).toBe(1);
+    expect(cohorts[0].amount_refunded).toBe(20.99);
+    expect(cohorts[0].refund_rate).toBe(100);
+    expect(cohorts[0].gross_revenue).toBe(29.99);
+    expect(cohorts[0].net_revenue).toBe(9);
+    expect(cohorts[0].gross_ltv).toBe(29.99);
+    expect(cohorts[0].net_ltv).toBe(9);
+  });
+
+  it("reports Palmer import diagnostics after transformation", () => {
+    const rawRows = [
       {
         id: "trial",
         customer_id: "u_1",
@@ -217,9 +267,10 @@ describe("Palmer transformation", () => {
         payment_status: "SUCCEEDED",
         metadata: JSON.stringify({ utm_campaign: "unknown_campaign" }),
       },
-    ]);
+    ];
+    const rows = transformPalmerRows(rawRows);
 
-    expect(getPalmerImportDiagnostics(rows, 2)).toEqual({
+    expect(getPalmerImportDiagnostics(rows, 2, rawRows)).toEqual({
       totalRows: 2,
       rowsWithAmountUsd: 2,
       successRows: 2,
@@ -229,7 +280,62 @@ describe("Palmer transformation", () => {
       rowsWithCohortId: 2,
       unknownFunnelRows: 2,
       unclassifiedSuccessfulSubscriptionRows: 0,
+      uniqueUserIdCount: 1,
+      missingEmailCount: 0,
+      missingCustomerIdCount: 0,
+      fallbackUnknownUserCount: 0,
     });
+  });
+
+  it("uses customerId as user_id when email is missing", () => {
+    const rows = transformPalmerRows([
+      {
+        id: "trial",
+        customerId: "customer_123",
+        created_at: "2026-01-01T10:00:00Z",
+        amount: "3499",
+        status: "SETTLED",
+      },
+    ]);
+
+    expect(rows[0].user_id).toBe("customer_123");
+    expect(rows[0].email).toBe("");
+  });
+
+  it("uses metadata.email as user_id and email when customerId is missing", () => {
+    const rows = transformPalmerRows([
+      {
+        id: "trial",
+        created_at: "2026-01-01T10:00:00Z",
+        amount: "3499",
+        status: "SETTLED",
+        metadata: JSON.stringify({ email: "metadata@example.com" }),
+      },
+    ]);
+
+    expect(rows[0].user_id).toBe("metadata@example.com");
+    expect(rows[0].email).toBe("metadata@example.com");
+  });
+
+  it("assigns unique fallback user ids when identity is missing", () => {
+    const rows = transformPalmerRows([
+      {
+        id: "row_1",
+        created_at: "2026-01-01T10:00:00Z",
+        amount: "3499",
+        status: "SETTLED",
+      },
+      {
+        id: "row_2",
+        created_at: "2026-01-01T11:00:00Z",
+        amount: "3499",
+        status: "SETTLED",
+      },
+    ]);
+
+    expect(rows.map((row) => row.user_id).sort()).toEqual(["unknown_user_1", "unknown_user_2"]);
+    expect(new Set(rows.map((row) => row.user_id)).size).toBe(2);
+    expect(rows.every((row) => row.email === "")).toBe(true);
   });
 
   it("counts unclassified successful $29.99 rows in diagnostics", () => {

@@ -24,6 +24,10 @@ export interface Transaction {
   email: string;
   event_time: string; // ISO timestamp
   amount_usd: number;
+  gross_amount_usd: number;
+  refund_amount_usd: number;
+  net_amount_usd: number;
+  is_refunded: boolean;
   currency: string;
   status: TransactionStatus;
   transaction_type: TransactionType;
@@ -47,6 +51,8 @@ export interface UserAggregate {
   total_revenue: number;
   has_upsell: boolean;
   has_first_subscription: boolean;
+  has_refund: boolean;
+  total_refund_usd: number;
   renewal_count: number;
   user_ltv: number;
 }
@@ -62,10 +68,18 @@ export interface CohortRow {
   renewal_2_users: number;
   renewal_3_users: number;
   renewal_users: number;
+  refund_users: number;
+  refunded_user_ids: string[];
   trial_revenue: number;
   upsell_revenue: number;
   first_subscription_revenue: number;
   renewal_revenue: number;
+  amount_refunded: number;
+  refund_rate: number;
+  gross_revenue: number;
+  net_revenue: number;
+  gross_ltv: number;
+  net_ltv: number;
   trial_to_upsell_cr: number;
   trial_to_first_subscription_cr: number;
   first_subscription_to_renewal_2_cr: number;

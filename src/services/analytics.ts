@@ -6,6 +6,9 @@ const DAY = 24 * 60 * 60 * 1000;
 const isMoneyMoving = (t: Transaction) => t.status !== "failed";
 const isRenewalType = (t: Transaction) =>
   t.transaction_type === "renewal_2" || t.transaction_type === "renewal_3" || t.transaction_type === "renewal";
+const grossAmount = (t: Transaction) => t.gross_amount_usd ?? (t.amount_usd > 0 ? t.amount_usd : 0);
+const refundAmount = (t: Transaction) => t.refund_amount_usd ?? (t.amount_usd < 0 ? Math.abs(t.amount_usd) : 0);
+const netAmount = (t: Transaction) => t.net_amount_usd ?? grossAmount(t) - refundAmount(t);
 
 export interface Kpis {
   totalRevenue: number;
@@ -166,15 +169,18 @@ export function computeUsers(txs: Transaction[]): UserAggregate[] {
       const sorted = [...list].sort((a, b) => (a.event_time < b.event_time ? -1 : 1));
       const trial = sorted.find((t) => t.transaction_type === "trial");
       const money = sorted.filter(isMoneyMoving);
-      const total_revenue = money.reduce((s, t) => s + t.amount_usd, 0);
+      const total_revenue = money.reduce((s, t) => s + netAmount(t), 0);
+      const total_refund_usd = sorted.reduce((s, t) => s + refundAmount(t), 0);
       return {
         user_id,
-        email: sorted[0].email,
+        email: sorted.find((t) => t.email)?.email || "",
         funnel: sorted[0].funnel,
         first_trial_date: trial ? trial.event_time : null,
         total_revenue: Math.round(total_revenue * 100) / 100,
         has_upsell: sorted.some((t) => t.transaction_type === "upsell" && t.status === "success"),
         has_first_subscription: sorted.some((t) => t.transaction_type === "first_subscription" && t.status === "success"),
+        has_refund: total_refund_usd > 0,
+        total_refund_usd: Math.round(total_refund_usd * 100) / 100,
         renewal_count: sorted.filter((t) => isRenewalType(t) && t.status === "success").length,
         user_ltv: Math.round(total_revenue * 100) / 100,
       } satisfies UserAggregate;
@@ -224,30 +230,41 @@ export function computeCohorts(txs: Transaction[]): CohortRow[] {
     let renewal_2_users = 0;
     let renewal_3_users = 0;
     let renewal_users = 0;
+    const refundedUserIds = new Set<string>();
     let trial_revenue = 0, upsell_revenue = 0, first_subscription_revenue = 0, renewal_revenue = 0;
+    let amount_refunded = 0, gross_revenue = 0, net_revenue = 0;
     let revenue_d0 = 0, revenue_d7 = 0, revenue_d14 = 0, revenue_d30 = 0, revenue_d37 = 0, revenue_d67 = 0, revenue_total = 0;
 
     for (const uid of userIds) {
       const list = userTxs.get(uid) ?? [];
       let hasUpsell = false, hasSub = false, hasRenewal2 = false, hasRenewal3 = false, hasRenewal = false;
+      let userRefundAmount = 0;
       const userCohort = cohortByUser.get(uid);
       if (!userCohort) continue;
       for (const t of list) {
-        if (!isMoneyMoving(t)) continue;
         const dt = (new Date(t.event_time).getTime() - userCohort.ts) / DAY;
+        if (dt < 0) continue;
+        const refunded = refundAmount(t);
+        amount_refunded += refunded;
+        userRefundAmount += refunded;
+        if (!isMoneyMoving(t)) continue;
+        const gross = grossAmount(t);
+        const net = netAmount(t);
         // D0/D7/D14/D30 are rolling windows from the user's trial timestamp.
         // D0 means first 24 hours, not same calendar date.
-        if (dt >= 0 && dt < 1) revenue_d0 += t.amount_usd;
-        if (dt >= 0 && dt < 7) revenue_d7 += t.amount_usd;
-        if (dt >= 0 && dt < 14) revenue_d14 += t.amount_usd;
-        if (dt >= 0 && dt < 30) revenue_d30 += t.amount_usd;
-        if (dt >= 0 && dt < 37) revenue_d37 += t.amount_usd;
-        if (dt >= 0 && dt < 67) revenue_d67 += t.amount_usd;
-        if (dt >= 0) revenue_total += t.amount_usd;
-        if (t.transaction_type === "trial") trial_revenue += t.amount_usd;
-        if (t.transaction_type === "upsell") upsell_revenue += t.amount_usd;
-        if (t.transaction_type === "first_subscription") first_subscription_revenue += t.amount_usd;
-        if (isRenewalType(t)) renewal_revenue += t.amount_usd;
+        if (dt < 1) revenue_d0 += net;
+        if (dt < 7) revenue_d7 += net;
+        if (dt < 14) revenue_d14 += net;
+        if (dt < 30) revenue_d30 += net;
+        if (dt < 37) revenue_d37 += net;
+        if (dt < 67) revenue_d67 += net;
+        revenue_total += net;
+        gross_revenue += gross;
+        net_revenue += net;
+        if (t.transaction_type === "trial") trial_revenue += net;
+        if (t.transaction_type === "upsell") upsell_revenue += net;
+        if (t.transaction_type === "first_subscription") first_subscription_revenue += net;
+        if (isRenewalType(t)) renewal_revenue += net;
         if (t.transaction_type === "upsell" && t.status === "success") hasUpsell = true;
         if (t.transaction_type === "first_subscription" && t.status === "success") hasSub = true;
         if (t.transaction_type === "renewal_2" && t.status === "success") hasRenewal2 = true;
@@ -259,7 +276,9 @@ export function computeCohorts(txs: Transaction[]): CohortRow[] {
       if (hasRenewal2) renewal_2_users += 1;
       if (hasRenewal3) renewal_3_users += 1;
       if (hasRenewal) renewal_users += 1;
+      if (userRefundAmount > 0) refundedUserIds.add(uid);
     }
+    const refund_users = refundedUserIds.size;
 
     rows.push({
       cohort_id,
@@ -272,10 +291,18 @@ export function computeCohorts(txs: Transaction[]): CohortRow[] {
       renewal_2_users,
       renewal_3_users,
       renewal_users,
+      refund_users,
+      refunded_user_ids: Array.from(refundedUserIds),
       trial_revenue: round2(trial_revenue),
       upsell_revenue: round2(upsell_revenue),
       first_subscription_revenue: round2(first_subscription_revenue),
       renewal_revenue: round2(renewal_revenue),
+      amount_refunded: round2(amount_refunded),
+      refund_rate: trial_users ? (refund_users / trial_users) * 100 : 0,
+      gross_revenue: round2(gross_revenue),
+      net_revenue: round2(net_revenue),
+      gross_ltv: round2(gross_revenue / trial_users),
+      net_ltv: round2(net_revenue / trial_users),
       trial_to_upsell_cr: (upsell_users / trial_users) * 100,
       trial_to_first_subscription_cr: (first_subscription_users / trial_users) * 100,
       first_subscription_to_renewal_2_cr: first_subscription_users ? (renewal_2_users / first_subscription_users) * 100 : 0,

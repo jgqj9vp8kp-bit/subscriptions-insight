@@ -45,12 +45,18 @@ function makeTx(
   product: string,
   reason: string,
 ): Transaction {
+  const refundAmount = status === "refunded" || status === "chargeback" ? Math.abs(amount) : 0;
+  const grossAmount = amount > 0 ? amount : 0;
   return {
     transaction_id: nextTxId(),
     user_id: user.user_id,
     email: user.email,
     event_time: eventTime,
     amount_usd: amount,
+    gross_amount_usd: grossAmount,
+    refund_amount_usd: refundAmount,
+    net_amount_usd: grossAmount - refundAmount,
+    is_refunded: refundAmount > 0,
     currency: "USD",
     status,
     transaction_type: type,
