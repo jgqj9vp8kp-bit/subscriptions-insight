@@ -264,97 +264,106 @@ export default function CohortsPage() {
             </TableHeader>
             <TableBody>
               {cohorts.map((c) => (
-                <TableRow key={c.cohort_id}>
-                  <TableCell className="sticky left-0 bg-card z-10 font-medium text-sm whitespace-nowrap">
+                <TableRow
+                  key={c.cohort_id}
+                  className="even:bg-muted/20 hover:bg-muted/40 [&>td.sticky]:even:bg-[hsl(var(--card))] [&>td.sticky]:hover:bg-[hsl(var(--muted))]"
+                >
+                  <TableCell
+                    className={`${CELL_BASE} sticky left-0 bg-card z-10 font-medium text-sm whitespace-nowrap shadow-[1px_0_0_0_hsl(var(--border))]`}
+                  >
                     {c.cohort_id}
                   </TableCell>
-                  <TableCell className="text-xs text-muted-foreground tabular-nums whitespace-nowrap">{c.cohort_date}</TableCell>
-                  <TableCell className="text-xs text-muted-foreground whitespace-nowrap">{c.campaign_path}</TableCell>
-                  <TableCell className="text-xs text-muted-foreground capitalize whitespace-nowrap">{c.funnel.replace("_", " ")}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{c.trial_users}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{c.upsell_users}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{c.first_subscription_users}</TableCell>
+                  <TableCell className={`${CELL_TXT} tabular-nums`}>{c.cohort_date}</TableCell>
+                  <TableCell className={CELL_TXT}>{c.campaign_path}</TableCell>
+                  <TableCell className={`${CELL_TXT} capitalize`}>{c.funnel.replace("_", " ")}</TableCell>
+                  <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{c.trial_users}</TableCell>
+                  <TableCell className={CELL_NUM}>{c.upsell_users}</TableCell>
+                  <TableCell className={CELL_NUM}>{c.first_subscription_users}</TableCell>
                   <TableCell
-                    className="text-right tabular-nums text-sm font-medium"
+                    className={`${CELL_NUM} ${SECTION_DIVIDER} font-medium`}
                     style={heatStyle(c.trial_to_upsell_cr, maxUpsellCR)}
                   >
                     {formatPct(c.trial_to_upsell_cr)}
                   </TableCell>
                   <TableCell
-                    className="text-right tabular-nums text-sm font-medium"
+                    className={`${CELL_NUM} font-medium`}
                     style={heatStyle(c.trial_to_first_subscription_cr, maxSubCR)}
                   >
                     {formatPct(c.trial_to_first_subscription_cr)}
                   </TableCell>
                   <TableCell
-                    className="text-right tabular-nums text-sm font-medium"
+                    className={`${CELL_NUM} font-medium`}
                     style={heatStyle(c.first_subscription_to_renewal_2_cr, maxRenewal2CR)}
                   >
                     {formatPct(c.first_subscription_to_renewal_2_cr)}
                   </TableCell>
                   <TableCell
-                    className="text-right tabular-nums text-sm font-medium"
+                    className={`${CELL_NUM} font-medium`}
                     style={heatStyle(c.renewal_2_to_renewal_3_cr, maxRenewal3CR)}
                   >
                     {formatPct(c.renewal_2_to_renewal_3_cr)}
                   </TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{c.renewal_2_users}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{c.renewal_3_users}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{c.renewal_users}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{c.refund_users}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(c.amount_refunded)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatPct(c.refund_rate)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(c.gross_revenue)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(c.net_revenue)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(c.gross_ltv)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(c.net_ltv)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(c.revenue_d0)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(c.revenue_d7)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(c.revenue_d14)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(c.revenue_d30)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(c.revenue_d37)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(c.revenue_d67)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(c.revenue_total)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(c.ltv_d7)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(c.ltv_d14)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(c.ltv_d30)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(c.trial_users ? c.revenue_total / c.trial_users : 0)}</TableCell>
+                  <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{c.renewal_2_users}</TableCell>
+                  <TableCell className={CELL_NUM}>{c.renewal_3_users}</TableCell>
+                  <TableCell className={CELL_NUM}>{c.renewal_users}</TableCell>
+                  <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{c.refund_users}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatCurrency(c.amount_refunded)}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatPct(c.refund_rate)}</TableCell>
+                  <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{formatCurrency(c.gross_revenue)}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatCurrency(c.net_revenue)}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatCurrency(c.gross_ltv)}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatCurrency(c.net_ltv)}</TableCell>
+                  <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{formatCurrency(c.revenue_d0)}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatCurrency(c.revenue_d7)}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatCurrency(c.revenue_d14)}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatCurrency(c.revenue_d30)}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatCurrency(c.revenue_d37)}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatCurrency(c.revenue_d67)}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatCurrency(c.revenue_total)}</TableCell>
+                  <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{formatCurrency(c.ltv_d7)}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatCurrency(c.ltv_d14)}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatCurrency(c.ltv_d30)}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatCurrency(c.trial_users ? c.revenue_total / c.trial_users : 0)}</TableCell>
                 </TableRow>
               ))}
               {cohorts.length > 0 && (
-                <TableRow className="border-t-2 border-border bg-muted/50 font-semibold">
-                  <TableCell className="sticky left-0 bg-muted z-10 text-sm whitespace-nowrap">Total</TableCell>
-                  <TableCell className="text-xs text-muted-foreground">—</TableCell>
-                  <TableCell className="text-xs text-muted-foreground">—</TableCell>
-                  <TableCell className="text-xs text-muted-foreground">—</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{totals.totalTrialUsers}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{totals.totalUpsellUsers}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{totals.totalFirstSubscriptionUsers}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatPct(totals.trialToUpsellCr)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatPct(totals.trialToFirstSubscriptionCr)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatPct(totals.firstSubscriptionToRenewal2Cr)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatPct(totals.renewal2ToRenewal3Cr)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{totals.totalRenewal2Users}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{totals.totalRenewal3Users}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{totals.totalRenewalUsers}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{totals.totalRefundUsers}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(totals.amountRefunded)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatPct(totals.refundRate)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(totals.grossRevenue)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(totals.netRevenue)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(totals.grossLtv)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(totals.netLtv)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(totals.revenueD0)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(totals.revenueD7)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(totals.revenueD14)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(totals.revenueD30)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(totals.revenueD37)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(totals.revenueD67)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(totals.totalRevenue)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(totals.ltvD7)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(totals.ltvD14)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(totals.ltvD30)}</TableCell>
-                  <TableCell className="text-right tabular-nums text-sm">{formatCurrency(totals.averageLtv)}</TableCell>
+                <TableRow className="sticky bottom-0 z-10 border-t-2 border-border bg-muted font-semibold hover:bg-muted">
+                  <TableCell
+                    className={`${CELL_BASE} sticky left-0 bg-muted z-20 text-sm whitespace-nowrap shadow-[1px_0_0_0_hsl(var(--border))]`}
+                  >
+                    Total
+                  </TableCell>
+                  <TableCell className={CELL_TXT}>—</TableCell>
+                  <TableCell className={CELL_TXT}>—</TableCell>
+                  <TableCell className={CELL_TXT}>—</TableCell>
+                  <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{totals.totalTrialUsers}</TableCell>
+                  <TableCell className={CELL_NUM}>{totals.totalUpsellUsers}</TableCell>
+                  <TableCell className={CELL_NUM}>{totals.totalFirstSubscriptionUsers}</TableCell>
+                  <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{formatPct(totals.trialToUpsellCr)}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatPct(totals.trialToFirstSubscriptionCr)}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatPct(totals.firstSubscriptionToRenewal2Cr)}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatPct(totals.renewal2ToRenewal3Cr)}</TableCell>
+                  <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{totals.totalRenewal2Users}</TableCell>
+                  <TableCell className={CELL_NUM}>{totals.totalRenewal3Users}</TableCell>
+                  <TableCell className={CELL_NUM}>{totals.totalRenewalUsers}</TableCell>
+                  <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{totals.totalRefundUsers}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatCurrency(totals.amountRefunded)}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatPct(totals.refundRate)}</TableCell>
+                  <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{formatCurrency(totals.grossRevenue)}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatCurrency(totals.netRevenue)}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatCurrency(totals.grossLtv)}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatCurrency(totals.netLtv)}</TableCell>
+                  <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{formatCurrency(totals.revenueD0)}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatCurrency(totals.revenueD7)}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatCurrency(totals.revenueD14)}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatCurrency(totals.revenueD30)}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatCurrency(totals.revenueD37)}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatCurrency(totals.revenueD67)}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatCurrency(totals.totalRevenue)}</TableCell>
+                  <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{formatCurrency(totals.ltvD7)}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatCurrency(totals.ltvD14)}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatCurrency(totals.ltvD30)}</TableCell>
+                  <TableCell className={CELL_NUM}>{formatCurrency(totals.averageLtv)}</TableCell>
                 </TableRow>
               )}
               {cohorts.length === 0 && (
