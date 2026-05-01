@@ -55,7 +55,7 @@ function norm(s: string): string {
 }
 
 /** Synonyms used during auto-mapping. Loose, additive — user can override in UI. */
-const SYNONYMS: Record<keyof Transaction, string[]> = {
+const SYNONYMS: Partial<Record<keyof Transaction, string[]>> = {
   transaction_id: ["transactionid", "txid", "id", "transaction"],
   user_id: ["userid", "uid", "customerid", "customer"],
   email: ["email", "useremail", "customeremail"],
