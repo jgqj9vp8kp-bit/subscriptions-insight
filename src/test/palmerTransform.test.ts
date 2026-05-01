@@ -194,6 +194,256 @@ describe("Palmer transformation", () => {
     ]);
   });
 
+  it("adds user plan price from the first successful non-upsell transaction and sorts cohort plan breakdown", () => {
+    const rows = transformPalmerRows([
+      {
+        id: "trial_a",
+        user_id: "u_plan_a",
+        email: "plan-a@example.com",
+        created_at: "2026-01-01T10:00:00Z",
+        amount: "100",
+        status: "SETTLED",
+        metadata: JSON.stringify({ ff_campaign_path: "/soulmate-reading" }),
+      },
+      {
+        id: "sub_a",
+        user_id: "u_plan_a",
+        email: "plan-a@example.com",
+        created_at: "2026-01-08T10:00:00Z",
+        amount: "5999",
+        status: "SETTLED",
+        metadata: JSON.stringify({ ff_campaign_path: "/soulmate-reading" }),
+      },
+      {
+        id: "trial_b",
+        user_id: "u_plan_b",
+        email: "plan-b@example.com",
+        created_at: "2026-01-01T11:00:00Z",
+        amount: "100",
+        status: "SETTLED",
+        metadata: JSON.stringify({ ff_campaign_path: "/soulmate-reading" }),
+      },
+      {
+        id: "sub_b",
+        user_id: "u_plan_b",
+        email: "plan-b@example.com",
+        created_at: "2026-01-08T11:00:00Z",
+        amount: "749",
+        status: "SETTLED",
+        metadata: JSON.stringify({ ff_campaign_path: "/soulmate-reading" }),
+      },
+      {
+        id: "trial_c",
+        user_id: "u_plan_c",
+        email: "plan-c@example.com",
+        created_at: "2026-01-01T12:00:00Z",
+        amount: "100",
+        status: "SETTLED",
+        metadata: JSON.stringify({ ff_campaign_path: "/soulmate-reading" }),
+      },
+      {
+        id: "sub_c",
+        user_id: "u_plan_c",
+        email: "plan-c@example.com",
+        created_at: "2026-01-08T12:00:00Z",
+        amount: "2999",
+        status: "SETTLED",
+        metadata: JSON.stringify({ ff_campaign_path: "/soulmate-reading" }),
+      },
+      {
+        id: "trial_d",
+        user_id: "u_plan_d",
+        email: "plan-d@example.com",
+        created_at: "2026-01-01T13:00:00Z",
+        amount: "100",
+        status: "SETTLED",
+        metadata: JSON.stringify({ ff_campaign_path: "/soulmate-reading" }),
+      },
+      {
+        id: "sub_d",
+        user_id: "u_plan_d",
+        email: "plan-d@example.com",
+        created_at: "2026-01-08T13:00:00Z",
+        amount: "2999",
+        status: "SETTLED",
+        metadata: JSON.stringify({ ff_campaign_path: "/soulmate-reading" }),
+      },
+    ]);
+
+    const users = computeUsers(rows);
+    const cohorts = computeCohorts(rows);
+
+    expect(users.find((user) => user.user_id === "u_plan_a")?.plan_price).toBe(1);
+    expect(users.find((user) => user.user_id === "u_plan_a")?.plan_name).toBe("$1.00");
+    expect(users.find((user) => user.user_id === "u_plan_a")?.plan_assignment_reason).toBe("Plan assigned from first successful non-upsell transaction");
+    expect(users.find((user) => user.user_id === "u_plan_b")?.plan_price).toBe(1);
+    expect(cohorts[0].plan_breakdown).toEqual([
+      expect.objectContaining({
+        price: 1,
+        trial_users: 4,
+        first_subscription_users: 4,
+        trial_to_first_subscription_cr: 100,
+        gross_revenue: 131.46,
+        amount_refunded: 0,
+        net_revenue: 131.46,
+        net_ltv: 32.87,
+      }),
+    ]);
+  });
+
+  it("skips an initial upsell when assigning plan price", () => {
+    const rows = transformPalmerRows([
+      {
+        id: "upsell_first",
+        user_id: "u_upsell_plan",
+        email: "upsell-plan@example.com",
+        created_at: "2026-01-01T10:00:00Z",
+        amount: "1498",
+        status: "SETTLED",
+        metadata: JSON.stringify({ ff_billing_reason: "upsell", ff_campaign_path: "/soulmate-reading" }),
+      },
+      {
+        id: "initial_non_upsell",
+        user_id: "u_upsell_plan",
+        email: "upsell-plan@example.com",
+        created_at: "2026-01-01T10:05:00Z",
+        amount: "749",
+        status: "SETTLED",
+        metadata: JSON.stringify({ ff_campaign_path: "/soulmate-reading" }),
+      },
+    ]);
+
+    const users = computeUsers(rows);
+    const cohorts = computeCohorts(rows);
+
+    expect(users[0].plan_price).toBe(7.49);
+    expect(users[0].plan_name).toBe("$7.49");
+    expect(cohorts[0].plan_breakdown).toEqual([
+      expect.objectContaining({ price: 7.49, trial_users: 1 }),
+    ]);
+  });
+
+  it("calculates plan-level cohort analytics from aggregated counts and revenue", () => {
+    const rows = transformPalmerRows([
+      {
+        id: "u_a_trial",
+        user_id: "u_plan_metrics_a",
+        email: "plan-metrics-a@example.com",
+        created_at: "2026-01-01T10:00:00Z",
+        amount: "749",
+        status: "SETTLED",
+        metadata: JSON.stringify({ ff_campaign_path: "/soulmate-reading" }),
+      },
+      {
+        id: "u_a_upsell",
+        user_id: "u_plan_metrics_a",
+        email: "plan-metrics-a@example.com",
+        created_at: "2026-01-01T10:15:00Z",
+        amount: "1498",
+        status: "SETTLED",
+        metadata: JSON.stringify({ ff_campaign_path: "/soulmate-reading", ff_billing_reason: "upsell" }),
+      },
+      {
+        id: "u_a_sub",
+        user_id: "u_plan_metrics_a",
+        email: "plan-metrics-a@example.com",
+        created_at: "2026-01-08T10:00:00Z",
+        amount: "2999",
+        status: "SETTLED",
+        metadata: JSON.stringify({ ff_campaign_path: "/soulmate-reading" }),
+      },
+      {
+        id: "u_a_renewal_2",
+        user_id: "u_plan_metrics_a",
+        email: "plan-metrics-a@example.com",
+        created_at: "2026-02-08T10:00:00Z",
+        amount: "2999",
+        amountRefunded: "999",
+        status: "SETTLED",
+        metadata: JSON.stringify({ ff_campaign_path: "/soulmate-reading" }),
+      },
+      {
+        id: "u_b_trial",
+        user_id: "u_plan_metrics_b",
+        email: "plan-metrics-b@example.com",
+        created_at: "2026-01-01T11:00:00Z",
+        amount: "749",
+        status: "SETTLED",
+        metadata: JSON.stringify({ ff_campaign_path: "/soulmate-reading" }),
+      },
+      {
+        id: "u_b_sub",
+        user_id: "u_plan_metrics_b",
+        email: "plan-metrics-b@example.com",
+        created_at: "2026-01-08T11:00:00Z",
+        amount: "2999",
+        status: "SETTLED",
+        metadata: JSON.stringify({ ff_campaign_path: "/soulmate-reading" }),
+      },
+      {
+        id: "u_c_trial",
+        user_id: "u_plan_metrics_c",
+        email: "plan-metrics-c@example.com",
+        created_at: "2026-01-01T12:00:00Z",
+        amount: "2999",
+        status: "SETTLED",
+        metadata: JSON.stringify({ ff_campaign_path: "/soulmate-reading" }),
+      },
+    ]);
+
+    const breakdown = computeCohorts(rows)[0].plan_breakdown;
+
+    expect(breakdown).toEqual([
+      expect.objectContaining({
+        price: 7.49,
+        trial_users: 2,
+        upsell_users: 1,
+        first_subscription_users: 2,
+        renewal_2_users: 1,
+        renewal_3_users: 0,
+        renewal_users: 1,
+        refund_users: 1,
+        trial_to_upsell_cr: 50,
+        trial_to_first_subscription_cr: 100,
+        first_subscription_to_renewal_2_cr: 50,
+        renewal_2_to_renewal_3_cr: 0,
+        refund_rate: 50,
+        gross_revenue: 119.93,
+        amount_refunded: 9.99,
+        net_revenue: 109.94,
+        net_ltv: 54.97,
+      }),
+      expect.objectContaining({
+        price: 29.99,
+        trial_users: 1,
+        first_subscription_users: 0,
+        gross_revenue: 29.99,
+        amount_refunded: 0,
+        net_revenue: 29.99,
+        net_ltv: 29.99,
+      }),
+    ]);
+  });
+
+  it("uses unknown plan fields when a user has no successful non-upsell transaction", () => {
+    const rows = transformPalmerRows([
+      {
+        id: "failed_only",
+        user_id: "u_no_plan",
+        email: "no-plan@example.com",
+        created_at: "2026-01-01T10:00:00Z",
+        amount: "100",
+        status: "DECLINED",
+      },
+    ]);
+
+    const users = computeUsers(rows);
+
+    expect(users[0].plan_price).toBeNull();
+    expect(users[0].plan_name).toBe("Unknown");
+    expect(users[0].plan_assignment_reason).toBeNull();
+  });
+
   it("allows an upsell before the first non-upsell trial", () => {
     const rows = transformPalmerRows([
       {

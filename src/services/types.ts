@@ -48,6 +48,9 @@ export interface UserAggregate {
   email: string;
   funnel: Funnel;
   first_trial_date: string | null;
+  plan_price: number | null;
+  plan_name?: string | null;
+  plan_assignment_reason?: string | null;
   total_revenue: number;
   has_upsell: boolean;
   has_first_subscription: boolean;
@@ -55,6 +58,26 @@ export interface UserAggregate {
   total_refund_usd: number;
   renewal_count: number;
   user_ltv: number;
+}
+
+export interface PlanBreakdownRow {
+  price: number;
+  trial_users: number;
+  upsell_users: number;
+  first_subscription_users: number;
+  renewal_2_users: number;
+  renewal_3_users: number;
+  renewal_users: number;
+  refund_users: number;
+  trial_to_upsell_cr: number;
+  trial_to_first_subscription_cr: number;
+  first_subscription_to_renewal_2_cr: number;
+  renewal_2_to_renewal_3_cr: number;
+  refund_rate: number;
+  gross_revenue: number;
+  amount_refunded: number;
+  net_revenue: number;
+  net_ltv: number;
 }
 
 export interface CohortRow {
@@ -70,6 +93,7 @@ export interface CohortRow {
   renewal_users: number;
   refund_users: number;
   refunded_user_ids: string[];
+  plan_breakdown: PlanBreakdownRow[];
   trial_revenue: number;
   upsell_revenue: number;
   first_subscription_revenue: number;

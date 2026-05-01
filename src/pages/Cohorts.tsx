@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react";
-import { ArrowDown, ArrowUp } from "lucide-react";
+import { Fragment, useMemo, useState } from "react";
+import { ArrowDown, ArrowUp, ChevronDown, ChevronRight } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -44,6 +44,7 @@ function heatStyle(value: number, max: number): React.CSSProperties {
 
 export default function CohortsPage() {
   const txs = useTransactions();
+  const [expandedCohortIds, setExpandedCohortIds] = useState<Set<string>>(() => new Set());
   const [funnelFilter, setFunnelFilter] = useState("all");
   const [campaignPathFilter, setCampaignPathFilter] = useState("all");
   const [trafficSourceFilter, setTrafficSourceFilter] = useState("all");
@@ -84,6 +85,14 @@ export default function CohortsPage() {
     [allCohorts, funnelFilter, campaignPathFilter, refundFilter, cohortDateFrom, cohortDateTo, dateSort]
   );
   const hasUsers = useMemo(() => new Set(txs.map((t) => t.user_id)).size > 0, [txs]);
+  const toggleExpanded = (cohortId: string) => {
+    setExpandedCohortIds((current) => {
+      const next = new Set(current);
+      if (next.has(cohortId)) next.delete(cohortId);
+      else next.add(cohortId);
+      return next;
+    });
+  };
 
   const maxUpsellCR = Math.max(0, ...cohorts.map((c) => c.trial_to_upsell_cr));
   const maxSubCR = Math.max(0, ...cohorts.map((c) => c.trial_to_first_subscription_cr));
@@ -263,69 +272,179 @@ export default function CohortsPage() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {cohorts.map((c) => (
-                <TableRow
-                  key={c.cohort_id}
-                  className="even:bg-muted/20 hover:bg-muted/40 [&>td.sticky]:even:bg-[hsl(var(--card))] [&>td.sticky]:hover:bg-[hsl(var(--muted))]"
-                >
-                  <TableCell
-                    className={`${CELL_BASE} sticky left-0 bg-card z-10 font-medium text-sm whitespace-nowrap shadow-[1px_0_0_0_hsl(var(--border))]`}
-                  >
-                    {c.cohort_id}
-                  </TableCell>
-                  <TableCell className={`${CELL_TXT} tabular-nums`}>{c.cohort_date}</TableCell>
-                  <TableCell className={CELL_TXT}>{c.campaign_path}</TableCell>
-                  <TableCell className={`${CELL_TXT} capitalize`}>{c.funnel.replace("_", " ")}</TableCell>
-                  <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{c.trial_users}</TableCell>
-                  <TableCell className={CELL_NUM}>{c.upsell_users}</TableCell>
-                  <TableCell className={CELL_NUM}>{c.first_subscription_users}</TableCell>
-                  <TableCell
-                    className={`${CELL_NUM} ${SECTION_DIVIDER} font-medium`}
-                    style={heatStyle(c.trial_to_upsell_cr, maxUpsellCR)}
-                  >
-                    {formatPct(c.trial_to_upsell_cr)}
-                  </TableCell>
-                  <TableCell
-                    className={`${CELL_NUM} font-medium`}
-                    style={heatStyle(c.trial_to_first_subscription_cr, maxSubCR)}
-                  >
-                    {formatPct(c.trial_to_first_subscription_cr)}
-                  </TableCell>
-                  <TableCell
-                    className={`${CELL_NUM} font-medium`}
-                    style={heatStyle(c.first_subscription_to_renewal_2_cr, maxRenewal2CR)}
-                  >
-                    {formatPct(c.first_subscription_to_renewal_2_cr)}
-                  </TableCell>
-                  <TableCell
-                    className={`${CELL_NUM} font-medium`}
-                    style={heatStyle(c.renewal_2_to_renewal_3_cr, maxRenewal3CR)}
-                  >
-                    {formatPct(c.renewal_2_to_renewal_3_cr)}
-                  </TableCell>
-                  <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{c.renewal_2_users}</TableCell>
-                  <TableCell className={CELL_NUM}>{c.renewal_3_users}</TableCell>
-                  <TableCell className={CELL_NUM}>{c.renewal_users}</TableCell>
-                  <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{c.refund_users}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatCurrency(c.amount_refunded)}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatPct(c.refund_rate)}</TableCell>
-                  <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{formatCurrency(c.gross_revenue)}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatCurrency(c.net_revenue)}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatCurrency(c.gross_ltv)}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatCurrency(c.net_ltv)}</TableCell>
-                  <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{formatCurrency(c.revenue_d0)}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatCurrency(c.revenue_d7)}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatCurrency(c.revenue_d14)}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatCurrency(c.revenue_d30)}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatCurrency(c.revenue_d37)}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatCurrency(c.revenue_d67)}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatCurrency(c.revenue_total)}</TableCell>
-                  <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{formatCurrency(c.ltv_d7)}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatCurrency(c.ltv_d14)}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatCurrency(c.ltv_d30)}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatCurrency(c.trial_users ? c.revenue_total / c.trial_users : 0)}</TableCell>
-                </TableRow>
-              ))}
+              {cohorts.map((c) => {
+                const expanded = expandedCohortIds.has(c.cohort_id);
+                return (
+                  <Fragment key={c.cohort_id}>
+                    <TableRow
+                      key={c.cohort_id}
+                      className="even:bg-muted/20 hover:bg-muted/40 [&>td.sticky]:even:bg-[hsl(var(--card))] [&>td.sticky]:hover:bg-[hsl(var(--muted))]"
+                    >
+                      <TableCell
+                        className={`${CELL_BASE} sticky left-0 bg-card z-10 font-medium text-sm whitespace-nowrap shadow-[1px_0_0_0_hsl(var(--border))]`}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => toggleExpanded(c.cohort_id)}
+                          className="inline-flex items-center gap-1.5 hover:text-primary"
+                          aria-expanded={expanded}
+                        >
+                          {expanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+                          {c.cohort_id}
+                        </button>
+                      </TableCell>
+                      <TableCell className={`${CELL_TXT} tabular-nums`}>{c.cohort_date}</TableCell>
+                      <TableCell className={CELL_TXT}>{c.campaign_path}</TableCell>
+                      <TableCell className={`${CELL_TXT} capitalize`}>{c.funnel.replace("_", " ")}</TableCell>
+                      <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{c.trial_users}</TableCell>
+                      <TableCell className={CELL_NUM}>{c.upsell_users}</TableCell>
+                      <TableCell className={CELL_NUM}>{c.first_subscription_users}</TableCell>
+                      <TableCell
+                        className={`${CELL_NUM} ${SECTION_DIVIDER} font-medium`}
+                        style={heatStyle(c.trial_to_upsell_cr, maxUpsellCR)}
+                      >
+                        {formatPct(c.trial_to_upsell_cr)}
+                      </TableCell>
+                      <TableCell
+                        className={`${CELL_NUM} font-medium`}
+                        style={heatStyle(c.trial_to_first_subscription_cr, maxSubCR)}
+                      >
+                        {formatPct(c.trial_to_first_subscription_cr)}
+                      </TableCell>
+                      <TableCell
+                        className={`${CELL_NUM} font-medium`}
+                        style={heatStyle(c.first_subscription_to_renewal_2_cr, maxRenewal2CR)}
+                      >
+                        {formatPct(c.first_subscription_to_renewal_2_cr)}
+                      </TableCell>
+                      <TableCell
+                        className={`${CELL_NUM} font-medium`}
+                        style={heatStyle(c.renewal_2_to_renewal_3_cr, maxRenewal3CR)}
+                      >
+                        {formatPct(c.renewal_2_to_renewal_3_cr)}
+                      </TableCell>
+                      <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{c.renewal_2_users}</TableCell>
+                      <TableCell className={CELL_NUM}>{c.renewal_3_users}</TableCell>
+                      <TableCell className={CELL_NUM}>{c.renewal_users}</TableCell>
+                      <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{c.refund_users}</TableCell>
+                      <TableCell className={CELL_NUM}>{formatCurrency(c.amount_refunded)}</TableCell>
+                      <TableCell className={CELL_NUM}>{formatPct(c.refund_rate)}</TableCell>
+                      <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{formatCurrency(c.gross_revenue)}</TableCell>
+                      <TableCell className={CELL_NUM}>{formatCurrency(c.net_revenue)}</TableCell>
+                      <TableCell className={CELL_NUM}>{formatCurrency(c.gross_ltv)}</TableCell>
+                      <TableCell className={CELL_NUM}>{formatCurrency(c.net_ltv)}</TableCell>
+                      <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{formatCurrency(c.revenue_d0)}</TableCell>
+                      <TableCell className={CELL_NUM}>{formatCurrency(c.revenue_d7)}</TableCell>
+                      <TableCell className={CELL_NUM}>{formatCurrency(c.revenue_d14)}</TableCell>
+                      <TableCell className={CELL_NUM}>{formatCurrency(c.revenue_d30)}</TableCell>
+                      <TableCell className={CELL_NUM}>{formatCurrency(c.revenue_d37)}</TableCell>
+                      <TableCell className={CELL_NUM}>{formatCurrency(c.revenue_d67)}</TableCell>
+                      <TableCell className={CELL_NUM}>{formatCurrency(c.revenue_total)}</TableCell>
+                      <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{formatCurrency(c.ltv_d7)}</TableCell>
+                      <TableCell className={CELL_NUM}>{formatCurrency(c.ltv_d14)}</TableCell>
+                      <TableCell className={CELL_NUM}>{formatCurrency(c.ltv_d30)}</TableCell>
+                      <TableCell className={CELL_NUM}>{formatCurrency(c.trial_users ? c.revenue_total / c.trial_users : 0)}</TableCell>
+                    </TableRow>
+                    {expanded && (
+                      <TableRow key={`${c.cohort_id}-plan-breakdown`} className="bg-muted/20 hover:bg-muted/20">
+                        <TableCell className="sticky left-0 z-10 bg-muted/20 shadow-[1px_0_0_0_hsl(var(--border))]" />
+                        <TableCell colSpan={31} className="px-3 py-3">
+                          <div className="overflow-x-auto rounded-md border border-border bg-card">
+                            <Table className="min-w-[1700px]">
+                              <TableHeader>
+                                <TableRow>
+                                  <TableHead className="h-8 px-3 text-xs">Price</TableHead>
+                                  <TableHead className="h-8 px-3 text-right text-xs">Trial</TableHead>
+                                  <TableHead className="h-8 px-3 text-right text-xs">Upsell</TableHead>
+                                  <TableHead className="h-8 px-3 text-right text-xs">First Sub</TableHead>
+                                  <TableHead className="h-8 px-3 text-right text-xs">Renewal 2</TableHead>
+                                  <TableHead className="h-8 px-3 text-right text-xs">Renewal 3</TableHead>
+                                  <TableHead className="h-8 px-3 text-right text-xs">Total Renewals</TableHead>
+                                  <TableHead className="h-8 px-3 text-right text-xs">Refund Users</TableHead>
+                                  <TableHead className="h-8 px-3 text-right text-xs">Upsell CR</TableHead>
+                                  <TableHead className="h-8 px-3 text-right text-xs">Sub CR</TableHead>
+                                  <TableHead className="h-8 px-3 text-right text-xs">Sub → Renewal 2 CR</TableHead>
+                                  <TableHead className="h-8 px-3 text-right text-xs">Renewal 2 → 3 CR</TableHead>
+                                  <TableHead className="h-8 px-3 text-right text-xs">Refund Rate</TableHead>
+                                  <TableHead className="h-8 px-3 text-right text-xs">Gross Revenue</TableHead>
+                                  <TableHead className="h-8 px-3 text-right text-xs">Amount Refunded</TableHead>
+                                  <TableHead className="h-8 px-3 text-right text-xs">Net Revenue</TableHead>
+                                  <TableHead className="h-8 px-3 text-right text-xs">Net LTV</TableHead>
+                                </TableRow>
+                              </TableHeader>
+                              <TableBody>
+                                {c.plan_breakdown.length > 0 ? (
+                                  c.plan_breakdown.map((plan) => (
+                                    <TableRow key={`${c.cohort_id}-${plan.price}`}>
+                                      <TableCell className="px-3 py-2 text-sm tabular-nums">
+                                        {formatCurrency(plan.price)}
+                                      </TableCell>
+                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
+                                        {plan.trial_users}
+                                      </TableCell>
+                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
+                                        {plan.upsell_users}
+                                      </TableCell>
+                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
+                                        {plan.first_subscription_users}
+                                      </TableCell>
+                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
+                                        {plan.renewal_2_users}
+                                      </TableCell>
+                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
+                                        {plan.renewal_3_users}
+                                      </TableCell>
+                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
+                                        {plan.renewal_users}
+                                      </TableCell>
+                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
+                                        {plan.refund_users}
+                                      </TableCell>
+                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
+                                        {formatPct(plan.trial_to_upsell_cr)}
+                                      </TableCell>
+                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
+                                        {formatPct(plan.trial_to_first_subscription_cr)}
+                                      </TableCell>
+                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
+                                        {formatPct(plan.first_subscription_to_renewal_2_cr)}
+                                      </TableCell>
+                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
+                                        {formatPct(plan.renewal_2_to_renewal_3_cr)}
+                                      </TableCell>
+                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
+                                        {formatPct(plan.refund_rate)}
+                                      </TableCell>
+                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
+                                        {formatCurrency(plan.gross_revenue)}
+                                      </TableCell>
+                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
+                                        {formatCurrency(plan.amount_refunded)}
+                                      </TableCell>
+                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
+                                        {formatCurrency(plan.net_revenue)}
+                                      </TableCell>
+                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
+                                        {formatCurrency(plan.net_ltv)}
+                                      </TableCell>
+                                    </TableRow>
+                                  ))
+                                ) : (
+                                  <TableRow>
+                                    <TableCell colSpan={17} className="px-3 py-3 text-sm text-muted-foreground">
+                                      No subscription data
+                                    </TableCell>
+                                  </TableRow>
+                                )}
+                              </TableBody>
+                            </Table>
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    )}
+                  </Fragment>
+                );
+              })}
               {cohorts.length > 0 && (
                 <TableRow className="sticky bottom-0 z-10 border-t-2 border-border bg-muted font-semibold hover:bg-muted">
                   <TableCell

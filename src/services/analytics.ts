@@ -1,4 +1,4 @@
-import type { CohortRow, Transaction, UserAggregate } from "./types";
+import type { CohortRow, PlanBreakdownRow, Transaction, UserAggregate } from "./types";
 
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -14,6 +14,64 @@ const dashboardRevenueAmount = (t: Transaction) => {
   if (typeof t.refund_amount_usd === "number") return t.amount_usd - t.refund_amount_usd;
   return t.amount_usd;
 };
+const PLAN_ASSIGNMENT_REASON = "Plan assigned from first successful non-upsell transaction";
+const initialPlanTransactionForUser = (txs: Transaction[]) =>
+  [...txs]
+    .sort((a, b) => (a.event_time < b.event_time ? -1 : 1))
+    .find((t) => t.status === "success" && t.transaction_type !== "upsell");
+const planNameFromPrice = (price: number | null) => (price == null ? "Unknown" : formatCurrency(price));
+
+interface MutablePlanBreakdown {
+  price: number;
+  trial_users: number;
+  upsell_users: number;
+  first_subscription_users: number;
+  renewal_2_users: number;
+  renewal_3_users: number;
+  renewal_users: number;
+  refund_users: number;
+  gross_revenue: number;
+  amount_refunded: number;
+  net_revenue: number;
+}
+
+function createPlanBreakdown(price: number): MutablePlanBreakdown {
+  return {
+    price,
+    trial_users: 0,
+    upsell_users: 0,
+    first_subscription_users: 0,
+    renewal_2_users: 0,
+    renewal_3_users: 0,
+    renewal_users: 0,
+    refund_users: 0,
+    gross_revenue: 0,
+    amount_refunded: 0,
+    net_revenue: 0,
+  };
+}
+
+function finalizePlanBreakdown(row: MutablePlanBreakdown): PlanBreakdownRow {
+  return {
+    price: row.price,
+    trial_users: row.trial_users,
+    upsell_users: row.upsell_users,
+    first_subscription_users: row.first_subscription_users,
+    renewal_2_users: row.renewal_2_users,
+    renewal_3_users: row.renewal_3_users,
+    renewal_users: row.renewal_users,
+    refund_users: row.refund_users,
+    trial_to_upsell_cr: row.trial_users ? (row.upsell_users / row.trial_users) * 100 : 0,
+    trial_to_first_subscription_cr: row.trial_users ? (row.first_subscription_users / row.trial_users) * 100 : 0,
+    first_subscription_to_renewal_2_cr: row.first_subscription_users ? (row.renewal_2_users / row.first_subscription_users) * 100 : 0,
+    renewal_2_to_renewal_3_cr: row.renewal_2_users ? (row.renewal_3_users / row.renewal_2_users) * 100 : 0,
+    refund_rate: row.trial_users ? (row.refund_users / row.trial_users) * 100 : 0,
+    gross_revenue: round2(row.gross_revenue),
+    amount_refunded: round2(row.amount_refunded),
+    net_revenue: round2(row.net_revenue),
+    net_ltv: row.trial_users ? round2(row.net_revenue / row.trial_users) : 0,
+  };
+}
 
 export interface Kpis {
   totalRevenue: number;
@@ -174,6 +232,8 @@ export function computeUsers(txs: Transaction[]): UserAggregate[] {
     .map(([user_id, list]) => {
       const sorted = [...list].sort((a, b) => (a.event_time < b.event_time ? -1 : 1));
       const trial = sorted.find((t) => t.transaction_type === "trial");
+      const initialPlanTransaction = initialPlanTransactionForUser(sorted);
+      const planPrice = initialPlanTransaction ? round2(initialPlanTransaction.amount_usd) : null;
       const money = sorted.filter(isMoneyMoving);
       const total_revenue = money.reduce((s, t) => s + netAmount(t), 0);
       const total_refund_usd = sorted.reduce((s, t) => s + refundAmount(t), 0);
@@ -182,6 +242,9 @@ export function computeUsers(txs: Transaction[]): UserAggregate[] {
         email: sorted.find((t) => t.email)?.email || "",
         funnel: sorted[0].funnel,
         first_trial_date: trial ? trial.event_time : null,
+        plan_price: planPrice,
+        plan_name: planNameFromPrice(planPrice),
+        plan_assignment_reason: initialPlanTransaction ? PLAN_ASSIGNMENT_REASON : null,
         total_revenue: Math.round(total_revenue * 100) / 100,
         has_upsell: sorted.some((t) => t.transaction_type === "upsell" && t.status === "success"),
         has_first_subscription: sorted.some((t) => t.transaction_type === "first_subscription" && t.status === "success"),
@@ -237,12 +300,21 @@ export function computeCohorts(txs: Transaction[]): CohortRow[] {
     let renewal_3_users = 0;
     let renewal_users = 0;
     const refundedUserIds = new Set<string>();
+    const planBreakdown = new Map<number, MutablePlanBreakdown>();
     let trial_revenue = 0, upsell_revenue = 0, first_subscription_revenue = 0, renewal_revenue = 0;
     let amount_refunded = 0, gross_revenue = 0, net_revenue = 0;
     let revenue_d0 = 0, revenue_d7 = 0, revenue_d14 = 0, revenue_d30 = 0, revenue_d37 = 0, revenue_d67 = 0, revenue_total = 0;
 
     for (const uid of userIds) {
       const list = userTxs.get(uid) ?? [];
+      const initialPlanTransaction = initialPlanTransactionForUser(list);
+      const planPrice = initialPlanTransaction ? round2(initialPlanTransaction.amount_usd) : null;
+      const plan = planPrice == null
+        ? null
+        : planBreakdown.get(planPrice) ?? createPlanBreakdown(planPrice);
+      if (initialPlanTransaction) {
+        planBreakdown.set(planPrice, plan!);
+      }
       let hasUpsell = false, hasSub = false, hasRenewal2 = false, hasRenewal3 = false, hasRenewal = false;
       let userRefundAmount = 0;
       const userCohort = cohortByUser.get(uid);
@@ -253,6 +325,7 @@ export function computeCohorts(txs: Transaction[]): CohortRow[] {
         const refunded = refundAmount(t);
         amount_refunded += refunded;
         userRefundAmount += refunded;
+        if (plan) plan.amount_refunded += refunded;
         if (!isMoneyMoving(t)) continue;
         const gross = grossAmount(t);
         const net = netAmount(t);
@@ -267,6 +340,10 @@ export function computeCohorts(txs: Transaction[]): CohortRow[] {
         revenue_total += net;
         gross_revenue += gross;
         net_revenue += net;
+        if (plan) {
+          plan.gross_revenue += gross;
+          plan.net_revenue += net;
+        }
         if (t.transaction_type === "trial") trial_revenue += net;
         if (t.transaction_type === "upsell") upsell_revenue += net;
         if (t.transaction_type === "first_subscription") first_subscription_revenue += net;
@@ -283,6 +360,15 @@ export function computeCohorts(txs: Transaction[]): CohortRow[] {
       if (hasRenewal3) renewal_3_users += 1;
       if (hasRenewal) renewal_users += 1;
       if (userRefundAmount > 0) refundedUserIds.add(uid);
+      if (plan) {
+        plan.trial_users += 1;
+        if (hasUpsell) plan.upsell_users += 1;
+        if (hasSub) plan.first_subscription_users += 1;
+        if (hasRenewal2) plan.renewal_2_users += 1;
+        if (hasRenewal3) plan.renewal_3_users += 1;
+        if (hasRenewal) plan.renewal_users += 1;
+        if (userRefundAmount > 0) plan.refund_users += 1;
+      }
     }
     const refund_users = refundedUserIds.size;
 
@@ -299,6 +385,9 @@ export function computeCohorts(txs: Transaction[]): CohortRow[] {
       renewal_users,
       refund_users,
       refunded_user_ids: Array.from(refundedUserIds),
+      plan_breakdown: Array.from(planBreakdown.values())
+        .sort((a, b) => a.price - b.price)
+        .map(finalizePlanBreakdown),
       trial_revenue: round2(trial_revenue),
       upsell_revenue: round2(upsell_revenue),
       first_subscription_revenue: round2(first_subscription_revenue),
