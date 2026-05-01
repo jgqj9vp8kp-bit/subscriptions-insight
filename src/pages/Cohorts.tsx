@@ -153,7 +153,7 @@ export default function CohortsPage() {
 
   return (
     <AppLayout title="Cohorts" description="Grouped by trial date">
-      <Card className="p-4 shadow-card">
+      <Card className="rounded-lg border bg-card text-card-foreground shadow-sm p-4 shadow-card py-[20px]">
         <div className="mb-3 flex flex-wrap items-center gap-2 pb-3 border-b border-border">
           <Select value={funnelFilter} onValueChange={setFunnelFilter}>
             <SelectTrigger className="h-9 w-[160px]"><SelectValue placeholder="Funnel" /></SelectTrigger>
