@@ -8,6 +8,7 @@ import Transactions from "./pages/Transactions.tsx";
 import UsersPage from "./pages/Users.tsx";
 import Cohorts from "./pages/Cohorts.tsx";
 import ImportPage from "./pages/Import.tsx";
+import SubscriptionsPage from "./pages/Subscriptions.tsx";
 import NotFound from "./pages/NotFound.tsx";
 
 const queryClient = new QueryClient();
@@ -23,6 +24,7 @@ const App = () => (
           <Route path="/transactions" element={<Transactions />} />
           <Route path="/users" element={<UsersPage />} />
           <Route path="/cohorts" element={<Cohorts />} />
+          <Route path="/subscriptions" element={<SubscriptionsPage />} />
           <Route path="/import" element={<ImportPage />} />
           {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
           <Route path="*" element={<NotFound />} />

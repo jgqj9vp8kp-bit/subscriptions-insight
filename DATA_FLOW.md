@@ -127,3 +127,42 @@ Cohort windows are timestamp-based:
 - D0 = first 24 hours after trial
 - D7 = first 7 days after trial
 - D30 = first 30 days after trial
+
+## 8. FunnelFox Subscription Monitoring
+
+FunnelFox subscription data is imported separately from Palmer payments.
+
+```text
+FunnelFox API /subscriptions
+-> server-side proxy with Fox-Secret
+-> `syncAllSubscriptions`
+-> `normalizeSubscription`
+-> Zustand `subscriptions`
+-> Subscriptions page
+```
+
+The frontend currently uses safe mock/proxy mode. It does not send `Fox-Secret` from browser code. A backend or serverless function must call:
+
+```text
+GET https://api.funnelfox.io/public/v1/subscriptions
+Fox-Secret: process.env.FUNNELFOX_SECRET
+```
+
+Pagination should follow `pagination.has_more` and `pagination.next_cursor`.
+
+Cancellation fields are normalized as:
+
+- status containing `cancel` -> cancelled
+- `renews === false` -> cancelled
+- `cancelled_at` preferred, falling back to `updated_at`
+- active access can continue until `period_ends_at`
+
+Webhook plan:
+
+```text
+POST /api/webhooks/funnelfox
+Verify: Fox-Secret-Key
+Events: subscription.cancelled, subscription.activated, subscription.renewed
+```
+
+Production webhooks are intentionally not implemented in the Vite frontend.
