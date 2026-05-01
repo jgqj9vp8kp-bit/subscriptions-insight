@@ -56,7 +56,7 @@ Palmer exports amounts in cents. `normalizeAmount` converts cents into USD:
 2999 -> 29.99
 ```
 
-Refunds and chargebacks are stored as negative money movement after status normalization.
+Refunds from Palmer `amountRefunded` are stored separately as `refund_amount_usd`, with `net_amount_usd` representing gross minus refund. Revenue analytics use net revenue.
 
 ## 4. Status Normalization
 
@@ -71,14 +71,14 @@ CHARGEBACK -> chargeback
 
 ## 5. Transaction Classification
 
-`classifyUserTransactions` groups transactions by `user_id`, sorts them by `event_time`, and applies explicit product rules:
+`classifyUserTransactions` groups transactions by `user_id`, sorts them by `event_time`, and applies lifecycle rules:
 
-- first successful `$1` payment is `trial`
-- successful `$14.98` payment within 60 minutes after trial is `upsell`
-- first successful `$29.99` payment around 5-10 days after trial is `first_subscription`
-- `$29.99` payment 25-40 days after first_subscription is `renewal_2`
-- `$29.99` payment 25-40 days after renewal_2 is `renewal_3`
-- later successful `$29.99` payments are `renewal`
+- first successful non-upsell payment is `trial`
+- successful upsell payment detected by `ff_billing_reason`, or a known upsell amount within 60 minutes after trial, is `upsell`
+- next successful non-upsell payment after trial is `first_subscription`
+- next successful non-upsell payment after first_subscription is `renewal_2`
+- next successful non-upsell payment after renewal_2 is `renewal_3`
+- later successful non-upsell payments are `renewal`
 
 Each row receives `transaction_type` and `classification_reason`.
 
@@ -119,6 +119,8 @@ Different campaign paths inside the same funnel stay separate:
 - trial -> upsell -> first_subscription funnel
 - users table
 - cohort table
+
+Revenue aggregation uses net revenue. `net_amount_usd` is preferred; if it is absent, analytics fall back to `amount_usd - refund_amount_usd`, then to `amount_usd`.
 
 Cohort windows are timestamp-based:
 

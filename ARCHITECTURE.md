@@ -28,13 +28,15 @@ The import page can still accept a clean template CSV. In that mode, `applyMappi
 
 `transaction_type` describes the business role of a payment:
 
-- `trial`: first successful $1 payment for a user.
-- `upsell`: successful $14.98 payment within 60 minutes after trial.
-- `first_subscription`: first successful $29.99 payment around 5-10 days after trial.
-- `renewal_2`: first renewal after first_subscription.
-- `renewal_3`: second renewal after first_subscription.
-- `renewal`: all later renewals.
+- `trial`: first successful non-upsell payment for a user.
+- `upsell`: successful upsell payment detected by `ff_billing_reason`, or a known upsell amount within 60 minutes after trial.
+- `first_subscription`: next successful non-upsell payment after trial.
+- `renewal_2`: next successful non-upsell payment after first_subscription.
+- `renewal_3`: next successful non-upsell payment after renewal_2.
+- `renewal`: all later successful non-upsell payments.
 - `failed_payment`, `refund`, `chargeback`, `unknown`: non-standard or non-success states.
+
+Revenue analytics use net revenue. When `net_amount_usd` is present, it is authoritative; otherwise revenue falls back to `amount_usd - refund_amount_usd`, then to `amount_usd`.
 
 ### cohort_date
 

@@ -9,6 +9,11 @@ const isRenewalType = (t: Transaction) =>
 const grossAmount = (t: Transaction) => t.gross_amount_usd ?? (t.amount_usd > 0 ? t.amount_usd : 0);
 const refundAmount = (t: Transaction) => t.refund_amount_usd ?? (t.amount_usd < 0 ? Math.abs(t.amount_usd) : 0);
 const netAmount = (t: Transaction) => t.net_amount_usd ?? grossAmount(t) - refundAmount(t);
+const dashboardRevenueAmount = (t: Transaction) => {
+  if (typeof t.net_amount_usd === "number") return t.net_amount_usd;
+  if (typeof t.refund_amount_usd === "number") return t.amount_usd - t.refund_amount_usd;
+  return t.amount_usd;
+};
 
 export interface Kpis {
   totalRevenue: number;
@@ -26,13 +31,13 @@ export function computeKpis(txs: Transaction[]): Kpis {
   // Failed payments are excluded because no money was collected.
   const money = txs.filter(isMoneyMoving);
   const sumByType = (type: string) =>
-    money.filter((t) => t.transaction_type === type).reduce((s, t) => s + t.amount_usd, 0);
+    money.filter((t) => t.transaction_type === type).reduce((s, t) => s + dashboardRevenueAmount(t), 0);
 
-  const totalRevenue = money.reduce((s, t) => s + t.amount_usd, 0);
+  const totalRevenue = money.reduce((s, t) => s + dashboardRevenueAmount(t), 0);
   const trialPayments = sumByType("trial");
   const upsellRevenue = sumByType("upsell");
   const firstSubscriptionRevenue = sumByType("first_subscription");
-  const renewalRevenue = money.filter(isRenewalType).reduce((s, t) => s + t.amount_usd, 0);
+  const renewalRevenue = money.filter(isRenewalType).reduce((s, t) => s + dashboardRevenueAmount(t), 0);
 
   const trialUsers = new Set(txs.filter((t) => t.transaction_type === "trial" && t.status === "success").map((t) => t.user_id));
   const upsellUsers = new Set(txs.filter((t) => t.transaction_type === "upsell" && t.status === "success").map((t) => t.user_id));
@@ -77,7 +82,7 @@ export function revenueByDay(txs: Transaction[]): DailyRevenuePoint[] {
   for (const t of txs) {
     if (!isMoneyMoving(t)) continue;
     const date = t.event_time.slice(0, 10);
-    map.set(date, (map.get(date) ?? 0) + t.amount_usd);
+    map.set(date, (map.get(date) ?? 0) + dashboardRevenueAmount(t));
   }
   return Array.from(map.entries())
     .sort(([a], [b]) => (a < b ? -1 : 1))
@@ -93,7 +98,7 @@ export function revenueByType(txs: Transaction[]): RevenueByTypePoint[] {
   const map = new Map<string, number>();
   for (const t of txs) {
     if (!isMoneyMoving(t)) continue;
-    map.set(t.transaction_type, (map.get(t.transaction_type) ?? 0) + t.amount_usd);
+    map.set(t.transaction_type, (map.get(t.transaction_type) ?? 0) + dashboardRevenueAmount(t));
   }
   return Array.from(map.entries()).map(([type, revenue]) => ({
     type,
@@ -124,12 +129,13 @@ export function revenueByFunnel(txs: Transaction[]): FunnelRevenuePoint[] {
       renewal_3: 0,
       renewal: 0,
     };
-    if (t.transaction_type === "trial") row.trial += t.amount_usd;
-    if (t.transaction_type === "upsell") row.upsell += t.amount_usd;
-    if (t.transaction_type === "first_subscription") row.first_subscription += t.amount_usd;
-    if (t.transaction_type === "renewal_2") row.renewal_2 += t.amount_usd;
-    if (t.transaction_type === "renewal_3") row.renewal_3 += t.amount_usd;
-    if (t.transaction_type === "renewal") row.renewal += t.amount_usd;
+    const revenue = dashboardRevenueAmount(t);
+    if (t.transaction_type === "trial") row.trial += revenue;
+    if (t.transaction_type === "upsell") row.upsell += revenue;
+    if (t.transaction_type === "first_subscription") row.first_subscription += revenue;
+    if (t.transaction_type === "renewal_2") row.renewal_2 += revenue;
+    if (t.transaction_type === "renewal_3") row.renewal_3 += revenue;
+    if (t.transaction_type === "renewal") row.renewal += revenue;
     funnels.set(t.funnel, row);
   }
   return Array.from(funnels.values());

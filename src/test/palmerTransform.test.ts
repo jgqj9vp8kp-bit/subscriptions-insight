@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { computeCohorts, computeUsers } from "@/services/analytics";
+import { computeCohorts, computeKpis, computeUsers } from "@/services/analytics";
 import {
   getPalmerImportDiagnostics,
   normalizeAmount,
@@ -68,7 +68,7 @@ describe("Palmer transformation", () => {
     expect(unknown[0].funnel).toBe("unknown");
   });
 
-  it("classifies a user journey by explicit Palmer amount and timing rules", () => {
+  it("classifies staged lifecycle payments after first subscription", () => {
     const rows = transformPalmerRows([
       {
         id: "trial",
@@ -129,13 +129,69 @@ describe("Palmer transformation", () => {
     expect(rows.find((row) => row.transaction_id === "trial")?.transaction_type).toBe("trial");
     expect(rows.find((row) => row.transaction_id === "upsell")?.transaction_type).toBe("upsell");
     expect(rows.find((row) => row.transaction_id === "sub")?.transaction_type).toBe("first_subscription");
-    expect(rows.find((row) => row.transaction_id === "renewal_2")?.transaction_type).toBe("renewal");
-    expect(rows.find((row) => row.transaction_id === "renewal_3")?.transaction_type).toBe("renewal");
+    expect(rows.find((row) => row.transaction_id === "renewal_2")?.transaction_type).toBe("renewal_2");
+    expect(rows.find((row) => row.transaction_id === "renewal_3")?.transaction_type).toBe("renewal_3");
     expect(rows.find((row) => row.transaction_id === "renewal")?.transaction_type).toBe("renewal");
     expect(rows.every((row) => row.cohort_id === "unknown_2026-01-01")).toBe(true);
     expect(rows.find((row) => row.transaction_id === "trial")?.classification_reason).toBe("First successful non-upsell payment → trial");
     expect(rows.find((row) => row.transaction_id === "upsell")?.classification_reason).toBe("Metadata ff_billing_reason contains upsell");
     expect(rows.find((row) => row.transaction_id === "sub")?.classification_reason).toBe("Next successful non-upsell payment after trial → first_subscription");
+    expect(rows.find((row) => row.transaction_id === "renewal_2")?.classification_reason).toBe("Second lifecycle payment after first_subscription → renewal_2");
+    expect(rows.find((row) => row.transaction_id === "renewal_3")?.classification_reason).toBe("Third lifecycle payment after first_subscription → renewal_3");
+    expect(rows.find((row) => row.transaction_id === "renewal")?.classification_reason).toBe("Later lifecycle payment → renewal");
+  });
+
+  it("classifies trial to first_subscription to renewal_2 to renewal_3 to renewal", () => {
+    const rows = transformPalmerRows([
+      {
+        id: "trial",
+        user_id: "u_lifecycle",
+        email: "lifecycle@example.com",
+        created_at: "2026-01-01T10:00:00Z",
+        amount: "100",
+        status: "SETTLED",
+      },
+      {
+        id: "first_subscription",
+        user_id: "u_lifecycle",
+        email: "lifecycle@example.com",
+        created_at: "2026-01-08T10:00:00Z",
+        amount: "2999",
+        status: "SETTLED",
+      },
+      {
+        id: "renewal_2",
+        user_id: "u_lifecycle",
+        email: "lifecycle@example.com",
+        created_at: "2026-02-08T10:00:00Z",
+        amount: "2999",
+        status: "SETTLED",
+      },
+      {
+        id: "renewal_3",
+        user_id: "u_lifecycle",
+        email: "lifecycle@example.com",
+        created_at: "2026-03-08T10:00:00Z",
+        amount: "2999",
+        status: "SETTLED",
+      },
+      {
+        id: "renewal",
+        user_id: "u_lifecycle",
+        email: "lifecycle@example.com",
+        created_at: "2026-04-08T10:00:00Z",
+        amount: "2999",
+        status: "SETTLED",
+      },
+    ]);
+
+    expect(rows.map((row) => [row.transaction_id, row.transaction_type])).toEqual([
+      ["renewal", "renewal"],
+      ["renewal_3", "renewal_3"],
+      ["renewal_2", "renewal_2"],
+      ["first_subscription", "first_subscription"],
+      ["trial", "trial"],
+    ]);
   });
 
   it("allows an upsell before the first non-upsell trial", () => {
@@ -245,6 +301,32 @@ describe("Palmer transformation", () => {
     expect(cohorts[0].net_revenue).toBe(9);
     expect(cohorts[0].gross_ltv).toBe(29.99);
     expect(cohorts[0].net_ltv).toBe(9);
+  });
+
+  it("uses net revenue consistently for fully refunded Palmer rows", () => {
+    const rows = transformPalmerRows([
+      {
+        id: "fully_refunded_tx",
+        customerId: "customer_full_refund",
+        customerEmailAddress: "full-refund@example.com",
+        created_at: "2026-04-26T10:00:00Z",
+        amount: "2099",
+        amountRefunded: "2099",
+        status: "SETTLED",
+        metadata: JSON.stringify({ ff_campaign_path: "/soulmate-reading" }),
+      },
+    ]);
+
+    const users = computeUsers(rows);
+    const cohorts = computeCohorts(rows);
+    const kpis = computeKpis(rows);
+
+    expect(rows[0].gross_amount_usd).toBe(20.99);
+    expect(rows[0].refund_amount_usd).toBe(20.99);
+    expect(rows[0].net_amount_usd).toBe(0);
+    expect(users[0].total_revenue).toBe(0);
+    expect(cohorts[0].net_revenue).toBe(0);
+    expect(kpis.totalRevenue).toBe(0);
   });
 
   it("reports Palmer import diagnostics after transformation", () => {

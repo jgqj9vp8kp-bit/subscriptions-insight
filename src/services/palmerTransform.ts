@@ -294,6 +294,8 @@ export function classifyUserTransactions(rows: Transaction[]): Transaction[] {
     const sorted = [...list].sort((a, b) => new Date(a.event_time).getTime() - new Date(b.event_time).getTime());
     let trialTs: number | null = null;
     let firstSubscriptionTs: number | null = null;
+    let renewal2Ts: number | null = null;
+    let renewal3Ts: number | null = null;
 
     for (const tx of sorted) {
       const eventTs = new Date(tx.event_time).getTime();
@@ -329,9 +331,17 @@ export function classifyUserTransactions(rows: Transaction[]): Transaction[] {
         firstSubscriptionTs = eventTs;
         transaction_type = "first_subscription";
         classification_reason = "Next successful non-upsell payment after trial → first_subscription";
+      } else if (renewal2Ts === null && !isUpsellByMetadata) {
+        renewal2Ts = eventTs;
+        transaction_type = "renewal_2";
+        classification_reason = "Second lifecycle payment after first_subscription → renewal_2";
+      } else if (renewal3Ts === null && !isUpsellByMetadata) {
+        renewal3Ts = eventTs;
+        transaction_type = "renewal_3";
+        classification_reason = "Third lifecycle payment after first_subscription → renewal_3";
       } else if (!isUpsellByMetadata) {
         transaction_type = "renewal";
-        classification_reason = "Later successful non-upsell payment → renewal";
+        classification_reason = "Later lifecycle payment → renewal";
       } else {
         transaction_type = "upsell";
         classification_reason = "Metadata ff_billing_reason contains upsell";
