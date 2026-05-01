@@ -348,96 +348,104 @@ export default function CohortsPage() {
                     {expanded && (
                       <TableRow key={`${c.cohort_id}-plan-breakdown`} className="bg-muted/20 hover:bg-muted/20">
                         <TableCell className="sticky left-0 z-10 bg-muted/20 shadow-[1px_0_0_0_hsl(var(--border))]" />
-                        <TableCell colSpan={31} className="px-3 py-3">
-                          <div className="overflow-x-auto rounded-md border border-border bg-card">
-                            <Table className="min-w-[1700px]">
-                              <TableHeader>
-                                <TableRow>
-                                  <TableHead className="h-8 px-3 text-xs">Price</TableHead>
-                                  <TableHead className="h-8 px-3 text-right text-xs">Trial</TableHead>
-                                  <TableHead className="h-8 px-3 text-right text-xs">Upsell</TableHead>
-                                  <TableHead className="h-8 px-3 text-right text-xs">First Sub</TableHead>
-                                  <TableHead className="h-8 px-3 text-right text-xs">Renewal 2</TableHead>
-                                  <TableHead className="h-8 px-3 text-right text-xs">Renewal 3</TableHead>
-                                  <TableHead className="h-8 px-3 text-right text-xs">Total Renewals</TableHead>
-                                  <TableHead className="h-8 px-3 text-right text-xs">Refund Users</TableHead>
-                                  <TableHead className="h-8 px-3 text-right text-xs">Upsell CR</TableHead>
-                                  <TableHead className="h-8 px-3 text-right text-xs">Sub CR</TableHead>
-                                  <TableHead className="h-8 px-3 text-right text-xs">Sub → Renewal 2 CR</TableHead>
-                                  <TableHead className="h-8 px-3 text-right text-xs">Renewal 2 → 3 CR</TableHead>
-                                  <TableHead className="h-8 px-3 text-right text-xs">Refund Rate</TableHead>
-                                  <TableHead className="h-8 px-3 text-right text-xs">Gross Revenue</TableHead>
-                                  <TableHead className="h-8 px-3 text-right text-xs">Amount Refunded</TableHead>
-                                  <TableHead className="h-8 px-3 text-right text-xs">Net Revenue</TableHead>
-                                  <TableHead className="h-8 px-3 text-right text-xs">Net LTV</TableHead>
-                                </TableRow>
-                              </TableHeader>
-                              <TableBody>
-                                {c.plan_breakdown.length > 0 ? (
-                                  c.plan_breakdown.map((plan) => (
-                                    <TableRow key={`${c.cohort_id}-${plan.price}`}>
-                                      <TableCell className="px-3 py-2 text-sm tabular-nums">
-                                        {formatCurrency(plan.price)}
-                                      </TableCell>
-                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
-                                        {plan.trial_users}
-                                      </TableCell>
-                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
-                                        {plan.upsell_users}
-                                      </TableCell>
-                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
-                                        {plan.first_subscription_users}
-                                      </TableCell>
-                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
-                                        {plan.renewal_2_users}
-                                      </TableCell>
-                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
-                                        {plan.renewal_3_users}
-                                      </TableCell>
-                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
-                                        {plan.renewal_users}
-                                      </TableCell>
-                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
-                                        {plan.refund_users}
-                                      </TableCell>
-                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
-                                        {formatPct(plan.trial_to_upsell_cr)}
-                                      </TableCell>
-                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
-                                        {formatPct(plan.trial_to_first_subscription_cr)}
-                                      </TableCell>
-                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
-                                        {formatPct(plan.first_subscription_to_renewal_2_cr)}
-                                      </TableCell>
-                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
-                                        {formatPct(plan.renewal_2_to_renewal_3_cr)}
-                                      </TableCell>
-                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
-                                        {formatPct(plan.refund_rate)}
-                                      </TableCell>
-                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
-                                        {formatCurrency(plan.gross_revenue)}
-                                      </TableCell>
-                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
-                                        {formatCurrency(plan.amount_refunded)}
-                                      </TableCell>
-                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
-                                        {formatCurrency(plan.net_revenue)}
-                                      </TableCell>
-                                      <TableCell className="px-3 py-2 text-right text-sm tabular-nums">
-                                        {formatCurrency(plan.net_ltv)}
-                                      </TableCell>
-                                    </TableRow>
-                                  ))
-                                ) : (
-                                  <TableRow>
-                                    <TableCell colSpan={17} className="px-3 py-3 text-sm text-muted-foreground">
-                                      No subscription data
-                                    </TableCell>
-                                  </TableRow>
-                                )}
-                              </TableBody>
-                            </Table>
+                        <TableCell colSpan={31} className="p-3 bg-muted/20">
+                          <div className="rounded-lg border border-border bg-muted/30 p-4 shadow-inner">
+                            <div className="mb-3 flex items-baseline justify-between gap-2">
+                              <div>
+                                <h4 className="text-sm font-semibold text-foreground">
+                                  Plan breakdown by entry price
+                                </h4>
+                                <p className="text-xs text-muted-foreground">
+                                  Metrics are grouped by users’ first successful non-upsell payment
+                                </p>
+                              </div>
+                              <span className="text-[11px] uppercase tracking-wide text-muted-foreground">
+                                Cohort {c.cohort_id}
+                              </span>
+                            </div>
+                            {c.plan_breakdown.length > 0 ? (
+                              <div className="overflow-x-auto rounded-md border border-border/70 bg-card">
+                                <table className="w-full min-w-[1500px] caption-bottom border-separate border-spacing-0 text-xs">
+                                  <thead>
+                                    <tr className="bg-muted/50 text-muted-foreground">
+                                      <th className="h-8 px-3 text-left font-medium border-b border-border/60" rowSpan={2}>
+                                        Price
+                                      </th>
+                                      <th
+                                        colSpan={6}
+                                        className="h-7 px-3 text-center font-medium text-[11px] uppercase tracking-wide border-b border-l border-border/60"
+                                      >
+                                        Counts
+                                      </th>
+                                      <th
+                                        colSpan={4}
+                                        className="h-7 px-3 text-center font-medium text-[11px] uppercase tracking-wide border-b border-l border-border/60"
+                                      >
+                                        Rates
+                                      </th>
+                                      <th
+                                        colSpan={6}
+                                        className="h-7 px-3 text-center font-medium text-[11px] uppercase tracking-wide border-b border-l border-border/60"
+                                      >
+                                        Revenue
+                                      </th>
+                                    </tr>
+                                    <tr className="bg-muted/40 text-muted-foreground">
+                                      <th className="h-8 px-3 text-right font-medium border-b border-l border-border/60">Trial</th>
+                                      <th className="h-8 px-3 text-right font-medium border-b border-border/60">Upsell</th>
+                                      <th className="h-8 px-3 text-right font-medium border-b border-border/60">First Sub</th>
+                                      <th className="h-8 px-3 text-right font-medium border-b border-border/60">Renewal 2</th>
+                                      <th className="h-8 px-3 text-right font-medium border-b border-border/60">Renewal 3</th>
+                                      <th className="h-8 px-3 text-right font-medium border-b border-border/60">Total Renewals</th>
+                                      <th className="h-8 px-3 text-right font-medium border-b border-l border-border/60">Upsell CR</th>
+                                      <th className="h-8 px-3 text-right font-medium border-b border-border/60">Sub CR</th>
+                                      <th className="h-8 px-3 text-right font-medium border-b border-border/60">Sub → R2 CR</th>
+                                      <th className="h-8 px-3 text-right font-medium border-b border-border/60">R2 → R3 CR</th>
+                                      <th className="h-8 px-3 text-right font-medium border-b border-l border-border/60">Refund Users</th>
+                                      <th className="h-8 px-3 text-right font-medium border-b border-border/60">Refund Rate</th>
+                                      <th className="h-8 px-3 text-right font-medium border-b border-border/60">Gross Revenue</th>
+                                      <th className="h-8 px-3 text-right font-medium border-b border-border/60">Amount Refunded</th>
+                                      <th className="h-8 px-3 text-right font-medium border-b border-border/60">Net Revenue</th>
+                                      <th className="h-8 px-3 text-right font-medium border-b border-border/60">Net LTV</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {c.plan_breakdown.map((plan, idx) => {
+                                      const numCell = "h-8 px-3 text-right tabular-nums whitespace-nowrap text-foreground";
+                                      const sectionCell = `${numCell} border-l border-border/60`;
+                                      const rowBg = idx % 2 === 1 ? "bg-muted/20" : "";
+                                      return (
+                                        <tr key={`${c.cohort_id}-${plan.price}`} className={`${rowBg} hover:bg-muted/40 transition-colors`}>
+                                          <td className="h-8 px-3 text-left font-medium tabular-nums whitespace-nowrap">
+                                            {formatCurrency(plan.price)}
+                                          </td>
+                                          <td className={sectionCell}>{plan.trial_users}</td>
+                                          <td className={numCell}>{plan.upsell_users}</td>
+                                          <td className={numCell}>{plan.first_subscription_users}</td>
+                                          <td className={numCell}>{plan.renewal_2_users}</td>
+                                          <td className={numCell}>{plan.renewal_3_users}</td>
+                                          <td className={numCell}>{plan.renewal_users}</td>
+                                          <td className={sectionCell}>{formatPct(plan.trial_to_upsell_cr)}</td>
+                                          <td className={numCell}>{formatPct(plan.trial_to_first_subscription_cr)}</td>
+                                          <td className={numCell}>{formatPct(plan.first_subscription_to_renewal_2_cr)}</td>
+                                          <td className={numCell}>{formatPct(plan.renewal_2_to_renewal_3_cr)}</td>
+                                          <td className={sectionCell}>{plan.refund_users}</td>
+                                          <td className={numCell}>{formatPct(plan.refund_rate)}</td>
+                                          <td className={numCell}>{formatCurrency(plan.gross_revenue)}</td>
+                                          <td className={numCell}>{formatCurrency(plan.amount_refunded)}</td>
+                                          <td className={numCell}>{formatCurrency(plan.net_revenue)}</td>
+                                          <td className={numCell}>{formatCurrency(plan.net_ltv)}</td>
+                                        </tr>
+                                      );
+                                    })}
+                                  </tbody>
+                                </table>
+                              </div>
+                            ) : (
+                              <div className="rounded-md border border-dashed border-border bg-card/50 px-4 py-6 text-center text-xs text-muted-foreground">
+                                No price breakdown available for this cohort
+                              </div>
+                            )}
                           </div>
                         </TableCell>
                       </TableRow>
