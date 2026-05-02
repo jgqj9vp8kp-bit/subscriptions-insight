@@ -63,6 +63,12 @@ export interface UserAggregate {
 export interface PlanBreakdownRow {
   price: number;
   trial_users: number;
+  active_users: number;
+  active_rate: number;
+  active_subscriptions: number;
+  active_subscriptions_rate: number;
+  cancelled_users: number;
+  cancellation_rate: number;
   upsell_users: number;
   first_subscription_users: number;
   renewal_2_users: number;
@@ -86,6 +92,17 @@ export interface CohortRow {
   funnel: Funnel;
   campaign_path: string;
   trial_users: number;
+  active_users: number;
+  active_rate: number;
+  active_subscriptions: number;
+  active_subscriptions_rate: number;
+  active_subscription_user_ids: string[];
+  cancelled_users: number;
+  cancellation_rate: number;
+  cancelled_active_users: number;
+  active_user_ids: string[];
+  cancelled_user_ids: string[];
+  cancelled_active_user_ids: string[];
   upsell_users: number;
   first_subscription_users: number;
   renewal_2_users: number;

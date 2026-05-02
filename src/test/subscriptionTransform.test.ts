@@ -138,4 +138,37 @@ describe("FunnelFox subscription normalization", () => {
     expect(row.session_id).toBe("sess_1");
     expect(row.cancellation_reason).toBe("too_expensive");
   });
+
+  it("calculates cancellation timing when cancelled after the period ended", () => {
+    const row = normalizeSubscription({
+      id: "sub_cancelled_after_period",
+      status: "cancelled",
+      renews: false,
+      cancellation_reason: "",
+      created_at: "2026-03-31T12:02:01Z",
+      period_ends_at: "2026-04-07T12:02:01Z",
+      cancelled_at: "2026-04-14T10:07:56Z",
+    });
+
+    expect(row.cancellation_type).toBe("cancelled_unknown_reason");
+    expect(row.cancellation_timing_bucket).toBe("after_period_end");
+    expect(row.days_to_cancel).toBe(13);
+    expect(row.hours_before_period_end).toBeLessThan(0);
+  });
+
+  it("classifies payment-related cancellations without overclaiming manual intent", () => {
+    const row = normalizeSubscription({
+      id: "sub_payment_failed",
+      status: "past_due",
+      renews: false,
+      cancellation_reason: "card declined",
+      created_at: "2026-04-01T00:00:00Z",
+      period_ends_at: "2026-04-08T00:00:00Z",
+      cancelled_at: "2026-04-07T12:00:00Z",
+    });
+
+    expect(row.cancellation_type).toBe("auto_payment_related");
+    expect(row.cancellation_timing_bucket).toBe("before_renewal_48h");
+    expect(row.hours_before_period_end).toBe(12);
+  });
 });

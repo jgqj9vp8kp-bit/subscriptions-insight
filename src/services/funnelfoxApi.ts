@@ -158,6 +158,16 @@ export async function fetchProfileDebug(profileId: string, options?: FunnelFoxRe
   return res.json() as Promise<FunnelFoxProfileDebugResponse>;
 }
 
+export async function fetchSubscriptionDebug(subscriptionId: string, options?: FunnelFoxRequestOptions): Promise<unknown> {
+  const url = new URL(subscriptionDetailsEndpoint(), window.location.origin);
+  url.searchParams.set("id", subscriptionId);
+  const res = await fetch(url.toString(), { headers: requestHeaders(options) });
+  if (!res.ok) {
+    throw new Error(await safeErrorMessage(res, `Could not load FunnelFox subscription debug (HTTP ${res.status}).`));
+  }
+  return res.json() as Promise<unknown>;
+}
+
 async function fetchSubscriptionDetails(subscriptionId: string, options?: FunnelFoxRequestOptions): Promise<FunnelFoxSubscriptionRaw> {
   const url = new URL(subscriptionDetailsEndpoint(), window.location.origin);
   url.searchParams.set("id", subscriptionId);
@@ -236,8 +246,20 @@ function mergeSubscriptionDetails(row: SubscriptionClean, detail: SubscriptionCl
     profile_id: row.profile_id || detail.profile_id,
     status: detail.status || row.status,
     renews: detail.renews ?? row.renews,
+    is_cancelled: detail.is_cancelled || row.is_cancelled,
+    cancellation_source: detail.cancellation_source ?? row.cancellation_source,
     cancelled_at: detail.cancelled_at ?? row.cancelled_at,
     cancellation_reason: detail.cancellation_reason ?? row.cancellation_reason,
+    days_to_cancel: detail.days_to_cancel ?? row.days_to_cancel,
+    hours_before_period_end: detail.hours_before_period_end ?? row.hours_before_period_end,
+    cancellation_timing_bucket:
+      detail.cancellation_timing_bucket !== "not_cancelled"
+        ? detail.cancellation_timing_bucket
+        : row.cancellation_timing_bucket,
+    cancellation_type:
+      detail.cancellation_type !== "not_cancelled"
+        ? detail.cancellation_type
+        : row.cancellation_type,
     is_active_now: detail.period_ends_at ? detail.is_active_now : row.is_active_now,
     period_ends_at: detail.period_ends_at || row.period_ends_at,
     product_name: detail.product_name || row.product_name,

@@ -77,6 +77,22 @@ export interface SubscriptionClean {
   cancelled_at: string | null;
   cancellation_source: "api_status_cancelled" | "api_renews_false" | null;
   cancellation_reason: string | null;
+  days_to_cancel: number | null;
+  hours_before_period_end: number | null;
+  cancellation_timing_bucket:
+    | "not_cancelled"
+    | "after_period_end"
+    | "before_renewal_48h"
+    | "before_renewal_7d"
+    | "first_24h"
+    | "days_2_3"
+    | "first_week"
+    | "later";
+  cancellation_type:
+    | "not_cancelled"
+    | "auto_payment_related"
+    | "cancelled_unknown_reason"
+    | "user_or_manual_cancelled";
   is_active_now: boolean;
   created_at: string;
   updated_at: string;

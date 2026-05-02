@@ -1,6 +1,7 @@
 import { Fragment, useMemo, useState } from "react";
 import { ArrowDown, ArrowUp, ChevronDown, ChevronRight } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
+import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -21,6 +22,8 @@ import {
 } from "@/components/ui/table";
 import { useTransactions } from "@/services/sheets";
 import { computeCohorts, formatCurrency, formatPct } from "@/services/analytics";
+import type { CohortRow, PlanBreakdownRow } from "@/services/types";
+import { useDataStore } from "@/store/dataStore";
 
 // Visual-only helpers — no data/logic impact.
 const HEAD_BASE =
@@ -29,8 +32,145 @@ const HEAD_NUM = `${HEAD_BASE} text-right`;
 const CELL_BASE = "py-2 px-3 align-middle";
 const CELL_NUM = `${CELL_BASE} text-right tabular-nums whitespace-nowrap text-sm`;
 const CELL_TXT = `${CELL_BASE} text-xs text-muted-foreground whitespace-nowrap`;
-// Left border marks the start of a logical section (no column reorder).
+// Left border marks the start of a logical section.
 const SECTION_DIVIDER = "border-l border-border/60";
+const COLUMN_ORDER_STORAGE_KEY = "cohorts_column_order";
+
+const DEFAULT_COLUMN_ORDER = [
+  "cohort_date",
+  "campaign_path",
+  "funnel",
+  "trial_users",
+  "active_users",
+  "active_subscriptions",
+  "active_subscriptions_rate",
+  "active_rate",
+  "cancelled_users",
+  "cancellation_rate",
+  "cancelled_active_users",
+  "upsell_users",
+  "first_subscription_users",
+  "trial_to_upsell_cr",
+  "trial_to_first_subscription_cr",
+  "first_subscription_to_renewal_2_cr",
+  "renewal_2_to_renewal_3_cr",
+  "renewal_2_users",
+  "renewal_3_users",
+  "renewal_users",
+  "refund_users",
+  "amount_refunded",
+  "refund_rate",
+  "gross_revenue",
+  "net_revenue",
+  "gross_ltv",
+  "net_ltv",
+  "revenue_d0",
+  "revenue_d7",
+  "revenue_d14",
+  "revenue_d30",
+  "revenue_d37",
+  "revenue_d67",
+  "revenue_total",
+  "ltv_d7",
+  "ltv_d14",
+  "ltv_d30",
+  "ltv_total",
+] as const;
+
+type CohortColumnId = (typeof DEFAULT_COLUMN_ORDER)[number];
+
+const COLUMN_LABELS: Record<CohortColumnId, string> = {
+  cohort_date: "Cohort date",
+  campaign_path: "Campaign path",
+  funnel: "Funnel",
+  trial_users: "Trial",
+  active_users: "Active Users",
+  active_subscriptions: "Active Subscriptions",
+  active_subscriptions_rate: "Active Subscriptions Rate",
+  active_rate: "Active Rate",
+  cancelled_users: "Cancelled Users",
+  cancellation_rate: "Cancellation Rate",
+  cancelled_active_users: "Cancelled Active",
+  upsell_users: "Upsell",
+  first_subscription_users: "First Sub",
+  trial_to_upsell_cr: "→ Upsell CR",
+  trial_to_first_subscription_cr: "→ Sub CR",
+  first_subscription_to_renewal_2_cr: "Sub → Renewal 2 CR",
+  renewal_2_to_renewal_3_cr: "Renewal 2 → 3 CR",
+  renewal_2_users: "Renewal 2",
+  renewal_3_users: "Renewal 3",
+  renewal_users: "Total Renewals",
+  refund_users: "Refund Users",
+  amount_refunded: "Amount Refunded",
+  refund_rate: "Refund Rate",
+  gross_revenue: "Gross Revenue",
+  net_revenue: "Net Revenue",
+  gross_ltv: "Gross LTV",
+  net_ltv: "Net LTV",
+  revenue_d0: "Rev D0",
+  revenue_d7: "Rev D7",
+  revenue_d14: "Rev D14",
+  revenue_d30: "Rev D30",
+  revenue_d37: "Rev D37",
+  revenue_d67: "Rev D67",
+  revenue_total: "Rev Total",
+  ltv_d7: "LTV D7",
+  ltv_d14: "LTV D14",
+  ltv_d30: "LTV D30",
+  ltv_total: "LTV Total",
+};
+
+const COLUMN_MIN_WIDTHS: Record<CohortColumnId, number> = {
+  cohort_date: 120,
+  campaign_path: 160,
+  funnel: 110,
+  trial_users: 76,
+  active_users: 110,
+  active_subscriptions: 140,
+  active_subscriptions_rate: 150,
+  active_rate: 100,
+  cancelled_users: 120,
+  cancellation_rate: 120,
+  cancelled_active_users: 120,
+  upsell_users: 84,
+  first_subscription_users: 90,
+  trial_to_upsell_cr: 100,
+  trial_to_first_subscription_cr: 90,
+  first_subscription_to_renewal_2_cr: 140,
+  renewal_2_to_renewal_3_cr: 130,
+  renewal_2_users: 90,
+  renewal_3_users: 90,
+  renewal_users: 110,
+  refund_users: 100,
+  amount_refunded: 120,
+  refund_rate: 100,
+  gross_revenue: 110,
+  net_revenue: 110,
+  gross_ltv: 100,
+  net_ltv: 100,
+  revenue_d0: 90,
+  revenue_d7: 90,
+  revenue_d14: 90,
+  revenue_d30: 90,
+  revenue_d37: 90,
+  revenue_d67: 90,
+  revenue_total: 100,
+  ltv_d7: 90,
+  ltv_d14: 90,
+  ltv_d30: 90,
+  ltv_total: 100,
+};
+
+const TEXT_COLUMNS = new Set<CohortColumnId>(["cohort_date", "campaign_path", "funnel"]);
+const SECTION_DIVIDER_COLUMNS = new Set<CohortColumnId>([
+  "trial_users",
+  "trial_to_upsell_cr",
+  "renewal_2_users",
+  "refund_users",
+  "gross_revenue",
+  "revenue_d0",
+  "ltv_d7",
+]);
 
 function heatStyle(value: number, max: number): React.CSSProperties {
   if (max <= 0) return {};
@@ -42,8 +182,34 @@ function heatStyle(value: number, max: number): React.CSSProperties {
   };
 }
 
+function isValidColumnOrder(value: unknown): value is CohortColumnId[] {
+  if (!Array.isArray(value) || value.length !== DEFAULT_COLUMN_ORDER.length) return false;
+  const ids = new Set(value);
+  return ids.size === DEFAULT_COLUMN_ORDER.length && DEFAULT_COLUMN_ORDER.every((id) => ids.has(id));
+}
+
+function loadInitialColumnOrder(): CohortColumnId[] {
+  try {
+    const saved = localStorage.getItem(COLUMN_ORDER_STORAGE_KEY);
+    if (!saved) return [...DEFAULT_COLUMN_ORDER];
+    const parsed = JSON.parse(saved);
+    return isValidColumnOrder(parsed) ? parsed : [...DEFAULT_COLUMN_ORDER];
+  } catch {
+    return [...DEFAULT_COLUMN_ORDER];
+  }
+}
+
+function persistColumnOrder(order: CohortColumnId[]) {
+  try {
+    localStorage.setItem(COLUMN_ORDER_STORAGE_KEY, JSON.stringify(order));
+  } catch (error) {
+    console.warn("Unable to persist cohort column order", error);
+  }
+}
+
 export default function CohortsPage() {
   const txs = useTransactions();
+  const subscriptions = useDataStore((s) => s.subscriptions);
   const [expandedCohortIds, setExpandedCohortIds] = useState<Set<string>>(() => new Set());
   const [funnelFilter, setFunnelFilter] = useState("all");
   const [campaignPathFilter, setCampaignPathFilter] = useState("all");
@@ -53,6 +219,8 @@ export default function CohortsPage() {
   const [cohortDateFrom, setCohortDateFrom] = useState("");
   const [cohortDateTo, setCohortDateTo] = useState("");
   const [dateSort, setDateSort] = useState<"desc" | "asc">("desc");
+  const [columnSettingsOpen, setColumnSettingsOpen] = useState(false);
+  const [columnOrder, setColumnOrder] = useState<CohortColumnId[]>(loadInitialColumnOrder);
 
   const trafficSourceOptions = useMemo(() => Array.from(new Set(txs.map((t) => t.traffic_source))).sort(), [txs]);
   const campaignIdOptions = useMemo(() => Array.from(new Set(txs.map((t) => t.campaign_id || "unknown"))).sort(), [txs]);
@@ -65,7 +233,7 @@ export default function CohortsPage() {
       }),
     [txs, trafficSourceFilter, campaignIdFilter]
   );
-  const allCohorts = useMemo(() => computeCohorts(sourceFilteredTxs), [sourceFilteredTxs]);
+  const allCohorts = useMemo(() => computeCohorts(sourceFilteredTxs, subscriptions), [sourceFilteredTxs, subscriptions]);
   const funnelOptions = useMemo(() => Array.from(new Set(allCohorts.map((c) => c.funnel))).sort(), [allCohorts]);
   const campaignPathOptions = useMemo(() => Array.from(new Set(allCohorts.map((c) => c.campaign_path))).sort(), [allCohorts]);
   const cohorts = useMemo(
@@ -93,6 +261,25 @@ export default function CohortsPage() {
       return next;
     });
   };
+  const moveColumn = (index: number, direction: -1 | 1) => {
+    setColumnOrder((current) => {
+      const nextIndex = index + direction;
+      if (nextIndex < 0 || nextIndex >= current.length) return current;
+      const next = [...current];
+      [next[index], next[nextIndex]] = [next[nextIndex], next[index]];
+      persistColumnOrder(next);
+      return next;
+    });
+  };
+  const resetColumnOrder = () => {
+    const next = [...DEFAULT_COLUMN_ORDER];
+    setColumnOrder(next);
+    try {
+      localStorage.removeItem(COLUMN_ORDER_STORAGE_KEY);
+    } catch (error) {
+      console.warn("Unable to reset cohort column order", error);
+    }
+  };
 
   const maxUpsellCR = Math.max(0, ...cohorts.map((c) => c.trial_to_upsell_cr));
   const maxSubCR = Math.max(0, ...cohorts.map((c) => c.trial_to_first_subscription_cr));
@@ -108,6 +295,10 @@ export default function CohortsPage() {
     const totalRenewal3Users = sum((c) => c.renewal_3_users);
     const totalRenewalUsers = sum((c) => c.renewal_users);
     const totalRefundUsers = new Set(cohorts.flatMap((c) => c.refunded_user_ids)).size;
+    const totalActiveUsers = new Set(cohorts.flatMap((c) => c.active_user_ids)).size;
+    const totalActiveSubscriptions = new Set(cohorts.flatMap((c) => c.active_subscription_user_ids)).size;
+    const totalCancelledUsers = new Set(cohorts.flatMap((c) => c.cancelled_user_ids)).size;
+    const totalCancelledActiveUsers = new Set(cohorts.flatMap((c) => c.cancelled_active_user_ids)).size;
     const totalRevenue = sum((c) => c.revenue_total);
     const amountRefunded = sum((c) => c.amount_refunded);
     const grossRevenue = sum((c) => c.gross_revenue);
@@ -123,6 +314,13 @@ export default function CohortsPage() {
       totalRenewal3Users,
       totalRenewalUsers,
       totalRefundUsers,
+      totalActiveUsers,
+      totalActiveSubscriptions,
+      totalCancelledUsers,
+      totalCancelledActiveUsers,
+      totalActiveRate: totalTrialUsers ? (totalActiveUsers / totalTrialUsers) * 100 : 0,
+      totalActiveSubscriptionsRate: totalTrialUsers ? (totalActiveSubscriptions / totalTrialUsers) * 100 : 0,
+      totalCancellationRate: totalTrialUsers ? (totalCancelledUsers / totalTrialUsers) * 100 : 0,
       trialRevenue: sum((c) => c.trial_revenue),
       upsellRevenue: sum((c) => c.upsell_revenue),
       firstSubscriptionRevenue: sum((c) => c.first_subscription_revenue),
@@ -150,6 +348,266 @@ export default function CohortsPage() {
       renewal2ToRenewal3Cr: totalRenewal2Users ? (totalRenewal3Users / totalRenewal2Users) * 100 : 0,
     };
   }, [cohorts]);
+
+  const headerClassFor = (id: CohortColumnId) =>
+    `${TEXT_COLUMNS.has(id) ? `${HEAD_BASE} text-left` : HEAD_NUM} ${SECTION_DIVIDER_COLUMNS.has(id) ? SECTION_DIVIDER : ""}`;
+  const cellClassFor = (id: CohortColumnId, child = false) => {
+    const base = child
+      ? TEXT_COLUMNS.has(id)
+        ? "py-1.5 px-3 text-xs text-muted-foreground/60 whitespace-nowrap"
+        : "py-1.5 px-3 text-right text-xs text-muted-foreground tabular-nums whitespace-nowrap"
+      : TEXT_COLUMNS.has(id)
+        ? CELL_TXT
+        : CELL_NUM;
+    return `${base} ${SECTION_DIVIDER_COLUMNS.has(id) ? SECTION_DIVIDER : ""}`;
+  };
+  const dash = <span className="text-muted-foreground/40">—</span>;
+
+  const renderHeaderCell = (id: CohortColumnId) => (
+    <TableHead key={id} className={headerClassFor(id)} style={{ minWidth: COLUMN_MIN_WIDTHS[id] }}>
+      {id === "cohort_date" ? (
+        <button
+          onClick={() => setDateSort((s) => (s === "desc" ? "asc" : "desc"))}
+          className="inline-flex items-center gap-1 hover:text-foreground"
+        >
+          {COLUMN_LABELS[id]} {dateSort === "asc" ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />}
+        </button>
+      ) : (
+        COLUMN_LABELS[id]
+      )}
+    </TableHead>
+  );
+
+  const renderCohortCell = (id: CohortColumnId, c: CohortRow) => {
+    const className = cellClassFor(id);
+    switch (id) {
+      case "cohort_date":
+        return <TableCell key={id} className={`${className} tabular-nums`}>{c.cohort_date}</TableCell>;
+      case "campaign_path":
+        return <TableCell key={id} className={className}>{c.campaign_path}</TableCell>;
+      case "funnel":
+        return <TableCell key={id} className={`${className} capitalize`}>{c.funnel.replace("_", " ")}</TableCell>;
+      case "trial_users":
+        return <TableCell key={id} className={className}>{c.trial_users}</TableCell>;
+      case "active_users":
+        return <TableCell key={id} className={className}>{c.active_users}</TableCell>;
+      case "active_subscriptions":
+        return <TableCell key={id} className={className}>{c.active_subscriptions}</TableCell>;
+      case "active_subscriptions_rate":
+        return <TableCell key={id} className={className}>{formatPct(c.active_subscriptions_rate)}</TableCell>;
+      case "active_rate":
+        return <TableCell key={id} className={className}>{formatPct(c.active_rate)}</TableCell>;
+      case "cancelled_users":
+        return <TableCell key={id} className={className}>{c.cancelled_users}</TableCell>;
+      case "cancellation_rate":
+        return <TableCell key={id} className={className}>{formatPct(c.cancellation_rate)}</TableCell>;
+      case "cancelled_active_users":
+        return <TableCell key={id} className={className}>{c.cancelled_active_users}</TableCell>;
+      case "upsell_users":
+        return <TableCell key={id} className={className}>{c.upsell_users}</TableCell>;
+      case "first_subscription_users":
+        return <TableCell key={id} className={className}>{c.first_subscription_users}</TableCell>;
+      case "trial_to_upsell_cr":
+        return <TableCell key={id} className={`${className} font-medium`} style={heatStyle(c.trial_to_upsell_cr, maxUpsellCR)}>{formatPct(c.trial_to_upsell_cr)}</TableCell>;
+      case "trial_to_first_subscription_cr":
+        return <TableCell key={id} className={`${className} font-medium`} style={heatStyle(c.trial_to_first_subscription_cr, maxSubCR)}>{formatPct(c.trial_to_first_subscription_cr)}</TableCell>;
+      case "first_subscription_to_renewal_2_cr":
+        return <TableCell key={id} className={`${className} font-medium`} style={heatStyle(c.first_subscription_to_renewal_2_cr, maxRenewal2CR)}>{formatPct(c.first_subscription_to_renewal_2_cr)}</TableCell>;
+      case "renewal_2_to_renewal_3_cr":
+        return <TableCell key={id} className={`${className} font-medium`} style={heatStyle(c.renewal_2_to_renewal_3_cr, maxRenewal3CR)}>{formatPct(c.renewal_2_to_renewal_3_cr)}</TableCell>;
+      case "renewal_2_users":
+        return <TableCell key={id} className={className}>{c.renewal_2_users}</TableCell>;
+      case "renewal_3_users":
+        return <TableCell key={id} className={className}>{c.renewal_3_users}</TableCell>;
+      case "renewal_users":
+        return <TableCell key={id} className={className}>{c.renewal_users}</TableCell>;
+      case "refund_users":
+        return <TableCell key={id} className={className}>{c.refund_users}</TableCell>;
+      case "amount_refunded":
+        return <TableCell key={id} className={className}>{formatCurrency(c.amount_refunded)}</TableCell>;
+      case "refund_rate":
+        return <TableCell key={id} className={className}>{formatPct(c.refund_rate)}</TableCell>;
+      case "gross_revenue":
+        return <TableCell key={id} className={className}>{formatCurrency(c.gross_revenue)}</TableCell>;
+      case "net_revenue":
+        return <TableCell key={id} className={className}>{formatCurrency(c.net_revenue)}</TableCell>;
+      case "gross_ltv":
+        return <TableCell key={id} className={className}>{formatCurrency(c.gross_ltv)}</TableCell>;
+      case "net_ltv":
+        return <TableCell key={id} className={className}>{formatCurrency(c.net_ltv)}</TableCell>;
+      case "revenue_d0":
+        return <TableCell key={id} className={className}>{formatCurrency(c.revenue_d0)}</TableCell>;
+      case "revenue_d7":
+        return <TableCell key={id} className={className}>{formatCurrency(c.revenue_d7)}</TableCell>;
+      case "revenue_d14":
+        return <TableCell key={id} className={className}>{formatCurrency(c.revenue_d14)}</TableCell>;
+      case "revenue_d30":
+        return <TableCell key={id} className={className}>{formatCurrency(c.revenue_d30)}</TableCell>;
+      case "revenue_d37":
+        return <TableCell key={id} className={className}>{formatCurrency(c.revenue_d37)}</TableCell>;
+      case "revenue_d67":
+        return <TableCell key={id} className={className}>{formatCurrency(c.revenue_d67)}</TableCell>;
+      case "revenue_total":
+        return <TableCell key={id} className={className}>{formatCurrency(c.revenue_total)}</TableCell>;
+      case "ltv_d7":
+        return <TableCell key={id} className={className}>{formatCurrency(c.ltv_d7)}</TableCell>;
+      case "ltv_d14":
+        return <TableCell key={id} className={className}>{formatCurrency(c.ltv_d14)}</TableCell>;
+      case "ltv_d30":
+        return <TableCell key={id} className={className}>{formatCurrency(c.ltv_d30)}</TableCell>;
+      case "ltv_total":
+        return <TableCell key={id} className={className}>{formatCurrency(c.trial_users ? c.revenue_total / c.trial_users : 0)}</TableCell>;
+    }
+  };
+
+  const renderPlanCell = (id: CohortColumnId, plan: PlanBreakdownRow) => {
+    const className = cellClassFor(id, true);
+    switch (id) {
+      case "cohort_date":
+      case "campaign_path":
+      case "funnel":
+        return <TableCell key={id} className={className}>{dash}</TableCell>;
+      case "trial_users":
+        return <TableCell key={id} className={className}>{plan.trial_users}</TableCell>;
+      case "active_users":
+        return <TableCell key={id} className={className}>{plan.active_users}</TableCell>;
+      case "active_subscriptions":
+        return <TableCell key={id} className={className}>{plan.active_subscriptions}</TableCell>;
+      case "active_subscriptions_rate":
+        return <TableCell key={id} className={className}>{formatPct(plan.active_subscriptions_rate)}</TableCell>;
+      case "active_rate":
+        return <TableCell key={id} className={className}>{formatPct(plan.active_rate)}</TableCell>;
+      case "cancelled_users":
+        return <TableCell key={id} className={className}>{plan.cancelled_users}</TableCell>;
+      case "cancellation_rate":
+        return <TableCell key={id} className={className}>{formatPct(plan.cancellation_rate)}</TableCell>;
+      case "cancelled_active_users":
+        return <TableCell key={id} className={className}>{dash}</TableCell>;
+      case "upsell_users":
+        return <TableCell key={id} className={className}>{plan.upsell_users}</TableCell>;
+      case "first_subscription_users":
+        return <TableCell key={id} className={className}>{plan.first_subscription_users}</TableCell>;
+      case "trial_to_upsell_cr":
+        return <TableCell key={id} className={className}>{formatPct(plan.trial_to_upsell_cr)}</TableCell>;
+      case "trial_to_first_subscription_cr":
+        return <TableCell key={id} className={className}>{formatPct(plan.trial_to_first_subscription_cr)}</TableCell>;
+      case "first_subscription_to_renewal_2_cr":
+        return <TableCell key={id} className={className}>{formatPct(plan.first_subscription_to_renewal_2_cr)}</TableCell>;
+      case "renewal_2_to_renewal_3_cr":
+        return <TableCell key={id} className={className}>{formatPct(plan.renewal_2_to_renewal_3_cr)}</TableCell>;
+      case "renewal_2_users":
+        return <TableCell key={id} className={className}>{plan.renewal_2_users}</TableCell>;
+      case "renewal_3_users":
+        return <TableCell key={id} className={className}>{plan.renewal_3_users}</TableCell>;
+      case "renewal_users":
+        return <TableCell key={id} className={className}>{plan.renewal_users}</TableCell>;
+      case "refund_users":
+        return <TableCell key={id} className={className}>{plan.refund_users}</TableCell>;
+      case "amount_refunded":
+        return <TableCell key={id} className={className}>{formatCurrency(plan.amount_refunded)}</TableCell>;
+      case "refund_rate":
+        return <TableCell key={id} className={className}>{formatPct(plan.refund_rate)}</TableCell>;
+      case "gross_revenue":
+        return <TableCell key={id} className={className}>{formatCurrency(plan.gross_revenue)}</TableCell>;
+      case "net_revenue":
+        return <TableCell key={id} className={className}>{formatCurrency(plan.net_revenue)}</TableCell>;
+      case "net_ltv":
+        return <TableCell key={id} className={className}>{formatCurrency(plan.net_ltv)}</TableCell>;
+      case "gross_ltv":
+      case "revenue_d0":
+      case "revenue_d7":
+      case "revenue_d14":
+      case "revenue_d30":
+      case "revenue_d37":
+      case "revenue_d67":
+      case "revenue_total":
+      case "ltv_d7":
+      case "ltv_d14":
+      case "ltv_d30":
+      case "ltv_total":
+        return <TableCell key={id} className={className}>{dash}</TableCell>;
+    }
+  };
+
+  const renderTotalCell = (id: CohortColumnId) => {
+    const className = cellClassFor(id);
+    switch (id) {
+      case "cohort_date":
+      case "campaign_path":
+      case "funnel":
+        return <TableCell key={id} className={className}>—</TableCell>;
+      case "trial_users":
+        return <TableCell key={id} className={className}>{totals.totalTrialUsers}</TableCell>;
+      case "active_users":
+        return <TableCell key={id} className={className}>{totals.totalActiveUsers}</TableCell>;
+      case "active_subscriptions":
+        return <TableCell key={id} className={className}>{totals.totalActiveSubscriptions}</TableCell>;
+      case "active_subscriptions_rate":
+        return <TableCell key={id} className={className}>{formatPct(totals.totalActiveSubscriptionsRate)}</TableCell>;
+      case "active_rate":
+        return <TableCell key={id} className={className}>{formatPct(totals.totalActiveRate)}</TableCell>;
+      case "cancelled_users":
+        return <TableCell key={id} className={className}>{totals.totalCancelledUsers}</TableCell>;
+      case "cancellation_rate":
+        return <TableCell key={id} className={className}>{formatPct(totals.totalCancellationRate)}</TableCell>;
+      case "cancelled_active_users":
+        return <TableCell key={id} className={className}>{totals.totalCancelledActiveUsers}</TableCell>;
+      case "upsell_users":
+        return <TableCell key={id} className={className}>{totals.totalUpsellUsers}</TableCell>;
+      case "first_subscription_users":
+        return <TableCell key={id} className={className}>{totals.totalFirstSubscriptionUsers}</TableCell>;
+      case "trial_to_upsell_cr":
+        return <TableCell key={id} className={className}>{formatPct(totals.trialToUpsellCr)}</TableCell>;
+      case "trial_to_first_subscription_cr":
+        return <TableCell key={id} className={className}>{formatPct(totals.trialToFirstSubscriptionCr)}</TableCell>;
+      case "first_subscription_to_renewal_2_cr":
+        return <TableCell key={id} className={className}>{formatPct(totals.firstSubscriptionToRenewal2Cr)}</TableCell>;
+      case "renewal_2_to_renewal_3_cr":
+        return <TableCell key={id} className={className}>{formatPct(totals.renewal2ToRenewal3Cr)}</TableCell>;
+      case "renewal_2_users":
+        return <TableCell key={id} className={className}>{totals.totalRenewal2Users}</TableCell>;
+      case "renewal_3_users":
+        return <TableCell key={id} className={className}>{totals.totalRenewal3Users}</TableCell>;
+      case "renewal_users":
+        return <TableCell key={id} className={className}>{totals.totalRenewalUsers}</TableCell>;
+      case "refund_users":
+        return <TableCell key={id} className={className}>{totals.totalRefundUsers}</TableCell>;
+      case "amount_refunded":
+        return <TableCell key={id} className={className}>{formatCurrency(totals.amountRefunded)}</TableCell>;
+      case "refund_rate":
+        return <TableCell key={id} className={className}>{formatPct(totals.refundRate)}</TableCell>;
+      case "gross_revenue":
+        return <TableCell key={id} className={className}>{formatCurrency(totals.grossRevenue)}</TableCell>;
+      case "net_revenue":
+        return <TableCell key={id} className={className}>{formatCurrency(totals.netRevenue)}</TableCell>;
+      case "gross_ltv":
+        return <TableCell key={id} className={className}>{formatCurrency(totals.grossLtv)}</TableCell>;
+      case "net_ltv":
+        return <TableCell key={id} className={className}>{formatCurrency(totals.netLtv)}</TableCell>;
+      case "revenue_d0":
+        return <TableCell key={id} className={className}>{formatCurrency(totals.revenueD0)}</TableCell>;
+      case "revenue_d7":
+        return <TableCell key={id} className={className}>{formatCurrency(totals.revenueD7)}</TableCell>;
+      case "revenue_d14":
+        return <TableCell key={id} className={className}>{formatCurrency(totals.revenueD14)}</TableCell>;
+      case "revenue_d30":
+        return <TableCell key={id} className={className}>{formatCurrency(totals.revenueD30)}</TableCell>;
+      case "revenue_d37":
+        return <TableCell key={id} className={className}>{formatCurrency(totals.revenueD37)}</TableCell>;
+      case "revenue_d67":
+        return <TableCell key={id} className={className}>{formatCurrency(totals.revenueD67)}</TableCell>;
+      case "revenue_total":
+        return <TableCell key={id} className={className}>{formatCurrency(totals.totalRevenue)}</TableCell>;
+      case "ltv_d7":
+        return <TableCell key={id} className={className}>{formatCurrency(totals.ltvD7)}</TableCell>;
+      case "ltv_d14":
+        return <TableCell key={id} className={className}>{formatCurrency(totals.ltvD14)}</TableCell>;
+      case "ltv_d30":
+        return <TableCell key={id} className={className}>{formatCurrency(totals.ltvD30)}</TableCell>;
+      case "ltv_total":
+        return <TableCell key={id} className={className}>{formatCurrency(totals.averageLtv)}</TableCell>;
+    }
+  };
 
   return (
     <AppLayout title="Cohorts" description="Grouped by trial date">
@@ -219,7 +677,61 @@ export default function CohortsPage() {
               className="h-9 w-[150px]"
             />
           </div>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-9"
+            onClick={() => setColumnSettingsOpen((open) => !open)}
+          >
+            Columns
+          </Button>
         </div>
+
+        {columnSettingsOpen && (
+          <div className="mb-3 rounded-md border border-border bg-muted/20 p-3">
+            <div className="mb-2 flex items-center justify-between gap-3">
+              <div>
+                <div className="text-sm font-medium">Column settings</div>
+                <div className="text-xs text-muted-foreground">Expand arrow and Cohort are locked first.</div>
+              </div>
+              <Button type="button" variant="outline" size="sm" onClick={resetColumnOrder}>
+                Reset columns
+              </Button>
+            </div>
+            <div className="max-h-72 overflow-auto rounded-md border border-border bg-card">
+              <div className="flex items-center justify-between gap-3 border-b border-border px-3 py-2 text-sm">
+                <span className="font-medium">Cohort</span>
+                <span className="text-xs text-muted-foreground">Locked</span>
+              </div>
+              {columnOrder.map((id, index) => (
+                <div key={id} className="flex items-center justify-between gap-3 border-b border-border px-3 py-2 last:border-b-0">
+                  <span className="text-sm">{COLUMN_LABELS[id]}</span>
+                  <div className="flex items-center gap-1">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      disabled={index === 0}
+                      onClick={() => moveColumn(index, -1)}
+                    >
+                      Move up
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      disabled={index === columnOrder.length - 1}
+                      onClick={() => moveColumn(index, 1)}
+                    >
+                      Move down
+                    </Button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         <div className="rounded-lg border border-border [&>div]:max-h-[calc(100vh-280px)] [&>div]:overflow-auto [&>div]:rounded-lg">
           <Table className="border-separate border-spacing-0">
@@ -231,44 +743,7 @@ export default function CohortsPage() {
                 >
                   Cohort
                 </TableHead>
-                <TableHead className={`${HEAD_BASE} text-left`} style={{ minWidth: 120 }}>
-                  <button
-                    onClick={() => setDateSort((s) => (s === "desc" ? "asc" : "desc"))}
-                    className="inline-flex items-center gap-1 hover:text-foreground"
-                  >
-                    Cohort date {dateSort === "asc" ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />}
-                  </button>
-                </TableHead>
-                <TableHead className={`${HEAD_BASE} text-left`} style={{ minWidth: 160 }}>Campaign path</TableHead>
-                <TableHead className={`${HEAD_BASE} text-left`} style={{ minWidth: 110 }}>Funnel</TableHead>
-                <TableHead className={`${HEAD_NUM} ${SECTION_DIVIDER}`} style={{ minWidth: 76 }}>Trial</TableHead>
-                <TableHead className={HEAD_NUM} style={{ minWidth: 84 }}>Upsell</TableHead>
-                <TableHead className={HEAD_NUM} style={{ minWidth: 90 }}>First Sub</TableHead>
-                <TableHead className={`${HEAD_NUM} ${SECTION_DIVIDER}`} style={{ minWidth: 100 }}>→ Upsell CR</TableHead>
-                <TableHead className={HEAD_NUM} style={{ minWidth: 90 }}>→ Sub CR</TableHead>
-                <TableHead className={HEAD_NUM} style={{ minWidth: 140 }}>Sub → Renewal 2 CR</TableHead>
-                <TableHead className={HEAD_NUM} style={{ minWidth: 130 }}>Renewal 2 → 3 CR</TableHead>
-                <TableHead className={`${HEAD_NUM} ${SECTION_DIVIDER}`} style={{ minWidth: 90 }}>Renewal 2</TableHead>
-                <TableHead className={HEAD_NUM} style={{ minWidth: 90 }}>Renewal 3</TableHead>
-                <TableHead className={HEAD_NUM} style={{ minWidth: 110 }}>Total Renewals</TableHead>
-                <TableHead className={`${HEAD_NUM} ${SECTION_DIVIDER}`} style={{ minWidth: 100 }}>Refund Users</TableHead>
-                <TableHead className={HEAD_NUM} style={{ minWidth: 120 }}>Amount Refunded</TableHead>
-                <TableHead className={HEAD_NUM} style={{ minWidth: 100 }}>Refund Rate</TableHead>
-                <TableHead className={`${HEAD_NUM} ${SECTION_DIVIDER}`} style={{ minWidth: 110 }}>Gross Revenue</TableHead>
-                <TableHead className={HEAD_NUM} style={{ minWidth: 110 }}>Net Revenue</TableHead>
-                <TableHead className={HEAD_NUM} style={{ minWidth: 100 }}>Gross LTV</TableHead>
-                <TableHead className={HEAD_NUM} style={{ minWidth: 100 }}>Net LTV</TableHead>
-                <TableHead className={`${HEAD_NUM} ${SECTION_DIVIDER}`} style={{ minWidth: 90 }}>Rev D0</TableHead>
-                <TableHead className={HEAD_NUM} style={{ minWidth: 90 }}>Rev D7</TableHead>
-                <TableHead className={HEAD_NUM} style={{ minWidth: 90 }}>Rev D14</TableHead>
-                <TableHead className={HEAD_NUM} style={{ minWidth: 90 }}>Rev D30</TableHead>
-                <TableHead className={HEAD_NUM} style={{ minWidth: 90 }}>Rev D37</TableHead>
-                <TableHead className={HEAD_NUM} style={{ minWidth: 90 }}>Rev D67</TableHead>
-                <TableHead className={HEAD_NUM} style={{ minWidth: 100 }}>Rev Total</TableHead>
-                <TableHead className={`${HEAD_NUM} ${SECTION_DIVIDER}`} style={{ minWidth: 90 }}>LTV D7</TableHead>
-                <TableHead className={HEAD_NUM} style={{ minWidth: 90 }}>LTV D14</TableHead>
-                <TableHead className={HEAD_NUM} style={{ minWidth: 90 }}>LTV D30</TableHead>
-                <TableHead className={HEAD_NUM} style={{ minWidth: 100 }}>LTV Total</TableHead>
+                {columnOrder.map(renderHeaderCell)}
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -293,57 +768,7 @@ export default function CohortsPage() {
                           {c.cohort_id}
                         </button>
                       </TableCell>
-                      <TableCell className={`${CELL_TXT} tabular-nums`}>{c.cohort_date}</TableCell>
-                      <TableCell className={CELL_TXT}>{c.campaign_path}</TableCell>
-                      <TableCell className={`${CELL_TXT} capitalize`}>{c.funnel.replace("_", " ")}</TableCell>
-                      <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{c.trial_users}</TableCell>
-                      <TableCell className={CELL_NUM}>{c.upsell_users}</TableCell>
-                      <TableCell className={CELL_NUM}>{c.first_subscription_users}</TableCell>
-                      <TableCell
-                        className={`${CELL_NUM} ${SECTION_DIVIDER} font-medium`}
-                        style={heatStyle(c.trial_to_upsell_cr, maxUpsellCR)}
-                      >
-                        {formatPct(c.trial_to_upsell_cr)}
-                      </TableCell>
-                      <TableCell
-                        className={`${CELL_NUM} font-medium`}
-                        style={heatStyle(c.trial_to_first_subscription_cr, maxSubCR)}
-                      >
-                        {formatPct(c.trial_to_first_subscription_cr)}
-                      </TableCell>
-                      <TableCell
-                        className={`${CELL_NUM} font-medium`}
-                        style={heatStyle(c.first_subscription_to_renewal_2_cr, maxRenewal2CR)}
-                      >
-                        {formatPct(c.first_subscription_to_renewal_2_cr)}
-                      </TableCell>
-                      <TableCell
-                        className={`${CELL_NUM} font-medium`}
-                        style={heatStyle(c.renewal_2_to_renewal_3_cr, maxRenewal3CR)}
-                      >
-                        {formatPct(c.renewal_2_to_renewal_3_cr)}
-                      </TableCell>
-                      <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{c.renewal_2_users}</TableCell>
-                      <TableCell className={CELL_NUM}>{c.renewal_3_users}</TableCell>
-                      <TableCell className={CELL_NUM}>{c.renewal_users}</TableCell>
-                      <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{c.refund_users}</TableCell>
-                      <TableCell className={CELL_NUM}>{formatCurrency(c.amount_refunded)}</TableCell>
-                      <TableCell className={CELL_NUM}>{formatPct(c.refund_rate)}</TableCell>
-                      <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{formatCurrency(c.gross_revenue)}</TableCell>
-                      <TableCell className={CELL_NUM}>{formatCurrency(c.net_revenue)}</TableCell>
-                      <TableCell className={CELL_NUM}>{formatCurrency(c.gross_ltv)}</TableCell>
-                      <TableCell className={CELL_NUM}>{formatCurrency(c.net_ltv)}</TableCell>
-                      <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{formatCurrency(c.revenue_d0)}</TableCell>
-                      <TableCell className={CELL_NUM}>{formatCurrency(c.revenue_d7)}</TableCell>
-                      <TableCell className={CELL_NUM}>{formatCurrency(c.revenue_d14)}</TableCell>
-                      <TableCell className={CELL_NUM}>{formatCurrency(c.revenue_d30)}</TableCell>
-                      <TableCell className={CELL_NUM}>{formatCurrency(c.revenue_d37)}</TableCell>
-                      <TableCell className={CELL_NUM}>{formatCurrency(c.revenue_d67)}</TableCell>
-                      <TableCell className={CELL_NUM}>{formatCurrency(c.revenue_total)}</TableCell>
-                      <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{formatCurrency(c.ltv_d7)}</TableCell>
-                      <TableCell className={CELL_NUM}>{formatCurrency(c.ltv_d14)}</TableCell>
-                      <TableCell className={CELL_NUM}>{formatCurrency(c.ltv_d30)}</TableCell>
-                      <TableCell className={CELL_NUM}>{formatCurrency(c.trial_users ? c.revenue_total / c.trial_users : 0)}</TableCell>
+                      {columnOrder.map((id) => renderCohortCell(id, c))}
                     </TableRow>
                     {expanded && c.plan_breakdown.length === 0 && (
                       <TableRow className="bg-muted/10 hover:bg-muted/10 [&>td.sticky]:bg-muted/10">
@@ -352,62 +777,25 @@ export default function CohortsPage() {
                         >
                           No price breakdown
                         </TableCell>
-                        {Array.from({ length: 31 }).map((_, i) => (
-                          <TableCell key={i} className="py-1.5 px-3" />
+                        {columnOrder.map((id) => (
+                          <TableCell key={id} className="py-1.5 px-3" />
                         ))}
                       </TableRow>
                     )}
                     {expanded &&
-                      c.plan_breakdown.map((plan) => {
-                        const CHILD_NUM =
-                          "py-1.5 px-3 text-right text-xs text-muted-foreground tabular-nums whitespace-nowrap";
-                        const CHILD_NUM_SECTION = `${CHILD_NUM} ${SECTION_DIVIDER}`;
-                        const CHILD_TXT = "py-1.5 px-3 text-xs text-muted-foreground/60 whitespace-nowrap";
-                        const dash = <span className="text-muted-foreground/40">—</span>;
-                        return (
-                          <TableRow
-                            key={`${c.cohort_id}-plan-${plan.price}`}
-                            className="bg-muted/10 hover:bg-muted/20 [&>td.sticky]:bg-muted/10 [&>td.sticky]:hover:bg-muted/20"
+                      c.plan_breakdown.map((plan) => (
+                        <TableRow
+                          key={`${c.cohort_id}-plan-${plan.price}`}
+                          className="bg-muted/10 hover:bg-muted/20 [&>td.sticky]:bg-muted/10 [&>td.sticky]:hover:bg-muted/20"
+                        >
+                          <TableCell
+                            className={`${CELL_BASE} sticky left-0 z-10 shadow-[1px_0_0_0_hsl(var(--border))] text-xs font-medium text-muted-foreground whitespace-nowrap tabular-nums pl-8`}
                           >
-                            <TableCell
-                              className={`${CELL_BASE} sticky left-0 z-10 shadow-[1px_0_0_0_hsl(var(--border))] text-xs font-medium text-muted-foreground whitespace-nowrap tabular-nums pl-8`}
-                            >
-                              {formatCurrency(plan.price)}
-                            </TableCell>
-                            <TableCell className={CHILD_TXT}>{dash}</TableCell>
-                            <TableCell className={CHILD_TXT}>{dash}</TableCell>
-                            <TableCell className={CHILD_TXT}>{dash}</TableCell>
-                            <TableCell className={CHILD_NUM_SECTION}>{plan.trial_users}</TableCell>
-                            <TableCell className={CHILD_NUM}>{plan.upsell_users}</TableCell>
-                            <TableCell className={CHILD_NUM}>{plan.first_subscription_users}</TableCell>
-                            <TableCell className={CHILD_NUM_SECTION}>{formatPct(plan.trial_to_upsell_cr)}</TableCell>
-                            <TableCell className={CHILD_NUM}>{formatPct(plan.trial_to_first_subscription_cr)}</TableCell>
-                            <TableCell className={CHILD_NUM}>{formatPct(plan.first_subscription_to_renewal_2_cr)}</TableCell>
-                            <TableCell className={CHILD_NUM}>{formatPct(plan.renewal_2_to_renewal_3_cr)}</TableCell>
-                            <TableCell className={CHILD_NUM_SECTION}>{plan.renewal_2_users}</TableCell>
-                            <TableCell className={CHILD_NUM}>{plan.renewal_3_users}</TableCell>
-                            <TableCell className={CHILD_NUM}>{plan.renewal_users}</TableCell>
-                            <TableCell className={CHILD_NUM_SECTION}>{plan.refund_users}</TableCell>
-                            <TableCell className={CHILD_NUM}>{formatCurrency(plan.amount_refunded)}</TableCell>
-                            <TableCell className={CHILD_NUM}>{formatPct(plan.refund_rate)}</TableCell>
-                            <TableCell className={CHILD_NUM_SECTION}>{formatCurrency(plan.gross_revenue)}</TableCell>
-                            <TableCell className={CHILD_NUM}>{formatCurrency(plan.net_revenue)}</TableCell>
-                            <TableCell className={CHILD_NUM}>{dash}</TableCell>
-                            <TableCell className={CHILD_NUM}>{formatCurrency(plan.net_ltv)}</TableCell>
-                            <TableCell className={CHILD_NUM_SECTION}>{dash}</TableCell>
-                            <TableCell className={CHILD_NUM}>{dash}</TableCell>
-                            <TableCell className={CHILD_NUM}>{dash}</TableCell>
-                            <TableCell className={CHILD_NUM}>{dash}</TableCell>
-                            <TableCell className={CHILD_NUM}>{dash}</TableCell>
-                            <TableCell className={CHILD_NUM}>{dash}</TableCell>
-                            <TableCell className={CHILD_NUM}>{dash}</TableCell>
-                            <TableCell className={CHILD_NUM_SECTION}>{dash}</TableCell>
-                            <TableCell className={CHILD_NUM}>{dash}</TableCell>
-                            <TableCell className={CHILD_NUM}>{dash}</TableCell>
-                            <TableCell className={CHILD_NUM}>{dash}</TableCell>
-                          </TableRow>
-                        );
-                      })}
+                            {formatCurrency(plan.price)}
+                          </TableCell>
+                          {columnOrder.map((id) => renderPlanCell(id, plan))}
+                        </TableRow>
+                      ))}
                   </Fragment>
                 );
               })}
@@ -418,42 +806,12 @@ export default function CohortsPage() {
                   >
                     Total
                   </TableCell>
-                  <TableCell className={CELL_TXT}>—</TableCell>
-                  <TableCell className={CELL_TXT}>—</TableCell>
-                  <TableCell className={CELL_TXT}>—</TableCell>
-                  <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{totals.totalTrialUsers}</TableCell>
-                  <TableCell className={CELL_NUM}>{totals.totalUpsellUsers}</TableCell>
-                  <TableCell className={CELL_NUM}>{totals.totalFirstSubscriptionUsers}</TableCell>
-                  <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{formatPct(totals.trialToUpsellCr)}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatPct(totals.trialToFirstSubscriptionCr)}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatPct(totals.firstSubscriptionToRenewal2Cr)}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatPct(totals.renewal2ToRenewal3Cr)}</TableCell>
-                  <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{totals.totalRenewal2Users}</TableCell>
-                  <TableCell className={CELL_NUM}>{totals.totalRenewal3Users}</TableCell>
-                  <TableCell className={CELL_NUM}>{totals.totalRenewalUsers}</TableCell>
-                  <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{totals.totalRefundUsers}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatCurrency(totals.amountRefunded)}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatPct(totals.refundRate)}</TableCell>
-                  <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{formatCurrency(totals.grossRevenue)}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatCurrency(totals.netRevenue)}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatCurrency(totals.grossLtv)}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatCurrency(totals.netLtv)}</TableCell>
-                  <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{formatCurrency(totals.revenueD0)}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatCurrency(totals.revenueD7)}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatCurrency(totals.revenueD14)}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatCurrency(totals.revenueD30)}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatCurrency(totals.revenueD37)}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatCurrency(totals.revenueD67)}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatCurrency(totals.totalRevenue)}</TableCell>
-                  <TableCell className={`${CELL_NUM} ${SECTION_DIVIDER}`}>{formatCurrency(totals.ltvD7)}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatCurrency(totals.ltvD14)}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatCurrency(totals.ltvD30)}</TableCell>
-                  <TableCell className={CELL_NUM}>{formatCurrency(totals.averageLtv)}</TableCell>
+                  {columnOrder.map(renderTotalCell)}
                 </TableRow>
               )}
               {cohorts.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={32} className="text-center text-sm text-muted-foreground py-10">
+                  <TableCell colSpan={columnOrder.length + 1} className="text-center text-sm text-muted-foreground py-10">
                     {hasUsers && allCohorts.length === 0
                       ? "No cohorts found. Check whether trial transactions were detected."
                       : "No cohorts to display."}

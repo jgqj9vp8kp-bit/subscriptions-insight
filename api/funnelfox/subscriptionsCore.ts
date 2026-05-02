@@ -329,7 +329,7 @@ export async function handleFunnelFoxSubscriptionDetails(options: SubscriptionDe
       };
     }
 
-    return { status: 200, body: sanitizeApiValue(payload) };
+    return { status: 200, body: payload };
   } catch {
     return {
       status: 502,

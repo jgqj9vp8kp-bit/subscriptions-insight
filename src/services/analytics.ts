@@ -1,4 +1,5 @@
 import type { CohortRow, PlanBreakdownRow, Transaction, UserAggregate } from "./types";
+import type { SubscriptionClean } from "@/types/subscriptions";
 
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -20,10 +21,14 @@ const initialPlanTransactionForUser = (txs: Transaction[]) =>
     .sort((a, b) => (a.event_time < b.event_time ? -1 : 1))
     .find((t) => t.status === "success" && t.transaction_type !== "upsell");
 const planNameFromPrice = (price: number | null) => (price == null ? "Unknown" : formatCurrency(price));
+const normalizeEmailKey = (email: string | null | undefined) => email?.trim().toLowerCase() || "";
 
 interface MutablePlanBreakdown {
   price: number;
   trial_users: number;
+  active_users: number;
+  active_subscriptions: number;
+  cancelled_users: number;
   upsell_users: number;
   first_subscription_users: number;
   renewal_2_users: number;
@@ -39,6 +44,9 @@ function createPlanBreakdown(price: number): MutablePlanBreakdown {
   return {
     price,
     trial_users: 0,
+    active_users: 0,
+    active_subscriptions: 0,
+    cancelled_users: 0,
     upsell_users: 0,
     first_subscription_users: 0,
     renewal_2_users: 0,
@@ -55,6 +63,12 @@ function finalizePlanBreakdown(row: MutablePlanBreakdown): PlanBreakdownRow {
   return {
     price: row.price,
     trial_users: row.trial_users,
+    active_users: row.active_users,
+    active_rate: row.trial_users ? (row.active_users / row.trial_users) * 100 : 0,
+    active_subscriptions: row.active_subscriptions,
+    active_subscriptions_rate: row.trial_users ? (row.active_subscriptions / row.trial_users) * 100 : 0,
+    cancelled_users: row.cancelled_users,
+    cancellation_rate: row.trial_users ? (row.cancelled_users / row.trial_users) * 100 : 0,
     upsell_users: row.upsell_users,
     first_subscription_users: row.first_subscription_users,
     renewal_2_users: row.renewal_2_users,
@@ -257,7 +271,29 @@ export function computeUsers(txs: Transaction[]): UserAggregate[] {
     .sort((a, b) => b.total_revenue - a.total_revenue);
 }
 
-export function computeCohorts(txs: Transaction[]): CohortRow[] {
+type SubscriptionFlags = {
+  active: boolean;
+  activeSubscription: boolean;
+  cancelled: boolean;
+  cancelledActive: boolean;
+};
+
+function subscriptionFlagsByEmail(subscriptions: SubscriptionClean[]): Map<string, SubscriptionFlags> {
+  const result = new Map<string, SubscriptionFlags>();
+  for (const sub of subscriptions) {
+    const email = normalizeEmailKey(sub.email);
+    if (!email) continue;
+    const flags = result.get(email) ?? { active: false, activeSubscription: false, cancelled: false, cancelledActive: false };
+    flags.active = flags.active || sub.is_active_now;
+    flags.activeSubscription = flags.activeSubscription || (sub.status === "active" && sub.renews === true);
+    flags.cancelled = flags.cancelled || sub.is_cancelled;
+    flags.cancelledActive = flags.cancelledActive || (sub.is_cancelled && sub.is_active_now);
+    result.set(email, flags);
+  }
+  return result;
+}
+
+export function computeCohorts(txs: Transaction[], subscriptions: SubscriptionClean[] = []): CohortRow[] {
   // Cohort membership is anchored to the exact trial timestamp; the displayed
   // date is only a label. This keeps D0/D7/D30 windows aligned per user.
   const trials = txs.filter((t) => t.transaction_type === "trial" && t.status === "success");
@@ -289,6 +325,7 @@ export function computeCohorts(txs: Transaction[]): CohortRow[] {
     list.push(t);
     userTxs.set(t.user_id, list);
   }
+  const subscriptionFlags = subscriptionFlagsByEmail(subscriptions);
 
   const rows: CohortRow[] = [];
   groups.forEach((group, cohort_id) => {
@@ -300,6 +337,10 @@ export function computeCohorts(txs: Transaction[]): CohortRow[] {
     let renewal_3_users = 0;
     let renewal_users = 0;
     const refundedUserIds = new Set<string>();
+    const activeUserIds = new Set<string>();
+    const activeSubscriptionUserIds = new Set<string>();
+    const cancelledUserIds = new Set<string>();
+    const cancelledActiveUserIds = new Set<string>();
     const planBreakdown = new Map<number, MutablePlanBreakdown>();
     let trial_revenue = 0, upsell_revenue = 0, first_subscription_revenue = 0, renewal_revenue = 0;
     let amount_refunded = 0, gross_revenue = 0, net_revenue = 0;
@@ -308,6 +349,8 @@ export function computeCohorts(txs: Transaction[]): CohortRow[] {
     for (const uid of userIds) {
       const list = userTxs.get(uid) ?? [];
       const initialPlanTransaction = initialPlanTransactionForUser(list);
+      const userEmail = normalizeEmailKey(list.find((t) => t.email)?.email);
+      const subFlags = userEmail ? subscriptionFlags.get(userEmail) : undefined;
       const planPrice = initialPlanTransaction ? round2(initialPlanTransaction.amount_usd) : null;
       const plan = planPrice == null
         ? null
@@ -359,9 +402,16 @@ export function computeCohorts(txs: Transaction[]): CohortRow[] {
       if (hasRenewal2) renewal_2_users += 1;
       if (hasRenewal3) renewal_3_users += 1;
       if (hasRenewal) renewal_users += 1;
+      if (subFlags?.active) activeUserIds.add(uid);
+      if (subFlags?.activeSubscription) activeSubscriptionUserIds.add(uid);
+      if (subFlags?.cancelled) cancelledUserIds.add(uid);
+      if (subFlags?.cancelledActive) cancelledActiveUserIds.add(uid);
       if (userRefundAmount > 0) refundedUserIds.add(uid);
       if (plan) {
         plan.trial_users += 1;
+        if (subFlags?.active) plan.active_users += 1;
+        if (subFlags?.activeSubscription) plan.active_subscriptions += 1;
+        if (subFlags?.cancelled) plan.cancelled_users += 1;
         if (hasUpsell) plan.upsell_users += 1;
         if (hasSub) plan.first_subscription_users += 1;
         if (hasRenewal2) plan.renewal_2_users += 1;
@@ -371,6 +421,10 @@ export function computeCohorts(txs: Transaction[]): CohortRow[] {
       }
     }
     const refund_users = refundedUserIds.size;
+    const active_users = activeUserIds.size;
+    const active_subscriptions = activeSubscriptionUserIds.size;
+    const cancelled_users = cancelledUserIds.size;
+    const cancelled_active_users = cancelledActiveUserIds.size;
 
     rows.push({
       cohort_id,
@@ -378,6 +432,17 @@ export function computeCohorts(txs: Transaction[]): CohortRow[] {
       funnel,
       campaign_path,
       trial_users,
+      active_users,
+      active_rate: trial_users ? (active_users / trial_users) * 100 : 0,
+      active_subscriptions,
+      active_subscriptions_rate: trial_users ? (active_subscriptions / trial_users) * 100 : 0,
+      active_subscription_user_ids: Array.from(activeSubscriptionUserIds),
+      cancelled_users,
+      cancellation_rate: trial_users ? (cancelled_users / trial_users) * 100 : 0,
+      cancelled_active_users,
+      active_user_ids: Array.from(activeUserIds),
+      cancelled_user_ids: Array.from(cancelledUserIds),
+      cancelled_active_user_ids: Array.from(cancelledActiveUserIds),
       upsell_users,
       first_subscription_users,
       renewal_2_users,
