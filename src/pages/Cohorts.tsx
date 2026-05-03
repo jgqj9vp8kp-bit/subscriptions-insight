@@ -3,6 +3,13 @@ import { ArrowDown, ArrowUp, ChevronDown, ChevronRight } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -21,7 +28,14 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useTransactions } from "@/services/sheets";
-import { computeCohorts, formatCurrency, formatPct } from "@/services/analytics";
+import {
+  calculateManualLtvModel,
+  computeAbsoluteRetention,
+  computeCohorts,
+  forecastLtv,
+  formatCurrency,
+  formatPct,
+} from "@/services/analytics";
 import type { CohortRow, PlanBreakdownRow } from "@/services/types";
 import { useDataStore } from "@/store/dataStore";
 
@@ -46,6 +60,10 @@ const DEFAULT_COLUMN_ORDER = [
   "active_subscriptions_rate",
   "active_rate",
   "cancelled_users",
+  "user_cancelled_users",
+  "user_cancel_rate",
+  "auto_cancelled_users",
+  "auto_cancel_rate",
   "cancellation_rate",
   "cancelled_active_users",
   "upsell_users",
@@ -64,6 +82,10 @@ const DEFAULT_COLUMN_ORDER = [
   "net_revenue",
   "gross_ltv",
   "net_ltv",
+  "ltv_actual",
+  "ltv_3m",
+  "ltv_6m",
+  "ltv_12m",
   "revenue_d0",
   "revenue_d7",
   "revenue_d14",
@@ -89,6 +111,10 @@ const COLUMN_LABELS: Record<CohortColumnId, string> = {
   active_subscriptions_rate: "Active Subscriptions Rate",
   active_rate: "Active Rate",
   cancelled_users: "Cancelled Users",
+  user_cancelled_users: "User Cancelled",
+  user_cancel_rate: "User Cancel Rate",
+  auto_cancelled_users: "Auto Cancelled",
+  auto_cancel_rate: "Auto Cancel Rate",
   cancellation_rate: "Cancellation Rate",
   cancelled_active_users: "Cancelled Active",
   upsell_users: "Upsell",
@@ -107,6 +133,10 @@ const COLUMN_LABELS: Record<CohortColumnId, string> = {
   net_revenue: "Net Revenue",
   gross_ltv: "Gross LTV",
   net_ltv: "Net LTV",
+  ltv_actual: "LTV (Actual)",
+  ltv_3m: "LTV 3M",
+  ltv_6m: "LTV 6M",
+  ltv_12m: "LTV 12M",
   revenue_d0: "Rev D0",
   revenue_d7: "Rev D7",
   revenue_d14: "Rev D14",
@@ -130,6 +160,10 @@ const COLUMN_MIN_WIDTHS: Record<CohortColumnId, number> = {
   active_subscriptions_rate: 150,
   active_rate: 100,
   cancelled_users: 120,
+  user_cancelled_users: 120,
+  user_cancel_rate: 120,
+  auto_cancelled_users: 120,
+  auto_cancel_rate: 120,
   cancellation_rate: 120,
   cancelled_active_users: 120,
   upsell_users: 84,
@@ -148,6 +182,10 @@ const COLUMN_MIN_WIDTHS: Record<CohortColumnId, number> = {
   net_revenue: 110,
   gross_ltv: 100,
   net_ltv: 100,
+  ltv_actual: 110,
+  ltv_3m: 100,
+  ltv_6m: 100,
+  ltv_12m: 100,
   revenue_d0: 90,
   revenue_d7: 90,
   revenue_d14: 90,
@@ -171,6 +209,8 @@ const SECTION_DIVIDER_COLUMNS = new Set<CohortColumnId>([
   "revenue_d0",
   "ltv_d7",
 ]);
+
+const DEFAULT_MANUAL_RETENTION = [45, 30, 22, 17, 14, 12, 10, 9, 8, 7, 6, 5];
 
 function heatStyle(value: number, max: number): React.CSSProperties {
   if (max <= 0) return {};
@@ -207,6 +247,38 @@ function persistColumnOrder(order: CohortColumnId[]) {
   }
 }
 
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function forecastDetailsFor(cohort: CohortRow | null) {
+  if (!cohort) return null;
+  const firstSubCr = cohort.trial_users ? cohort.first_subscription_users / cohort.trial_users : 0;
+  const renewal2Cr = cohort.first_subscription_users ? cohort.renewal_2_users / cohort.first_subscription_users : 0;
+  const renewal3Cr = cohort.renewal_2_users ? cohort.renewal_3_users / cohort.renewal_2_users : 0;
+  const rawDecay = renewal2Cr > 0 && renewal3Cr > 0 ? renewal3Cr / renewal2Cr : 0.7;
+  const decay = clamp(rawDecay, 0.3, 0.95);
+  const avgSubscriptionPrice = cohort.first_subscription_users
+    ? cohort.first_subscription_revenue / cohort.first_subscription_users
+    : 0;
+  const confidence =
+    cohort.trial_users >= 100 && cohort.renewal_3_users >= 20
+      ? "High"
+      : cohort.trial_users >= 50 && cohort.renewal_2_users >= 10
+        ? "Medium"
+        : "Low";
+
+  return {
+    firstSubCr,
+    renewal2Cr,
+    renewal3Cr,
+    decay,
+    rawDecay,
+    avgSubscriptionPrice,
+    confidence,
+  };
+}
+
 export default function CohortsPage() {
   const txs = useTransactions();
   const subscriptions = useDataStore((s) => s.subscriptions);
@@ -221,6 +293,15 @@ export default function CohortsPage() {
   const [dateSort, setDateSort] = useState<"desc" | "asc">("desc");
   const [columnSettingsOpen, setColumnSettingsOpen] = useState(false);
   const [columnOrder, setColumnOrder] = useState<CohortColumnId[]>(loadInitialColumnOrder);
+  const [forecastDetailsCohort, setForecastDetailsCohort] = useState<CohortRow | null>(null);
+  const [manualTrialUsers, setManualTrialUsers] = useState("1000");
+  const [manualTrialPrice, setManualTrialPrice] = useState("1");
+  const [manualSubscriptionPrice, setManualSubscriptionPrice] = useState("29.99");
+  const [manualUpsellRate, setManualUpsellRate] = useState("20");
+  const [manualUpsellValue, setManualUpsellValue] = useState("14.98");
+  const [manualStripeCommission, setManualStripeCommission] = useState("3");
+  const [manualFbCommission, setManualFbCommission] = useState("0");
+  const [manualRetention, setManualRetention] = useState<string[]>(() => DEFAULT_MANUAL_RETENTION.map(String));
 
   const trafficSourceOptions = useMemo(() => Array.from(new Set(txs.map((t) => t.traffic_source))).sort(), [txs]);
   const campaignIdOptions = useMemo(() => Array.from(new Set(txs.map((t) => t.campaign_id || "unknown"))).sort(), [txs]);
@@ -234,6 +315,15 @@ export default function CohortsPage() {
     [txs, trafficSourceFilter, campaignIdFilter]
   );
   const allCohorts = useMemo(() => computeCohorts(sourceFilteredTxs, subscriptions), [sourceFilteredTxs, subscriptions]);
+  const absoluteRetentionRows = useMemo(
+    () =>
+      computeAbsoluteRetention(sourceFilteredTxs).filter((row) => {
+        if (cohortDateFrom && row.cohort_date < cohortDateFrom) return false;
+        if (cohortDateTo && row.cohort_date > cohortDateTo) return false;
+        return true;
+      }),
+    [sourceFilteredTxs, cohortDateFrom, cohortDateTo]
+  );
   const funnelOptions = useMemo(() => Array.from(new Set(allCohorts.map((c) => c.funnel))).sort(), [allCohorts]);
   const campaignPathOptions = useMemo(() => Array.from(new Set(allCohorts.map((c) => c.campaign_path))).sort(), [allCohorts]);
   const cohorts = useMemo(
@@ -298,6 +388,8 @@ export default function CohortsPage() {
     const totalActiveUsers = new Set(cohorts.flatMap((c) => c.active_user_ids)).size;
     const totalActiveSubscriptions = new Set(cohorts.flatMap((c) => c.active_subscription_user_ids)).size;
     const totalCancelledUsers = new Set(cohorts.flatMap((c) => c.cancelled_user_ids)).size;
+    const totalUserCancelledUsers = new Set(cohorts.flatMap((c) => c.user_cancelled_user_ids)).size;
+    const totalAutoCancelledUsers = new Set(cohorts.flatMap((c) => c.auto_cancelled_user_ids)).size;
     const totalCancelledActiveUsers = new Set(cohorts.flatMap((c) => c.cancelled_active_user_ids)).size;
     const totalRevenue = sum((c) => c.revenue_total);
     const amountRefunded = sum((c) => c.amount_refunded);
@@ -306,6 +398,14 @@ export default function CohortsPage() {
     const revenueD7 = sum((c) => c.revenue_d7);
     const revenueD14 = sum((c) => c.revenue_d14);
     const revenueD30 = sum((c) => c.revenue_d30);
+    const totalForecast = forecastLtv({
+      trialUsers: totalTrialUsers,
+      firstSubscriptionUsers: totalFirstSubscriptionUsers,
+      renewal2Users: totalRenewal2Users,
+      renewal3Users: totalRenewal3Users,
+      netRevenue,
+      firstSubscriptionRevenue: sum((c) => c.first_subscription_revenue),
+    });
     return {
       totalTrialUsers,
       totalUpsellUsers,
@@ -317,10 +417,14 @@ export default function CohortsPage() {
       totalActiveUsers,
       totalActiveSubscriptions,
       totalCancelledUsers,
+      totalUserCancelledUsers,
+      totalAutoCancelledUsers,
       totalCancelledActiveUsers,
       totalActiveRate: totalTrialUsers ? (totalActiveUsers / totalTrialUsers) * 100 : 0,
       totalActiveSubscriptionsRate: totalTrialUsers ? (totalActiveSubscriptions / totalTrialUsers) * 100 : 0,
       totalCancellationRate: totalTrialUsers ? (totalCancelledUsers / totalTrialUsers) * 100 : 0,
+      totalUserCancelRate: totalTrialUsers ? (totalUserCancelledUsers / totalTrialUsers) * 100 : 0,
+      totalAutoCancelRate: totalTrialUsers ? (totalAutoCancelledUsers / totalTrialUsers) * 100 : 0,
       trialRevenue: sum((c) => c.trial_revenue),
       upsellRevenue: sum((c) => c.upsell_revenue),
       firstSubscriptionRevenue: sum((c) => c.first_subscription_revenue),
@@ -331,6 +435,10 @@ export default function CohortsPage() {
       netRevenue,
       grossLtv: totalTrialUsers ? grossRevenue / totalTrialUsers : 0,
       netLtv: totalTrialUsers ? netRevenue / totalTrialUsers : 0,
+      ltvActual: totalForecast.ltv_actual,
+      ltv3m: totalForecast.ltv_3m,
+      ltv6m: totalForecast.ltv_6m,
+      ltv12m: totalForecast.ltv_12m,
       revenueD0: sum((c) => c.revenue_d0),
       revenueD7,
       revenueD14,
@@ -348,6 +456,33 @@ export default function CohortsPage() {
       renewal2ToRenewal3Cr: totalRenewal2Users ? (totalRenewal3Users / totalRenewal2Users) * 100 : 0,
     };
   }, [cohorts]);
+  const forecastDetails = forecastDetailsFor(forecastDetailsCohort);
+  const manualLtvRows = useMemo(
+    () =>
+      calculateManualLtvModel({
+        trialUsers: Number(manualTrialUsers) || 0,
+        trialPrice: Number(manualTrialPrice) || 0,
+        subscriptionPrice: Number(manualSubscriptionPrice) || 0,
+        upsellRatePct: Number(manualUpsellRate) || 0,
+        upsellValue: Number(manualUpsellValue) || 0,
+        retentionPctByMonth: manualRetention.map((value) => Number(value) || 0),
+        stripeCommissionPct: Number(manualStripeCommission) || 0,
+        fbCommissionPct: Number(manualFbCommission) || 0,
+      }),
+    [
+      manualTrialUsers,
+      manualTrialPrice,
+      manualSubscriptionPrice,
+      manualUpsellRate,
+      manualUpsellValue,
+      manualRetention,
+      manualStripeCommission,
+      manualFbCommission,
+    ]
+  );
+  const updateManualRetention = (index: number, value: string) => {
+    setManualRetention((current) => current.map((entry, entryIndex) => (entryIndex === index ? value : entry)));
+  };
 
   const headerClassFor = (id: CohortColumnId) =>
     `${TEXT_COLUMNS.has(id) ? `${HEAD_BASE} text-left` : HEAD_NUM} ${SECTION_DIVIDER_COLUMNS.has(id) ? SECTION_DIVIDER : ""}`;
@@ -399,6 +534,14 @@ export default function CohortsPage() {
         return <TableCell key={id} className={className}>{formatPct(c.active_rate)}</TableCell>;
       case "cancelled_users":
         return <TableCell key={id} className={className}>{c.cancelled_users}</TableCell>;
+      case "user_cancelled_users":
+        return <TableCell key={id} className={className}>{c.user_cancelled_users}</TableCell>;
+      case "user_cancel_rate":
+        return <TableCell key={id} className={className}>{formatPct(c.user_cancel_rate)}</TableCell>;
+      case "auto_cancelled_users":
+        return <TableCell key={id} className={className}>{c.auto_cancelled_users}</TableCell>;
+      case "auto_cancel_rate":
+        return <TableCell key={id} className={className}>{formatPct(c.auto_cancel_rate)}</TableCell>;
       case "cancellation_rate":
         return <TableCell key={id} className={className}>{formatPct(c.cancellation_rate)}</TableCell>;
       case "cancelled_active_users":
@@ -435,6 +578,14 @@ export default function CohortsPage() {
         return <TableCell key={id} className={className}>{formatCurrency(c.gross_ltv)}</TableCell>;
       case "net_ltv":
         return <TableCell key={id} className={className}>{formatCurrency(c.net_ltv)}</TableCell>;
+      case "ltv_actual":
+        return <TableCell key={id} className={className}>{formatCurrency(c.ltv_actual)}</TableCell>;
+      case "ltv_3m":
+        return <TableCell key={id} className={className}>{formatCurrency(c.ltv_3m)}</TableCell>;
+      case "ltv_6m":
+        return <TableCell key={id} className={className}>{formatCurrency(c.ltv_6m)}</TableCell>;
+      case "ltv_12m":
+        return <TableCell key={id} className={className}>{formatCurrency(c.ltv_12m)}</TableCell>;
       case "revenue_d0":
         return <TableCell key={id} className={className}>{formatCurrency(c.revenue_d0)}</TableCell>;
       case "revenue_d7":
@@ -479,6 +630,14 @@ export default function CohortsPage() {
         return <TableCell key={id} className={className}>{formatPct(plan.active_rate)}</TableCell>;
       case "cancelled_users":
         return <TableCell key={id} className={className}>{plan.cancelled_users}</TableCell>;
+      case "user_cancelled_users":
+        return <TableCell key={id} className={className}>{plan.user_cancelled_users}</TableCell>;
+      case "user_cancel_rate":
+        return <TableCell key={id} className={className}>{formatPct(plan.user_cancel_rate)}</TableCell>;
+      case "auto_cancelled_users":
+        return <TableCell key={id} className={className}>{plan.auto_cancelled_users}</TableCell>;
+      case "auto_cancel_rate":
+        return <TableCell key={id} className={className}>{formatPct(plan.auto_cancel_rate)}</TableCell>;
       case "cancellation_rate":
         return <TableCell key={id} className={className}>{formatPct(plan.cancellation_rate)}</TableCell>;
       case "cancelled_active_users":
@@ -513,6 +672,14 @@ export default function CohortsPage() {
         return <TableCell key={id} className={className}>{formatCurrency(plan.net_revenue)}</TableCell>;
       case "net_ltv":
         return <TableCell key={id} className={className}>{formatCurrency(plan.net_ltv)}</TableCell>;
+      case "ltv_actual":
+        return <TableCell key={id} className={className}>{formatCurrency(plan.ltv_actual)}</TableCell>;
+      case "ltv_3m":
+        return <TableCell key={id} className={className}>{formatCurrency(plan.ltv_3m)}</TableCell>;
+      case "ltv_6m":
+        return <TableCell key={id} className={className}>{formatCurrency(plan.ltv_6m)}</TableCell>;
+      case "ltv_12m":
+        return <TableCell key={id} className={className}>{formatCurrency(plan.ltv_12m)}</TableCell>;
       case "gross_ltv":
       case "revenue_d0":
       case "revenue_d7":
@@ -548,6 +715,14 @@ export default function CohortsPage() {
         return <TableCell key={id} className={className}>{formatPct(totals.totalActiveRate)}</TableCell>;
       case "cancelled_users":
         return <TableCell key={id} className={className}>{totals.totalCancelledUsers}</TableCell>;
+      case "user_cancelled_users":
+        return <TableCell key={id} className={className}>{totals.totalUserCancelledUsers}</TableCell>;
+      case "user_cancel_rate":
+        return <TableCell key={id} className={className}>{formatPct(totals.totalUserCancelRate)}</TableCell>;
+      case "auto_cancelled_users":
+        return <TableCell key={id} className={className}>{totals.totalAutoCancelledUsers}</TableCell>;
+      case "auto_cancel_rate":
+        return <TableCell key={id} className={className}>{formatPct(totals.totalAutoCancelRate)}</TableCell>;
       case "cancellation_rate":
         return <TableCell key={id} className={className}>{formatPct(totals.totalCancellationRate)}</TableCell>;
       case "cancelled_active_users":
@@ -584,6 +759,14 @@ export default function CohortsPage() {
         return <TableCell key={id} className={className}>{formatCurrency(totals.grossLtv)}</TableCell>;
       case "net_ltv":
         return <TableCell key={id} className={className}>{formatCurrency(totals.netLtv)}</TableCell>;
+      case "ltv_actual":
+        return <TableCell key={id} className={className}>{formatCurrency(totals.ltvActual)}</TableCell>;
+      case "ltv_3m":
+        return <TableCell key={id} className={className}>{formatCurrency(totals.ltv3m)}</TableCell>;
+      case "ltv_6m":
+        return <TableCell key={id} className={className}>{formatCurrency(totals.ltv6m)}</TableCell>;
+      case "ltv_12m":
+        return <TableCell key={id} className={className}>{formatCurrency(totals.ltv12m)}</TableCell>;
       case "revenue_d0":
         return <TableCell key={id} className={className}>{formatCurrency(totals.revenueD0)}</TableCell>;
       case "revenue_d7":
@@ -758,15 +941,26 @@ export default function CohortsPage() {
                       <TableCell
                         className={`${CELL_BASE} sticky left-0 bg-card z-10 font-medium text-sm whitespace-nowrap shadow-[1px_0_0_0_hsl(var(--border))]`}
                       >
-                        <button
-                          type="button"
-                          onClick={() => toggleExpanded(c.cohort_id)}
-                          className="inline-flex items-center gap-1.5 hover:text-primary"
-                          aria-expanded={expanded}
-                        >
-                          {expanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
-                          {c.cohort_id}
-                        </button>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => toggleExpanded(c.cohort_id)}
+                            className="inline-flex items-center gap-1.5 hover:text-primary"
+                            aria-expanded={expanded}
+                          >
+                            {expanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+                            {c.cohort_id}
+                          </button>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            className="h-7 px-2 text-xs"
+                            onClick={() => setForecastDetailsCohort(c)}
+                          >
+                            Forecast details
+                          </Button>
+                        </div>
                       </TableCell>
                       {columnOrder.map((id) => renderCohortCell(id, c))}
                     </TableRow>
@@ -815,6 +1009,191 @@ export default function CohortsPage() {
                     {hasUsers && allCohorts.length === 0
                       ? "No cohorts found. Check whether trial transactions were detected."
                       : "No cohorts to display."}
+                  </TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
+        </div>
+      </Card>
+      <Dialog open={Boolean(forecastDetailsCohort)} onOpenChange={(open) => !open && setForecastDetailsCohort(null)}>
+        <DialogContent className="max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>Forecast Details</DialogTitle>
+            <DialogDescription>
+              Forecast is based on observed subscription conversion and renewal retention. Future months are projected using retention decay.
+            </DialogDescription>
+          </DialogHeader>
+          {forecastDetailsCohort && forecastDetails && (
+            <div className="space-y-4">
+              <div className="rounded-md border border-border p-3">
+                <div className="text-sm font-medium">{forecastDetailsCohort.cohort_id}</div>
+                <div className="mt-1 text-xs text-muted-foreground">
+                  {forecastDetailsCohort.cohort_date} · {forecastDetailsCohort.campaign_path} · {forecastDetailsCohort.funnel.replace("_", " ")}
+                </div>
+              </div>
+
+              <div className="grid gap-3 md:grid-cols-3">
+                <div className="rounded-md border border-border p-3">
+                  <div className="mb-2 text-xs font-medium uppercase text-muted-foreground">Base data</div>
+                  <dl className="space-y-1 text-sm">
+                    <div className="flex justify-between gap-3"><dt>Trial Users</dt><dd className="tabular-nums">{forecastDetailsCohort.trial_users}</dd></div>
+                    <div className="flex justify-between gap-3"><dt>First Sub Users</dt><dd className="tabular-nums">{forecastDetailsCohort.first_subscription_users}</dd></div>
+                    <div className="flex justify-between gap-3"><dt>Renewal 2 Users</dt><dd className="tabular-nums">{forecastDetailsCohort.renewal_2_users}</dd></div>
+                    <div className="flex justify-between gap-3"><dt>Renewal 3 Users</dt><dd className="tabular-nums">{forecastDetailsCohort.renewal_3_users}</dd></div>
+                    <div className="flex justify-between gap-3"><dt>Net Revenue</dt><dd className="tabular-nums">{formatCurrency(forecastDetailsCohort.net_revenue)}</dd></div>
+                    <div className="flex justify-between gap-3"><dt>Actual Net LTV</dt><dd className="tabular-nums">{formatCurrency(forecastDetailsCohort.net_ltv)}</dd></div>
+                  </dl>
+                </div>
+
+                <div className="rounded-md border border-border p-3">
+                  <div className="mb-2 text-xs font-medium uppercase text-muted-foreground">Model parameters</div>
+                  <dl className="space-y-1 text-sm">
+                    <div className="flex justify-between gap-3"><dt>First Sub CR</dt><dd className="tabular-nums">{formatPct(forecastDetails.firstSubCr * 100)}</dd></div>
+                    <div className="flex justify-between gap-3"><dt>Renewal 2 CR</dt><dd className="tabular-nums">{formatPct(forecastDetails.renewal2Cr * 100)}</dd></div>
+                    <div className="flex justify-between gap-3"><dt>Renewal 3 CR</dt><dd className="tabular-nums">{formatPct(forecastDetails.renewal3Cr * 100)}</dd></div>
+                    <div className="flex justify-between gap-3"><dt>Decay</dt><dd className="tabular-nums">{forecastDetails.decay.toFixed(2)}</dd></div>
+                    <div className="flex justify-between gap-3"><dt>Avg Subscription Price</dt><dd className="tabular-nums">{formatCurrency(forecastDetails.avgSubscriptionPrice)}</dd></div>
+                    <div className="flex justify-between gap-3"><dt>Forecast Horizon</dt><dd>3M / 6M / 12M</dd></div>
+                    <div className="flex justify-between gap-3"><dt>Confidence</dt><dd>{forecastDetails.confidence}</dd></div>
+                  </dl>
+                </div>
+
+                <div className="rounded-md border border-border p-3">
+                  <div className="mb-2 text-xs font-medium uppercase text-muted-foreground">Forecast output</div>
+                  <dl className="space-y-1 text-sm">
+                    <div className="flex justify-between gap-3"><dt>Forecast LTV 3M</dt><dd className="tabular-nums">{formatCurrency(forecastDetailsCohort.ltv_3m)}</dd></div>
+                    <div className="flex justify-between gap-3"><dt>Forecast LTV 6M</dt><dd className="tabular-nums">{formatCurrency(forecastDetailsCohort.ltv_6m)}</dd></div>
+                    <div className="flex justify-between gap-3"><dt>Forecast LTV 12M</dt><dd className="tabular-nums">{formatCurrency(forecastDetailsCohort.ltv_12m)}</dd></div>
+                  </dl>
+                </div>
+              </div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+      <Card className="mt-4 rounded-lg border bg-card text-card-foreground shadow-sm p-4 shadow-card">
+        <div className="mb-3 flex items-center justify-between gap-3 border-b border-border pb-3">
+          <div>
+            <h2 className="text-sm font-semibold">Manual LTV Model</h2>
+            <p className="text-xs text-muted-foreground">
+              Spreadsheet-style model using direct absolute retention inputs. No decay or renewal ratios are applied.
+            </p>
+          </div>
+        </div>
+        <div className="grid gap-3 md:grid-cols-4 xl:grid-cols-7">
+          <div className="space-y-1.5">
+            <Label htmlFor="manual-trial-users" className="text-xs text-muted-foreground">Trial Users</Label>
+            <Input id="manual-trial-users" type="number" min="0" value={manualTrialUsers} onChange={(e) => setManualTrialUsers(e.target.value)} className="h-9" />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="manual-trial-price" className="text-xs text-muted-foreground">Trial Price</Label>
+            <Input id="manual-trial-price" type="number" min="0" step="0.01" value={manualTrialPrice} onChange={(e) => setManualTrialPrice(e.target.value)} className="h-9" />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="manual-sub-price" className="text-xs text-muted-foreground">Subscription Price</Label>
+            <Input id="manual-sub-price" type="number" min="0" step="0.01" value={manualSubscriptionPrice} onChange={(e) => setManualSubscriptionPrice(e.target.value)} className="h-9" />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="manual-upsell-rate" className="text-xs text-muted-foreground">Upsell Rate (%)</Label>
+            <Input id="manual-upsell-rate" type="number" min="0" step="0.1" value={manualUpsellRate} onChange={(e) => setManualUpsellRate(e.target.value)} className="h-9" />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="manual-upsell-value" className="text-xs text-muted-foreground">Upsell Value</Label>
+            <Input id="manual-upsell-value" type="number" min="0" step="0.01" value={manualUpsellValue} onChange={(e) => setManualUpsellValue(e.target.value)} className="h-9" />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="manual-stripe" className="text-xs text-muted-foreground">Stripe Commission (%)</Label>
+            <Input id="manual-stripe" type="number" min="0" step="0.1" value={manualStripeCommission} onChange={(e) => setManualStripeCommission(e.target.value)} className="h-9" />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="manual-fb" className="text-xs text-muted-foreground">FB Commission (%)</Label>
+            <Input id="manual-fb" type="number" min="0" step="0.1" value={manualFbCommission} onChange={(e) => setManualFbCommission(e.target.value)} className="h-9" />
+          </div>
+        </div>
+
+        <div className="mt-4 grid gap-2 md:grid-cols-6 xl:grid-cols-12">
+          {manualRetention.map((value, index) => (
+            <div key={index + 1} className="space-y-1.5">
+              <Label htmlFor={`manual-retention-${index + 1}`} className="text-xs text-muted-foreground">M{index + 1} (%)</Label>
+              <Input
+                id={`manual-retention-${index + 1}`}
+                type="number"
+                min="0"
+                step="0.1"
+                value={value}
+                onChange={(e) => updateManualRetention(index, e.target.value)}
+                className="h-9"
+              />
+            </div>
+          ))}
+        </div>
+
+        <div className="mt-4 overflow-x-auto rounded-lg border border-border">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Month</TableHead>
+                <TableHead className="text-right">Users</TableHead>
+                <TableHead className="text-right">Revenue</TableHead>
+                <TableHead className="text-right">Cumulative Revenue</TableHead>
+                <TableHead className="text-right">LTV</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {manualLtvRows.map((row) => (
+                <TableRow key={row.month}>
+                  <TableCell className="font-medium">M{row.month}</TableCell>
+                  <TableCell className="text-right tabular-nums">{row.users.toLocaleString(undefined, { maximumFractionDigits: 2 })}</TableCell>
+                  <TableCell className="text-right tabular-nums">{formatCurrency(row.revenue)}</TableCell>
+                  <TableCell className="text-right tabular-nums">{formatCurrency(row.cumulative_revenue)}</TableCell>
+                  <TableCell className="text-right tabular-nums">{formatCurrency(row.ltv)}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      </Card>
+
+      <Card className="mt-4 rounded-lg border bg-card text-card-foreground shadow-sm p-4 shadow-card">
+        <div className="mb-3 flex items-center justify-between gap-3 border-b border-border pb-3">
+          <div>
+            <h2 className="text-sm font-semibold">Absolute Retention</h2>
+            <p className="text-xs text-muted-foreground">
+              Unique users with at least one successful subscription transaction in each 30-day month, divided by original cohort size.
+            </p>
+          </div>
+        </div>
+        <div className="overflow-x-auto rounded-lg border border-border">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead className="whitespace-nowrap">Cohort</TableHead>
+                <TableHead className="whitespace-nowrap text-right">Users</TableHead>
+                {Array.from({ length: 12 }, (_, index) => (
+                  <TableHead key={index + 1} className="whitespace-nowrap text-right">
+                    M{index + 1}
+                  </TableHead>
+                ))}
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {absoluteRetentionRows.map((row) => (
+                <TableRow key={row.cohort}>
+                  <TableCell className="whitespace-nowrap text-sm font-medium">{row.cohort}</TableCell>
+                  <TableCell className="text-right text-sm tabular-nums">{row.total_users}</TableCell>
+                  {row.retention_by_month.map((retention, index) => (
+                    <TableCell key={index + 1} className="text-right text-sm tabular-nums">
+                      <div>{formatPct(retention)}</div>
+                      <div className="text-[11px] text-muted-foreground">{row.users_by_month[index]}</div>
+                    </TableCell>
+                  ))}
+                </TableRow>
+              ))}
+              {absoluteRetentionRows.length === 0 && (
+                <TableRow>
+                  <TableCell colSpan={14} className="py-8 text-center text-sm text-muted-foreground">
+                    No absolute retention cohorts to display.
                   </TableCell>
                 </TableRow>
               )}
