@@ -1,4 +1,4 @@
-import { Fragment, useMemo, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDown, ArrowUp, ChevronDown, ChevronRight } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { Button } from "@/components/ui/button";
@@ -31,14 +31,17 @@ import { useDataStore } from "@/store/dataStore";
 
 // Visual-only helpers — no data/logic impact.
 const HEAD_BASE =
-  "sticky top-0 z-20 bg-card h-10 px-3 whitespace-nowrap border-b border-border text-xs font-semibold text-muted-foreground";
+  "sticky top-0 z-20 bg-card h-8 px-2 whitespace-nowrap border-b border-border text-xs font-semibold text-muted-foreground relative select-none";
 const HEAD_NUM = `${HEAD_BASE} text-right`;
-const CELL_BASE = "py-2 px-3 align-middle";
+const CELL_BASE = "py-1 px-2 align-middle";
 const CELL_NUM = `${CELL_BASE} text-right tabular-nums whitespace-nowrap text-sm`;
 const CELL_TXT = `${CELL_BASE} text-xs text-muted-foreground whitespace-nowrap`;
 // Left border marks the start of a logical section.
 const SECTION_DIVIDER = "border-l border-border/60";
 const COLUMN_ORDER_STORAGE_KEY = "cohorts_column_order";
+const COLUMN_WIDTHS_STORAGE_KEY = "cohorts_column_widths_v1";
+const MIN_COLUMN_WIDTH = 80;
+const COHORT_FIRST_COL_KEY = "__cohort__";
 
 const DEFAULT_COLUMN_ORDER = [
   "cohort_date",
@@ -150,6 +153,38 @@ const COLUMN_MIN_WIDTHS: Record<CohortColumnId, number> = {
   revenue_d60: 90,
 };
 
+// Compact defaults — tighter than before for higher data density.
+const DEFAULT_COLUMN_WIDTHS: Record<string, number> = (() => {
+  const out: Record<string, number> = { [COHORT_FIRST_COL_KEY]: 150 };
+  for (const id of DEFAULT_COLUMN_ORDER) {
+    const isText = id === "cohort_date" || id === "campaign_path" || id === "funnel";
+    out[id] = isText ? Math.max(130, COLUMN_MIN_WIDTHS[id]) : Math.max(MIN_COLUMN_WIDTH, Math.min(100, COLUMN_MIN_WIDTHS[id]));
+  }
+  return out;
+})();
+
+function loadInitialColumnWidths(): Record<string, number> {
+  try {
+    const saved = localStorage.getItem(COLUMN_WIDTHS_STORAGE_KEY);
+    if (!saved) return { ...DEFAULT_COLUMN_WIDTHS };
+    const parsed = JSON.parse(saved);
+    if (parsed && typeof parsed === "object") {
+      return { ...DEFAULT_COLUMN_WIDTHS, ...parsed };
+    }
+  } catch {
+    // fall through
+  }
+  return { ...DEFAULT_COLUMN_WIDTHS };
+}
+
+function persistColumnWidths(widths: Record<string, number>) {
+  try {
+    localStorage.setItem(COLUMN_WIDTHS_STORAGE_KEY, JSON.stringify(widths));
+  } catch (error) {
+    console.warn("Unable to persist cohort column widths", error);
+  }
+}
+
 const TEXT_COLUMNS = new Set<CohortColumnId>(["cohort_date", "campaign_path", "funnel"]);
 const SECTION_DIVIDER_COLUMNS = new Set<CohortColumnId>([
   "trial_users",
@@ -209,6 +244,59 @@ export default function CohortsPage() {
   const [dateSort, setDateSort] = useState<"desc" | "asc">("desc");
   const [columnSettingsOpen, setColumnSettingsOpen] = useState(false);
   const [columnOrder, setColumnOrder] = useState<CohortColumnId[]>(loadInitialColumnOrder);
+  const [columnWidths, setColumnWidths] = useState<Record<string, number>>(loadInitialColumnWidths);
+  const resizingRef = useRef<{ key: string; startX: number; startWidth: number } | null>(null);
+
+  const startResize = useCallback((key: string, e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const startWidth = columnWidths[key] ?? DEFAULT_COLUMN_WIDTHS[key] ?? 100;
+    resizingRef.current = { key, startX: e.clientX, startWidth };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  }, [columnWidths]);
+
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      const r = resizingRef.current;
+      if (!r) return;
+      const next = Math.max(MIN_COLUMN_WIDTH, r.startWidth + (e.clientX - r.startX));
+      setColumnWidths((cur) => (cur[r.key] === next ? cur : { ...cur, [r.key]: next }));
+    };
+    const onUp = () => {
+      if (!resizingRef.current) return;
+      resizingRef.current = null;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      setColumnWidths((cur) => {
+        persistColumnWidths(cur);
+        return cur;
+      });
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, []);
+
+  const autoFitColumn = useCallback((key: string) => {
+    setColumnWidths((cur) => {
+      const next = { ...cur, [key]: DEFAULT_COLUMN_WIDTHS[key] ?? 100 };
+      persistColumnWidths(next);
+      return next;
+    });
+  }, []);
+
+  const resetColumnWidths = useCallback(() => {
+    setColumnWidths({ ...DEFAULT_COLUMN_WIDTHS });
+    try {
+      localStorage.removeItem(COLUMN_WIDTHS_STORAGE_KEY);
+    } catch (error) {
+      console.warn("Unable to reset cohort column widths", error);
+    }
+  }, []);
 
   const trafficSourceOptions = useMemo(() => Array.from(new Set(txs.map((t) => t.traffic_source))).sort(), [txs]);
   const campaignIdOptions = useMemo(() => Array.from(new Set(txs.map((t) => t.campaign_id || "unknown"))).sort(), [txs]);
@@ -267,6 +355,7 @@ export default function CohortsPage() {
     } catch (error) {
       console.warn("Unable to reset cohort column order", error);
     }
+    resetColumnWidths();
   };
 
   const maxUpsellCR = Math.max(0, ...cohorts.map((c) => c.trial_to_upsell_cr));
@@ -345,7 +434,11 @@ export default function CohortsPage() {
   const dash = <span className="text-muted-foreground/40">—</span>;
 
   const renderHeaderCell = (id: CohortColumnId) => (
-    <TableHead key={id} className={headerClassFor(id)} style={{ minWidth: COLUMN_MIN_WIDTHS[id] }}>
+    <TableHead
+      key={id}
+      className={headerClassFor(id)}
+      style={{ width: columnWidths[id], minWidth: MIN_COLUMN_WIDTH }}
+    >
       {id === "cohort_date" ? (
         <button
           onClick={() => setDateSort((s) => (s === "desc" ? "asc" : "desc"))}
@@ -356,6 +449,14 @@ export default function CohortsPage() {
       ) : (
         COLUMN_LABELS[id]
       )}
+      <div
+        role="separator"
+        aria-orientation="vertical"
+        onMouseDown={(e) => startResize(id, e)}
+        onDoubleClick={() => autoFitColumn(id)}
+        title="Drag to resize · double-click to reset"
+        className="absolute top-0 right-0 h-full w-1.5 -mr-px cursor-col-resize hover:bg-primary/40 active:bg-primary"
+      />
     </TableHead>
   );
 
@@ -695,15 +796,23 @@ export default function CohortsPage() {
           </div>
         )}
 
-        <div className="rounded-lg border border-border [&>div]:max-h-[calc(100vh-280px)] [&>div]:overflow-auto [&>div]:rounded-lg">
-          <Table className="border-separate border-spacing-0">
+        <div className="rounded-lg border border-border [&>div]:max-h-[calc(100vh-220px)] [&>div]:overflow-auto [&>div]:rounded-lg [&>div]:scroll-smooth">
+          <Table className="border-separate border-spacing-0 w-auto">
             <TableHeader>
               <TableRow className="hover:bg-transparent">
                 <TableHead
                   className={`${HEAD_BASE} sticky left-0 z-30 shadow-[1px_0_0_0_hsl(var(--border))] text-left`}
-                  style={{ minWidth: 140 }}
+                  style={{ width: columnWidths[COHORT_FIRST_COL_KEY], minWidth: MIN_COLUMN_WIDTH }}
                 >
                   Cohort
+                  <div
+                    role="separator"
+                    aria-orientation="vertical"
+                    onMouseDown={(e) => startResize(COHORT_FIRST_COL_KEY, e)}
+                    onDoubleClick={() => autoFitColumn(COHORT_FIRST_COL_KEY)}
+                    title="Drag to resize · double-click to reset"
+                    className="absolute top-0 right-0 h-full w-1.5 -mr-px cursor-col-resize hover:bg-primary/40 active:bg-primary"
+                  />
                 </TableHead>
                 {columnOrder.map(renderHeaderCell)}
               </TableRow>
