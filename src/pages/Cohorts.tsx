@@ -1,10 +1,12 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowDown, ArrowUp, ChevronDown, ChevronRight } from "lucide-react";
+import { ArrowDown, ArrowUp, ChevronDown, ChevronRight, GripVertical, Check, Plus, Trash2 } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   Select,
   SelectContent,
@@ -40,6 +42,9 @@ const CELL_TXT = `${CELL_BASE} text-xs text-muted-foreground whitespace-nowrap`;
 const SECTION_DIVIDER = "border-l border-border/60";
 const COLUMN_ORDER_STORAGE_KEY = "cohorts_column_order";
 const COLUMN_WIDTHS_STORAGE_KEY = "cohorts_column_widths_v1";
+const COLUMN_VISIBILITY_STORAGE_KEY = "cohorts_column_visibility_v1";
+const SAVED_VIEWS_STORAGE_KEY = "cohorts_saved_views_v1";
+const ACTIVE_VIEW_STORAGE_KEY = "cohorts_active_view_v1";
 const MIN_COLUMN_WIDTH = 80;
 const COHORT_FIRST_COL_KEY = "__cohort__";
 
@@ -230,6 +235,100 @@ function persistColumnOrder(order: CohortColumnId[]) {
   }
 }
 
+// ---- Column visibility ----
+const DEFAULT_HIDDEN: CohortColumnId[] = [];
+
+function loadInitialVisibility(): Record<CohortColumnId, boolean> {
+  const base = Object.fromEntries(DEFAULT_COLUMN_ORDER.map((id) => [id, !DEFAULT_HIDDEN.includes(id)])) as Record<CohortColumnId, boolean>;
+  try {
+    const saved = localStorage.getItem(COLUMN_VISIBILITY_STORAGE_KEY);
+    if (!saved) return base;
+    const parsed = JSON.parse(saved);
+    if (parsed && typeof parsed === "object") {
+      for (const id of DEFAULT_COLUMN_ORDER) {
+        if (typeof parsed[id] === "boolean") base[id] = parsed[id];
+      }
+    }
+  } catch {
+    /* noop */
+  }
+  return base;
+}
+
+function persistVisibility(v: Record<CohortColumnId, boolean>) {
+  try {
+    localStorage.setItem(COLUMN_VISIBILITY_STORAGE_KEY, JSON.stringify(v));
+  } catch (error) {
+    console.warn("Unable to persist cohort column visibility", error);
+  }
+}
+
+// ---- Saved views ----
+interface SavedView {
+  id: string;
+  name: string;
+  order: CohortColumnId[];
+  visibility: Record<CohortColumnId, boolean>;
+  builtin?: boolean;
+}
+
+function buildVisibility(visibleIds: CohortColumnId[]): Record<CohortColumnId, boolean> {
+  const v = {} as Record<CohortColumnId, boolean>;
+  for (const id of DEFAULT_COLUMN_ORDER) v[id] = visibleIds.includes(id);
+  return v;
+}
+
+const BUILTIN_VIEWS: SavedView[] = [
+  {
+    id: "default",
+    name: "Default",
+    order: [...DEFAULT_COLUMN_ORDER],
+    visibility: Object.fromEntries(DEFAULT_COLUMN_ORDER.map((id) => [id, true])) as Record<CohortColumnId, boolean>,
+    builtin: true,
+  },
+  {
+    id: "revenue",
+    name: "Revenue",
+    order: [...DEFAULT_COLUMN_ORDER],
+    visibility: buildVisibility(["gross_revenue", "net_revenue", "revenue_d0", "revenue_d7", "revenue_d30", "revenue_d60"]),
+    builtin: true,
+  },
+  {
+    id: "cancellations",
+    name: "Cancellations",
+    order: [...DEFAULT_COLUMN_ORDER],
+    visibility: buildVisibility(["cancelled_users", "user_cancelled_users", "auto_cancelled_users", "cancellation_rate"]),
+    builtin: true,
+  },
+  {
+    id: "active_subs",
+    name: "Active Subs",
+    order: [...DEFAULT_COLUMN_ORDER],
+    visibility: buildVisibility(["active_subscriptions", "active_subscriptions_rate"]),
+    builtin: true,
+  },
+];
+
+function loadCustomViews(): SavedView[] {
+  try {
+    const raw = localStorage.getItem(SAVED_VIEWS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed.filter((v) => v && v.id && v.name && Array.isArray(v.order));
+  } catch {
+    /* noop */
+  }
+  return [];
+}
+
+function persistCustomViews(views: SavedView[]) {
+  try {
+    localStorage.setItem(SAVED_VIEWS_STORAGE_KEY, JSON.stringify(views));
+  } catch (error) {
+    console.warn("Unable to persist cohort saved views", error);
+  }
+}
+
 export default function CohortsPage() {
   const txs = useTransactions();
   const subscriptions = useDataStore((s) => s.subscriptions);
@@ -242,8 +341,16 @@ export default function CohortsPage() {
   const [cohortDateFrom, setCohortDateFrom] = useState("");
   const [cohortDateTo, setCohortDateTo] = useState("");
   const [dateSort, setDateSort] = useState<"desc" | "asc">("desc");
-  const [columnSettingsOpen, setColumnSettingsOpen] = useState(false);
+  const [columnsPopoverOpen, setColumnsPopoverOpen] = useState(false);
+  const [viewsPopoverOpen, setViewsPopoverOpen] = useState(false);
   const [columnOrder, setColumnOrder] = useState<CohortColumnId[]>(loadInitialColumnOrder);
+  const [columnVisibility, setColumnVisibility] = useState<Record<CohortColumnId, boolean>>(loadInitialVisibility);
+  const [customViews, setCustomViews] = useState<SavedView[]>(loadCustomViews);
+  const [activeViewId, setActiveViewId] = useState<string | null>(() => {
+    try { return localStorage.getItem(ACTIVE_VIEW_STORAGE_KEY); } catch { return null; }
+  });
+  const [newViewName, setNewViewName] = useState("");
+  const dragColRef = useRef<CohortColumnId | null>(null);
   const [columnWidths, setColumnWidths] = useState<Record<string, number>>(loadInitialColumnWidths);
   const resizingRef = useRef<{ key: string; startX: number; startWidth: number } | null>(null);
 
@@ -358,6 +465,89 @@ export default function CohortsPage() {
     resetColumnWidths();
   };
 
+  const allViews = useMemo<SavedView[]>(() => [...BUILTIN_VIEWS, ...customViews], [customViews]);
+  const activeView = useMemo(() => allViews.find((v) => v.id === activeViewId) ?? null, [allViews, activeViewId]);
+
+  const setVisibility = (id: CohortColumnId, value: boolean) => {
+    setColumnVisibility((cur) => {
+      const next = { ...cur, [id]: value };
+      persistVisibility(next);
+      return next;
+    });
+    setActiveViewId(null);
+    try { localStorage.removeItem(ACTIVE_VIEW_STORAGE_KEY); } catch { /* noop */ }
+  };
+
+  const applyView = (view: SavedView) => {
+    setColumnOrder(view.order);
+    setColumnVisibility(view.visibility);
+    persistColumnOrder(view.order);
+    persistVisibility(view.visibility);
+    setActiveViewId(view.id);
+    try { localStorage.setItem(ACTIVE_VIEW_STORAGE_KEY, view.id); } catch { /* noop */ }
+  };
+
+  const resetToDefault = () => {
+    applyView(BUILTIN_VIEWS[0]);
+    resetColumnWidths();
+  };
+
+  const saveCurrentAsView = () => {
+    const name = newViewName.trim();
+    if (!name) return;
+    const view: SavedView = {
+      id: `custom_${Date.now()}`,
+      name,
+      order: [...columnOrder],
+      visibility: { ...columnVisibility },
+    };
+    const next = [...customViews, view];
+    setCustomViews(next);
+    persistCustomViews(next);
+    setActiveViewId(view.id);
+    try { localStorage.setItem(ACTIVE_VIEW_STORAGE_KEY, view.id); } catch { /* noop */ }
+    setNewViewName("");
+  };
+
+  const deleteView = (id: string) => {
+    const next = customViews.filter((v) => v.id !== id);
+    setCustomViews(next);
+    persistCustomViews(next);
+    if (activeViewId === id) {
+      setActiveViewId(null);
+      try { localStorage.removeItem(ACTIVE_VIEW_STORAGE_KEY); } catch { /* noop */ }
+    }
+  };
+
+  const onHeaderDragStart = (id: CohortColumnId) => {
+    dragColRef.current = id;
+  };
+  const onHeaderDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+  };
+  const onHeaderDrop = (targetId: CohortColumnId) => {
+    const src = dragColRef.current;
+    dragColRef.current = null;
+    if (!src || src === targetId) return;
+    setColumnOrder((cur) => {
+      const next = [...cur];
+      const from = next.indexOf(src);
+      const to = next.indexOf(targetId);
+      if (from < 0 || to < 0) return cur;
+      next.splice(from, 1);
+      next.splice(to, 0, src);
+      persistColumnOrder(next);
+      return next;
+    });
+    setActiveViewId(null);
+    try { localStorage.removeItem(ACTIVE_VIEW_STORAGE_KEY); } catch { /* noop */ }
+  };
+
+  const visibleColumnOrder = useMemo(
+    () => columnOrder.filter((id) => columnVisibility[id] !== false),
+    [columnOrder, columnVisibility],
+  );
+
   const maxUpsellCR = Math.max(0, ...cohorts.map((c) => c.trial_to_upsell_cr));
   const maxSubCR = Math.max(0, ...cohorts.map((c) => c.trial_to_first_subscription_cr));
   const maxRenewal2CR = Math.max(0, ...cohorts.map((c) => c.first_subscription_to_renewal_2_cr));
@@ -438,6 +628,10 @@ export default function CohortsPage() {
       key={id}
       className={headerClassFor(id)}
       style={{ width: columnWidths[id], minWidth: MIN_COLUMN_WIDTH }}
+      draggable
+      onDragStart={() => onHeaderDragStart(id)}
+      onDragOver={onHeaderDragOver}
+      onDrop={() => onHeaderDrop(id)}
     >
       {id === "cohort_date" ? (
         <button
@@ -447,7 +641,10 @@ export default function CohortsPage() {
           {COLUMN_LABELS[id]} {dateSort === "asc" ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />}
         </button>
       ) : (
-        COLUMN_LABELS[id]
+        <span className="inline-flex items-center gap-1 cursor-grab active:cursor-grabbing">
+          <GripVertical className="h-3 w-3 opacity-40" />
+          {COLUMN_LABELS[id]}
+        </span>
       )}
       <div
         role="separator"
@@ -740,61 +937,88 @@ export default function CohortsPage() {
               className="h-9 w-[150px]"
             />
           </div>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className="h-9"
-            onClick={() => setColumnSettingsOpen((open) => !open)}
-          >
-            Columns
-          </Button>
-        </div>
-
-        {columnSettingsOpen && (
-          <div className="mb-3 rounded-md border border-border bg-muted/20 p-3">
-            <div className="mb-2 flex items-center justify-between gap-3">
-              <div>
-                <div className="text-sm font-medium">Column settings</div>
-                <div className="text-xs text-muted-foreground">Expand arrow and Cohort are locked first.</div>
-              </div>
-              <Button type="button" variant="outline" size="sm" onClick={resetColumnOrder}>
-                Reset columns
-              </Button>
-            </div>
-            <div className="max-h-72 overflow-auto rounded-md border border-border bg-card">
-              <div className="flex items-center justify-between gap-3 border-b border-border px-3 py-2 text-sm">
-                <span className="font-medium">Cohort</span>
-                <span className="text-xs text-muted-foreground">Locked</span>
-              </div>
-              {columnOrder.map((id, index) => (
-                <div key={id} className="flex items-center justify-between gap-3 border-b border-border px-3 py-2 last:border-b-0">
-                  <span className="text-sm">{COLUMN_LABELS[id]}</span>
-                  <div className="flex items-center gap-1">
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      disabled={index === 0}
-                      onClick={() => moveColumn(index, -1)}
-                    >
-                      Move up
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      disabled={index === columnOrder.length - 1}
-                      onClick={() => moveColumn(index, 1)}
-                    >
-                      Move down
-                    </Button>
-                  </div>
+          <div className="ml-auto flex items-center gap-2">
+            {activeView && (
+              <span className="text-xs text-muted-foreground">
+                View: <span className="font-medium text-foreground">{activeView.name}</span>
+              </span>
+            )}
+            <Popover open={viewsPopoverOpen} onOpenChange={setViewsPopoverOpen}>
+              <PopoverTrigger asChild>
+                <Button type="button" variant="outline" size="sm" className="h-9">Views</Button>
+              </PopoverTrigger>
+              <PopoverContent align="end" className="w-72 p-0">
+                <div className="px-3 py-2 border-b border-border text-xs font-medium text-muted-foreground">Saved views</div>
+                <div className="max-h-64 overflow-auto">
+                  {allViews.map((v) => (
+                    <div key={v.id} className="flex items-center justify-between gap-2 px-3 py-1.5 hover:bg-muted/50">
+                      <button
+                        type="button"
+                        onClick={() => applyView(v)}
+                        className="flex-1 flex items-center gap-2 text-left text-sm"
+                      >
+                        <span className="w-4">{activeViewId === v.id && <Check className="h-3.5 w-3.5 text-primary" />}</span>
+                        <span>{v.name}</span>
+                        {v.builtin && <span className="text-[10px] uppercase text-muted-foreground">built-in</span>}
+                      </button>
+                      {!v.builtin && (
+                        <button
+                          type="button"
+                          onClick={() => deleteView(v.id)}
+                          className="text-muted-foreground hover:text-destructive"
+                          aria-label="Delete view"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      )}
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
+                <div className="border-t border-border p-2 flex items-center gap-2">
+                  <Input
+                    placeholder="View name…"
+                    value={newViewName}
+                    onChange={(e) => setNewViewName(e.target.value)}
+                    className="h-8 text-xs"
+                    onKeyDown={(e) => { if (e.key === "Enter") saveCurrentAsView(); }}
+                  />
+                  <Button type="button" size="sm" className="h-8" onClick={saveCurrentAsView} disabled={!newViewName.trim()}>
+                    <Plus className="h-3.5 w-3.5" /> Save
+                  </Button>
+                </div>
+                <div className="border-t border-border p-2">
+                  <Button type="button" variant="ghost" size="sm" className="w-full h-8" onClick={resetToDefault}>
+                    Reset to Default
+                  </Button>
+                </div>
+              </PopoverContent>
+            </Popover>
+            <Popover open={columnsPopoverOpen} onOpenChange={setColumnsPopoverOpen}>
+              <PopoverTrigger asChild>
+                <Button type="button" variant="outline" size="sm" className="h-9">Columns</Button>
+              </PopoverTrigger>
+              <PopoverContent align="end" className="w-72 p-0">
+                <div className="flex items-center justify-between px-3 py-2 border-b border-border">
+                  <span className="text-xs font-medium text-muted-foreground">Toggle columns</span>
+                  <Button type="button" variant="ghost" size="sm" className="h-7 text-xs" onClick={resetColumnOrder}>
+                    Reset
+                  </Button>
+                </div>
+                <div className="max-h-80 overflow-auto py-1">
+                  {columnOrder.map((id) => (
+                    <label key={id} className="flex items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted/50 cursor-pointer">
+                      <Checkbox
+                        checked={columnVisibility[id] !== false}
+                        onCheckedChange={(c) => setVisibility(id, c === true)}
+                      />
+                      <span>{COLUMN_LABELS[id]}</span>
+                    </label>
+                  ))}
+                </div>
+              </PopoverContent>
+            </Popover>
           </div>
-        )}
+        </div>
 
         <div className="rounded-lg border border-border [&>div]:max-h-[calc(100vh-220px)] [&>div]:overflow-auto [&>div]:rounded-lg [&>div]:scroll-smooth">
           <Table className="border-separate border-spacing-0 w-auto">
@@ -814,7 +1038,7 @@ export default function CohortsPage() {
                     className="absolute top-0 right-0 h-full w-1.5 -mr-px cursor-col-resize hover:bg-primary/40 active:bg-primary"
                   />
                 </TableHead>
-                {columnOrder.map(renderHeaderCell)}
+                {visibleColumnOrder.map(renderHeaderCell)}
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -841,7 +1065,7 @@ export default function CohortsPage() {
                           </button>
                         </div>
                       </TableCell>
-                      {columnOrder.map((id) => renderCohortCell(id, c))}
+                      {visibleColumnOrder.map((id) => renderCohortCell(id, c))}
                     </TableRow>
                     {expanded && c.plan_breakdown.length === 0 && (
                       <TableRow className="bg-muted/10 hover:bg-muted/10 [&>td.sticky]:bg-muted/10">
@@ -850,7 +1074,7 @@ export default function CohortsPage() {
                         >
                           No price breakdown
                         </TableCell>
-                        {columnOrder.map((id) => (
+                        {visibleColumnOrder.map((id) => (
                           <TableCell key={id} className="py-1.5 px-3" />
                         ))}
                       </TableRow>
@@ -866,7 +1090,7 @@ export default function CohortsPage() {
                           >
                             {formatCurrency(plan.price)}
                           </TableCell>
-                          {columnOrder.map((id) => renderPlanCell(id, plan))}
+                          {visibleColumnOrder.map((id) => renderPlanCell(id, plan))}
                         </TableRow>
                       ))}
                   </Fragment>
@@ -879,12 +1103,12 @@ export default function CohortsPage() {
                   >
                     Total
                   </TableCell>
-                  {columnOrder.map(renderTotalCell)}
+                  {visibleColumnOrder.map(renderTotalCell)}
                 </TableRow>
               )}
               {cohorts.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={columnOrder.length + 1} className="text-center text-sm text-muted-foreground py-10">
+                  <TableCell colSpan={visibleColumnOrder.length + 1} className="text-center text-sm text-muted-foreground py-10">
                     {hasUsers && allCohorts.length === 0
                       ? "No cohorts found. Check whether trial transactions were detected."
                       : "No cohorts to display."}
