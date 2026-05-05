@@ -1038,7 +1038,7 @@ export default function CohortsPage() {
                     className="absolute top-0 right-0 h-full w-1.5 -mr-px cursor-col-resize hover:bg-primary/40 active:bg-primary"
                   />
                 </TableHead>
-                {columnOrder.map(renderHeaderCell)}
+                {visibleColumnOrder.map(renderHeaderCell)}
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -1065,7 +1065,7 @@ export default function CohortsPage() {
                           </button>
                         </div>
                       </TableCell>
-                      {columnOrder.map((id) => renderCohortCell(id, c))}
+                      {visibleColumnOrder.map((id) => renderCohortCell(id, c))}
                     </TableRow>
                     {expanded && c.plan_breakdown.length === 0 && (
                       <TableRow className="bg-muted/10 hover:bg-muted/10 [&>td.sticky]:bg-muted/10">
@@ -1074,7 +1074,7 @@ export default function CohortsPage() {
                         >
                           No price breakdown
                         </TableCell>
-                        {columnOrder.map((id) => (
+                        {visibleColumnOrder.map((id) => (
                           <TableCell key={id} className="py-1.5 px-3" />
                         ))}
                       </TableRow>
@@ -1090,7 +1090,7 @@ export default function CohortsPage() {
                           >
                             {formatCurrency(plan.price)}
                           </TableCell>
-                          {columnOrder.map((id) => renderPlanCell(id, plan))}
+                          {visibleColumnOrder.map((id) => renderPlanCell(id, plan))}
                         </TableRow>
                       ))}
                   </Fragment>
@@ -1103,12 +1103,12 @@ export default function CohortsPage() {
                   >
                     Total
                   </TableCell>
-                  {columnOrder.map(renderTotalCell)}
+                  {visibleColumnOrder.map(renderTotalCell)}
                 </TableRow>
               )}
               {cohorts.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={columnOrder.length + 1} className="text-center text-sm text-muted-foreground py-10">
+                  <TableCell colSpan={visibleColumnOrder.length + 1} className="text-center text-sm text-muted-foreground py-10">
                     {hasUsers && allCohorts.length === 0
                       ? "No cohorts found. Check whether trial transactions were detected."
                       : "No cohorts to display."}
