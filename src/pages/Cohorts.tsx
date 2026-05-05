@@ -628,6 +628,10 @@ export default function CohortsPage() {
       key={id}
       className={headerClassFor(id)}
       style={{ width: columnWidths[id], minWidth: MIN_COLUMN_WIDTH }}
+      draggable
+      onDragStart={() => onHeaderDragStart(id)}
+      onDragOver={onHeaderDragOver}
+      onDrop={() => onHeaderDrop(id)}
     >
       {id === "cohort_date" ? (
         <button
@@ -637,7 +641,10 @@ export default function CohortsPage() {
           {COLUMN_LABELS[id]} {dateSort === "asc" ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />}
         </button>
       ) : (
-        COLUMN_LABELS[id]
+        <span className="inline-flex items-center gap-1 cursor-grab active:cursor-grabbing">
+          <GripVertical className="h-3 w-3 opacity-40" />
+          {COLUMN_LABELS[id]}
+        </span>
       )}
       <div
         role="separator"
