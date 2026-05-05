@@ -235,6 +235,100 @@ function persistColumnOrder(order: CohortColumnId[]) {
   }
 }
 
+// ---- Column visibility ----
+const DEFAULT_HIDDEN: CohortColumnId[] = [];
+
+function loadInitialVisibility(): Record<CohortColumnId, boolean> {
+  const base = Object.fromEntries(DEFAULT_COLUMN_ORDER.map((id) => [id, !DEFAULT_HIDDEN.includes(id)])) as Record<CohortColumnId, boolean>;
+  try {
+    const saved = localStorage.getItem(COLUMN_VISIBILITY_STORAGE_KEY);
+    if (!saved) return base;
+    const parsed = JSON.parse(saved);
+    if (parsed && typeof parsed === "object") {
+      for (const id of DEFAULT_COLUMN_ORDER) {
+        if (typeof parsed[id] === "boolean") base[id] = parsed[id];
+      }
+    }
+  } catch {
+    /* noop */
+  }
+  return base;
+}
+
+function persistVisibility(v: Record<CohortColumnId, boolean>) {
+  try {
+    localStorage.setItem(COLUMN_VISIBILITY_STORAGE_KEY, JSON.stringify(v));
+  } catch (error) {
+    console.warn("Unable to persist cohort column visibility", error);
+  }
+}
+
+// ---- Saved views ----
+interface SavedView {
+  id: string;
+  name: string;
+  order: CohortColumnId[];
+  visibility: Record<CohortColumnId, boolean>;
+  builtin?: boolean;
+}
+
+function buildVisibility(visibleIds: CohortColumnId[]): Record<CohortColumnId, boolean> {
+  const v = {} as Record<CohortColumnId, boolean>;
+  for (const id of DEFAULT_COLUMN_ORDER) v[id] = visibleIds.includes(id);
+  return v;
+}
+
+const BUILTIN_VIEWS: SavedView[] = [
+  {
+    id: "default",
+    name: "Default",
+    order: [...DEFAULT_COLUMN_ORDER],
+    visibility: Object.fromEntries(DEFAULT_COLUMN_ORDER.map((id) => [id, true])) as Record<CohortColumnId, boolean>,
+    builtin: true,
+  },
+  {
+    id: "revenue",
+    name: "Revenue",
+    order: [...DEFAULT_COLUMN_ORDER],
+    visibility: buildVisibility(["gross_revenue", "net_revenue", "revenue_d0", "revenue_d7", "revenue_d30", "revenue_d60"]),
+    builtin: true,
+  },
+  {
+    id: "cancellations",
+    name: "Cancellations",
+    order: [...DEFAULT_COLUMN_ORDER],
+    visibility: buildVisibility(["cancelled_users", "user_cancelled_users", "auto_cancelled_users", "cancellation_rate"]),
+    builtin: true,
+  },
+  {
+    id: "active_subs",
+    name: "Active Subs",
+    order: [...DEFAULT_COLUMN_ORDER],
+    visibility: buildVisibility(["active_subscriptions", "active_subscriptions_rate"]),
+    builtin: true,
+  },
+];
+
+function loadCustomViews(): SavedView[] {
+  try {
+    const raw = localStorage.getItem(SAVED_VIEWS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed.filter((v) => v && v.id && v.name && Array.isArray(v.order));
+  } catch {
+    /* noop */
+  }
+  return [];
+}
+
+function persistCustomViews(views: SavedView[]) {
+  try {
+    localStorage.setItem(SAVED_VIEWS_STORAGE_KEY, JSON.stringify(views));
+  } catch (error) {
+    console.warn("Unable to persist cohort saved views", error);
+  }
+}
+
 export default function CohortsPage() {
   const txs = useTransactions();
   const subscriptions = useDataStore((s) => s.subscriptions);
