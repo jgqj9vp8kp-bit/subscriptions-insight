@@ -1,10 +1,12 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowDown, ArrowUp, ChevronDown, ChevronRight } from "lucide-react";
+import { ArrowDown, ArrowUp, ChevronDown, ChevronRight, GripVertical, Check, Plus, Trash2 } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   Select,
   SelectContent,
@@ -40,6 +42,9 @@ const CELL_TXT = `${CELL_BASE} text-xs text-muted-foreground whitespace-nowrap`;
 const SECTION_DIVIDER = "border-l border-border/60";
 const COLUMN_ORDER_STORAGE_KEY = "cohorts_column_order";
 const COLUMN_WIDTHS_STORAGE_KEY = "cohorts_column_widths_v1";
+const COLUMN_VISIBILITY_STORAGE_KEY = "cohorts_column_visibility_v1";
+const SAVED_VIEWS_STORAGE_KEY = "cohorts_saved_views_v1";
+const ACTIVE_VIEW_STORAGE_KEY = "cohorts_active_view_v1";
 const MIN_COLUMN_WIDTH = 80;
 const COHORT_FIRST_COL_KEY = "__cohort__";
 
