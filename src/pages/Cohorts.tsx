@@ -937,61 +937,88 @@ export default function CohortsPage() {
               className="h-9 w-[150px]"
             />
           </div>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className="h-9"
-            onClick={() => setColumnSettingsOpen((open) => !open)}
-          >
-            Columns
-          </Button>
-        </div>
-
-        {columnSettingsOpen && (
-          <div className="mb-3 rounded-md border border-border bg-muted/20 p-3">
-            <div className="mb-2 flex items-center justify-between gap-3">
-              <div>
-                <div className="text-sm font-medium">Column settings</div>
-                <div className="text-xs text-muted-foreground">Expand arrow and Cohort are locked first.</div>
-              </div>
-              <Button type="button" variant="outline" size="sm" onClick={resetColumnOrder}>
-                Reset columns
-              </Button>
-            </div>
-            <div className="max-h-72 overflow-auto rounded-md border border-border bg-card">
-              <div className="flex items-center justify-between gap-3 border-b border-border px-3 py-2 text-sm">
-                <span className="font-medium">Cohort</span>
-                <span className="text-xs text-muted-foreground">Locked</span>
-              </div>
-              {columnOrder.map((id, index) => (
-                <div key={id} className="flex items-center justify-between gap-3 border-b border-border px-3 py-2 last:border-b-0">
-                  <span className="text-sm">{COLUMN_LABELS[id]}</span>
-                  <div className="flex items-center gap-1">
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      disabled={index === 0}
-                      onClick={() => moveColumn(index, -1)}
-                    >
-                      Move up
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      disabled={index === columnOrder.length - 1}
-                      onClick={() => moveColumn(index, 1)}
-                    >
-                      Move down
-                    </Button>
-                  </div>
+          <div className="ml-auto flex items-center gap-2">
+            {activeView && (
+              <span className="text-xs text-muted-foreground">
+                View: <span className="font-medium text-foreground">{activeView.name}</span>
+              </span>
+            )}
+            <Popover open={viewsPopoverOpen} onOpenChange={setViewsPopoverOpen}>
+              <PopoverTrigger asChild>
+                <Button type="button" variant="outline" size="sm" className="h-9">Views</Button>
+              </PopoverTrigger>
+              <PopoverContent align="end" className="w-72 p-0">
+                <div className="px-3 py-2 border-b border-border text-xs font-medium text-muted-foreground">Saved views</div>
+                <div className="max-h-64 overflow-auto">
+                  {allViews.map((v) => (
+                    <div key={v.id} className="flex items-center justify-between gap-2 px-3 py-1.5 hover:bg-muted/50">
+                      <button
+                        type="button"
+                        onClick={() => applyView(v)}
+                        className="flex-1 flex items-center gap-2 text-left text-sm"
+                      >
+                        <span className="w-4">{activeViewId === v.id && <Check className="h-3.5 w-3.5 text-primary" />}</span>
+                        <span>{v.name}</span>
+                        {v.builtin && <span className="text-[10px] uppercase text-muted-foreground">built-in</span>}
+                      </button>
+                      {!v.builtin && (
+                        <button
+                          type="button"
+                          onClick={() => deleteView(v.id)}
+                          className="text-muted-foreground hover:text-destructive"
+                          aria-label="Delete view"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      )}
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
+                <div className="border-t border-border p-2 flex items-center gap-2">
+                  <Input
+                    placeholder="View name…"
+                    value={newViewName}
+                    onChange={(e) => setNewViewName(e.target.value)}
+                    className="h-8 text-xs"
+                    onKeyDown={(e) => { if (e.key === "Enter") saveCurrentAsView(); }}
+                  />
+                  <Button type="button" size="sm" className="h-8" onClick={saveCurrentAsView} disabled={!newViewName.trim()}>
+                    <Plus className="h-3.5 w-3.5" /> Save
+                  </Button>
+                </div>
+                <div className="border-t border-border p-2">
+                  <Button type="button" variant="ghost" size="sm" className="w-full h-8" onClick={resetToDefault}>
+                    Reset to Default
+                  </Button>
+                </div>
+              </PopoverContent>
+            </Popover>
+            <Popover open={columnsPopoverOpen} onOpenChange={setColumnsPopoverOpen}>
+              <PopoverTrigger asChild>
+                <Button type="button" variant="outline" size="sm" className="h-9">Columns</Button>
+              </PopoverTrigger>
+              <PopoverContent align="end" className="w-72 p-0">
+                <div className="flex items-center justify-between px-3 py-2 border-b border-border">
+                  <span className="text-xs font-medium text-muted-foreground">Toggle columns</span>
+                  <Button type="button" variant="ghost" size="sm" className="h-7 text-xs" onClick={resetColumnOrder}>
+                    Reset
+                  </Button>
+                </div>
+                <div className="max-h-80 overflow-auto py-1">
+                  {columnOrder.map((id) => (
+                    <label key={id} className="flex items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted/50 cursor-pointer">
+                      <Checkbox
+                        checked={columnVisibility[id] !== false}
+                        onCheckedChange={(c) => setVisibility(id, c === true)}
+                      />
+                      <span>{COLUMN_LABELS[id]}</span>
+                    </label>
+                  ))}
+                </div>
+              </PopoverContent>
+            </Popover>
           </div>
-        )}
+        </div>
 
         <div className="rounded-lg border border-border [&>div]:max-h-[calc(100vh-220px)] [&>div]:overflow-auto [&>div]:rounded-lg [&>div]:scroll-smooth">
           <Table className="border-separate border-spacing-0 w-auto">
