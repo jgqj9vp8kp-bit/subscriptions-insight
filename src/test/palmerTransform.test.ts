@@ -693,7 +693,7 @@ describe("Palmer transformation", () => {
     expect(getPalmerImportDiagnostics(rows).unclassifiedSuccessfulSubscriptionRows).toBe(0);
   });
 
-  it("calculates cohort windows from trial timestamp, not calendar midnight", () => {
+  it("calculates cohort revenue windows from transaction_day", () => {
     const rows = transformPalmerRows([
       {
         id: "trial",
@@ -727,7 +727,8 @@ describe("Palmer transformation", () => {
 
     expect(cohort.cohort_id).toBe("unknown_2026-01-01");
     expect(cohort.revenue_d0).toBe(15.98);
-    expect(cohort.revenue_d7).toBe(15.98);
+    expect(cohort.revenue_d7).toBe(45.97);
     expect(cohort.revenue_d30).toBe(45.97);
+    expect(cohort.revenue_d60).toBe(45.97);
   });
 });

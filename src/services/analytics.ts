@@ -1,4 +1,4 @@
-import type { AbsoluteRetentionRow, CohortRow, PlanBreakdownRow, Transaction, UserAggregate } from "./types";
+import type { CohortRow, PlanBreakdownRow, Transaction, UserAggregate } from "./types";
 import type { SubscriptionClean } from "@/types/subscriptions";
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -7,10 +7,6 @@ const DAY = 24 * 60 * 60 * 1000;
 const isMoneyMoving = (t: Transaction) => t.status !== "failed";
 const isRenewalType = (t: Transaction) =>
   t.transaction_type === "renewal_2" || t.transaction_type === "renewal_3" || t.transaction_type === "renewal";
-const isSubscriptionType = (t: Transaction) =>
-  t.transaction_type === "first_subscription" || isRenewalType(t);
-const isSuccessfulRetentionStatus = (t: Transaction) =>
-  ["success", "paid", "completed"].includes(String(t.status).toLowerCase());
 const grossAmount = (t: Transaction) => t.gross_amount_usd ?? (t.amount_usd > 0 ? t.amount_usd : 0);
 const refundAmount = (t: Transaction) => t.refund_amount_usd ?? (t.amount_usd < 0 ? Math.abs(t.amount_usd) : 0);
 const netAmount = (t: Transaction) => t.net_amount_usd ?? grossAmount(t) - refundAmount(t);
@@ -34,6 +30,8 @@ const initialPlanTransactionForUser = (txs: Transaction[]) =>
     .find((t) => t.status === "success" && t.transaction_type !== "upsell");
 const planNameFromPrice = (price: number | null) => (price == null ? "Unknown" : formatCurrency(price));
 const normalizeEmailKey = (email: string | null | undefined) => email?.trim().toLowerCase() || "";
+const transactionDay = (t: Transaction, daysFromCohort: number) =>
+  typeof t.transaction_day === "number" ? t.transaction_day : Math.floor(daysFromCohort);
 
 interface MutablePlanBreakdown {
   price: number;
@@ -52,6 +50,10 @@ interface MutablePlanBreakdown {
   gross_revenue: number;
   amount_refunded: number;
   net_revenue: number;
+  revenue_d0: number;
+  revenue_d7: number;
+  revenue_d30: number;
+  revenue_d60: number;
   first_subscription_revenue: number;
 }
 
@@ -73,129 +75,16 @@ function createPlanBreakdown(price: number): MutablePlanBreakdown {
     gross_revenue: 0,
     amount_refunded: 0,
     net_revenue: 0,
+    revenue_d0: 0,
+    revenue_d7: 0,
+    revenue_d30: 0,
+    revenue_d60: 0,
     first_subscription_revenue: 0,
   };
 }
 
-type ForecastInput = {
-  trialUsers: number;
-  firstSubscriptionUsers: number;
-  renewal2Users: number;
-  renewal3Users: number;
-  netRevenue: number;
-  firstSubscriptionRevenue: number;
-};
-
-type LtvForecast = {
-  ltv_actual: number;
-  ltv_3m: number;
-  ltv_6m: number;
-  ltv_12m: number;
-};
-
-export type ManualLtvModelInput = {
-  trialUsers: number;
-  trialPrice: number;
-  subscriptionPrice: number;
-  upsellRatePct: number;
-  upsellValue: number;
-  retentionPctByMonth: number[];
-  stripeCommissionPct: number;
-  fbCommissionPct: number;
-};
-
-export type ManualLtvModelRow = {
-  month: number;
-  users: number;
-  revenue: number;
-  cumulative_revenue: number;
-  ltv: number;
-};
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
-}
-
-export function calculateManualLtvModel(input: ManualLtvModelInput): ManualLtvModelRow[] {
-  const trialUsers = Math.max(0, input.trialUsers);
-  const trialRevenue = trialUsers * Math.max(0, input.trialPrice);
-  const upsellRevenue = trialUsers * (Math.max(0, input.upsellRatePct) / 100) * Math.max(0, input.upsellValue);
-  const netMultiplier = Math.max(0, 1 - (Math.max(0, input.stripeCommissionPct) + Math.max(0, input.fbCommissionPct)) / 100);
-  let cumulativeSubscriptionRevenue = 0;
-
-  return input.retentionPctByMonth.slice(0, 12).map((retentionPct, index) => {
-    const month = index + 1;
-    const users = trialUsers * (Math.max(0, retentionPct) / 100);
-    const revenue = users * Math.max(0, input.subscriptionPrice);
-    cumulativeSubscriptionRevenue += revenue;
-    const cumulativeGrossRevenue = trialRevenue + upsellRevenue + cumulativeSubscriptionRevenue;
-    const cumulativeNetRevenue = cumulativeGrossRevenue * netMultiplier;
-
-    return {
-      month,
-      users: round2(users),
-      revenue: round2(revenue),
-      cumulative_revenue: round2(cumulativeNetRevenue),
-      ltv: trialUsers ? round2(cumulativeNetRevenue / trialUsers) : 0,
-    };
-  });
-}
-
-export function forecastLtv(input: ForecastInput): LtvForecast {
-  const {
-    trialUsers,
-    firstSubscriptionUsers,
-    renewal2Users,
-    renewal3Users,
-    netRevenue,
-    firstSubscriptionRevenue,
-  } = input;
-
-  if (!trialUsers) {
-    return { ltv_actual: 0, ltv_3m: 0, ltv_6m: 0, ltv_12m: 0 };
-  }
-
-  const subCr = firstSubscriptionUsers / trialUsers;
-  const r2 = firstSubscriptionUsers ? renewal2Users / firstSubscriptionUsers : 0;
-  const r3 = renewal2Users ? renewal3Users / renewal2Users : 0;
-  const decay = clamp(r2 > 0 && r3 > 0 ? r3 / r2 : 0.7, 0.3, 0.95);
-  const avgSubscriptionPrice = firstSubscriptionUsers ? firstSubscriptionRevenue / firstSubscriptionUsers : 0;
-  const monthlyUsers: number[] = [];
-
-  monthlyUsers[1] = trialUsers * subCr;
-  monthlyUsers[2] = monthlyUsers[1] * r2;
-  monthlyUsers[3] = monthlyUsers[2] * r3;
-
-  for (let month = 4; month <= 12; month += 1) {
-    const users = monthlyUsers[month - 1] * decay;
-    monthlyUsers[month] = users < 1 ? 0 : users;
-  }
-
-  const revenueForRange = (from: number, to: number) => {
-    let total = 0;
-    for (let month = from; month <= to; month += 1) {
-      total += (monthlyUsers[month] ?? 0) * avgSubscriptionPrice;
-    }
-    return total;
-  };
-
-  return {
-    ltv_actual: round2(netRevenue / trialUsers),
-    ltv_3m: round2((netRevenue + revenueForRange(2, 3)) / trialUsers),
-    ltv_6m: round2((netRevenue + revenueForRange(2, 6)) / trialUsers),
-    ltv_12m: round2((netRevenue + revenueForRange(2, 12)) / trialUsers),
-  };
-}
-
 function finalizePlanBreakdown(row: MutablePlanBreakdown): PlanBreakdownRow {
-  const forecast = forecastLtv({
-    trialUsers: row.trial_users,
-    firstSubscriptionUsers: row.first_subscription_users,
-    renewal2Users: row.renewal_2_users,
-    renewal3Users: row.renewal_3_users,
-    netRevenue: row.net_revenue,
-    firstSubscriptionRevenue: row.first_subscription_revenue,
-  });
+  const netRevenue = row.gross_revenue - row.amount_refunded;
 
   return {
     price: row.price,
@@ -223,9 +112,12 @@ function finalizePlanBreakdown(row: MutablePlanBreakdown): PlanBreakdownRow {
     refund_rate: row.trial_users ? (row.refund_users / row.trial_users) * 100 : 0,
     gross_revenue: round2(row.gross_revenue),
     amount_refunded: round2(row.amount_refunded),
-    net_revenue: round2(row.net_revenue),
-    ...forecast,
-    net_ltv: row.trial_users ? round2(row.net_revenue / row.trial_users) : 0,
+    net_revenue: round2(netRevenue),
+    revenue_d0: round2(row.revenue_d0),
+    revenue_d7: round2(row.revenue_d7),
+    revenue_d30: round2(row.revenue_d30),
+    revenue_d60: round2(row.revenue_d60),
+    net_ltv: row.trial_users ? round2(netRevenue / row.trial_users) : 0,
   };
 }
 
@@ -413,59 +305,6 @@ export function computeUsers(txs: Transaction[]): UserAggregate[] {
     .sort((a, b) => b.total_revenue - a.total_revenue);
 }
 
-export function computeAbsoluteRetention(txs: Transaction[], maxMonths = 12): AbsoluteRetentionRow[] {
-  const byUser = new Map<string, Transaction[]>();
-  for (const tx of txs) {
-    const userKey = normalizeEmailKey(tx.email) || tx.user_id;
-    if (!userKey) continue;
-    const list = byUser.get(userKey) ?? [];
-    list.push(tx);
-    byUser.set(userKey, list);
-  }
-
-  const cohorts = new Map<string, { users: Set<string>; monthUsers: Array<Set<string>> }>();
-  byUser.forEach((list, userKey) => {
-    const sorted = [...list].sort((a, b) => (a.event_time < b.event_time ? -1 : 1));
-    const firstSuccessful = sorted.find(isSuccessfulRetentionStatus);
-    if (!firstSuccessful) return;
-
-    const cohortTs = new Date(firstSuccessful.event_time).getTime();
-    if (!Number.isFinite(cohortTs)) return;
-
-    const cohortDate = firstSuccessful.event_time.slice(0, 10);
-    const cohort = cohorts.get(cohortDate) ?? {
-      users: new Set<string>(),
-      monthUsers: Array.from({ length: maxMonths }, () => new Set<string>()),
-    };
-    cohort.users.add(userKey);
-
-    for (const tx of sorted) {
-      if (!isSuccessfulRetentionStatus(tx) || !isSubscriptionType(tx)) continue;
-      const txTs = new Date(tx.event_time).getTime();
-      if (!Number.isFinite(txTs) || txTs < cohortTs) continue;
-      const monthNumber = Math.floor((txTs - cohortTs) / (30 * DAY)) + 1;
-      if (monthNumber < 1 || monthNumber > maxMonths) continue;
-      cohort.monthUsers[monthNumber - 1].add(userKey);
-    }
-
-    cohorts.set(cohortDate, cohort);
-  });
-
-  return Array.from(cohorts.entries())
-    .map(([cohortDate, cohort]) => {
-      const totalUsers = cohort.users.size;
-      const usersByMonth = cohort.monthUsers.map((users) => users.size);
-      return {
-        cohort: cohortDate,
-        cohort_date: cohortDate,
-        total_users: totalUsers,
-        users_by_month: usersByMonth,
-        retention_by_month: usersByMonth.map((users) => (totalUsers ? (users / totalUsers) * 100 : 0)),
-      };
-    })
-    .sort((a, b) => (a.cohort_date < b.cohort_date ? 1 : -1));
-}
-
 type SubscriptionFlags = {
   active: boolean;
   activeSubscription: boolean;
@@ -630,8 +469,8 @@ export function computeCohorts(txs: Transaction[], subscriptions: SubscriptionCl
     const cancelledActiveUserIds = new Set<string>();
     const planBreakdown = new Map<number, MutablePlanBreakdown>();
     let trial_revenue = 0, upsell_revenue = 0, first_subscription_revenue = 0, renewal_revenue = 0;
-    let amount_refunded = 0, gross_revenue = 0, net_revenue = 0;
-    let revenue_d0 = 0, revenue_d7 = 0, revenue_d14 = 0, revenue_d30 = 0, revenue_d37 = 0, revenue_d67 = 0, revenue_total = 0;
+    let amount_refunded = 0, gross_revenue = 0;
+    let revenue_d0 = 0, revenue_d7 = 0, revenue_d14 = 0, revenue_d30 = 0, revenue_d60 = 0, revenue_d37 = 0, revenue_d67 = 0, revenue_total = 0;
 
     for (const uid of userIds) {
       const list = userTxs.get(uid) ?? [];
@@ -656,23 +495,26 @@ export function computeCohorts(txs: Transaction[], subscriptions: SubscriptionCl
         amount_refunded += refunded;
         userRefundAmount += refunded;
         if (plan) plan.amount_refunded += refunded;
-        if (!isMoneyMoving(t)) continue;
+        if (t.status !== "success") continue;
         const gross = grossAmount(t);
         const net = netAmount(t);
-        // D0/D7/D14/D30 are rolling windows from the user's trial timestamp.
-        // D0 means first 24 hours, not same calendar date.
-        if (dt < 1) revenue_d0 += net;
-        if (dt < 7) revenue_d7 += net;
-        if (dt < 14) revenue_d14 += net;
-        if (dt < 30) revenue_d30 += net;
-        if (dt < 37) revenue_d37 += net;
-        if (dt < 67) revenue_d67 += net;
+        const day = transactionDay(t, dt);
+        if (day === 0) revenue_d0 += net;
+        if (day <= 7) revenue_d7 += net;
+        if (day <= 14) revenue_d14 += net;
+        if (day <= 30) revenue_d30 += net;
+        if (day <= 60) revenue_d60 += net;
+        if (day <= 37) revenue_d37 += net;
+        if (day <= 67) revenue_d67 += net;
         revenue_total += net;
         gross_revenue += gross;
-        net_revenue += net;
         if (plan) {
           plan.gross_revenue += gross;
           plan.net_revenue += net;
+          if (day === 0) plan.revenue_d0 += net;
+          if (day <= 7) plan.revenue_d7 += net;
+          if (day <= 30) plan.revenue_d30 += net;
+          if (day <= 60) plan.revenue_d60 += net;
         }
         if (t.transaction_type === "trial") trial_revenue += net;
         if (t.transaction_type === "upsell") upsell_revenue += net;
@@ -723,14 +565,7 @@ export function computeCohorts(txs: Transaction[], subscriptions: SubscriptionCl
     const user_cancelled_users = userCancelledUserIds.size;
     const auto_cancelled_users = autoCancelledUserIds.size;
     const cancelled_active_users = cancelledActiveUserIds.size;
-    const forecast = forecastLtv({
-      trialUsers: trial_users,
-      firstSubscriptionUsers: first_subscription_users,
-      renewal2Users: renewal_2_users,
-      renewal3Users: renewal_3_users,
-      netRevenue: net_revenue,
-      firstSubscriptionRevenue: first_subscription_revenue,
-    });
+    const netRevenue = gross_revenue - amount_refunded;
 
     rows.push({
       cohort_id,
@@ -772,10 +607,9 @@ export function computeCohorts(txs: Transaction[], subscriptions: SubscriptionCl
       amount_refunded: round2(amount_refunded),
       refund_rate: trial_users ? (refund_users / trial_users) * 100 : 0,
       gross_revenue: round2(gross_revenue),
-      net_revenue: round2(net_revenue),
+      net_revenue: round2(netRevenue),
       gross_ltv: round2(gross_revenue / trial_users),
-      net_ltv: round2(net_revenue / trial_users),
-      ...forecast,
+      net_ltv: round2(netRevenue / trial_users),
       trial_to_upsell_cr: (upsell_users / trial_users) * 100,
       trial_to_first_subscription_cr: (first_subscription_users / trial_users) * 100,
       first_subscription_to_renewal_2_cr: first_subscription_users ? (renewal_2_users / first_subscription_users) * 100 : 0,
@@ -784,6 +618,7 @@ export function computeCohorts(txs: Transaction[], subscriptions: SubscriptionCl
       revenue_d7: round2(revenue_d7),
       revenue_d14: round2(revenue_d14),
       revenue_d30: round2(revenue_d30),
+      revenue_d60: round2(revenue_d60),
       revenue_d37: round2(revenue_d37),
       revenue_d67: round2(revenue_d67),
       revenue_total: round2(revenue_total),

@@ -87,10 +87,10 @@ export interface PlanBreakdownRow {
   gross_revenue: number;
   amount_refunded: number;
   net_revenue: number;
-  ltv_actual: number;
-  ltv_3m: number;
-  ltv_6m: number;
-  ltv_12m: number;
+  revenue_d0: number;
+  revenue_d7: number;
+  revenue_d30: number;
+  revenue_d60: number;
   net_ltv: number;
 }
 
@@ -135,10 +135,6 @@ export interface CohortRow {
   net_revenue: number;
   gross_ltv: number;
   net_ltv: number;
-  ltv_actual: number;
-  ltv_3m: number;
-  ltv_6m: number;
-  ltv_12m: number;
   trial_to_upsell_cr: number;
   trial_to_first_subscription_cr: number;
   first_subscription_to_renewal_2_cr: number;
@@ -147,18 +143,11 @@ export interface CohortRow {
   revenue_d7: number;
   revenue_d14: number;
   revenue_d30: number;
+  revenue_d60: number;
   revenue_d37: number;
   revenue_d67: number;
   revenue_total: number;
   ltv_d7: number;
   ltv_d14: number;
   ltv_d30: number;
-}
-
-export interface AbsoluteRetentionRow {
-  cohort: string;
-  cohort_date: string;
-  total_users: number;
-  users_by_month: number[];
-  retention_by_month: number[];
 }
