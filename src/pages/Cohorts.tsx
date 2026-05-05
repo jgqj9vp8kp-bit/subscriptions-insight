@@ -341,8 +341,16 @@ export default function CohortsPage() {
   const [cohortDateFrom, setCohortDateFrom] = useState("");
   const [cohortDateTo, setCohortDateTo] = useState("");
   const [dateSort, setDateSort] = useState<"desc" | "asc">("desc");
-  const [columnSettingsOpen, setColumnSettingsOpen] = useState(false);
+  const [columnsPopoverOpen, setColumnsPopoverOpen] = useState(false);
+  const [viewsPopoverOpen, setViewsPopoverOpen] = useState(false);
   const [columnOrder, setColumnOrder] = useState<CohortColumnId[]>(loadInitialColumnOrder);
+  const [columnVisibility, setColumnVisibility] = useState<Record<CohortColumnId, boolean>>(loadInitialVisibility);
+  const [customViews, setCustomViews] = useState<SavedView[]>(loadCustomViews);
+  const [activeViewId, setActiveViewId] = useState<string | null>(() => {
+    try { return localStorage.getItem(ACTIVE_VIEW_STORAGE_KEY); } catch { return null; }
+  });
+  const [newViewName, setNewViewName] = useState("");
+  const dragColRef = useRef<CohortColumnId | null>(null);
   const [columnWidths, setColumnWidths] = useState<Record<string, number>>(loadInitialColumnWidths);
   const resizingRef = useRef<{ key: string; startX: number; startWidth: number } | null>(null);
 
@@ -456,6 +464,89 @@ export default function CohortsPage() {
     }
     resetColumnWidths();
   };
+
+  const allViews = useMemo<SavedView[]>(() => [...BUILTIN_VIEWS, ...customViews], [customViews]);
+  const activeView = useMemo(() => allViews.find((v) => v.id === activeViewId) ?? null, [allViews, activeViewId]);
+
+  const setVisibility = (id: CohortColumnId, value: boolean) => {
+    setColumnVisibility((cur) => {
+      const next = { ...cur, [id]: value };
+      persistVisibility(next);
+      return next;
+    });
+    setActiveViewId(null);
+    try { localStorage.removeItem(ACTIVE_VIEW_STORAGE_KEY); } catch { /* noop */ }
+  };
+
+  const applyView = (view: SavedView) => {
+    setColumnOrder(view.order);
+    setColumnVisibility(view.visibility);
+    persistColumnOrder(view.order);
+    persistVisibility(view.visibility);
+    setActiveViewId(view.id);
+    try { localStorage.setItem(ACTIVE_VIEW_STORAGE_KEY, view.id); } catch { /* noop */ }
+  };
+
+  const resetToDefault = () => {
+    applyView(BUILTIN_VIEWS[0]);
+    resetColumnWidths();
+  };
+
+  const saveCurrentAsView = () => {
+    const name = newViewName.trim();
+    if (!name) return;
+    const view: SavedView = {
+      id: `custom_${Date.now()}`,
+      name,
+      order: [...columnOrder],
+      visibility: { ...columnVisibility },
+    };
+    const next = [...customViews, view];
+    setCustomViews(next);
+    persistCustomViews(next);
+    setActiveViewId(view.id);
+    try { localStorage.setItem(ACTIVE_VIEW_STORAGE_KEY, view.id); } catch { /* noop */ }
+    setNewViewName("");
+  };
+
+  const deleteView = (id: string) => {
+    const next = customViews.filter((v) => v.id !== id);
+    setCustomViews(next);
+    persistCustomViews(next);
+    if (activeViewId === id) {
+      setActiveViewId(null);
+      try { localStorage.removeItem(ACTIVE_VIEW_STORAGE_KEY); } catch { /* noop */ }
+    }
+  };
+
+  const onHeaderDragStart = (id: CohortColumnId) => {
+    dragColRef.current = id;
+  };
+  const onHeaderDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+  };
+  const onHeaderDrop = (targetId: CohortColumnId) => {
+    const src = dragColRef.current;
+    dragColRef.current = null;
+    if (!src || src === targetId) return;
+    setColumnOrder((cur) => {
+      const next = [...cur];
+      const from = next.indexOf(src);
+      const to = next.indexOf(targetId);
+      if (from < 0 || to < 0) return cur;
+      next.splice(from, 1);
+      next.splice(to, 0, src);
+      persistColumnOrder(next);
+      return next;
+    });
+    setActiveViewId(null);
+    try { localStorage.removeItem(ACTIVE_VIEW_STORAGE_KEY); } catch { /* noop */ }
+  };
+
+  const visibleColumnOrder = useMemo(
+    () => columnOrder.filter((id) => columnVisibility[id] !== false),
+    [columnOrder, columnVisibility],
+  );
 
   const maxUpsellCR = Math.max(0, ...cohorts.map((c) => c.trial_to_upsell_cr));
   const maxSubCR = Math.max(0, ...cohorts.map((c) => c.trial_to_first_subscription_cr));
