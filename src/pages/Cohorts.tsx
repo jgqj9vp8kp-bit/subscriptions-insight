@@ -28,12 +28,19 @@ import {
   formatCurrency,
   formatPct,
 } from "@/services/analytics";
+import {
+  clearPalmerDatasetCache,
+  getPalmerCacheInfo,
+  loadLastPalmerDatasetFromCache,
+  type PalmerCacheMetadata,
+} from "@/services/palmerCache";
+import { normalizeCampaignPath, type TrafficMetric } from "@/services/trafficImport";
 import type { CohortRow, PlanBreakdownRow } from "@/services/types";
 import { useDataStore } from "@/store/dataStore";
 
 // Visual-only helpers — no data/logic impact.
 const HEAD_BASE =
-  "sticky top-0 z-20 bg-card h-8 px-2 whitespace-nowrap border-b border-border text-xs font-semibold text-muted-foreground relative select-none";
+  "sticky top-0 z-40 bg-card h-8 px-2 whitespace-nowrap border-b border-border shadow-[0_1px_0_0_hsl(var(--border))] text-xs font-semibold text-muted-foreground select-none";
 const HEAD_NUM = `${HEAD_BASE} text-right`;
 const CELL_BASE = "py-1 px-2 align-middle";
 const CELL_NUM = `${CELL_BASE} text-right tabular-nums whitespace-nowrap text-sm`;
@@ -82,6 +89,20 @@ const DEFAULT_COLUMN_ORDER = [
   "revenue_d7",
   "revenue_d30",
   "revenue_d60",
+  "traffic_spend",
+  "profit",
+  "profit_d7",
+  "profit_1m",
+  "profit_2m",
+  "traffic_cac",
+  "traffic_trial_count",
+  "traffic_clicks",
+  "traffic_cpc",
+  "traffic_cpm",
+  "traffic_ctr",
+  "roas_d7",
+  "roas_1m",
+  "roas_2m",
 ] as const;
 
 type CohortColumnId = (typeof DEFAULT_COLUMN_ORDER)[number];
@@ -120,6 +141,20 @@ const COLUMN_LABELS: Record<CohortColumnId, string> = {
   revenue_d7: "Rev D7",
   revenue_d30: "Rev 1M",
   revenue_d60: "Rev 2M",
+  traffic_spend: "Spend",
+  profit: "Profit",
+  profit_d7: "Profit D7",
+  profit_1m: "Profit 1M",
+  profit_2m: "Profit 2M",
+  traffic_cac: "CAC",
+  traffic_trial_count: "FB Trial Count",
+  traffic_clicks: "Clicks",
+  traffic_cpc: "CPC",
+  traffic_cpm: "CPM",
+  traffic_ctr: "CTR",
+  roas_d7: "ROAS D7",
+  roas_1m: "ROAS 1M",
+  roas_2m: "ROAS 2M",
 };
 
 const COLUMN_MIN_WIDTHS: Record<CohortColumnId, number> = {
@@ -156,6 +191,20 @@ const COLUMN_MIN_WIDTHS: Record<CohortColumnId, number> = {
   revenue_d7: 90,
   revenue_d30: 90,
   revenue_d60: 90,
+  traffic_spend: 90,
+  profit: 90,
+  profit_d7: 100,
+  profit_1m: 100,
+  profit_2m: 100,
+  traffic_cac: 90,
+  traffic_trial_count: 120,
+  traffic_clicks: 90,
+  traffic_cpc: 90,
+  traffic_cpm: 90,
+  traffic_ctr: 90,
+  roas_d7: 90,
+  roas_1m: 90,
+  roas_2m: 90,
 };
 
 // Compact defaults — tighter than before for higher data density.
@@ -198,6 +247,9 @@ const SECTION_DIVIDER_COLUMNS = new Set<CohortColumnId>([
   "refund_users",
   "gross_revenue",
   "revenue_d0",
+  "traffic_spend",
+  "profit",
+  "roas_d7",
 ]);
 
 function heatStyle(value: number, max: number): React.CSSProperties {
@@ -272,6 +324,84 @@ interface SavedView {
   builtin?: boolean;
 }
 
+type TrafficAggregate = TrafficMetric & {
+  row_count: number;
+};
+
+type CohortTraffic = {
+  spend: number;
+  cac: number;
+  trial_count: number;
+  clicks: number;
+  cpc: number;
+  cpm: number | null;
+  ctr: number | null;
+};
+
+function normalizeCohortDate(date: string): string {
+  const trimmed = String(date ?? "").trim();
+  const isoMatch = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (isoMatch) return `${isoMatch[1]}-${isoMatch[2]}-${isoMatch[3]}`;
+  const parsed = new Date(trimmed);
+  if (Number.isNaN(parsed.getTime())) return trimmed;
+  const yyyy = parsed.getFullYear();
+  const mm = String(parsed.getMonth() + 1).padStart(2, "0");
+  const dd = String(parsed.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function normalizeCohortCampaignPath(campaignPath: string): string {
+  return String(campaignPath ?? "")
+    .trim()
+    .replace(/^["']+|["']+$/g, "")
+    .trim()
+    .replace(/^\/+/, "")
+    .toLowerCase();
+}
+
+function trafficKey(date: string, campaignPath: string): string {
+  return `${normalizeCohortDate(date)}__${normalizeCampaignPath(campaignPath)}`;
+}
+
+function cohortTrafficKey(row: CohortRow): string {
+  return `${normalizeCohortDate(row.cohort_date)}__${normalizeCohortCampaignPath(row.campaign_path)}`;
+}
+
+function aggregateTrafficMetrics(rows: TrafficMetric[]): Map<string, TrafficAggregate> {
+  const map = new Map<string, TrafficAggregate>();
+  for (const row of rows) {
+    const key = trafficKey(row.date, row.campaign_path);
+    const current = map.get(key);
+    if (!current) {
+      map.set(key, { ...row, row_count: 1 });
+      continue;
+    }
+    current.trial_count += row.trial_count;
+    current.spend += row.spend;
+    current.clicks += row.clicks;
+    current.cac = current.trial_count ? current.spend / current.trial_count : 0;
+    current.cpc = current.clicks ? current.spend / current.clicks : 0;
+    current.cpm = 0;
+    current.ctr = 0;
+    current.row_count += 1;
+  }
+  return map;
+}
+
+function trafficForCohort(row: CohortRow, trafficByKey: Map<string, TrafficAggregate>): CohortTraffic | null {
+  const traffic = trafficByKey.get(cohortTrafficKey(row));
+  if (!traffic) return null;
+  return {
+    spend: traffic.spend,
+    cac: traffic.trial_count ? traffic.spend / traffic.trial_count : traffic.cac,
+    trial_count: traffic.trial_count,
+    clicks: traffic.clicks,
+    cpc: traffic.clicks ? traffic.spend / traffic.clicks : traffic.cpc,
+    cpm: traffic.row_count === 1 ? traffic.cpm : null,
+    ctr: traffic.row_count === 1 ? traffic.ctr : null,
+  };
+}
+
 function buildVisibility(visibleIds: CohortColumnId[]): Record<CohortColumnId, boolean> {
   const v = {} as Record<CohortColumnId, boolean>;
   for (const id of DEFAULT_COLUMN_ORDER) v[id] = visibleIds.includes(id);
@@ -290,7 +420,7 @@ const BUILTIN_VIEWS: SavedView[] = [
     id: "revenue",
     name: "Revenue",
     order: [...DEFAULT_COLUMN_ORDER],
-    visibility: buildVisibility(["gross_revenue", "net_revenue", "revenue_d0", "revenue_d7", "revenue_d30", "revenue_d60"]),
+    visibility: buildVisibility(["gross_revenue", "net_revenue", "revenue_d0", "revenue_d7", "revenue_d30", "revenue_d60", "traffic_spend", "profit", "profit_d7", "profit_1m", "profit_2m"]),
     builtin: true,
   },
   {
@@ -332,6 +462,8 @@ function persistCustomViews(views: SavedView[]) {
 export default function CohortsPage() {
   const txs = useTransactions();
   const subscriptions = useDataStore((s) => s.subscriptions);
+  const trafficMetrics = useDataStore((s) => s.trafficMetrics);
+  const setImported = useDataStore((s) => s.setImported);
   const [expandedCohortIds, setExpandedCohortIds] = useState<Set<string>>(() => new Set());
   const [funnelFilter, setFunnelFilter] = useState("all");
   const [campaignPathFilter, setCampaignPathFilter] = useState("all");
@@ -353,6 +485,23 @@ export default function CohortsPage() {
   const dragColRef = useRef<CohortColumnId | null>(null);
   const [columnWidths, setColumnWidths] = useState<Record<string, number>>(loadInitialColumnWidths);
   const resizingRef = useRef<{ key: string; startX: number; startWidth: number } | null>(null);
+  const [palmerCacheInfo, setPalmerCacheInfo] = useState<PalmerCacheMetadata | null>(null);
+  const [palmerCacheLoading, setPalmerCacheLoading] = useState(false);
+  const [palmerCacheMessage, setPalmerCacheMessage] = useState<string | null>(null);
+  const [palmerCacheError, setPalmerCacheError] = useState<string | null>(null);
+
+  const refreshPalmerCacheInfo = useCallback(async () => {
+    try {
+      setPalmerCacheInfo(await getPalmerCacheInfo());
+    } catch (error) {
+      console.warn("Could not load Palmer cache info", error);
+      setPalmerCacheInfo(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshPalmerCacheInfo();
+  }, [refreshPalmerCacheInfo]);
 
   const startResize = useCallback((key: string, e: React.MouseEvent) => {
     e.preventDefault();
@@ -417,6 +566,7 @@ export default function CohortsPage() {
     [txs, trafficSourceFilter, campaignIdFilter]
   );
   const allCohorts = useMemo(() => computeCohorts(sourceFilteredTxs, subscriptions), [sourceFilteredTxs, subscriptions]);
+  const trafficByKey = useMemo(() => aggregateTrafficMetrics(trafficMetrics), [trafficMetrics]);
   const funnelOptions = useMemo(() => Array.from(new Set(allCohorts.map((c) => c.funnel))).sort(), [allCohorts]);
   const campaignPathOptions = useMemo(() => Array.from(new Set(allCohorts.map((c) => c.campaign_path))).sort(), [allCohorts]);
   const cohorts = useMemo(
@@ -435,6 +585,39 @@ export default function CohortsPage() {
       }),
     [allCohorts, funnelFilter, campaignPathFilter, refundFilter, cohortDateFrom, cohortDateTo, dateSort]
   );
+  const matchedTrafficCount = useMemo(
+    () => cohorts.filter((cohort) => trafficByKey.has(cohortTrafficKey(cohort))).length,
+    [cohorts, trafficByKey],
+  );
+  const firstCohortTrafficDebug = useMemo(() => {
+    const first = cohorts[0] ?? null;
+    if (!first) return null;
+    const matched = trafficByKey.get(cohortTrafficKey(first)) ?? null;
+    return { cohort: first, matched };
+  }, [cohorts, trafficByKey]);
+
+  useEffect(() => {
+    console.log("traffic rows:", trafficMetrics.length);
+    console.log(
+      "first 5 normalized traffic rows:",
+      trafficMetrics.slice(0, 5).map((row) => ({
+        date: normalizeCohortDate(row.date),
+        campaign_path: normalizeCampaignPath(row.campaign_path),
+        key: trafficKey(row.date, row.campaign_path),
+      })),
+    );
+    console.log("cohorts:", cohorts.length);
+    console.log(
+      "first 5 cohort match keys:",
+      cohorts.slice(0, 5).map((cohort) => ({
+        cohort_date: normalizeCohortDate(cohort.cohort_date),
+        campaign_path: normalizeCohortCampaignPath(cohort.campaign_path),
+        key: cohortTrafficKey(cohort),
+      })),
+    );
+    console.log("matched rows:", matchedTrafficCount);
+  }, [trafficMetrics, cohorts, matchedTrafficCount]);
+
   const hasUsers = useMemo(() => new Set(txs.map((t) => t.user_id)).size > 0, [txs]);
   const toggleExpanded = (cohortId: string) => {
     setExpandedCohortIds((current) => {
@@ -543,6 +726,50 @@ export default function CohortsPage() {
     try { localStorage.removeItem(ACTIVE_VIEW_STORAGE_KEY); } catch { /* noop */ }
   };
 
+  const onLoadSavedPalmerDataset = async () => {
+    try {
+      setPalmerCacheLoading(true);
+      setPalmerCacheError(null);
+      setPalmerCacheMessage(null);
+      const cached = await loadLastPalmerDatasetFromCache();
+      if (!cached) {
+        setPalmerCacheInfo(null);
+        setPalmerCacheMessage("No saved Palmer dataset found.");
+        return;
+      }
+      setImported(
+        cached.transactions,
+        {
+          source: "palmer_raw",
+          importMode: "palmer_raw",
+          fileName: cached.metadata.file_name,
+        },
+        cached.rawPalmerRows ?? [],
+      );
+      setPalmerCacheInfo(cached.metadata);
+      setPalmerCacheMessage("Loaded saved Palmer dataset");
+    } catch (error) {
+      setPalmerCacheError(error instanceof Error ? error.message : "Could not load saved Palmer dataset.");
+    } finally {
+      setPalmerCacheLoading(false);
+    }
+  };
+
+  const onClearSavedPalmerDataset = async () => {
+    try {
+      setPalmerCacheLoading(true);
+      setPalmerCacheError(null);
+      setPalmerCacheMessage(null);
+      await clearPalmerDatasetCache();
+      setPalmerCacheInfo(null);
+      setPalmerCacheMessage("Saved Palmer dataset cache cleared. Current table remains loaded.");
+    } catch (error) {
+      setPalmerCacheError(error instanceof Error ? error.message : "Could not clear saved Palmer dataset.");
+    } finally {
+      setPalmerCacheLoading(false);
+    }
+  };
+
   const visibleColumnOrder = useMemo(
     () => columnOrder.filter((id) => columnVisibility[id] !== false),
     [columnOrder, columnVisibility],
@@ -571,6 +798,15 @@ export default function CohortsPage() {
     const amountRefunded = sum((c) => c.amount_refunded);
     const grossRevenue = sum((c) => c.gross_revenue);
     const netRevenue = sum((c) => c.net_revenue);
+    const trafficRows = cohorts.map((c) => trafficForCohort(c, trafficByKey)).filter(Boolean) as CohortTraffic[];
+    const hasTrafficSpend = trafficRows.length > 0;
+    const hasCompleteTrafficSpend = cohorts.length > 0 && trafficRows.length === cohorts.length;
+    const totalTrafficSpend = trafficRows.reduce((total, traffic) => total + traffic.spend, 0);
+    const totalTrafficTrials = trafficRows.reduce((total, traffic) => total + traffic.trial_count, 0);
+    const totalTrafficClicks = trafficRows.reduce((total, traffic) => total + traffic.clicks, 0);
+    const totalRevenueD7 = sum((c) => c.revenue_d7);
+    const totalRevenueD30 = sum((c) => c.revenue_d30);
+    const totalRevenueD60 = sum((c) => c.revenue_d60);
     return {
       totalTrialUsers,
       totalUpsellUsers,
@@ -599,15 +835,29 @@ export default function CohortsPage() {
       grossRevenue,
       netRevenue,
       revenueD0: sum((c) => c.revenue_d0),
-      revenueD7: sum((c) => c.revenue_d7),
-      revenueD30: sum((c) => c.revenue_d30),
-      revenueD60: sum((c) => c.revenue_d60),
+      revenueD7: totalRevenueD7,
+      revenueD30: totalRevenueD30,
+      revenueD60: totalRevenueD60,
+      trafficSpend: totalTrafficSpend,
+      hasTrafficSpend,
+      hasCompleteTrafficSpend,
+      profit: netRevenue - totalTrafficSpend,
+      profitD7: totalRevenueD7 - totalTrafficSpend,
+      profit1m: totalRevenueD30 - totalTrafficSpend,
+      profit2m: totalRevenueD60 - totalTrafficSpend,
+      trafficTrials: totalTrafficTrials,
+      trafficClicks: totalTrafficClicks,
+      trafficCac: totalTrafficTrials ? totalTrafficSpend / totalTrafficTrials : 0,
+      trafficCpc: totalTrafficClicks ? totalTrafficSpend / totalTrafficClicks : 0,
+      roasD7: totalTrafficSpend ? totalRevenueD7 / totalTrafficSpend : 0,
+      roas1m: totalTrafficSpend ? totalRevenueD30 / totalTrafficSpend : 0,
+      roas2m: totalTrafficSpend ? totalRevenueD60 / totalTrafficSpend : 0,
       trialToUpsellCr: totalTrialUsers ? (totalUpsellUsers / totalTrialUsers) * 100 : 0,
       trialToFirstSubscriptionCr: totalTrialUsers ? (totalFirstSubscriptionUsers / totalTrialUsers) * 100 : 0,
       firstSubscriptionToRenewal2Cr: totalFirstSubscriptionUsers ? (totalRenewal2Users / totalFirstSubscriptionUsers) * 100 : 0,
       renewal2ToRenewal3Cr: totalRenewal2Users ? (totalRenewal3Users / totalRenewal2Users) * 100 : 0,
     };
-  }, [cohorts]);
+  }, [cohorts, trafficByKey]);
 
   const headerClassFor = (id: CohortColumnId) =>
     `${TEXT_COLUMNS.has(id) ? `${HEAD_BASE} text-left` : HEAD_NUM} ${SECTION_DIVIDER_COLUMNS.has(id) ? SECTION_DIVIDER : ""}`;
@@ -622,6 +872,7 @@ export default function CohortsPage() {
     return `${base} ${SECTION_DIVIDER_COLUMNS.has(id) ? SECTION_DIVIDER : ""}`;
   };
   const dash = <span className="text-muted-foreground/40">—</span>;
+  const formatRoas = (value: number) => `${value.toFixed(2)}x`;
 
   const renderHeaderCell = (id: CohortColumnId) => (
     <TableHead
@@ -659,6 +910,7 @@ export default function CohortsPage() {
 
   const renderCohortCell = (id: CohortColumnId, c: CohortRow) => {
     const className = cellClassFor(id);
+    const traffic = trafficForCohort(c, trafficByKey);
     switch (id) {
       case "cohort_date":
         return <TableCell key={id} className={`${className} tabular-nums`}>{c.cohort_date}</TableCell>;
@@ -726,6 +978,34 @@ export default function CohortsPage() {
         return <TableCell key={id} className={className}>{formatCurrency(c.revenue_d30)}</TableCell>;
       case "revenue_d60":
         return <TableCell key={id} className={className}>{formatCurrency(c.revenue_d60)}</TableCell>;
+      case "traffic_spend":
+        return <TableCell key={id} className={className}>{traffic ? formatCurrency(traffic.spend) : dash}</TableCell>;
+      case "profit":
+        return <TableCell key={id} className={className}>{traffic ? formatCurrency(c.net_revenue - traffic.spend) : dash}</TableCell>;
+      case "profit_d7":
+        return <TableCell key={id} className={className}>{traffic ? formatCurrency(c.revenue_d7 - traffic.spend) : dash}</TableCell>;
+      case "profit_1m":
+        return <TableCell key={id} className={className}>{traffic ? formatCurrency(c.revenue_d30 - traffic.spend) : dash}</TableCell>;
+      case "profit_2m":
+        return <TableCell key={id} className={className}>{traffic ? formatCurrency(c.revenue_d60 - traffic.spend) : dash}</TableCell>;
+      case "traffic_cac":
+        return <TableCell key={id} className={className}>{traffic ? formatCurrency(traffic.cac) : dash}</TableCell>;
+      case "traffic_trial_count":
+        return <TableCell key={id} className={className}>{traffic ? traffic.trial_count : dash}</TableCell>;
+      case "traffic_clicks":
+        return <TableCell key={id} className={className}>{traffic ? traffic.clicks : dash}</TableCell>;
+      case "traffic_cpc":
+        return <TableCell key={id} className={className}>{traffic ? formatCurrency(traffic.cpc) : dash}</TableCell>;
+      case "traffic_cpm":
+        return <TableCell key={id} className={className}>{traffic?.cpm != null ? formatCurrency(traffic.cpm) : dash}</TableCell>;
+      case "traffic_ctr":
+        return <TableCell key={id} className={className}>{traffic?.ctr != null ? formatPct(traffic.ctr) : dash}</TableCell>;
+      case "roas_d7":
+        return <TableCell key={id} className={className}>{traffic?.spend ? formatRoas(c.revenue_d7 / traffic.spend) : dash}</TableCell>;
+      case "roas_1m":
+        return <TableCell key={id} className={className}>{traffic?.spend ? formatRoas(c.revenue_d30 / traffic.spend) : dash}</TableCell>;
+      case "roas_2m":
+        return <TableCell key={id} className={className}>{traffic?.spend ? formatRoas(c.revenue_d60 / traffic.spend) : dash}</TableCell>;
     }
   };
 
@@ -796,6 +1076,21 @@ export default function CohortsPage() {
         return <TableCell key={id} className={className}>{formatCurrency(plan.revenue_d30)}</TableCell>;
       case "revenue_d60":
         return <TableCell key={id} className={className}>{formatCurrency(plan.revenue_d60)}</TableCell>;
+      case "traffic_spend":
+      case "profit":
+      case "profit_d7":
+      case "profit_1m":
+      case "profit_2m":
+      case "traffic_cac":
+      case "traffic_trial_count":
+      case "traffic_clicks":
+      case "traffic_cpc":
+      case "traffic_cpm":
+      case "traffic_ctr":
+      case "roas_d7":
+      case "roas_1m":
+      case "roas_2m":
+        return <TableCell key={id} className={className}>{dash}</TableCell>;
     }
   };
 
@@ -866,6 +1161,33 @@ export default function CohortsPage() {
         return <TableCell key={id} className={className}>{formatCurrency(totals.revenueD30)}</TableCell>;
       case "revenue_d60":
         return <TableCell key={id} className={className}>{formatCurrency(totals.revenueD60)}</TableCell>;
+      case "traffic_spend":
+        return <TableCell key={id} className={className}>{totals.hasTrafficSpend ? formatCurrency(totals.trafficSpend) : dash}</TableCell>;
+      case "profit":
+        return <TableCell key={id} className={className}>{totals.hasCompleteTrafficSpend ? formatCurrency(totals.profit) : dash}</TableCell>;
+      case "profit_d7":
+        return <TableCell key={id} className={className}>{totals.hasCompleteTrafficSpend ? formatCurrency(totals.profitD7) : dash}</TableCell>;
+      case "profit_1m":
+        return <TableCell key={id} className={className}>{totals.hasCompleteTrafficSpend ? formatCurrency(totals.profit1m) : dash}</TableCell>;
+      case "profit_2m":
+        return <TableCell key={id} className={className}>{totals.hasCompleteTrafficSpend ? formatCurrency(totals.profit2m) : dash}</TableCell>;
+      case "traffic_cac":
+        return <TableCell key={id} className={className}>{totals.trafficTrials ? formatCurrency(totals.trafficCac) : dash}</TableCell>;
+      case "traffic_trial_count":
+        return <TableCell key={id} className={className}>{totals.trafficTrials || dash}</TableCell>;
+      case "traffic_clicks":
+        return <TableCell key={id} className={className}>{totals.trafficClicks || dash}</TableCell>;
+      case "traffic_cpc":
+        return <TableCell key={id} className={className}>{totals.trafficClicks ? formatCurrency(totals.trafficCpc) : dash}</TableCell>;
+      case "traffic_cpm":
+      case "traffic_ctr":
+        return <TableCell key={id} className={className}>{dash}</TableCell>;
+      case "roas_d7":
+        return <TableCell key={id} className={className}>{totals.hasCompleteTrafficSpend && totals.trafficSpend ? formatRoas(totals.roasD7) : dash}</TableCell>;
+      case "roas_1m":
+        return <TableCell key={id} className={className}>{totals.hasCompleteTrafficSpend && totals.trafficSpend ? formatRoas(totals.roas1m) : dash}</TableCell>;
+      case "roas_2m":
+        return <TableCell key={id} className={className}>{totals.hasCompleteTrafficSpend && totals.trafficSpend ? formatRoas(totals.roas2m) : dash}</TableCell>;
     }
   };
 
@@ -1020,12 +1342,85 @@ export default function CohortsPage() {
           </div>
         </div>
 
+        {(palmerCacheInfo || palmerCacheMessage || palmerCacheError) && (
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-md border border-border bg-muted/20 px-3 py-2 text-xs">
+            <div className="min-w-0">
+              {palmerCacheInfo ? (
+                <div className="text-muted-foreground">
+                  Saved dataset available:{" "}
+                  <span className="font-medium text-foreground">{palmerCacheInfo.file_name}</span>, imported at{" "}
+                  <span className="tabular-nums text-foreground">
+                    {new Date(palmerCacheInfo.imported_at).toLocaleString()}
+                  </span>
+                  , <span className="tabular-nums text-foreground">{palmerCacheInfo.rows_count}</span> rows
+                </div>
+              ) : (
+                <div className="text-muted-foreground">Saved Palmer dataset available</div>
+              )}
+              {palmerCacheMessage && <div className="mt-1 text-primary">{palmerCacheMessage}</div>}
+              {palmerCacheError && <div className="mt-1 text-destructive">{palmerCacheError}</div>}
+            </div>
+            <div className="flex items-center gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-8"
+                onClick={onLoadSavedPalmerDataset}
+                disabled={palmerCacheLoading || !palmerCacheInfo}
+              >
+                Load saved dataset
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-8"
+                onClick={onClearSavedPalmerDataset}
+                disabled={palmerCacheLoading || !palmerCacheInfo}
+              >
+                Clear saved dataset
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {firstCohortTrafficDebug && (
+          <div className="mb-3 rounded-md border border-dashed border-border bg-muted/10 px-3 py-2 text-xs text-muted-foreground">
+            <div className="font-medium text-foreground">Traffic match debug</div>
+            <div className="mt-1 grid gap-1 sm:grid-cols-3">
+              <div>
+                cohort_date:{" "}
+                <span className="font-mono text-foreground">
+                  {normalizeCohortDate(firstCohortTrafficDebug.cohort.cohort_date)}
+                </span>
+              </div>
+              <div>
+                cohort_campaign_path:{" "}
+                <span className="font-mono text-foreground">
+                  {normalizeCohortCampaignPath(firstCohortTrafficDebug.cohort.campaign_path)}
+                </span>
+              </div>
+              <div>
+                matched traffic row:{" "}
+                {firstCohortTrafficDebug.matched ? (
+                  <span className="font-mono text-foreground">
+                    {firstCohortTrafficDebug.matched.date} / {firstCohortTrafficDebug.matched.campaign_path}
+                  </span>
+                ) : (
+                  dash
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
         <div className="rounded-lg border border-border [&>div]:max-h-[calc(100vh-220px)] [&>div]:overflow-auto [&>div]:rounded-lg [&>div]:scroll-smooth">
           <Table className="border-separate border-spacing-0 w-auto">
             <TableHeader>
               <TableRow className="hover:bg-transparent">
                 <TableHead
-                  className={`${HEAD_BASE} sticky left-0 z-30 shadow-[1px_0_0_0_hsl(var(--border))] text-left`}
+                  className={`${HEAD_BASE} left-0 z-50 shadow-[1px_0_0_0_hsl(var(--border)),0_1px_0_0_hsl(var(--border))] text-left`}
                   style={{ width: columnWidths[COHORT_FIRST_COL_KEY], minWidth: MIN_COLUMN_WIDTH }}
                 >
                   Cohort

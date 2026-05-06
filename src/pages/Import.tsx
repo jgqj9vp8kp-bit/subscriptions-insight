@@ -47,6 +47,8 @@ import {
   type PalmerImportDiagnostics,
   type RawPalmerRow,
 } from "@/services/palmerTransform";
+import { savePalmerDatasetToCache } from "@/services/palmerCache";
+import { fetchTrafficMetricsFromGoogleSheet } from "@/services/trafficImport";
 import type { Transaction } from "@/services/types";
 
 const NONE = "__none__";
@@ -71,7 +73,9 @@ export default function ImportPage() {
   const { toast } = useToast();
   const fileRef = useRef<HTMLInputElement>(null);
   const meta = useDataStore((s) => s.meta);
+  const trafficMeta = useDataStore((s) => s.trafficMeta);
   const setImported = useDataStore((s) => s.setImported);
+  const setTrafficMetrics = useDataStore((s) => s.setTrafficMetrics);
   const resetToMock = useDataStore((s) => s.resetToMock);
 
   const [tab, setTab] = useState<"csv" | "google">("csv");
@@ -82,6 +86,10 @@ export default function ImportPage() {
   const [sourceKind, setSourceKind] = useState<"csv" | "google_sheet">("csv");
   const [sheetUrl, setSheetUrl] = useState("");
   const [loading, setLoading] = useState(false);
+  const [cacheSavedMessage, setCacheSavedMessage] = useState<string | null>(null);
+  const [trafficSheetUrl, setTrafficSheetUrl] = useState("");
+  const [trafficYear, setTrafficYear] = useState(String(new Date().getFullYear()));
+  const [trafficLoading, setTrafficLoading] = useState(false);
 
   const requiredMissing = useMemo(
     () =>
@@ -145,7 +153,29 @@ export default function ImportPage() {
     }
   }
 
-  function confirmImport() {
+  async function onImportFacebookTraffic() {
+    if (!trafficSheetUrl.trim()) return;
+    try {
+      setTrafficLoading(true);
+      const year = Number(trafficYear) || new Date().getFullYear();
+      const rows = await fetchTrafficMetricsFromGoogleSheet(trafficSheetUrl, year);
+      setTrafficMetrics(rows);
+      toast({
+        title: "Facebook traffic imported",
+        description: `Loaded ${rows.length} traffic rows from Google Sheets.`,
+      });
+    } catch (error) {
+      toast({
+        title: "Could not import Facebook traffic",
+        description: error instanceof Error ? error.message : String(error),
+        variant: "destructive",
+      });
+    } finally {
+      setTrafficLoading(false);
+    }
+  }
+
+  async function confirmImport() {
     if (!parsed) return;
     if (requiredMissing.length) {
       toast({
@@ -159,6 +189,7 @@ export default function ImportPage() {
     const rows = importMode === "palmer_raw" ? transformPalmerRows(rawRows) : applyMapping(parsed, mapping).rows;
     const diagnostics =
       importMode === "palmer_raw" ? getPalmerImportDiagnostics(rows, rawRows.length, rawRows) : undefined;
+    const importedAt = new Date().toISOString();
 
     setImported(rows, {
       source: importMode === "palmer_raw" ? "palmer_raw" : sourceKind,
@@ -167,11 +198,41 @@ export default function ImportPage() {
       sheetUrl: sourceKind === "google_sheet" ? sourceLabel : undefined,
       diagnostics,
     }, importMode === "palmer_raw" ? rawRows : undefined);
+
+    if (importMode === "palmer_raw") {
+      try {
+        const cacheMetadata = await savePalmerDatasetToCache(
+          {
+            transactions: rows,
+            rawPalmerRows: rawRows,
+          },
+          {
+            file_name: sourceKind === "csv" ? sourceLabel : "Palmer import",
+            imported_at: importedAt,
+            rows_count: rawRows.length,
+            transactions_count: rows.length,
+          },
+        );
+        setCacheSavedMessage(
+          `Saved imported dataset locally: ${cacheMetadata.file_name}, ${cacheMetadata.rows_count} rows.`,
+        );
+      } catch (error) {
+        setCacheSavedMessage(null);
+        toast({
+          title: "Import complete, local save failed",
+          description: error instanceof Error ? error.message : "Could not save imported dataset locally.",
+          variant: "destructive",
+        });
+      }
+    } else {
+      setCacheSavedMessage(null);
+    }
+
     toast({
       title: "Import complete",
       description: `Loaded ${rows.length} transactions from ${
         importMode === "palmer_raw" ? "Palmer raw export" : sourceKind === "csv" ? "CSV" : "Google Sheet"
-      }.`,
+      }.${importMode === "palmer_raw" ? " Saved imported dataset locally." : ""}`,
     });
     setParsed(null);
     setMapping({});
@@ -454,6 +515,13 @@ export default function ImportPage() {
             </div>
           )}
 
+          {cacheSavedMessage && (
+            <div className="mt-4 rounded-md border border-primary/20 bg-primary/5 p-3 text-xs text-primary">
+              Saved imported dataset locally
+              <div className="mt-1 text-muted-foreground">{cacheSavedMessage}</div>
+            </div>
+          )}
+
           <Button
             variant="outline"
             size="sm"
@@ -468,6 +536,60 @@ export default function ImportPage() {
           </Button>
         </Card>
       </div>
+
+      <Card className="mt-3 p-4 shadow-card">
+        <div className="mb-3 flex items-center gap-2">
+          <FileSpreadsheet className="h-4 w-4 text-muted-foreground" />
+          <h3 className="text-sm font-semibold text-foreground">Facebook Traffic Import</h3>
+        </div>
+        <div className="grid gap-3 md:grid-cols-[1fr_120px_auto]">
+          <div className="space-y-1.5">
+            <Label htmlFor="facebook-traffic-url" className="text-xs text-muted-foreground">
+              Google Sheet URL or CSV export URL
+            </Label>
+            <Input
+              id="facebook-traffic-url"
+              value={trafficSheetUrl}
+              onChange={(e) => setTrafficSheetUrl(e.target.value)}
+              placeholder="https://docs.google.com/spreadsheets/d/..."
+              className="h-9"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="facebook-traffic-year" className="text-xs text-muted-foreground">
+              Year
+            </Label>
+            <Input
+              id="facebook-traffic-year"
+              type="number"
+              value={trafficYear}
+              onChange={(e) => setTrafficYear(e.target.value)}
+              className="h-9"
+            />
+          </div>
+          <div className="flex items-end">
+            <Button
+              type="button"
+              className="h-9"
+              onClick={onImportFacebookTraffic}
+              disabled={trafficLoading || !trafficSheetUrl.trim()}
+            >
+              {trafficLoading && <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />}
+              Import Facebook traffic
+            </Button>
+          </div>
+        </div>
+        <p className="mt-2 text-xs text-muted-foreground">
+          Date values like DD.MM use the selected year. Campaign paths are matched after lowercasing and removing a leading slash.
+        </p>
+        {trafficMeta.importedAt && (
+          <div className="mt-3 text-xs text-muted-foreground">
+            Current Facebook traffic data:{" "}
+            <span className="font-medium text-foreground">{trafficMeta.rowCount}</span> rows imported at{" "}
+            <span className="tabular-nums text-foreground">{new Date(trafficMeta.importedAt).toLocaleString()}</span>
+          </div>
+        )}
+      </Card>
     </AppLayout>
   );
 }

@@ -1,26 +1,16 @@
 import { useMemo, useState } from "react";
 import {
-  Area,
-  AreaChart,
-  Bar,
-  BarChart,
-  CartesianGrid,
-  Cell,
-  Legend,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from "recharts";
-import {
+  Activity,
   ArrowUpRight,
   CreditCard,
   DollarSign,
-  Repeat,
+  MousePointerClick,
+  ShieldAlert,
   Sparkles,
+  Target,
   TrendingUp,
   Users as UsersIcon,
-  Wallet,
+  XCircle,
 } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { Card } from "@/components/ui/card";
@@ -35,56 +25,53 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useTransactions } from "@/services/sheets";
-import {
-  computeKpis,
-  formatCurrency,
-  formatPct,
-  revenueByDay,
-  revenueByFunnel,
-  revenueByType,
-  trialFunnel,
-} from "@/services/analytics";
+import { computeCohorts, formatCurrency } from "@/services/analytics";
+import { aggregateTrafficMetrics, computeCohortReportTotals } from "@/services/cohortReporting";
+import { useDataStore } from "@/store/dataStore";
 
-const TYPE_LABEL: Record<string, string> = {
-  trial: "Trial",
-  upsell: "Upsell",
-  first_subscription: "First Sub",
-  renewal_2: "Renewal 2",
-  renewal_3: "Renewal 3",
-  renewal: "Renewal",
-  refund: "Refund",
-  chargeback: "Chargeback",
-};
+const formatRoas = (value: number) => (value ? `${value.toFixed(2)}x` : "—");
 
 export default function Dashboard() {
   const txs = useTransactions();
+  const subscriptions = useDataStore((s) => s.subscriptions);
+  const trafficMetrics = useDataStore((s) => s.trafficMetrics);
   const [funnelFilter, setFunnelFilter] = useState("all");
   const [campaignPathFilter, setCampaignPathFilter] = useState("all");
+  const [trafficSourceFilter, setTrafficSourceFilter] = useState("all");
+  const [campaignIdFilter, setCampaignIdFilter] = useState("all");
   const [cohortDateFrom, setCohortDateFrom] = useState("");
   const [cohortDateTo, setCohortDateTo] = useState("");
 
-  const funnelOptions = useMemo(() => Array.from(new Set(txs.map((t) => t.funnel))).sort(), [txs]);
-  const campaignPathOptions = useMemo(() => Array.from(new Set(txs.map((t) => t.campaign_path || "unknown"))).sort(), [txs]);
-  const filteredTxs = useMemo(
+  const trafficSourceOptions = useMemo(() => Array.from(new Set(txs.map((t) => t.traffic_source))).sort(), [txs]);
+  const campaignIdOptions = useMemo(() => Array.from(new Set(txs.map((t) => t.campaign_id || "unknown"))).sort(), [txs]);
+  const sourceFilteredTxs = useMemo(
     () =>
       txs.filter((t) => {
-        if (funnelFilter !== "all" && t.funnel !== funnelFilter) return false;
-        if (campaignPathFilter !== "all" && (t.campaign_path || "unknown") !== campaignPathFilter) return false;
-        if (cohortDateFrom && (!t.cohort_date || t.cohort_date < cohortDateFrom)) return false;
-        if (cohortDateTo && (!t.cohort_date || t.cohort_date > cohortDateTo)) return false;
+        if (trafficSourceFilter !== "all" && t.traffic_source !== trafficSourceFilter) return false;
+        if (campaignIdFilter !== "all" && (t.campaign_id || "unknown") !== campaignIdFilter) return false;
         return true;
       }),
-    [txs, funnelFilter, campaignPathFilter, cohortDateFrom, cohortDateTo]
+    [txs, trafficSourceFilter, campaignIdFilter],
   );
-
-  const kpis = computeKpis(filteredTxs);
-  const daily = revenueByDay(filteredTxs);
-  const byType = revenueByType(filteredTxs).map((d) => ({ ...d, label: TYPE_LABEL[d.type] ?? d.type }));
-  const byFunnel = revenueByFunnel(filteredTxs);
-  const funnel = trialFunnel(filteredTxs);
+  const allCohorts = useMemo(() => computeCohorts(sourceFilteredTxs, subscriptions), [sourceFilteredTxs, subscriptions]);
+  const trafficByKey = useMemo(() => aggregateTrafficMetrics(trafficMetrics), [trafficMetrics]);
+  const funnelOptions = useMemo(() => Array.from(new Set(allCohorts.map((c) => c.funnel))).sort(), [allCohorts]);
+  const campaignPathOptions = useMemo(() => Array.from(new Set(allCohorts.map((c) => c.campaign_path))).sort(), [allCohorts]);
+  const cohorts = useMemo(
+    () =>
+      allCohorts.filter((c) => {
+        if (funnelFilter !== "all" && c.funnel !== funnelFilter) return false;
+        if (campaignPathFilter !== "all" && c.campaign_path !== campaignPathFilter) return false;
+        if (cohortDateFrom && c.cohort_date < cohortDateFrom) return false;
+        if (cohortDateTo && c.cohort_date > cohortDateTo) return false;
+        return true;
+      }),
+    [allCohorts, funnelFilter, campaignPathFilter, cohortDateFrom, cohortDateTo],
+  );
+  const totals = useMemo(() => computeCohortReportTotals(cohorts, trafficByKey), [cohorts, trafficByKey]);
 
   return (
-    <AppLayout title="Dashboard" description="Subscription performance overview">
+    <AppLayout title="Dashboard" description="Cohort-based business overview">
       <Card className="mb-4 p-3 shadow-card">
         <div className="flex flex-wrap items-center gap-2">
           <Select value={funnelFilter} onValueChange={setFunnelFilter}>
@@ -102,6 +89,24 @@ export default function Dashboard() {
               <SelectItem value="all">All campaign paths</SelectItem>
               {campaignPathOptions.map((path) => (
                 <SelectItem key={path} value={path}>{path}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Select value={trafficSourceFilter} onValueChange={setTrafficSourceFilter}>
+            <SelectTrigger className="h-9 w-[160px]"><SelectValue placeholder="Traffic source" /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All traffic</SelectItem>
+              {trafficSourceOptions.map((source) => (
+                <SelectItem key={source} value={source}>{source}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Select value={campaignIdFilter} onValueChange={setCampaignIdFilter}>
+            <SelectTrigger className="h-9 w-[190px]"><SelectValue placeholder="Campaign ID" /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All campaign IDs</SelectItem>
+              {campaignIdOptions.map((id) => (
+                <SelectItem key={id} value={id}>{id}</SelectItem>
               ))}
             </SelectContent>
           </Select>
@@ -126,126 +131,53 @@ export default function Dashboard() {
             />
           </div>
           <span className="text-xs text-muted-foreground">
-            {filteredTxs.length} of {txs.length} transactions
+            {cohorts.length} of {allCohorts.length} cohorts
           </span>
         </div>
       </Card>
-      <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-4">
-        <KpiCard label="Total Revenue" value={formatCurrency(kpis.totalRevenue)} icon={<DollarSign className="h-4 w-4" />} accent="primary" />
-        <KpiCard label="Trial Payments" value={formatCurrency(kpis.trialPayments)} icon={<Sparkles className="h-4 w-4" />} accent="accent" />
-        <KpiCard label="Upsell Revenue" value={formatCurrency(kpis.upsellRevenue)} icon={<ArrowUpRight className="h-4 w-4" />} accent="accent" />
-        <KpiCard label="First Subscription" value={formatCurrency(kpis.firstSubscriptionRevenue)} icon={<CreditCard className="h-4 w-4" />} accent="success" />
-        <KpiCard label="Renewal Revenue" value={formatCurrency(kpis.renewalRevenue)} icon={<Repeat className="h-4 w-4" />} accent="primary" />
-        <KpiCard label="Trial → Upsell CR" value={formatPct(kpis.trialToUpsellCR)} icon={<TrendingUp className="h-4 w-4" />} accent="accent" />
-        <KpiCard label="Trial → First Sub CR" value={formatPct(kpis.trialToFirstSubscriptionCR)} icon={<UsersIcon className="h-4 w-4" />} accent="success" />
-        <KpiCard label="Avg LTV / User" value={formatCurrency(kpis.averageLtv)} icon={<Wallet className="h-4 w-4" />} accent="primary" />
-      </div>
 
-      <div className="mt-4 grid gap-3 lg:grid-cols-2">
-        <Card className="p-4 shadow-card">
-          <div className="mb-3 flex items-baseline justify-between">
-            <h2 className="text-sm font-semibold text-foreground">Revenue by day</h2>
-            <span className="text-xs text-muted-foreground">Last {daily.length} days</span>
-          </div>
-          <div className="h-64">
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={daily} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
-                <defs>
-                  <linearGradient id="rev" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="hsl(var(--chart-1))" stopOpacity={0.4} />
-                    <stop offset="100%" stopColor="hsl(var(--chart-1))" stopOpacity={0} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid stroke="hsl(var(--border))" strokeDasharray="3 3" vertical={false} />
-                <XAxis dataKey="date" tick={{ fontSize: 11, fill: "hsl(var(--muted-foreground))" }} tickFormatter={(d) => d.slice(5)} interval="preserveStartEnd" />
-                <YAxis tick={{ fontSize: 11, fill: "hsl(var(--muted-foreground))" }} tickFormatter={(v) => `$${v}`} />
-                <Tooltip
-                  contentStyle={{ background: "hsl(var(--card))", border: "1px solid hsl(var(--border))", borderRadius: 8, fontSize: 12 }}
-                  formatter={(v: number) => formatCurrency(v)}
-                />
-                <Area type="monotone" dataKey="revenue" stroke="hsl(var(--chart-1))" strokeWidth={2} fill="url(#rev)" />
-              </AreaChart>
-            </ResponsiveContainer>
-          </div>
-        </Card>
+      <section className="space-y-3">
+        <h2 className="text-sm font-semibold text-foreground">Revenue</h2>
+        <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
+          <KpiCard label="Gross Rev" value={formatCurrency(totals.grossRevenue)} icon={<DollarSign className="h-4 w-4" />} accent="primary" />
+          <KpiCard label="Net Rev" value={formatCurrency(totals.netRevenue)} icon={<DollarSign className="h-4 w-4" />} accent="success" />
+          <KpiCard label="Rev D0" value={formatCurrency(totals.revenueD0)} icon={<Sparkles className="h-4 w-4" />} accent="accent" />
+          <KpiCard label="Rev D7" value={formatCurrency(totals.revenueD7)} icon={<TrendingUp className="h-4 w-4" />} accent="primary" />
+          <KpiCard label="Rev 1M" value={formatCurrency(totals.revenueD30)} icon={<TrendingUp className="h-4 w-4" />} accent="primary" />
+          <KpiCard label="Rev 2M" value={formatCurrency(totals.revenueD60)} icon={<TrendingUp className="h-4 w-4" />} accent="primary" />
+        </div>
+      </section>
 
-        <Card className="p-4 shadow-card">
-          <div className="mb-3 flex items-baseline justify-between">
-            <h2 className="text-sm font-semibold text-foreground">Revenue by transaction type</h2>
-          </div>
-          <div className="h-64">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={byType} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
-                <CartesianGrid stroke="hsl(var(--border))" strokeDasharray="3 3" vertical={false} />
-                <XAxis dataKey="label" tick={{ fontSize: 11, fill: "hsl(var(--muted-foreground))" }} />
-                <YAxis tick={{ fontSize: 11, fill: "hsl(var(--muted-foreground))" }} tickFormatter={(v) => `$${v}`} />
-                <Tooltip
-                  contentStyle={{ background: "hsl(var(--card))", border: "1px solid hsl(var(--border))", borderRadius: 8, fontSize: 12 }}
-                  formatter={(v: number) => formatCurrency(v)}
-                />
-                <Bar dataKey="revenue" radius={[6, 6, 0, 0]}>
-                  {byType.map((_, i) => (
-                    <Cell key={i} fill={`hsl(var(--chart-${(i % 6) + 1}))`} />
-                  ))}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        </Card>
+      <section className="mt-5 space-y-3">
+        <h2 className="text-sm font-semibold text-foreground">Acquisition</h2>
+        <div className="grid gap-3 md:grid-cols-3">
+          <KpiCard label="Trial" value={totals.totalTrialUsers.toLocaleString()} icon={<UsersIcon className="h-4 w-4" />} accent="accent" />
+          <KpiCard label="Upsell" value={totals.totalUpsellUsers.toLocaleString()} icon={<ArrowUpRight className="h-4 w-4" />} accent="accent" />
+          <KpiCard label="First Sub" value={totals.totalFirstSubscriptionUsers.toLocaleString()} icon={<CreditCard className="h-4 w-4" />} accent="success" />
+        </div>
+      </section>
 
-        <Card className="p-4 shadow-card">
-          <div className="mb-3 flex items-baseline justify-between">
-            <h2 className="text-sm font-semibold text-foreground">Funnel comparison by revenue</h2>
-          </div>
-          <div className="h-64">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={byFunnel} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
-                <CartesianGrid stroke="hsl(var(--border))" strokeDasharray="3 3" vertical={false} />
-                <XAxis dataKey="funnel" tick={{ fontSize: 11, fill: "hsl(var(--muted-foreground))" }} tickFormatter={(v) => v.replace("_", " ")} />
-                <YAxis tick={{ fontSize: 11, fill: "hsl(var(--muted-foreground))" }} tickFormatter={(v) => `$${v}`} />
-                <Tooltip
-                  contentStyle={{ background: "hsl(var(--card))", border: "1px solid hsl(var(--border))", borderRadius: 8, fontSize: 12 }}
-                  formatter={(v: number) => formatCurrency(v)}
-                />
-                <Legend wrapperStyle={{ fontSize: 11 }} />
-                <Bar dataKey="trial" stackId="a" fill="hsl(var(--chart-1))" name="Trial" />
-                <Bar dataKey="upsell" stackId="a" fill="hsl(var(--chart-2))" name="Upsell" />
-                <Bar dataKey="first_subscription" stackId="a" fill="hsl(var(--chart-3))" name="First Sub" />
-                <Bar dataKey="renewal_2" stackId="a" fill="hsl(var(--chart-4))" name="Renewal 2" />
-                <Bar dataKey="renewal_3" stackId="a" fill="hsl(var(--chart-5))" name="Renewal 3" />
-                <Bar dataKey="renewal" stackId="a" fill="hsl(var(--chart-5))" name="Renewal" radius={[6, 6, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        </Card>
+      <section className="mt-5 space-y-3">
+        <h2 className="text-sm font-semibold text-foreground">Subscription Health</h2>
+        <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-4">
+          <KpiCard label="Active Subscriptions" value={totals.totalActiveSubscriptions.toLocaleString()} icon={<Activity className="h-4 w-4" />} accent="success" />
+          <KpiCard label="Cancelled Users" value={totals.totalCancelledUsers.toLocaleString()} icon={<XCircle className="h-4 w-4" />} accent="primary" />
+          <KpiCard label="User Cancelled" value={totals.totalUserCancelledUsers.toLocaleString()} icon={<UsersIcon className="h-4 w-4" />} accent="accent" />
+          <KpiCard label="Auto Cancelled" value={totals.totalAutoCancelledUsers.toLocaleString()} icon={<ShieldAlert className="h-4 w-4" />} accent="primary" />
+        </div>
+      </section>
 
-        <Card className="p-4 shadow-card">
-          <div className="mb-3 flex items-baseline justify-between">
-            <h2 className="text-sm font-semibold text-foreground">Trial → Upsell → First Subscription</h2>
-          </div>
-          <div className="space-y-3 py-2">
-            {funnel.map((step, i) => (
-              <div key={step.step}>
-                <div className="mb-1 flex items-baseline justify-between text-xs">
-                  <span className="font-medium text-foreground">{step.step}</span>
-                  <span className="tabular-nums text-muted-foreground">
-                    {step.users} users · {step.conversion.toFixed(1)}%
-                  </span>
-                </div>
-                <div className="h-8 w-full overflow-hidden rounded-md bg-secondary">
-                  <div
-                    className="h-full rounded-md transition-all"
-                    style={{
-                      width: `${Math.max(step.conversion, 4)}%`,
-                      background: `hsl(var(--chart-${i + 1}))`,
-                    }}
-                  />
-                </div>
-              </div>
-            ))}
-          </div>
-        </Card>
-      </div>
+      <section className="mt-5 space-y-3">
+        <h2 className="text-sm font-semibold text-foreground">Traffic</h2>
+        <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
+          <KpiCard label="Spend" value={totals.hasTrafficSpend ? formatCurrency(totals.trafficSpend) : "—"} icon={<DollarSign className="h-4 w-4" />} accent="primary" />
+          <KpiCard label="CAC" value={totals.trafficTrials ? formatCurrency(totals.trafficCac) : "—"} icon={<Target className="h-4 w-4" />} accent="accent" />
+          <KpiCard label="FB Trial Count" value={totals.trafficTrials ? totals.trafficTrials.toLocaleString() : "—"} icon={<UsersIcon className="h-4 w-4" />} accent="accent" />
+          <KpiCard label="ROAS D7" value={totals.hasCompleteTrafficSpend ? formatRoas(totals.roasD7) : "—"} icon={<MousePointerClick className="h-4 w-4" />} accent="success" />
+          <KpiCard label="ROAS 1M" value={totals.hasCompleteTrafficSpend ? formatRoas(totals.roas1m) : "—"} icon={<MousePointerClick className="h-4 w-4" />} accent="success" />
+          <KpiCard label="ROAS 2M" value={totals.hasCompleteTrafficSpend ? formatRoas(totals.roas2m) : "—"} icon={<MousePointerClick className="h-4 w-4" />} accent="success" />
+        </div>
+      </section>
     </AppLayout>
   );
 }

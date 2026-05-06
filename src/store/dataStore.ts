@@ -4,6 +4,7 @@ import { MOCK_TRANSACTIONS } from "@/services/mockTransactions";
 import type { Transaction } from "@/services/types";
 import type { PalmerImportDiagnostics, RawPalmerRow } from "@/services/palmerTransform";
 import type { SubscriptionClean } from "@/types/subscriptions";
+import type { TrafficMetric } from "@/services/trafficImport";
 
 export type DataSource = "mock" | "csv" | "google_sheet" | "palmer_raw";
 export type ImportMode = "clean_template" | "palmer_raw";
@@ -22,6 +23,8 @@ interface ImportMeta {
 interface DataState {
   transactions: Transaction[];
   rawPalmerRows: RawPalmerRow[];
+  trafficMetrics: TrafficMetric[];
+  trafficMeta: { importedAt: string | null; rowCount: number; source?: "facebook" };
   subscriptions: SubscriptionClean[];
   lastSubscriptionSyncAt: string | null;
   meta: ImportMeta;
@@ -30,6 +33,7 @@ interface DataState {
     info: Omit<ImportMeta, "rowCount" | "importedAt" | "rawRowCount">,
     rawPalmerRows?: RawPalmerRow[]
   ) => void;
+  setTrafficMetrics: (rows: TrafficMetric[]) => void;
   setSubscriptions: (rows: SubscriptionClean[]) => void;
   resetToMock: () => void;
 }
@@ -61,6 +65,8 @@ export const useDataStore = create<DataState>()(
     (set) => ({
       transactions: MOCK_TRANSACTIONS,
       rawPalmerRows: [],
+      trafficMetrics: [],
+      trafficMeta: { importedAt: null, rowCount: 0 },
       subscriptions: [],
       lastSubscriptionSyncAt: null,
       meta: initialMeta,
@@ -74,6 +80,11 @@ export const useDataStore = create<DataState>()(
             rawRowCount: rawPalmerRows.length || undefined,
             importedAt: new Date().toISOString(),
           },
+        }),
+      setTrafficMetrics: (rows) =>
+        set({
+          trafficMetrics: rows,
+          trafficMeta: { importedAt: new Date().toISOString(), rowCount: rows.length, source: "facebook" },
         }),
       setSubscriptions: (rows) =>
         set({
@@ -92,10 +103,8 @@ export const useDataStore = create<DataState>()(
       version: 1,
       storage: createJSONStorage(() => safeLocalStorage),
       partialize: (state) => ({
-        transactions: state.transactions,
-        rawPalmerRows: state.rawPalmerRows,
         lastSubscriptionSyncAt: state.lastSubscriptionSyncAt,
-        meta: state.meta,
+        trafficMeta: state.trafficMeta,
       }),
     }
   )
