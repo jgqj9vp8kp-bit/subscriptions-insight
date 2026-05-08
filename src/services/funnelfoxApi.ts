@@ -1,5 +1,6 @@
 import { normalizeSubscription } from "@/services/subscriptionTransform";
 import { isSupabaseConfigured, supabase } from "@/services/supabaseClient";
+import { publicRuntimeConfig } from "@/config/publicRuntimeConfig";
 import type { FunnelFoxListResponse, FunnelFoxSubscriptionRaw, SubscriptionClean } from "@/types/subscriptions";
 
 const DEFAULT_PROXY_ENDPOINT = "/api/funnelfox/subscriptions";
@@ -68,7 +69,7 @@ type FunnelFoxRuntimeEnv = {
 };
 
 function isMockMode(): boolean {
-  return import.meta.env.VITE_FUNNELFOX_MOCK !== "false";
+  return publicRuntimeConfig.funnelFoxMock !== "false";
 }
 
 function isEnabled(value: unknown): boolean {
