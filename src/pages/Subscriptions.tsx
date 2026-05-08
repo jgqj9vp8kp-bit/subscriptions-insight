@@ -75,7 +75,7 @@ function boolLabel(value: boolean | null): string {
 }
 
 function readableValue(value: string): string {
-  return value.replaceAll("_", " ");
+  return value.split("_").join(" ");
 }
 
 function normalizeEmailForMatch(value: string | null | undefined): string {
