@@ -4,15 +4,19 @@ import { AuthContext, type AuthContextValue, type AuthProviderName, type AuthUse
 import { isSupabaseConfigured, supabase } from "@/services/supabaseClient";
 
 const LOCAL_AUTH_SESSION_KEY = "subengine_local_admin_session";
-const LOCAL_ADMIN_USERNAME = "admin";
-const LOCAL_ADMIN_PASSWORD = "Mobidima";
 
 function isEnabled(value: unknown): boolean {
   return String(value ?? "").toLowerCase() === "true";
 }
 
 function localAuthEnabled(): boolean {
-  return Boolean(import.meta.env.DEV) || isEnabled(import.meta.env.VITE_ENABLE_LOCAL_AUTH);
+  // Local-only dev fallback. NEVER enabled in production builds, regardless of env flags.
+  if (!import.meta.env.DEV) return false;
+  if (!isEnabled(import.meta.env.VITE_ENABLE_LOCAL_AUTH)) return false;
+  // Require both credentials to be supplied via env vars; no defaults.
+  const username = import.meta.env.VITE_LOCAL_ADMIN_USERNAME?.trim();
+  const password = import.meta.env.VITE_LOCAL_ADMIN_PASSWORD;
+  return Boolean(username && password);
 }
 
 function localAdminUser(): AuthUser {
@@ -86,7 +90,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           return;
         }
 
-        if (isLocalAuthEnabled && normalizedLogin === LOCAL_ADMIN_USERNAME && password === LOCAL_ADMIN_PASSWORD) {
+        const expectedUser = import.meta.env.VITE_LOCAL_ADMIN_USERNAME?.trim();
+        const expectedPass = import.meta.env.VITE_LOCAL_ADMIN_PASSWORD;
+        if (
+          isLocalAuthEnabled &&
+          expectedUser &&
+          expectedPass &&
+          normalizedLogin === expectedUser &&
+          password === expectedPass
+        ) {
           sessionStorage.setItem(LOCAL_AUTH_SESSION_KEY, "true");
           setLocalUser(localAdminUser());
           return;
