@@ -266,8 +266,10 @@ function profileDebugBody(profileId: string, payload: unknown) {
 }
 
 export async function handleFunnelFoxSubscriptions(options: ProxyOptions): Promise<ProxyResult> {
-  const secret = options.secret ?? process.env.FUNNELFOX_SECRET;
   const debug = Boolean(options.debug);
+  const authError = await verifyAuth(options.authHeader);
+  if (authError) return authError;
+  const secret = process.env.FUNNELFOX_SECRET;
 
   if (!secret) {
     return {
@@ -322,7 +324,9 @@ export async function handleFunnelFoxSubscriptions(options: ProxyOptions): Promi
 }
 
 export async function handleFunnelFoxSubscriptionDetails(options: SubscriptionDetailsProxyOptions): Promise<ProxyResult> {
-  const secret = options.secret ?? process.env.FUNNELFOX_SECRET;
+  const authError = await verifyAuth(options.authHeader);
+  if (authError) return authError;
+  const secret = process.env.FUNNELFOX_SECRET;
   const subscriptionId = options.subscriptionId.trim();
 
   if (!subscriptionId) {
@@ -373,7 +377,9 @@ export async function handleFunnelFoxSubscriptionDetails(options: SubscriptionDe
 }
 
 export async function handleFunnelFoxProfile(options: ProfileProxyOptions): Promise<ProxyResult> {
-  const secret = options.secret ?? process.env.FUNNELFOX_SECRET;
+  const authError = await verifyAuth(options.authHeader);
+  if (authError) return authError;
+  const secret = process.env.FUNNELFOX_SECRET;
   const profileId = options.profileId.trim();
 
   if (!profileId) {
