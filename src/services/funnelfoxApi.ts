@@ -261,7 +261,7 @@ export async function listSubscriptionsWithOptions(
 
   const url = proxyUrl();
   if (cursor) url.searchParams.set("cursor", cursor);
-  const res = await fetch(url.toString(), { headers: requestHeaders(options) });
+  const res = await fetch(url.toString(), { headers: await requestHeaders(options) });
   if (!res.ok) {
     throw new Error(await safeErrorMessage(res, `Could not load FunnelFox subscriptions (HTTP ${res.status}).`));
   }
@@ -271,7 +271,7 @@ export async function listSubscriptionsWithOptions(
 export async function testFunnelFoxConnection(options?: FunnelFoxRequestOptions): Promise<FunnelFoxDebugResponse> {
   const url = proxyUrl();
   url.searchParams.set("debug", "1");
-  const res = await fetch(url.toString(), { headers: requestHeaders(options) });
+  const res = await fetch(url.toString(), { headers: await requestHeaders(options) });
   if (!res.ok) {
     throw new Error(await safeErrorMessage(res, `Could not test FunnelFox connection (HTTP ${res.status}).`));
   }
@@ -281,7 +281,7 @@ export async function testFunnelFoxConnection(options?: FunnelFoxRequestOptions)
 export async function fetchProfileDebug(profileId: string, options?: FunnelFoxRequestOptions): Promise<FunnelFoxProfileDebugResponse> {
   const url = profileDebugUrl();
   url.searchParams.set("id", profileId);
-  const res = await fetch(url.toString(), { headers: requestHeaders(options) });
+  const res = await fetch(url.toString(), { headers: await requestHeaders(options) });
   if (!res.ok) {
     throw new Error(await safeErrorMessage(res, `Could not load FunnelFox profile debug (HTTP ${res.status}).`));
   }
@@ -291,7 +291,7 @@ export async function fetchProfileDebug(profileId: string, options?: FunnelFoxRe
 export async function fetchSubscriptionDebug(subscriptionId: string, options?: FunnelFoxRequestOptions): Promise<unknown> {
   const url = subscriptionDetailsUrl();
   url.searchParams.set("id", subscriptionId);
-  const res = await fetch(url.toString(), { headers: requestHeaders(options) });
+  const res = await fetch(url.toString(), { headers: await requestHeaders(options) });
   if (!res.ok) {
     throw new Error(await safeErrorMessage(res, `Could not load FunnelFox subscription debug (HTTP ${res.status}).`));
   }
@@ -304,7 +304,7 @@ async function fetchSubscriptionDetails(subscriptionId: string, options?: Funnel
 
   let lastError: Error | null = null;
   for (let attempt = 0; attempt <= DETAIL_MAX_RETRIES; attempt += 1) {
-    const res = await fetch(url.toString(), { headers: requestHeaders(options) });
+    const res = await fetch(url.toString(), { headers: await requestHeaders(options) });
     if (res.ok) {
       const payload = (await res.json()) as { data?: FunnelFoxSubscriptionRaw } & FunnelFoxSubscriptionRaw;
       return (payload.data && typeof payload.data === "object" ? payload.data : payload) as FunnelFoxSubscriptionRaw;
