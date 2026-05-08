@@ -73,6 +73,13 @@ import {
 import { formatPct } from "@/services/analytics";
 import { fetchTrafficMetricsFromGoogleSheet } from "@/services/trafficImport";
 import {
+  clearTrafficDataCache,
+  getTrafficCacheInfo,
+  loadLastTrafficDataFromCache,
+  saveTrafficDataToCache,
+  type TrafficCacheMetadata,
+} from "@/services/trafficCache";
+import {
   BUILTIN_DEFAULT_RETENTION_CURVE,
   loadDefaultRetentionCurve,
   saveDefaultRetentionCurve,
@@ -133,6 +140,10 @@ export default function ImportPage() {
   const [palmerCacheError, setPalmerCacheError] = useState<string | null>(null);
   const [subscriptionCacheInfo, setSubscriptionCacheInfo] = useState<SubscriptionCacheMetadata | null>(null);
   const [subscriptionCacheLoading, setSubscriptionCacheLoading] = useState(false);
+  const [trafficCacheInfo, setTrafficCacheInfo] = useState<TrafficCacheMetadata | null>(null);
+  const [trafficCacheLoading, setTrafficCacheLoading] = useState(false);
+  const [trafficCacheMessage, setTrafficCacheMessage] = useState<string | null>(null);
+  const [trafficCacheError, setTrafficCacheError] = useState<string | null>(null);
   const [funnelFoxSecret, setFunnelFoxSecret] = useState("");
   const [testingFunnelFox, setTestingFunnelFox] = useState(false);
   const [syncingFunnelFox, setSyncingFunnelFox] = useState(false);
@@ -146,12 +157,14 @@ export default function ImportPage() {
   const temporaryKeyInputEnabled = isFunnelFoxTemporaryKeyInputEnabled();
 
   const refreshLocalCacheInfo = useCallback(async () => {
-    const [palmerInfo, funnelFoxInfo] = await Promise.all([
+    const [palmerInfo, funnelFoxInfo, trafficInfo] = await Promise.all([
       getPalmerCacheInfo().catch(() => null),
       getSubscriptionsCacheInfo().catch(() => null),
+      getTrafficCacheInfo().catch(() => null),
     ]);
     setPalmerCacheInfo(palmerInfo);
     setSubscriptionCacheInfo(funnelFoxInfo);
+    setTrafficCacheInfo(trafficInfo);
   }, []);
 
   useEffect(() => {
@@ -238,12 +251,20 @@ export default function ImportPage() {
     if (!trafficSheetUrl.trim()) return;
     try {
       setTrafficLoading(true);
+      setTrafficCacheMessage(null);
+      setTrafficCacheError(null);
       const year = Number(trafficYear) || new Date().getFullYear();
       const rows = await fetchTrafficMetricsFromGoogleSheet(trafficSheetUrl, year);
       setTrafficMetrics(rows);
+      const cacheMetadata = await saveTrafficDataToCache(rows, {
+        google_sheet_url: trafficSheetUrl.trim(),
+        year,
+      });
+      setTrafficCacheInfo(cacheMetadata);
+      setTrafficCacheMessage("Saved imported Facebook traffic data locally.");
       toast({
         title: "Facebook traffic imported",
-        description: `Loaded ${rows.length} traffic rows from Google Sheets.`,
+        description: `Loaded ${rows.length} traffic rows from Google Sheets and saved them locally.`,
       });
     } catch (error) {
       toast({
@@ -253,6 +274,47 @@ export default function ImportPage() {
       });
     } finally {
       setTrafficLoading(false);
+    }
+  }
+
+  async function onLoadSavedTrafficData() {
+    try {
+      setTrafficCacheLoading(true);
+      setTrafficCacheMessage(null);
+      setTrafficCacheError(null);
+      const cached = await loadLastTrafficDataFromCache();
+      if (!cached) {
+        setTrafficCacheInfo(null);
+        setTrafficCacheMessage("No saved Facebook traffic data found.");
+        return;
+      }
+
+      setTrafficMetrics(cached.trafficMetrics);
+      setTrafficCacheInfo(cached.metadata);
+      setTrafficCacheMessage("Loaded saved Facebook traffic data");
+      toast({
+        title: "Loaded saved Facebook traffic data",
+        description: `Loaded ${cached.trafficMetrics.length} traffic rows from local cache.`,
+      });
+    } catch (error) {
+      setTrafficCacheError(error instanceof Error ? error.message : "Could not load saved Facebook traffic data.");
+    } finally {
+      setTrafficCacheLoading(false);
+    }
+  }
+
+  async function onClearSavedTrafficData() {
+    try {
+      setTrafficCacheLoading(true);
+      setTrafficCacheMessage(null);
+      setTrafficCacheError(null);
+      await clearTrafficDataCache();
+      setTrafficCacheInfo(null);
+      setTrafficCacheMessage("Saved Facebook traffic cache cleared. Current data remains loaded.");
+    } catch (error) {
+      setTrafficCacheError(error instanceof Error ? error.message : "Could not clear saved Facebook traffic data.");
+    } finally {
+      setTrafficCacheLoading(false);
     }
   }
 
@@ -994,7 +1056,7 @@ export default function ImportPage() {
           <Database className="h-4 w-4 text-muted-foreground" />
           <h3 className="text-sm font-semibold text-foreground">Local Saved Data</h3>
         </div>
-        <div className="grid gap-3 lg:grid-cols-2">
+        <div className="grid gap-3 xl:grid-cols-3">
           <div className="rounded-md border border-border p-3">
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0">
@@ -1074,6 +1136,62 @@ export default function ImportPage() {
                   size="sm"
                   onClick={onClearSavedSubscriptions}
                   disabled={subscriptionCacheLoading || !subscriptionCacheInfo}
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                  Clear
+                </Button>
+              </div>
+            </div>
+          </div>
+
+          <div className="rounded-md border border-border p-3">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="text-sm font-medium text-foreground">Saved Facebook traffic data</div>
+                <div className="mt-1 text-xs text-muted-foreground">
+                  {trafficCacheInfo ? (
+                    <>
+                      Saved Facebook traffic data available:{" "}
+                      <span className="font-medium tabular-nums text-foreground">{trafficCacheInfo.rows_count}</span>{" "}
+                      rows, imported at{" "}
+                      <span className="tabular-nums text-foreground">
+                        {new Date(trafficCacheInfo.imported_at).toLocaleString()}
+                      </span>
+                      {trafficCacheInfo.year ? (
+                        <>
+                          , year <span className="tabular-nums text-foreground">{trafficCacheInfo.year}</span>
+                        </>
+                      ) : null}
+                      {trafficCacheInfo.google_sheet_url ? (
+                        <div className="mt-1 truncate">
+                          Source: <span className="text-foreground">{trafficCacheInfo.google_sheet_url}</span>
+                        </div>
+                      ) : null}
+                    </>
+                  ) : (
+                    "No saved Facebook traffic data found."
+                  )}
+                </div>
+                {trafficCacheMessage && <div className="mt-1 text-xs text-primary">{trafficCacheMessage}</div>}
+                {trafficCacheError && <div className="mt-1 text-xs text-destructive">{trafficCacheError}</div>}
+              </div>
+              <div className="flex shrink-0 flex-wrap justify-end gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={onLoadSavedTrafficData}
+                  disabled={trafficCacheLoading || !trafficCacheInfo}
+                >
+                  {trafficCacheLoading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                  Load saved traffic data
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={onClearSavedTrafficData}
+                  disabled={trafficCacheLoading || !trafficCacheInfo}
                 >
                   <Trash2 className="h-3.5 w-3.5" />
                   Clear

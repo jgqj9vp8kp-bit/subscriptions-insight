@@ -1,6 +1,7 @@
 import { Navigate, Outlet, useLocation } from "react-router-dom";
 import { Loader2 } from "lucide-react";
 import { useAuth } from "@/hooks/useAuth";
+import { SavedDataAutoLoader } from "@/components/SavedDataAutoLoader";
 
 export function ProtectedRoute() {
   const location = useLocation();
@@ -21,5 +22,10 @@ export function ProtectedRoute() {
     return <Navigate to="/login" replace state={{ from: location }} />;
   }
 
-  return <Outlet />;
+  return (
+    <>
+      <SavedDataAutoLoader />
+      <Outlet />
+    </>
+  );
 }
