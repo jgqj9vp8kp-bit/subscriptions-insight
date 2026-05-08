@@ -1,4 +1,4 @@
-import { BarChart3, LayoutDashboard, Receipt, Users, Layers, Upload, Repeat } from "lucide-react";
+import { LayoutDashboard, Receipt, Users, Layers, Upload, Repeat, Calculator } from "lucide-react";
 import { NavLink } from "@/components/NavLink";
 import {
   Sidebar,
@@ -18,6 +18,7 @@ const items = [
   { title: "Transactions", url: "/transactions", icon: Receipt, end: false },
   { title: "Users", url: "/users", icon: Users, end: false },
   { title: "Cohorts", url: "/cohorts", icon: Layers, end: false },
+  { title: "Forecasting", url: "/forecasting", icon: Calculator, end: false },
   { title: "Subscriptions", url: "/subscriptions", icon: Repeat, end: false },
   { title: "Import data", url: "/import", icon: Upload, end: false },
 ];
@@ -30,13 +31,16 @@ export function AppSidebar() {
     <Sidebar collapsible="icon" className="border-r border-sidebar-border">
       <SidebarHeader className="border-b border-sidebar-border">
         <div className="flex items-center gap-2 px-2 py-3">
-          <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-primary to-primary-glow text-primary-foreground shadow-sm">
-            <BarChart3 className="h-4 w-4" />
+          <div className="relative flex h-8 w-8 items-center justify-center overflow-hidden rounded-lg bg-gradient-to-br from-primary via-primary-glow to-accent text-primary-foreground shadow-sm">
+            <span className="text-sm font-bold leading-none">S</span>
+            <span className="absolute bottom-1.5 right-1.5 h-1 w-1 rounded-full bg-primary-foreground/90" />
+            <span className="absolute bottom-1.5 right-3 h-2 w-1 rounded-full bg-primary-foreground/75" />
+            <span className="absolute bottom-1.5 right-[1.125rem] h-3 w-1 rounded-full bg-primary-foreground/60" />
           </div>
           {!collapsed && (
             <div className="flex flex-col">
-              <span className="text-sm font-semibold leading-none text-foreground">Subscription</span>
-              <span className="text-xs text-muted-foreground leading-none mt-1">Analytics</span>
+              <span className="text-sm font-semibold leading-none text-foreground">Subengine</span>
+              <span className="text-xs text-muted-foreground leading-none mt-1">Analytics engine</span>
             </div>
           )}
         </div>

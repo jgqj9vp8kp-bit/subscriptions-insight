@@ -1,12 +1,15 @@
-import { useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   CheckCircle2,
   Database,
   FileSpreadsheet,
+  KeyRound,
   Link as LinkIcon,
   Loader2,
+  RefreshCw,
   RotateCcw,
+  Trash2,
   Upload,
 } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
@@ -31,6 +34,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useToast } from "@/hooks/use-toast";
+import { usePersistedPageState } from "@/hooks/usePersistedPageState";
 import { useDataStore } from "@/store/dataStore";
 import {
   applyMapping,
@@ -47,11 +51,44 @@ import {
   type PalmerImportDiagnostics,
   type RawPalmerRow,
 } from "@/services/palmerTransform";
-import { savePalmerDatasetToCache } from "@/services/palmerCache";
+import {
+  clearPalmerDatasetCache,
+  getPalmerCacheInfo,
+  loadLastPalmerDatasetFromCache,
+  savePalmerDatasetToCache,
+  type PalmerCacheMetadata,
+} from "@/services/palmerCache";
+import {
+  isFunnelFoxTemporaryKeyInputEnabled,
+  syncAllSubscriptionsWithDiagnostics,
+  testFunnelFoxConnection,
+} from "@/services/funnelfoxApi";
+import {
+  clearSubscriptionsCache,
+  getSubscriptionsCacheInfo,
+  loadSubscriptionsFromCache,
+  saveSubscriptionsToCache,
+  type SubscriptionCacheMetadata,
+} from "@/services/subscriptionCache";
+import { formatPct } from "@/services/analytics";
 import { fetchTrafficMetricsFromGoogleSheet } from "@/services/trafficImport";
+import {
+  BUILTIN_DEFAULT_RETENTION_CURVE,
+  loadDefaultRetentionCurve,
+  saveDefaultRetentionCurve,
+  resetDefaultRetentionCurve,
+} from "@/services/forecastingSettings";
 import type { Transaction } from "@/services/types";
 
 const NONE = "__none__";
+
+const DEFAULT_IMPORT_UI_STATE = {
+  tab: "csv" as "csv" | "google",
+  importMode: "clean_template" as "clean_template" | "palmer_raw",
+  sheetUrl: "",
+  trafficSheetUrl: "",
+  trafficYear: String(new Date().getFullYear()),
+};
 
 const DIAGNOSTIC_LABELS: { key: keyof PalmerImportDiagnostics; label: string }[] = [
   { key: "totalRows", label: "Total rows" },
@@ -74,22 +111,52 @@ export default function ImportPage() {
   const fileRef = useRef<HTMLInputElement>(null);
   const meta = useDataStore((s) => s.meta);
   const trafficMeta = useDataStore((s) => s.trafficMeta);
+  const subscriptions = useDataStore((s) => s.subscriptions);
   const setImported = useDataStore((s) => s.setImported);
   const setTrafficMetrics = useDataStore((s) => s.setTrafficMetrics);
+  const setSubscriptions = useDataStore((s) => s.setSubscriptions);
   const resetToMock = useDataStore((s) => s.resetToMock);
 
-  const [tab, setTab] = useState<"csv" | "google">("csv");
-  const [importMode, setImportMode] = useState<"clean_template" | "palmer_raw">("clean_template");
+  const [uiState, setUiState] = usePersistedPageState("ui_state_import_data", DEFAULT_IMPORT_UI_STATE);
+  const { tab, importMode, sheetUrl, trafficSheetUrl, trafficYear } = uiState;
+  const updateUiState = (patch: Partial<typeof DEFAULT_IMPORT_UI_STATE>) => setUiState((current) => ({ ...current, ...patch }));
   const [parsed, setParsed] = useState<ParsedSheet | null>(null);
   const [mapping, setMapping] = useState<ColumnMapping>({});
   const [sourceLabel, setSourceLabel] = useState<string>("");
   const [sourceKind, setSourceKind] = useState<"csv" | "google_sheet">("csv");
-  const [sheetUrl, setSheetUrl] = useState("");
   const [loading, setLoading] = useState(false);
   const [cacheSavedMessage, setCacheSavedMessage] = useState<string | null>(null);
-  const [trafficSheetUrl, setTrafficSheetUrl] = useState("");
-  const [trafficYear, setTrafficYear] = useState(String(new Date().getFullYear()));
   const [trafficLoading, setTrafficLoading] = useState(false);
+  const [palmerCacheInfo, setPalmerCacheInfo] = useState<PalmerCacheMetadata | null>(null);
+  const [palmerCacheLoading, setPalmerCacheLoading] = useState(false);
+  const [palmerCacheMessage, setPalmerCacheMessage] = useState<string | null>(null);
+  const [palmerCacheError, setPalmerCacheError] = useState<string | null>(null);
+  const [subscriptionCacheInfo, setSubscriptionCacheInfo] = useState<SubscriptionCacheMetadata | null>(null);
+  const [subscriptionCacheLoading, setSubscriptionCacheLoading] = useState(false);
+  const [funnelFoxSecret, setFunnelFoxSecret] = useState("");
+  const [testingFunnelFox, setTestingFunnelFox] = useState(false);
+  const [syncingFunnelFox, setSyncingFunnelFox] = useState(false);
+  const [funnelFoxConnectionMessage, setFunnelFoxConnectionMessage] = useState<string | null>(null);
+  const [funnelFoxConnectionError, setFunnelFoxConnectionError] = useState<string | null>(null);
+  const [funnelFoxSyncMessage, setFunnelFoxSyncMessage] = useState<string | null>(null);
+  const [funnelFoxSyncError, setFunnelFoxSyncError] = useState<string | null>(null);
+  const [retentionCurveDraft, setRetentionCurveDraft] = useState<string[]>(() => loadDefaultRetentionCurve().map(String));
+  const [retentionCurveMessage, setRetentionCurveMessage] = useState<string | null>(null);
+
+  const temporaryKeyInputEnabled = isFunnelFoxTemporaryKeyInputEnabled();
+
+  const refreshLocalCacheInfo = useCallback(async () => {
+    const [palmerInfo, funnelFoxInfo] = await Promise.all([
+      getPalmerCacheInfo().catch(() => null),
+      getSubscriptionsCacheInfo().catch(() => null),
+    ]);
+    setPalmerCacheInfo(palmerInfo);
+    setSubscriptionCacheInfo(funnelFoxInfo);
+  }, []);
+
+  useEffect(() => {
+    void refreshLocalCacheInfo();
+  }, [refreshLocalCacheInfo]);
 
   const requiredMissing = useMemo(
     () =>
@@ -104,6 +171,20 @@ export default function ImportPage() {
     if (importMode === "palmer_raw") return transformPalmerRows(parsed.rows as RawPalmerRow[]).slice(0, 5);
     return applyMapping({ headers: parsed.headers, rows: parsed.rows.slice(0, 5) }, mapping).rows;
   }, [parsed, importMode, mapping]);
+
+  const subscriptionEmailDiagnostics = useMemo(() => {
+    const total = subscriptions.length;
+    const withEmail = subscriptions.filter((sub) => Boolean(sub.email)).length;
+    const missingEmail = total - withEmail;
+    const coverage = total ? (withEmail / total) * 100 : 0;
+    return { total, withEmail, missingEmail, coverage };
+  }, [subscriptions]);
+
+  function funnelFoxSecretOptions() {
+    if (!temporaryKeyInputEnabled) return undefined;
+    const secret = funnelFoxSecret.trim();
+    return secret ? { secret } : undefined;
+  }
 
   function handleParsed(p: ParsedSheet, label: string, kind: "csv" | "google_sheet") {
     if (!p.headers.length || !p.rows.length) {
@@ -216,6 +297,7 @@ export default function ImportPage() {
         setCacheSavedMessage(
           `Saved imported dataset locally: ${cacheMetadata.file_name}, ${cacheMetadata.rows_count} rows.`,
         );
+        setPalmerCacheInfo(cacheMetadata);
       } catch (error) {
         setCacheSavedMessage(null);
         toast({
@@ -238,11 +320,200 @@ export default function ImportPage() {
     setMapping({});
   }
 
+  async function onTestFunnelFoxConnection() {
+    try {
+      setTestingFunnelFox(true);
+      setFunnelFoxConnectionMessage(null);
+      setFunnelFoxConnectionError(null);
+      const result = await testFunnelFoxConnection(funnelFoxSecretOptions());
+      if (!result.secret_exists) {
+        setFunnelFoxConnectionError("Add FunnelFox Secret Key or configure FUNNELFOX_SECRET on the server.");
+        return;
+      }
+      if (!result.can_call_funnelfox) {
+        setFunnelFoxConnectionError("Could not connect to FunnelFox. Check the key and try again.");
+        return;
+      }
+      setFunnelFoxConnectionMessage(`Connection successful. Returned ${result.subscription_count} subscriptions.`);
+    } catch (error) {
+      setFunnelFoxConnectionError(error instanceof Error ? error.message : "Could not test FunnelFox connection.");
+    } finally {
+      setTestingFunnelFox(false);
+    }
+  }
+
+  async function onSyncFunnelFoxSubscriptions() {
+    try {
+      setSyncingFunnelFox(true);
+      setFunnelFoxSyncError(null);
+      setFunnelFoxSyncMessage(null);
+      const result = await syncAllSubscriptionsWithDiagnostics(funnelFoxSecretOptions());
+      const { rows, diagnostics } = result;
+      console.info("FunnelFox sync result count before store update", { count: rows.length });
+      setSubscriptions(rows);
+      console.info("FunnelFox store subscriptions count after setSubscriptions", {
+        count: useDataStore.getState().subscriptions.length,
+      });
+      const cacheMetadata = await saveSubscriptionsToCache(rows, {
+        last_sync_at: new Date().toISOString(),
+      });
+      setSubscriptionCacheInfo(cacheMetadata);
+      const coverage = diagnostics.total_subscriptions
+        ? ((diagnostics.total_subscriptions - diagnostics.missing_email_after_details) / diagnostics.total_subscriptions) * 100
+        : 0;
+      const failedDetailRequests = diagnostics.warnings.length;
+      setFunnelFoxSyncMessage(
+        rows.length
+          ? `${failedDetailRequests ? "Sync completed with partial enrichment warnings" : "Sync completed"}. Total subscriptions loaded: ${diagnostics.total_subscriptions}. Raw subscriptions: ${diagnostics.raw_subscriptions_count}. Duplicates removed: ${diagnostics.duplicates_removed}. Email coverage: ${diagnostics.total_subscriptions - diagnostics.missing_email_after_details}/${diagnostics.total_subscriptions} (${formatPct(coverage)}). Missing emails: ${diagnostics.missing_email_after_details}. Failed detail/profile requests: ${failedDetailRequests}.`
+          : "Mock mode is active or the backend proxy returned no subscriptions.",
+      );
+      toast({
+        title: "FunnelFox sync complete",
+        description: `Loaded ${rows.length} subscriptions.`,
+      });
+    } catch (error) {
+      if (useDataStore.getState().subscriptions.length > 0) {
+        setFunnelFoxSyncMessage("Sync failed before new data loaded. Keeping existing subscriptions visible.");
+      } else {
+        setFunnelFoxSyncError(error instanceof Error ? error.message : String(error));
+      }
+    } finally {
+      setSyncingFunnelFox(false);
+    }
+  }
+
+  async function onLoadSavedPalmerDataset() {
+    try {
+      setPalmerCacheLoading(true);
+      setPalmerCacheError(null);
+      setPalmerCacheMessage(null);
+      const cached = await loadLastPalmerDatasetFromCache();
+      if (!cached) {
+        setPalmerCacheInfo(null);
+        setPalmerCacheMessage("No saved Palmer dataset found.");
+        return;
+      }
+      setImported(
+        cached.transactions,
+        {
+          source: "palmer_raw",
+          importMode: "palmer_raw",
+          fileName: cached.metadata.file_name,
+        },
+        cached.rawPalmerRows ?? [],
+      );
+      setPalmerCacheInfo(cached.metadata);
+      setPalmerCacheMessage("Loaded saved Palmer dataset");
+      toast({ title: "Loaded saved Palmer dataset", description: `${cached.metadata.rows_count} rows restored.` });
+    } catch (error) {
+      setPalmerCacheError(error instanceof Error ? error.message : "Could not load saved Palmer dataset.");
+    } finally {
+      setPalmerCacheLoading(false);
+    }
+  }
+
+  async function onClearSavedPalmerDataset() {
+    try {
+      setPalmerCacheLoading(true);
+      setPalmerCacheError(null);
+      setPalmerCacheMessage(null);
+      await clearPalmerDatasetCache();
+      setPalmerCacheInfo(null);
+      setPalmerCacheMessage("Saved Palmer dataset cache cleared. Current data remains loaded.");
+    } catch (error) {
+      setPalmerCacheError(error instanceof Error ? error.message : "Could not clear saved Palmer dataset.");
+    } finally {
+      setPalmerCacheLoading(false);
+    }
+  }
+
+  async function onLoadSavedSubscriptions() {
+    try {
+      setSubscriptionCacheLoading(true);
+      setFunnelFoxSyncError(null);
+      const cached = await loadSubscriptionsFromCache();
+      if (!cached) {
+        setFunnelFoxSyncMessage("No saved FunnelFox subscriptions found.");
+        setSubscriptionCacheInfo(null);
+        return;
+      }
+      setSubscriptions(cached.subscriptions);
+      setSubscriptionCacheInfo(cached.metadata);
+      setFunnelFoxSyncMessage(`Loaded saved FunnelFox subscriptions. Total subscriptions loaded: ${cached.metadata.count}. Email coverage: ${formatPct(cached.metadata.email_coverage)}.`);
+      toast({ title: "Loaded saved FunnelFox subscriptions", description: `${cached.metadata.count} subscriptions restored.` });
+    } catch (error) {
+      setFunnelFoxSyncError(error instanceof Error ? error.message : "Could not load saved FunnelFox subscriptions.");
+    } finally {
+      setSubscriptionCacheLoading(false);
+    }
+  }
+
+  async function onClearSavedSubscriptions() {
+    try {
+      setSubscriptionCacheLoading(true);
+      setFunnelFoxSyncError(null);
+      await clearSubscriptionsCache();
+      setSubscriptionCacheInfo(null);
+      setFunnelFoxSyncMessage("Saved FunnelFox subscriptions cache cleared. Current table remains loaded.");
+    } catch (error) {
+      setFunnelFoxSyncError(error instanceof Error ? error.message : "Could not clear saved FunnelFox subscriptions.");
+    } finally {
+      setSubscriptionCacheLoading(false);
+    }
+  }
+
+  function parseRetentionCurveDraftValue(value: string): number | null {
+    const normalized = value.trim().replace(",", ".");
+    if (!normalized) return null;
+    const parsed = Number(normalized);
+    if (!Number.isFinite(parsed)) return null;
+    return Math.min(100, Math.max(0, parsed));
+  }
+
+  function updateRetentionCurveMonth(index: number, value: string) {
+    setRetentionCurveDraft((current) =>
+      current.map((item, itemIndex) =>
+        itemIndex === index ? value : item,
+      ),
+    );
+    setRetentionCurveMessage(null);
+  }
+
+  function commitRetentionCurveMonth(index: number) {
+    const parsed = parseRetentionCurveDraftValue(retentionCurveDraft[index] ?? "");
+    if (parsed == null) {
+      setRetentionCurveMessage("Enter valid retention values from 0 to 100 before saving.");
+      return;
+    }
+    setRetentionCurveDraft((current) => current.map((item, itemIndex) => (itemIndex === index ? String(parsed) : item)));
+  }
+
+  function onSaveForecastingSettings() {
+    const parsed = retentionCurveDraft.map(parseRetentionCurveDraftValue);
+    if (parsed.some((value) => value == null)) {
+      setRetentionCurveMessage("Enter valid retention values from 0 to 100 before saving.");
+      return;
+    }
+    const saved = saveDefaultRetentionCurve(parsed as number[]);
+    setRetentionCurveDraft(saved.map(String));
+    setRetentionCurveMessage("Forecasting default retention curve saved.");
+  }
+
+  function onResetForecastingSettings() {
+    const reset = resetDefaultRetentionCurve();
+    setRetentionCurveDraft(reset.map(String));
+    setRetentionCurveMessage("Forecasting default retention curve reset to default values.");
+  }
+
   return (
-    <AppLayout title="Import data" description="Replace dataset with a CSV file or a public Google Sheet">
+    <AppLayout title="Import data" description="Data sources, sync, and local cache controls">
       <div className="grid gap-3 lg:grid-cols-3">
         <Card className="p-4 shadow-card lg:col-span-2">
-          <Tabs value={tab} onValueChange={(v) => setTab(v as "csv" | "google")}>
+          <div className="mb-3 flex items-center gap-2">
+            <Upload className="h-4 w-4 text-muted-foreground" />
+            <h3 className="text-sm font-semibold text-foreground">Palmer Transactions Import</h3>
+          </div>
+          <Tabs value={tab} onValueChange={(v) => updateUiState({ tab: v as "csv" | "google" })}>
             <TabsList className="mb-3">
               <TabsTrigger value="csv">
                 <Upload className="mr-1.5 h-3.5 w-3.5" /> CSV file
@@ -300,7 +571,7 @@ export default function ImportPage() {
                       id="sheet-url"
                       placeholder="https://docs.google.com/spreadsheets/d/…"
                       value={sheetUrl}
-                      onChange={(e) => setSheetUrl(e.target.value)}
+                      onChange={(e) => updateUiState({ sheetUrl: e.target.value })}
                       className="pl-8 h-9"
                     />
                   </div>
@@ -322,7 +593,7 @@ export default function ImportPage() {
               <Select
                 value={importMode}
                 onValueChange={(v) => {
-                  setImportMode(v as "clean_template" | "palmer_raw");
+                  updateUiState({ importMode: v as "clean_template" | "palmer_raw" });
                   if (parsed && v === "clean_template") setMapping(autoMap(parsed.headers));
                 }}
               >
@@ -550,7 +821,7 @@ export default function ImportPage() {
             <Input
               id="facebook-traffic-url"
               value={trafficSheetUrl}
-              onChange={(e) => setTrafficSheetUrl(e.target.value)}
+              onChange={(e) => updateUiState({ trafficSheetUrl: e.target.value })}
               placeholder="https://docs.google.com/spreadsheets/d/..."
               className="h-9"
             />
@@ -563,7 +834,7 @@ export default function ImportPage() {
               id="facebook-traffic-year"
               type="number"
               value={trafficYear}
-              onChange={(e) => setTrafficYear(e.target.value)}
+              onChange={(e) => updateUiState({ trafficYear: e.target.value })}
               className="h-9"
             />
           </div>
@@ -589,6 +860,228 @@ export default function ImportPage() {
             <span className="tabular-nums text-foreground">{new Date(trafficMeta.importedAt).toLocaleString()}</span>
           </div>
         )}
+      </Card>
+
+      <Card className="mt-3 p-4 shadow-card">
+        <div className="mb-3 flex items-center gap-2">
+          <KeyRound className="h-4 w-4 text-muted-foreground" />
+          <h3 className="text-sm font-semibold text-foreground">FunnelFox Subscriptions Sync</h3>
+        </div>
+        <div
+          className={
+            temporaryKeyInputEnabled
+              ? "grid gap-3 md:grid-cols-[minmax(240px,1fr)_auto_auto] md:items-end"
+              : "flex flex-wrap items-center gap-3"
+          }
+        >
+          {temporaryKeyInputEnabled ? (
+            <div className="space-y-1.5">
+              <Label htmlFor="funnelfox-secret" className="text-xs text-muted-foreground">
+                FunnelFox Secret Key
+              </Label>
+              <Input
+                id="funnelfox-secret"
+                type="password"
+                value={funnelFoxSecret}
+                onChange={(e) => {
+                  setFunnelFoxSecret(e.target.value);
+                  setFunnelFoxConnectionMessage(null);
+                  setFunnelFoxConnectionError(null);
+                }}
+                placeholder="Paste key for this session"
+                autoComplete="off"
+                className="h-9"
+              />
+            </div>
+          ) : (
+            <div className="text-sm text-muted-foreground">
+              Configure <span className="font-mono text-foreground">FUNNELFOX_SECRET</span> on the server.
+            </div>
+          )}
+          <Button
+            type="button"
+            variant="outline"
+            onClick={onTestFunnelFoxConnection}
+            disabled={testingFunnelFox || syncingFunnelFox}
+          >
+            <RefreshCw className={testingFunnelFox ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
+            Test connection
+          </Button>
+          <Button
+            type="button"
+            onClick={onSyncFunnelFoxSubscriptions}
+            disabled={syncingFunnelFox || testingFunnelFox}
+          >
+            <RefreshCw className={syncingFunnelFox ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
+            Sync subscriptions
+          </Button>
+        </div>
+        <p className="mt-2 text-xs text-muted-foreground">
+          {temporaryKeyInputEnabled
+            ? "This key is used only for the current browser session and is sent to the server proxy. For production, configure "
+            : "Production sync uses only the server-side "}
+          <span className="font-mono text-foreground">FUNNELFOX_SECRET</span>
+          {temporaryKeyInputEnabled ? " on the server." : "."}
+        </p>
+        {(funnelFoxConnectionMessage || funnelFoxConnectionError || funnelFoxSyncMessage || funnelFoxSyncError) && (
+          <div className="mt-3 rounded-md border border-border bg-muted/20 p-3 text-xs">
+            {funnelFoxConnectionMessage && <div className="text-success">{funnelFoxConnectionMessage}</div>}
+            {funnelFoxConnectionError && <div className="text-destructive">{funnelFoxConnectionError}</div>}
+            {funnelFoxSyncMessage && <div className="mt-1 text-muted-foreground">{funnelFoxSyncMessage}</div>}
+            {funnelFoxSyncError && <div className="mt-1 text-destructive">{funnelFoxSyncError}</div>}
+          </div>
+        )}
+        {subscriptions.length > 0 && (
+          <div className="mt-3 text-xs text-muted-foreground">
+            Loaded subscriptions:{" "}
+            <span className="font-medium tabular-nums text-foreground">{subscriptionEmailDiagnostics.total}</span>.
+            Email coverage:{" "}
+            <span className="font-medium tabular-nums text-foreground">
+              {subscriptionEmailDiagnostics.withEmail}/{subscriptionEmailDiagnostics.total}
+            </span>{" "}
+            ({formatPct(subscriptionEmailDiagnostics.coverage)}), missing{" "}
+            <span className="font-medium tabular-nums text-foreground">{subscriptionEmailDiagnostics.missingEmail}</span>.
+          </div>
+        )}
+      </Card>
+
+      <Card className="mt-3 p-4 shadow-card">
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <div>
+            <h3 className="text-sm font-semibold text-foreground">Forecasting Settings</h3>
+            <p className="mt-1 text-xs text-muted-foreground">
+              These values are used only when actual or historical retention is unavailable.
+            </p>
+          </div>
+          <div className="flex shrink-0 gap-2">
+            <Button type="button" variant="outline" size="sm" onClick={onResetForecastingSettings}>
+              Reset to default
+            </Button>
+            <Button type="button" size="sm" onClick={onSaveForecastingSettings}>
+              Save settings
+            </Button>
+          </div>
+        </div>
+        <div className="mb-2 text-xs font-medium text-muted-foreground">Default Retention Curve</div>
+        <div className="grid gap-2 sm:grid-cols-3 lg:grid-cols-4">
+          {retentionCurveDraft.map((value, index) => (
+            <div key={index} className="space-y-1.5">
+              <Label htmlFor={`default-retention-m${index + 1}`} className="text-xs text-muted-foreground">
+                M{index + 1} %
+              </Label>
+              <Input
+                id={`default-retention-m${index + 1}`}
+                type="text"
+                inputMode="decimal"
+                value={value}
+                onChange={(event) => updateRetentionCurveMonth(index, event.target.value)}
+                onBlur={() => commitRetentionCurveMonth(index)}
+                className="h-9"
+              />
+            </div>
+          ))}
+        </div>
+        {retentionCurveMessage && (
+          <div className="mt-3 text-xs text-primary">{retentionCurveMessage}</div>
+        )}
+        <p className="mt-3 text-xs text-muted-foreground">
+          Built-in defaults: {BUILTIN_DEFAULT_RETENTION_CURVE.map((value, index) => `M${index + 1} ${value}%`).join(", ")}.
+        </p>
+      </Card>
+
+      <Card className="mt-3 p-4 shadow-card">
+        <div className="mb-3 flex items-center gap-2">
+          <Database className="h-4 w-4 text-muted-foreground" />
+          <h3 className="text-sm font-semibold text-foreground">Local Saved Data</h3>
+        </div>
+        <div className="grid gap-3 lg:grid-cols-2">
+          <div className="rounded-md border border-border p-3">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="text-sm font-medium text-foreground">Saved Palmer dataset</div>
+                <div className="mt-1 text-xs text-muted-foreground">
+                  {palmerCacheInfo ? (
+                    <>
+                      Saved dataset available:{" "}
+                      <span className="font-medium text-foreground">{palmerCacheInfo.file_name}</span>, imported at{" "}
+                      <span className="tabular-nums text-foreground">
+                        {new Date(palmerCacheInfo.imported_at).toLocaleString()}
+                      </span>
+                      , <span className="tabular-nums text-foreground">{palmerCacheInfo.rows_count}</span> rows
+                    </>
+                  ) : (
+                    "No saved Palmer dataset found."
+                  )}
+                </div>
+                {palmerCacheMessage && <div className="mt-1 text-xs text-primary">{palmerCacheMessage}</div>}
+                {palmerCacheError && <div className="mt-1 text-xs text-destructive">{palmerCacheError}</div>}
+              </div>
+              <div className="flex shrink-0 flex-wrap justify-end gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={onLoadSavedPalmerDataset}
+                  disabled={palmerCacheLoading || !palmerCacheInfo}
+                >
+                  Load saved dataset
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={onClearSavedPalmerDataset}
+                  disabled={palmerCacheLoading || !palmerCacheInfo}
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                  Clear
+                </Button>
+              </div>
+            </div>
+          </div>
+
+          <div className="rounded-md border border-border p-3">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="text-sm font-medium text-foreground">Saved FunnelFox subscriptions</div>
+                <div className="mt-1 text-xs text-muted-foreground">
+                  {subscriptionCacheInfo ? (
+                    <>
+                      Saved subscriptions available:{" "}
+                      <span className="tabular-nums text-foreground">{subscriptionCacheInfo.count}</span>, saved at{" "}
+                      <span className="tabular-nums text-foreground">
+                        {new Date(subscriptionCacheInfo.saved_at).toLocaleString()}
+                      </span>
+                    </>
+                  ) : (
+                    "No saved subscriptions cache found."
+                  )}
+                </div>
+              </div>
+              <div className="flex shrink-0 flex-wrap justify-end gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={onLoadSavedSubscriptions}
+                  disabled={subscriptionCacheLoading || !subscriptionCacheInfo}
+                >
+                  Load saved subscriptions
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={onClearSavedSubscriptions}
+                  disabled={subscriptionCacheLoading || !subscriptionCacheInfo}
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                  Clear
+                </Button>
+              </div>
+            </div>
+          </div>
+        </div>
       </Card>
     </AppLayout>
   );

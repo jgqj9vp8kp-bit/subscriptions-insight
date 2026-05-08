@@ -5,12 +5,21 @@
 This project is a Vite + React + TypeScript subscription analytics dashboard.
 It is organized into four main layers:
 
-- UI layer (React): pages and components for Dashboard, Transactions, Users, Cohorts, and Import.
+- Auth/access layer: Supabase Auth email/password login, session persistence, and protected routes for analytics pages.
+- UI layer (React): pages and components for Dashboard, Transactions, Users, Cohorts, Forecasting, Subscriptions, and Import Data.
 - Data transformation layer: import parsing, Palmer normalization, transaction classification, and cohort assignment.
 - Analytics layer: KPI, revenue, user, funnel, and cohort aggregation functions used by the UI.
 - Subscription monitoring layer: FunnelFox subscription sync, cancellation normalization, and subscription status UI.
 
 The UI should stay presentation-focused. Business rules belong in `src/services`, especially in `palmerTransform.ts` and `analytics.ts`.
+
+The Import Data page is the single source connection center. Palmer upload, Facebook traffic import, FunnelFox connection testing/sync, and local IndexedDB cache load/clear controls live there. Analytics pages should only render already-loaded data, filters, tables, and summaries.
+
+Forecasting is a read-only scenario layer over existing cohort data. It uses Cohorts as the factual base, calculates absolute retention from original trial users, and lets the user edit forecast assumptions without mutating Palmer, FunnelFox, traffic, or cohort calculations.
+
+Small page UI state is persisted in localStorage via `src/hooks/usePersistedPageState.ts`. Large data remains outside localStorage: Palmer/FunnelFox datasets use IndexedDB or in-memory Zustand state, and API keys/secrets are never persisted.
+
+All analytics routes are protected by Supabase Auth. `/login` is public; Dashboard, Cohorts, Forecasting, Transactions, Users, Subscriptions, and Import Data require an authenticated session. Supabase signup should be disabled in production, and allowed users should be created in Supabase Auth.
 
 ## Data Flow
 
@@ -23,17 +32,19 @@ Raw Palmer export
 
 The import page can still accept a clean template CSV. In that mode, `applyMapping` maps user-provided columns into the shared `Transaction` shape. In Palmer mode, raw rows are preserved and transformed through the Palmer pipeline before they enter analytics.
 
-FunnelFox subscription monitoring is separate from transaction analytics:
+FunnelFox subscription monitoring is imported separately from Palmer transactions, then joined into cohort reporting by normalized email for subscription-health metrics:
 
 ```text
 FunnelFox subscriptions API
 -> backend/serverless proxy
+-> optional subscription details enrichment
 -> `normalizeSubscription`
 -> `subscriptions`
 -> Subscriptions UI
+-> Cohorts/Dashboard active and cancellation metrics
 ```
 
-The browser must never call FunnelFox directly with `Fox-Secret`. A backend endpoint should read `process.env.FUNNELFOX_SECRET`, call `https://api.funnelfox.io/public/v1/subscriptions`, and return sanitized JSON to the frontend.
+The browser must never call FunnelFox directly with `Fox-Secret` or `https://api.funnelfox.io`. Backend endpoints read `process.env.FUNNELFOX_SECRET`, call FunnelFox server-side, and return JSON to the frontend. Frontend proxy URLs are restricted to same-origin `/api/funnelfox/...` paths unless external proxy use is explicitly enabled.
 
 ## Key Concepts
 
@@ -93,7 +104,11 @@ FunnelFox data answers subscription-state questions that Palmer transaction expo
 - `is_cancelled` is true when FunnelFox status includes `cancel` or `renews === false`.
 - `cancelled_at` uses FunnelFox `cancelled_at`, or falls back to `updated_at` when the subscription is cancelled.
 - `is_active_now` can remain true after cancellation when the paid period has not ended.
-- FunnelFox data is displayed on the Subscriptions page and does not change cohort calculations.
+- The Subscriptions page uses FunnelFox-normalized cancellation labels such as `cancelled_unknown_reason` and `auto_payment_related`.
+- Cohorts and Dashboard use a cross-source cancellation classification based on FunnelFox subscription timing plus Palmer failed transactions near cancellation.
+- FunnelFox subscriptions are cached in IndexedDB, not localStorage.
+- Temporary FunnelFox key input is development-only and is shown only on Import Data. Production sync must use server-side `FUNNELFOX_SECRET`.
+- Raw subscription debug output is development-only unless explicitly enabled with `VITE_ENABLE_FUNNELFOX_DEBUG=true`.
 
 Planned webhook endpoint:
 

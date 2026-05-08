@@ -28,15 +28,10 @@ import {
   formatCurrency,
   formatPct,
 } from "@/services/analytics";
-import {
-  clearPalmerDatasetCache,
-  getPalmerCacheInfo,
-  loadLastPalmerDatasetFromCache,
-  type PalmerCacheMetadata,
-} from "@/services/palmerCache";
 import { normalizeCampaignPath, type TrafficMetric } from "@/services/trafficImport";
 import type { CohortRow, PlanBreakdownRow } from "@/services/types";
 import { useDataStore } from "@/store/dataStore";
+import { usePersistedPageState } from "@/hooks/usePersistedPageState";
 
 // Visual-only helpers — no data/logic impact.
 const HEAD_BASE =
@@ -54,6 +49,18 @@ const SAVED_VIEWS_STORAGE_KEY = "cohorts_saved_views_v1";
 const ACTIVE_VIEW_STORAGE_KEY = "cohorts_active_view_v1";
 const MIN_COLUMN_WIDTH = 80;
 const COHORT_FIRST_COL_KEY = "__cohort__";
+
+const DEFAULT_COHORTS_UI_STATE = {
+  funnelFilter: "all",
+  campaignPathFilter: "all",
+  trafficSourceFilter: "all",
+  campaignIdFilter: "all",
+  refundFilter: "all",
+  cohortDateFrom: "",
+  cohortDateTo: "",
+  dateSort: "desc" as "desc" | "asc",
+  expandedCohortIds: [] as string[],
+};
 
 const DEFAULT_COLUMN_ORDER = [
   "cohort_date",
@@ -463,16 +470,20 @@ export default function CohortsPage() {
   const txs = useTransactions();
   const subscriptions = useDataStore((s) => s.subscriptions);
   const trafficMetrics = useDataStore((s) => s.trafficMetrics);
-  const setImported = useDataStore((s) => s.setImported);
-  const [expandedCohortIds, setExpandedCohortIds] = useState<Set<string>>(() => new Set());
-  const [funnelFilter, setFunnelFilter] = useState("all");
-  const [campaignPathFilter, setCampaignPathFilter] = useState("all");
-  const [trafficSourceFilter, setTrafficSourceFilter] = useState("all");
-  const [campaignIdFilter, setCampaignIdFilter] = useState("all");
-  const [refundFilter, setRefundFilter] = useState("all");
-  const [cohortDateFrom, setCohortDateFrom] = useState("");
-  const [cohortDateTo, setCohortDateTo] = useState("");
-  const [dateSort, setDateSort] = useState<"desc" | "asc">("desc");
+  const [uiState, setUiState, resetUiState] = usePersistedPageState("ui_state_cohorts", DEFAULT_COHORTS_UI_STATE);
+  const {
+    funnelFilter,
+    campaignPathFilter,
+    trafficSourceFilter,
+    campaignIdFilter,
+    refundFilter,
+    cohortDateFrom,
+    cohortDateTo,
+    dateSort,
+    expandedCohortIds: expandedCohortIdList,
+  } = uiState;
+  const expandedCohortIds = useMemo(() => new Set(expandedCohortIdList), [expandedCohortIdList]);
+  const updateUiState = (patch: Partial<typeof DEFAULT_COHORTS_UI_STATE>) => setUiState((current) => ({ ...current, ...patch }));
   const [columnsPopoverOpen, setColumnsPopoverOpen] = useState(false);
   const [viewsPopoverOpen, setViewsPopoverOpen] = useState(false);
   const [columnOrder, setColumnOrder] = useState<CohortColumnId[]>(loadInitialColumnOrder);
@@ -485,23 +496,6 @@ export default function CohortsPage() {
   const dragColRef = useRef<CohortColumnId | null>(null);
   const [columnWidths, setColumnWidths] = useState<Record<string, number>>(loadInitialColumnWidths);
   const resizingRef = useRef<{ key: string; startX: number; startWidth: number } | null>(null);
-  const [palmerCacheInfo, setPalmerCacheInfo] = useState<PalmerCacheMetadata | null>(null);
-  const [palmerCacheLoading, setPalmerCacheLoading] = useState(false);
-  const [palmerCacheMessage, setPalmerCacheMessage] = useState<string | null>(null);
-  const [palmerCacheError, setPalmerCacheError] = useState<string | null>(null);
-
-  const refreshPalmerCacheInfo = useCallback(async () => {
-    try {
-      setPalmerCacheInfo(await getPalmerCacheInfo());
-    } catch (error) {
-      console.warn("Could not load Palmer cache info", error);
-      setPalmerCacheInfo(null);
-    }
-  }, []);
-
-  useEffect(() => {
-    void refreshPalmerCacheInfo();
-  }, [refreshPalmerCacheInfo]);
 
   const startResize = useCallback((key: string, e: React.MouseEvent) => {
     e.preventDefault();
@@ -585,46 +579,13 @@ export default function CohortsPage() {
       }),
     [allCohorts, funnelFilter, campaignPathFilter, refundFilter, cohortDateFrom, cohortDateTo, dateSort]
   );
-  const matchedTrafficCount = useMemo(
-    () => cohorts.filter((cohort) => trafficByKey.has(cohortTrafficKey(cohort))).length,
-    [cohorts, trafficByKey],
-  );
-  const firstCohortTrafficDebug = useMemo(() => {
-    const first = cohorts[0] ?? null;
-    if (!first) return null;
-    const matched = trafficByKey.get(cohortTrafficKey(first)) ?? null;
-    return { cohort: first, matched };
-  }, [cohorts, trafficByKey]);
-
-  useEffect(() => {
-    console.log("traffic rows:", trafficMetrics.length);
-    console.log(
-      "first 5 normalized traffic rows:",
-      trafficMetrics.slice(0, 5).map((row) => ({
-        date: normalizeCohortDate(row.date),
-        campaign_path: normalizeCampaignPath(row.campaign_path),
-        key: trafficKey(row.date, row.campaign_path),
-      })),
-    );
-    console.log("cohorts:", cohorts.length);
-    console.log(
-      "first 5 cohort match keys:",
-      cohorts.slice(0, 5).map((cohort) => ({
-        cohort_date: normalizeCohortDate(cohort.cohort_date),
-        campaign_path: normalizeCohortCampaignPath(cohort.campaign_path),
-        key: cohortTrafficKey(cohort),
-      })),
-    );
-    console.log("matched rows:", matchedTrafficCount);
-  }, [trafficMetrics, cohorts, matchedTrafficCount]);
-
   const hasUsers = useMemo(() => new Set(txs.map((t) => t.user_id)).size > 0, [txs]);
   const toggleExpanded = (cohortId: string) => {
-    setExpandedCohortIds((current) => {
-      const next = new Set(current);
+    setUiState((current) => {
+      const next = new Set(current.expandedCohortIds);
       if (next.has(cohortId)) next.delete(cohortId);
       else next.add(cohortId);
-      return next;
+      return { ...current, expandedCohortIds: Array.from(next) };
     });
   };
   const moveColumn = (index: number, direction: -1 | 1) => {
@@ -724,50 +685,6 @@ export default function CohortsPage() {
     });
     setActiveViewId(null);
     try { localStorage.removeItem(ACTIVE_VIEW_STORAGE_KEY); } catch { /* noop */ }
-  };
-
-  const onLoadSavedPalmerDataset = async () => {
-    try {
-      setPalmerCacheLoading(true);
-      setPalmerCacheError(null);
-      setPalmerCacheMessage(null);
-      const cached = await loadLastPalmerDatasetFromCache();
-      if (!cached) {
-        setPalmerCacheInfo(null);
-        setPalmerCacheMessage("No saved Palmer dataset found.");
-        return;
-      }
-      setImported(
-        cached.transactions,
-        {
-          source: "palmer_raw",
-          importMode: "palmer_raw",
-          fileName: cached.metadata.file_name,
-        },
-        cached.rawPalmerRows ?? [],
-      );
-      setPalmerCacheInfo(cached.metadata);
-      setPalmerCacheMessage("Loaded saved Palmer dataset");
-    } catch (error) {
-      setPalmerCacheError(error instanceof Error ? error.message : "Could not load saved Palmer dataset.");
-    } finally {
-      setPalmerCacheLoading(false);
-    }
-  };
-
-  const onClearSavedPalmerDataset = async () => {
-    try {
-      setPalmerCacheLoading(true);
-      setPalmerCacheError(null);
-      setPalmerCacheMessage(null);
-      await clearPalmerDatasetCache();
-      setPalmerCacheInfo(null);
-      setPalmerCacheMessage("Saved Palmer dataset cache cleared. Current table remains loaded.");
-    } catch (error) {
-      setPalmerCacheError(error instanceof Error ? error.message : "Could not clear saved Palmer dataset.");
-    } finally {
-      setPalmerCacheLoading(false);
-    }
   };
 
   const visibleColumnOrder = useMemo(
@@ -886,7 +803,7 @@ export default function CohortsPage() {
     >
       {id === "cohort_date" ? (
         <button
-          onClick={() => setDateSort((s) => (s === "desc" ? "asc" : "desc"))}
+          onClick={() => updateUiState({ dateSort: dateSort === "desc" ? "asc" : "desc" })}
           className="inline-flex items-center gap-1 hover:text-foreground"
         >
           {COLUMN_LABELS[id]} {dateSort === "asc" ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />}
@@ -1195,7 +1112,7 @@ export default function CohortsPage() {
     <AppLayout title="Cohorts" description="Grouped by trial date">
       <Card className="rounded-lg border bg-card text-card-foreground shadow-sm p-4 shadow-card py-[20px]">
         <div className="mb-3 flex flex-wrap items-center gap-2 pb-3 border-b border-border">
-          <Select value={funnelFilter} onValueChange={setFunnelFilter}>
+          <Select value={funnelFilter} onValueChange={(value) => updateUiState({ funnelFilter: value })}>
             <SelectTrigger className="h-9 w-[160px]"><SelectValue placeholder="Funnel" /></SelectTrigger>
             <SelectContent>
               <SelectItem value="all">All funnels</SelectItem>
@@ -1204,7 +1121,7 @@ export default function CohortsPage() {
               ))}
             </SelectContent>
           </Select>
-          <Select value={campaignPathFilter} onValueChange={setCampaignPathFilter}>
+          <Select value={campaignPathFilter} onValueChange={(value) => updateUiState({ campaignPathFilter: value })}>
             <SelectTrigger className="h-9 w-[220px]"><SelectValue placeholder="Campaign path" /></SelectTrigger>
             <SelectContent>
               <SelectItem value="all">All campaign paths</SelectItem>
@@ -1213,7 +1130,7 @@ export default function CohortsPage() {
               ))}
             </SelectContent>
           </Select>
-          <Select value={trafficSourceFilter} onValueChange={setTrafficSourceFilter}>
+          <Select value={trafficSourceFilter} onValueChange={(value) => updateUiState({ trafficSourceFilter: value })}>
             <SelectTrigger className="h-9 w-[160px]"><SelectValue placeholder="Traffic source" /></SelectTrigger>
             <SelectContent>
               <SelectItem value="all">All traffic</SelectItem>
@@ -1222,7 +1139,7 @@ export default function CohortsPage() {
               ))}
             </SelectContent>
           </Select>
-          <Select value={campaignIdFilter} onValueChange={setCampaignIdFilter}>
+          <Select value={campaignIdFilter} onValueChange={(value) => updateUiState({ campaignIdFilter: value })}>
             <SelectTrigger className="h-9 w-[190px]"><SelectValue placeholder="Campaign ID" /></SelectTrigger>
             <SelectContent>
               <SelectItem value="all">All campaign IDs</SelectItem>
@@ -1231,7 +1148,7 @@ export default function CohortsPage() {
               ))}
             </SelectContent>
           </Select>
-          <Select value={refundFilter} onValueChange={setRefundFilter}>
+          <Select value={refundFilter} onValueChange={(value) => updateUiState({ refundFilter: value })}>
             <SelectTrigger className="h-9 w-[150px]"><SelectValue placeholder="Refund" /></SelectTrigger>
             <SelectContent>
               <SelectItem value="all">All refunds</SelectItem>
@@ -1245,7 +1162,7 @@ export default function CohortsPage() {
               id="cohort-date-from"
               type="date"
               value={cohortDateFrom}
-              onChange={(e) => setCohortDateFrom(e.target.value)}
+              onChange={(e) => updateUiState({ cohortDateFrom: e.target.value })}
               className="h-9 w-[150px]"
             />
           </div>
@@ -1255,11 +1172,14 @@ export default function CohortsPage() {
               id="cohort-date-to"
               type="date"
               value={cohortDateTo}
-              onChange={(e) => setCohortDateTo(e.target.value)}
+              onChange={(e) => updateUiState({ cohortDateTo: e.target.value })}
               className="h-9 w-[150px]"
             />
           </div>
           <div className="ml-auto flex items-center gap-2">
+            <Button type="button" variant="ghost" size="sm" className="h-9" onClick={resetUiState}>
+              Reset filters
+            </Button>
             {activeView && (
               <span className="text-xs text-muted-foreground">
                 View: <span className="font-medium text-foreground">{activeView.name}</span>
@@ -1341,79 +1261,6 @@ export default function CohortsPage() {
             </Popover>
           </div>
         </div>
-
-        {(palmerCacheInfo || palmerCacheMessage || palmerCacheError) && (
-          <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-md border border-border bg-muted/20 px-3 py-2 text-xs">
-            <div className="min-w-0">
-              {palmerCacheInfo ? (
-                <div className="text-muted-foreground">
-                  Saved dataset available:{" "}
-                  <span className="font-medium text-foreground">{palmerCacheInfo.file_name}</span>, imported at{" "}
-                  <span className="tabular-nums text-foreground">
-                    {new Date(palmerCacheInfo.imported_at).toLocaleString()}
-                  </span>
-                  , <span className="tabular-nums text-foreground">{palmerCacheInfo.rows_count}</span> rows
-                </div>
-              ) : (
-                <div className="text-muted-foreground">Saved Palmer dataset available</div>
-              )}
-              {palmerCacheMessage && <div className="mt-1 text-primary">{palmerCacheMessage}</div>}
-              {palmerCacheError && <div className="mt-1 text-destructive">{palmerCacheError}</div>}
-            </div>
-            <div className="flex items-center gap-2">
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                className="h-8"
-                onClick={onLoadSavedPalmerDataset}
-                disabled={palmerCacheLoading || !palmerCacheInfo}
-              >
-                Load saved dataset
-              </Button>
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                className="h-8"
-                onClick={onClearSavedPalmerDataset}
-                disabled={palmerCacheLoading || !palmerCacheInfo}
-              >
-                Clear saved dataset
-              </Button>
-            </div>
-          </div>
-        )}
-
-        {firstCohortTrafficDebug && (
-          <div className="mb-3 rounded-md border border-dashed border-border bg-muted/10 px-3 py-2 text-xs text-muted-foreground">
-            <div className="font-medium text-foreground">Traffic match debug</div>
-            <div className="mt-1 grid gap-1 sm:grid-cols-3">
-              <div>
-                cohort_date:{" "}
-                <span className="font-mono text-foreground">
-                  {normalizeCohortDate(firstCohortTrafficDebug.cohort.cohort_date)}
-                </span>
-              </div>
-              <div>
-                cohort_campaign_path:{" "}
-                <span className="font-mono text-foreground">
-                  {normalizeCohortCampaignPath(firstCohortTrafficDebug.cohort.campaign_path)}
-                </span>
-              </div>
-              <div>
-                matched traffic row:{" "}
-                {firstCohortTrafficDebug.matched ? (
-                  <span className="font-mono text-foreground">
-                    {firstCohortTrafficDebug.matched.date} / {firstCohortTrafficDebug.matched.campaign_path}
-                  </span>
-                ) : (
-                  dash
-                )}
-              </div>
-            </div>
-          </div>
-        )}
 
         <div className="rounded-lg border border-border [&>div]:max-h-[calc(100vh-220px)] [&>div]:overflow-auto [&>div]:rounded-lg [&>div]:scroll-smooth">
           <Table className="border-separate border-spacing-0 w-auto">

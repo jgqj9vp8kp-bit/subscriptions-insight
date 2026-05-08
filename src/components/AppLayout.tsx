@@ -1,6 +1,9 @@
-import { ReactNode } from "react";
+import { ReactNode, useEffect, useState } from "react";
+import { LogOut } from "lucide-react";
 import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import { AppSidebar } from "@/components/AppSidebar";
+import { Button } from "@/components/ui/button";
+import { useAuth } from "@/hooks/useAuth";
 
 interface AppLayoutProps {
   title: string;
@@ -10,6 +13,22 @@ interface AppLayoutProps {
 }
 
 export function AppLayout({ title, description, actions, children }: AppLayoutProps) {
+  const { signOut, user } = useAuth();
+  const [signingOut, setSigningOut] = useState(false);
+
+  useEffect(() => {
+    document.title = title ? `${title} • Subengine` : "Subengine";
+  }, [title]);
+
+  async function onLogout() {
+    try {
+      setSigningOut(true);
+      await signOut();
+    } finally {
+      setSigningOut(false);
+    }
+  }
+
   return (
     <SidebarProvider>
       <div className="min-h-screen flex w-full bg-background">
@@ -25,7 +44,18 @@ export function AppLayout({ title, description, actions, children }: AppLayoutPr
                 )}
               </div>
             </div>
-            {actions && <div className="flex items-center gap-2">{actions}</div>}
+            <div className="flex items-center gap-2">
+              {actions}
+              {user?.email && (
+                <div className="hidden max-w-[240px] truncate text-xs text-muted-foreground md:block">
+                  {user.email}
+                </div>
+              )}
+              <Button type="button" variant="ghost" size="sm" onClick={onLogout} disabled={signingOut}>
+                <LogOut className="h-4 w-4" />
+                <span className="hidden sm:inline">Logout</span>
+              </Button>
+            </div>
           </header>
           <main className="flex-1 p-4 md:p-6 max-w-[1600px] w-full">{children}</main>
         </div>

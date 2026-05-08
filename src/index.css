@@ -8,7 +8,7 @@ All colors MUST be HSL.
 
 @layer base {
   :root {
-    /* Subscription Analytics — Posthog/Mixpanel-inspired light theme */
+    /* Subengine — Posthog/Mixpanel-inspired light theme */
     --background: 240 20% 99%;
     --foreground: 240 10% 12%;
 

@@ -1,8 +1,21 @@
 # Data Flow
 
+## 0. Access Control
+
+Subengine requires Supabase Auth before any analytics or import page is accessible. `/login` is the only public app route. Authenticated sessions persist across refreshes through Supabase Auth.
+
+The frontend uses:
+
+```text
+VITE_SUPABASE_URL
+VITE_SUPABASE_ANON_KEY
+```
+
+Public signup should be disabled in Supabase; users are created/administered outside the app.
+
 ## 1. Raw Import
 
-Data enters through the Import page from either:
+Data enters through the Import Data page from either:
 
 - CSV file
 - Public Google Sheet
@@ -11,6 +24,19 @@ The project supports two import modes:
 
 - Clean template: already structured analytics rows.
 - Palmer raw export: raw payment rows that need normalization and classification.
+
+Import Data is the only page that owns data connection controls:
+
+- Palmer Transactions Import
+- Facebook Traffic Import
+- FunnelFox Subscriptions Sync
+- Local Saved Data
+
+Cohorts, Subscriptions, Dashboard, Users, and Transactions consume already-loaded Zustand data and should not render import, sync, test connection, cache load, or cache clear controls.
+
+Forecasting also consumes already-loaded data. It reads cohort facts and transactions, then calculates editable scenario outputs without writing back into cohort analytics.
+
+Page filters and lightweight UI settings persist in localStorage under `ui_state_*` keys. Imported Palmer data, FunnelFox subscriptions, traffic rows, raw payloads, and secrets are not stored in these UI-state keys.
 
 Example Palmer row:
 
@@ -136,12 +162,16 @@ FunnelFox subscription data is imported separately from Palmer payments.
 FunnelFox API /subscriptions
 -> server-side proxy with Fox-Secret
 -> `syncAllSubscriptions`
+-> duplicate removal by subscription id / psp id
+-> optional subscription details enrichment
 -> `normalizeSubscription`
 -> Zustand `subscriptions`
+-> Import Data sync/cache status
 -> Subscriptions page
+-> Cohorts/Dashboard active and cancellation metrics by email match
 ```
 
-The frontend currently uses safe mock/proxy mode. It does not send `Fox-Secret` from browser code. A backend or serverless function must call:
+The frontend uses safe mock/proxy mode unless real sync is enabled. It does not send `Fox-Secret` from browser code and blocks direct browser calls to `https://api.funnelfox.io`. A backend or serverless function must call:
 
 ```text
 GET https://api.funnelfox.io/public/v1/subscriptions
@@ -150,12 +180,21 @@ Fox-Secret: process.env.FUNNELFOX_SECRET
 
 Pagination should follow `pagination.has_more` and `pagination.next_cursor`.
 
+Subscriptions are cached locally in IndexedDB, not localStorage, because the dataset is too large for browser key-value storage.
+
 Cancellation fields are normalized as:
 
 - status containing `cancel` -> cancelled
 - `renews === false` -> cancelled
 - `cancelled_at` preferred, falling back to `updated_at`
 - active access can continue until `period_ends_at`
+
+Cancellation labels differ by reporting surface:
+
+- Subscriptions page: FunnelFox-normalized cancel type from status, renews, cancellation_reason, and timing.
+- Cohorts/Dashboard: cross-source cancellation classification using FunnelFox cancellation timing plus Palmer failed/declined transactions within 48 hours before cancellation.
+
+Temporary key input lives on Import Data and is a development-only tool. In production, configure `FUNNELFOX_SECRET` on the server and keep raw payload debug disabled unless explicitly enabled.
 
 Webhook plan:
 
@@ -166,3 +205,26 @@ Events: subscription.cancelled, subscription.activated, subscription.renewed
 ```
 
 Production webhooks are intentionally not implemented in the Vite frontend.
+
+## 9. Forecasting
+
+The Forecasting page uses existing cohort data as the factual base:
+
+```text
+transactions + subscriptions
+-> computeCohorts
+-> selected cohorts
+-> absolute retention M1-M12
+-> editable scenario
+-> forecast output
+```
+
+Retention is absolute from original trial users:
+
+```text
+Retention_Mn = unique users with successful first_subscription / renewal payment in month n / trial_users
+```
+
+Retention includes `first_subscription`, `renewal_2`, `renewal_3`, and `renewal`. It excludes `trial`, `upsell`, failed rows, declined rows, and refund-only rows.
+
+If selected cohorts have no observed paid users in a month, Forecasting falls back to matching historical cohorts with the same campaign path, then global history, then the user-editable default curve from Import Data. The curve is stored in localStorage under `forecasting_default_retention_curve`.

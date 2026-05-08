@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Subengine icon">
+  <defs>
+    <linearGradient id="subengine-bg" x1="38" y1="28" x2="214" y2="224" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6D5EF6"/>
+      <stop offset="0.62" stop-color="#5A43D5"/>
+      <stop offset="1" stop-color="#21B8A6"/>
+    </linearGradient>
+    <linearGradient id="subengine-mark" x1="70" y1="60" x2="178" y2="188" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#DDE7FF"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="url(#subengine-bg)"/>
+  <path
+    d="M164.5 76.5C154 68.7 140.2 64 124.8 64c-30.8 0-53 16.6-53 40.6 0 25.9 24.6 33.4 48.3 38.7 20.1 4.5 31.9 8.5 31.9 20.6 0 11.5-10.8 18.7-27.8 18.7-16.4 0-31-5.3-43.2-15.5l-16.2 20.2c14.6 13.1 35.3 20.7 58.3 20.7 33.4 0 57.3-16.7 57.3-43.2 0-27.7-25.4-35.6-50.8-41.3-20.2-4.4-29.6-7.9-29.6-18.8 0-10.4 9.4-16.8 24.7-16.8 13.1 0 24.6 3.8 34.5 11.4l15.3-22.8Z"
+    fill="url(#subengine-mark)"
+  />
+  <rect x="174" y="155" width="11" height="34" rx="5.5" fill="#FFFFFF" opacity="0.72"/>
+  <rect x="191" y="132" width="11" height="57" rx="5.5" fill="#FFFFFF" opacity="0.86"/>
+  <rect x="208" y="106" width="11" height="83" rx="5.5" fill="#FFFFFF"/>
+</svg>

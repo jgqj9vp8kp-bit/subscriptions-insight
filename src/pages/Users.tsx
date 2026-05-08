@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 import { ArrowDown, ArrowUp, ArrowUpDown, Check, Search, X } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { Button } from "@/components/ui/button";
@@ -22,12 +22,24 @@ import {
 import { useTransactions } from "@/services/sheets";
 import { computeUsers, formatCurrency } from "@/services/analytics";
 import { formatDateKey, toDateKey } from "@/services/dateKeys";
+import { usePersistedPageState } from "@/hooks/usePersistedPageState";
 import type { Transaction, UserAggregate } from "@/services/types";
 
 type SortKey = "first_trial_date" | "total_revenue" | "user_ltv" | "renewal_count" | "has_refund" | "total_refund_usd";
 type FirstSubFilter = "all" | "has" | "none";
 type RefundFilter = "all" | "has" | "none";
 type UserWithCampaignPath = UserAggregate & { campaign_path: string };
+
+const DEFAULT_USERS_UI_STATE = {
+  search: "",
+  campaignPathFilter: "all",
+  firstSubFilter: "all" as FirstSubFilter,
+  refundFilter: "all" as RefundFilter,
+  firstTrialFrom: "",
+  firstTrialTo: "",
+  sortKey: "first_trial_date" as SortKey,
+  sortDir: "desc" as "asc" | "desc",
+};
 
 function buildCampaignPathByUser(txs: Transaction[]): Map<string, string> {
   const byUser = new Map<string, Transaction[]>();
@@ -68,14 +80,9 @@ function normalizeCampaignPathLabel(path: string | undefined): string {
 
 export default function UsersPage() {
   const txs = useTransactions();
-  const [search, setSearch] = useState("");
-  const [campaignPathFilter, setCampaignPathFilter] = useState("all");
-  const [firstSubFilter, setFirstSubFilter] = useState<FirstSubFilter>("all");
-  const [refundFilter, setRefundFilter] = useState<RefundFilter>("all");
-  const [firstTrialFrom, setFirstTrialFrom] = useState("");
-  const [firstTrialTo, setFirstTrialTo] = useState("");
-  const [sortKey, setSortKey] = useState<SortKey>("first_trial_date");
-  const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+  const [uiState, setUiState, resetUiState] = usePersistedPageState("ui_state_users", DEFAULT_USERS_UI_STATE);
+  const { search, campaignPathFilter, firstSubFilter, refundFilter, firstTrialFrom, firstTrialTo, sortKey, sortDir } = uiState;
+  const updateUiState = (patch: Partial<typeof DEFAULT_USERS_UI_STATE>) => setUiState((current) => ({ ...current, ...patch }));
 
   const users: UserAggregate[] = useMemo(() => computeUsers(txs), [txs]);
   const campaignPathByUser = useMemo(() => buildCampaignPathByUser(txs), [txs]);
@@ -125,8 +132,8 @@ export default function UsersPage() {
   const hasFirstTrialFilter = Boolean(firstTrialFrom || firstTrialTo);
 
   const toggleSort = (key: SortKey) => {
-    if (sortKey === key) setSortDir((d) => (d === "asc" ? "desc" : "asc"));
-    else { setSortKey(key); setSortDir("desc"); }
+    if (sortKey === key) updateUiState({ sortDir: sortDir === "asc" ? "desc" : "asc" });
+    else updateUiState({ sortKey: key, sortDir: "desc" });
   };
 
   const icon = (key: SortKey) =>
@@ -142,11 +149,11 @@ export default function UsersPage() {
             <Input
               placeholder="Search by email…"
               value={search}
-              onChange={(e) => setSearch(e.target.value)}
+              onChange={(e) => updateUiState({ search: e.target.value })}
               className="pl-8 h-9"
             />
           </div>
-          <Select value={campaignPathFilter} onValueChange={setCampaignPathFilter}>
+          <Select value={campaignPathFilter} onValueChange={(value) => updateUiState({ campaignPathFilter: value })}>
             <SelectTrigger className="h-9 w-[220px]"><SelectValue placeholder="Campaign path" /></SelectTrigger>
             <SelectContent>
               <SelectItem value="all">All campaign paths</SelectItem>
@@ -157,7 +164,7 @@ export default function UsersPage() {
           </Select>
           <label className="flex items-center gap-2 text-sm text-muted-foreground">
             First sub
-            <Select value={firstSubFilter} onValueChange={(value: FirstSubFilter) => setFirstSubFilter(value)}>
+            <Select value={firstSubFilter} onValueChange={(value: FirstSubFilter) => updateUiState({ firstSubFilter: value })}>
               <SelectTrigger className="h-9 w-[150px]"><SelectValue placeholder="First sub" /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">All</SelectItem>
@@ -168,7 +175,7 @@ export default function UsersPage() {
           </label>
           <label className="flex items-center gap-2 text-sm text-muted-foreground">
             Refund
-            <Select value={refundFilter} onValueChange={(value: RefundFilter) => setRefundFilter(value)}>
+            <Select value={refundFilter} onValueChange={(value: RefundFilter) => updateUiState({ refundFilter: value })}>
               <SelectTrigger className="h-9 w-[140px]"><SelectValue placeholder="Refund" /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">All</SelectItem>
@@ -182,7 +189,7 @@ export default function UsersPage() {
             <Input
               type="date"
               value={firstTrialFrom}
-              onChange={(e) => setFirstTrialFrom(e.target.value)}
+              onChange={(e) => updateUiState({ firstTrialFrom: e.target.value })}
               className="h-9 w-[150px]"
             />
           </label>
@@ -191,7 +198,7 @@ export default function UsersPage() {
             <Input
               type="date"
               value={firstTrialTo}
-              onChange={(e) => setFirstTrialTo(e.target.value)}
+              onChange={(e) => updateUiState({ firstTrialTo: e.target.value })}
               className="h-9 w-[150px]"
             />
           </label>
@@ -200,14 +207,14 @@ export default function UsersPage() {
               type="button"
               variant="outline"
               size="sm"
-              onClick={() => {
-                setFirstTrialFrom("");
-                setFirstTrialTo("");
-              }}
+              onClick={() => updateUiState({ firstTrialFrom: "", firstTrialTo: "" })}
             >
               Clear date filter
             </Button>
           )}
+          <Button type="button" variant="ghost" size="sm" onClick={resetUiState}>
+            Reset filters
+          </Button>
         </div>
 
         <div className="mt-4 overflow-x-auto rounded-lg border border-border">

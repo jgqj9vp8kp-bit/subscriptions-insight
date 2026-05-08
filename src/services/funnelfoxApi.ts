@@ -21,6 +21,9 @@ export type FunnelFoxDebugResponse = {
 };
 
 export type FunnelFoxSyncDiagnostics = {
+  raw_subscriptions_count: number;
+  deduped_subscriptions_count: number;
+  duplicates_removed: number;
   total_subscriptions: number;
   subscriptions_with_profile_id: number;
   subscriptions_missing_profile_id: number;
@@ -49,20 +52,67 @@ export type FunnelFoxProfileDebugResponse = {
   profile: unknown;
 };
 
+type FunnelFoxRuntimeEnv = {
+  DEV?: boolean;
+  VITE_FUNNELFOX_PROXY_URL?: string;
+  VITE_FUNNELFOX_SUBSCRIPTION_DETAILS_URL?: string;
+  VITE_FUNNELFOX_PROFILE_DEBUG_URL?: string;
+  VITE_ALLOW_EXTERNAL_FUNNELFOX_PROXY?: string;
+  VITE_ENABLE_FUNNELFOX_DEBUG?: string;
+  VITE_ENABLE_FUNNELFOX_KEY_INPUT?: string;
+};
+
 function isMockMode(): boolean {
   return import.meta.env.VITE_FUNNELFOX_MOCK !== "false";
 }
 
-function proxyEndpoint(): string {
-  return import.meta.env.VITE_FUNNELFOX_PROXY_URL || DEFAULT_PROXY_ENDPOINT;
+function isEnabled(value: unknown): boolean {
+  return String(value ?? "").toLowerCase() === "true";
 }
 
-function subscriptionDetailsEndpoint(): string {
-  return import.meta.env.VITE_FUNNELFOX_SUBSCRIPTION_DETAILS_URL || DEFAULT_SUBSCRIPTION_DETAILS_ENDPOINT;
+export function isFunnelFoxDebugEnabled(env: FunnelFoxRuntimeEnv = import.meta.env): boolean {
+  return Boolean(env.DEV) || isEnabled(env.VITE_ENABLE_FUNNELFOX_DEBUG);
 }
 
-function profileDebugEndpoint(): string {
-  return import.meta.env.VITE_FUNNELFOX_PROFILE_DEBUG_URL || DEFAULT_PROFILE_DEBUG_ENDPOINT;
+export function isFunnelFoxTemporaryKeyInputEnabled(env: FunnelFoxRuntimeEnv = import.meta.env): boolean {
+  return Boolean(env.DEV);
+}
+
+export function resolveFunnelFoxProxyUrl(
+  configuredUrl: string | undefined,
+  fallbackPath: string,
+  env: FunnelFoxRuntimeEnv = import.meta.env,
+  origin = window.location.origin,
+): URL {
+  const endpoint = (configuredUrl || fallbackPath).trim();
+  const url = new URL(endpoint, origin);
+  const isSameOrigin = url.origin === origin;
+  const isFunnelFoxApi = url.hostname === "api.funnelfox.io";
+
+  if (isFunnelFoxApi) {
+    throw new Error("Direct browser calls to FunnelFox API are blocked. Use the server-side proxy.");
+  }
+
+  if (!isSameOrigin && !isEnabled(env.VITE_ALLOW_EXTERNAL_FUNNELFOX_PROXY)) {
+    throw new Error("External FunnelFox proxy URLs are disabled. Use a same-origin /api/funnelfox proxy.");
+  }
+
+  return url;
+}
+
+function proxyUrl(): URL {
+  return resolveFunnelFoxProxyUrl(import.meta.env.VITE_FUNNELFOX_PROXY_URL, DEFAULT_PROXY_ENDPOINT);
+}
+
+function subscriptionDetailsUrl(): URL {
+  return resolveFunnelFoxProxyUrl(
+    import.meta.env.VITE_FUNNELFOX_SUBSCRIPTION_DETAILS_URL,
+    DEFAULT_SUBSCRIPTION_DETAILS_ENDPOINT,
+  );
+}
+
+function profileDebugUrl(): URL {
+  return resolveFunnelFoxProxyUrl(import.meta.env.VITE_FUNNELFOX_PROFILE_DEBUG_URL, DEFAULT_PROFILE_DEBUG_ENDPOINT);
 }
 
 function extractRows(response: FunnelFoxListResponse): FunnelFoxSubscriptionRaw[] {
@@ -96,6 +146,79 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
+function dedupeSubscriptionKey(row: FunnelFoxSubscriptionRaw): string {
+  const subscriptionId = typeof row.subscription_id === "string" || typeof row.subscription_id === "number"
+    ? String(row.subscription_id).trim()
+    : "";
+  return String(row.id ?? "").trim() || subscriptionId || String(row.psp_id ?? "").trim();
+}
+
+function updatedAtMs(row: FunnelFoxSubscriptionRaw): number {
+  const ms = new Date(String(row.updated_at ?? "")).getTime();
+  return Number.isFinite(ms) ? ms : Number.NEGATIVE_INFINITY;
+}
+
+export function dedupeFunnelFoxSubscriptions(rows: FunnelFoxSubscriptionRaw[]): {
+  rows: FunnelFoxSubscriptionRaw[];
+  rawCount: number;
+  dedupedCount: number;
+  duplicatesRemoved: number;
+} {
+  const keyed = new Map<string, FunnelFoxSubscriptionRaw>();
+  const unkeyed: FunnelFoxSubscriptionRaw[] = [];
+
+  for (const row of rows) {
+    const key = dedupeSubscriptionKey(row);
+    if (!key) {
+      unkeyed.push(row);
+      continue;
+    }
+
+    const current = keyed.get(key);
+    if (!current || updatedAtMs(row) >= updatedAtMs(current)) {
+      keyed.set(key, row);
+    }
+  }
+
+  const deduped = [...keyed.values(), ...unkeyed];
+  return {
+    rows: deduped,
+    rawCount: rows.length,
+    dedupedCount: deduped.length,
+    duplicatesRemoved: rows.length - deduped.length,
+  };
+}
+
+function isSensitiveDebugKey(key: string): boolean {
+  const normalized = key.toLowerCase();
+  return (
+    normalized.includes("secret") ||
+    normalized.includes("token") ||
+    normalized.includes("password") ||
+    normalized.includes("authorization") ||
+    normalized.includes("provider_metadata") ||
+    normalized.includes("providermetadata") ||
+    normalized.includes("metadata") ||
+    normalized.includes("payment") ||
+    normalized.includes("card") ||
+    normalized.includes("pan") ||
+    normalized.includes("cvv") ||
+    normalized.includes("cvc")
+  );
+}
+
+export function sanitizeFunnelFoxDebugPayload(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sanitizeFunnelFoxDebugPayload);
+  if (!value || typeof value !== "object") return value;
+
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, entry]) => [
+      key,
+      isSensitiveDebugKey(key) ? "[redacted]" : sanitizeFunnelFoxDebugPayload(entry),
+    ]),
+  );
+}
+
 export async function listSubscriptions(cursor?: string): Promise<FunnelFoxListResponse> {
   if (isMockMode()) {
     return {
@@ -104,7 +227,7 @@ export async function listSubscriptions(cursor?: string): Promise<FunnelFoxListR
     };
   }
 
-  const url = new URL(proxyEndpoint(), window.location.origin);
+  const url = proxyUrl();
   if (cursor) url.searchParams.set("cursor", cursor);
   const res = await fetch(url.toString());
   if (!res.ok) {
@@ -129,7 +252,7 @@ export async function listSubscriptionsWithOptions(
     };
   }
 
-  const url = new URL(proxyEndpoint(), window.location.origin);
+  const url = proxyUrl();
   if (cursor) url.searchParams.set("cursor", cursor);
   const res = await fetch(url.toString(), { headers: requestHeaders(options) });
   if (!res.ok) {
@@ -139,7 +262,7 @@ export async function listSubscriptionsWithOptions(
 }
 
 export async function testFunnelFoxConnection(options?: FunnelFoxRequestOptions): Promise<FunnelFoxDebugResponse> {
-  const url = new URL(proxyEndpoint(), window.location.origin);
+  const url = proxyUrl();
   url.searchParams.set("debug", "1");
   const res = await fetch(url.toString(), { headers: requestHeaders(options) });
   if (!res.ok) {
@@ -149,7 +272,7 @@ export async function testFunnelFoxConnection(options?: FunnelFoxRequestOptions)
 }
 
 export async function fetchProfileDebug(profileId: string, options?: FunnelFoxRequestOptions): Promise<FunnelFoxProfileDebugResponse> {
-  const url = new URL(profileDebugEndpoint(), window.location.origin);
+  const url = profileDebugUrl();
   url.searchParams.set("id", profileId);
   const res = await fetch(url.toString(), { headers: requestHeaders(options) });
   if (!res.ok) {
@@ -159,7 +282,7 @@ export async function fetchProfileDebug(profileId: string, options?: FunnelFoxRe
 }
 
 export async function fetchSubscriptionDebug(subscriptionId: string, options?: FunnelFoxRequestOptions): Promise<unknown> {
-  const url = new URL(subscriptionDetailsEndpoint(), window.location.origin);
+  const url = subscriptionDetailsUrl();
   url.searchParams.set("id", subscriptionId);
   const res = await fetch(url.toString(), { headers: requestHeaders(options) });
   if (!res.ok) {
@@ -169,7 +292,7 @@ export async function fetchSubscriptionDebug(subscriptionId: string, options?: F
 }
 
 async function fetchSubscriptionDetails(subscriptionId: string, options?: FunnelFoxRequestOptions): Promise<FunnelFoxSubscriptionRaw> {
-  const url = new URL(subscriptionDetailsEndpoint(), window.location.origin);
+  const url = subscriptionDetailsUrl();
   url.searchParams.set("id", subscriptionId);
 
   let lastError: Error | null = null;
@@ -366,8 +489,9 @@ export async function syncAllSubscriptionsWithDiagnostics(options?: FunnelFoxReq
   }
 
   logFirstRawSubscriptionDebug(rows);
+  const deduped = dedupeFunnelFoxSubscriptions(rows);
 
-  const normalized = rows.map(normalizeSubscription);
+  const normalized = deduped.rows.map(normalizeSubscription);
   console.info("FunnelFox normalized subscriptions count", { count: normalized.length });
   const withEmailBefore = normalized.filter((row) => Boolean(row.email)).length;
   const detailEnriched = await enrichFromSubscriptionDetails(normalized, options);
@@ -387,6 +511,9 @@ export async function syncAllSubscriptionsWithDiagnostics(options?: FunnelFoxReq
   return {
     rows: detailEnriched.rows,
     diagnostics: {
+      raw_subscriptions_count: deduped.rawCount,
+      deduped_subscriptions_count: deduped.dedupedCount,
+      duplicates_removed: deduped.duplicatesRemoved,
       total_subscriptions: total,
       subscriptions_with_profile_id: withProfileId,
       subscriptions_missing_profile_id: total - withProfileId,

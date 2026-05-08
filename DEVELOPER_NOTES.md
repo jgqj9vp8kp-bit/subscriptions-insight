@@ -7,8 +7,11 @@
 - Funnel detection is string-based and intentionally conservative.
 - Successful non-upsell transactions are classified by lifecycle order, not by strict product price windows.
 - Existing clean-template imports are trusted more than Palmer imports because they already include `transaction_type`.
-- FunnelFox subscription monitoring is separate from Palmer transaction analytics and must not mutate transaction/cohort calculations.
+- FunnelFox subscription monitoring is imported separately from Palmer transactions. It does not mutate Palmer transactions, but Cohorts and Dashboard use it for active/cancellation metrics after matching by normalized email.
 - FunnelFox API secrets must stay server-side; do not expose `FUNNELFOX_SECRET` in Vite/browser code.
+- Import Data is the single connection center. Keep Palmer import/cache, Facebook traffic import, FunnelFox sync/test, and local saved-data controls there; analytics pages should not own data loading controls.
+- Page filters and small UI settings are persisted through `usePersistedPageState`; never put imported datasets, raw API payloads, or secrets into page UI state.
+- Subengine requires Supabase Auth before analytics routes render. Keep Supabase credentials in environment variables and disable public signup in the Supabase project.
 
 ## Assumptions
 
@@ -35,10 +38,12 @@
 - FunnelFox cancelled subscriptions may remain active until `period_ends_at`.
 - FunnelFox mock mode returns no subscriptions until a backend proxy is configured.
 - Set `VITE_FUNNELFOX_MOCK=false` only after a backend proxy exists; the browser still must not receive `FUNNELFOX_SECRET`.
+- FunnelFox subscriptions are cached in IndexedDB, not localStorage.
+- localStorage is only for small UI state such as filters, column settings, selected views, and forecast assumptions.
 
 ## FunnelFox Backend Requirement
 
-The Subscriptions page calls `syncAllSubscriptions`, which uses a frontend-safe proxy placeholder. A production backend/serverless function should implement:
+The Import Data page calls `syncAllSubscriptions`, which uses a frontend-safe proxy placeholder. A production backend/serverless function should implement:
 
 ```text
 GET /api/funnelfox/subscriptions
@@ -67,12 +72,15 @@ After the server-side endpoint is available, enable real sync in the frontend en
 VITE_FUNNELFOX_MOCK=false
 ```
 
-The browser will then call:
+The browser will then call same-origin proxy routes:
 
 ```text
 GET /api/funnelfox/subscriptions
-GET /api/funnelfox/profiles/{id}
+GET /api/funnelfox/subscription?id=...
+GET /api/funnelfox/profile?id=...
 ```
+
+By default the browser blocks direct calls to `https://api.funnelfox.io` and blocks absolute external proxy URLs. External proxy URLs require `VITE_ALLOW_EXTERNAL_FUNNELFOX_PROXY=true`, and direct FunnelFox API URLs remain blocked.
 
 The serverless endpoint calls FunnelFox:
 
@@ -83,14 +91,14 @@ Fox-Secret: process.env.FUNNELFOX_SECRET
 
 The endpoint proxies page-by-page requests. The frontend keeps following `pagination.has_more` and passes `pagination.next_cursor` back as the `cursor` query parameter.
 
-If subscription rows do not include email, sync enriches missing emails through the server proxy:
+If subscription rows do not include email, product, funnel, or session fields, sync enriches them through subscription details via the server proxy:
 
 ```text
-GET https://api.funnelfox.io/public/v1/profiles/{id}
+GET https://api.funnelfox.io/public/v1/subscriptions/{id}
 Fox-Secret: process.env.FUNNELFOX_SECRET
 ```
 
-Profile ids are read from `profile_id`, `profile.id`, `profileId`, or string `profile`. Profile fetches are cached per sync so repeated subscriptions for the same profile only call FunnelFox once. Profile fetch failures do not fail the whole subscription sync; the email stays `null`.
+Duplicate subscriptions are removed before normalization using `id`, then `subscription_id`, then `psp_id`; the most recently updated record is kept. Detail fetches are cached per sync so repeated subscription ids only call FunnelFox once. Detail failures do not fail the whole subscription sync; missing fields stay empty and the UI reports partial enrichment warnings.
 
 Security warning: never put `Fox-Secret`, `FUNNELFOX_SECRET`, or the raw FunnelFox API URL in browser code. The browser must only call the server-side proxy.
 
@@ -109,7 +117,7 @@ Run the app:
 npm run dev
 ```
 
-Open the app and use the Subscriptions sync button. In local development, Vite serves the app and the dev proxy at:
+Open the app, go to Import Data, and use the FunnelFox Subscriptions Sync section. In local development, Vite serves the app and the dev proxy at:
 
 ```text
 http://localhost:8080/api/funnelfox/subscriptions
@@ -134,7 +142,14 @@ The debug response includes:
 
 If `secret_exists` is `false`, the server process did not receive `FUNNELFOX_SECRET`. If `can_call_funnelfox` is `false`, check the secret value, FunnelFox availability, and network access. The debug response never returns the secret.
 
-For development only, the Subscriptions page also has a collapsible FunnelFox API connection panel. A pasted key is kept only in React component state for the current browser session and is sent only to the server proxy as `X-FunnelFox-Secret`. The proxy still calls FunnelFox with `Fox-Secret` server-side. Do not store this key in localStorage, commit it, log it, or use this temporary input as the production configuration path.
+For development only, Import Data can show a temporary FunnelFox key input. A pasted key is kept only in React component state for the current browser session and is sent only to the server proxy as `X-FunnelFox-Secret`. The proxy still calls FunnelFox with `Fox-Secret` server-side. Do not store this key in localStorage, commit it, log it, or use this temporary input as the production configuration path. In production, the temporary key input is hidden and sync must use server-side `FUNNELFOX_SECRET`.
+
+Raw subscription payload debug is also development-only unless `VITE_ENABLE_FUNNELFOX_DEBUG=true`. Debug output is sanitized before rendering and redacts payment/card fields, provider metadata, tokens, secrets, and authorization-like fields.
+
+Cancellation labels differ by surface:
+
+- Subscriptions page uses FunnelFox-normalized cancel type from `status`, `renews`, `cancelled_at`, `period_ends_at`, and `cancellation_reason`.
+- Cohorts and Dashboard use cross-source cancellation classification with Palmer failed/declined transactions near cancellation plus FunnelFox period timing.
 
 Webhook planning:
 
@@ -145,6 +160,54 @@ Handle: subscription.cancelled, subscription.activated, subscription.renewed
 ```
 
 Do not implement production webhooks in the Vite frontend.
+
+## Supabase Auth
+
+Subengine protects all analytics and data pages behind Supabase email/password authentication:
+
+```text
+/                       Dashboard
+/cohorts                Cohorts
+/forecasting            Forecasting
+/transactions           Transactions
+/users                  Users
+/subscriptions          Subscriptions
+/import                 Import Data
+```
+
+Unauthenticated users are redirected to:
+
+```text
+/login
+```
+
+Set browser-safe Supabase project values in Vite/Lovable/Vercel:
+
+```text
+VITE_SUPABASE_URL=https://your-project.supabase.co
+VITE_SUPABASE_ANON_KEY=...
+```
+
+The anon key is intentionally public, but it must be paired with Supabase Auth, RLS policies, and disabled public signup. Create allowed users in Supabase Auth before deployment and turn off public self-registration in the Supabase dashboard. Subengine only renders a login form; it does not render a signup flow.
+
+Sessions persist through Supabase Auth local storage and auto-refresh. The app header shows the current user email and a logout button on protected pages.
+
+### Temporary local admin fallback
+
+When Supabase is not configured, local development can use a temporary sessionStorage-only admin fallback:
+
+```text
+username: admin
+password: Mobidima
+```
+
+This fallback is enabled automatically in Vite development (`import.meta.env.DEV`) and can be enabled explicitly with:
+
+```text
+VITE_ENABLE_LOCAL_AUTH=true
+```
+
+Do not enable `VITE_ENABLE_LOCAL_AUTH` for production deployments. The fallback exists only for local demos before Supabase is configured. It stores only a local session flag in `sessionStorage`, never in localStorage.
 
 ## Naming
 

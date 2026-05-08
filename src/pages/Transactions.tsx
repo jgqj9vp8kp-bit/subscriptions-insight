@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 import { ArrowDown, ArrowUp, ArrowUpDown, Search, X } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { Card } from "@/components/ui/card";
@@ -22,6 +22,7 @@ import {
 import { FunnelBadge, StatusBadge, TypeBadge } from "@/components/StatusBadges";
 import { useTransactions } from "@/services/sheets";
 import { formatCurrency } from "@/services/analytics";
+import { usePersistedPageState } from "@/hooks/usePersistedPageState";
 import type { TransactionStatus, TransactionType } from "@/services/types";
 
 type SortKey = "event_time" | "amount_usd";
@@ -33,16 +34,24 @@ const FUNNELS = ["past_life", "soulmate", "starseed", "unknown"] as const;
 
 const PAGE_SIZE = 25;
 
+const DEFAULT_TRANSACTIONS_UI_STATE = {
+  search: "",
+  typeFilter: "all",
+  funnelFilter: "all",
+  campaignPathFilter: "all",
+  statusFilter: "all",
+  dateFrom: "",
+  dateTo: "",
+  sortKey: "event_time" as SortKey,
+  sortDir: "desc" as SortDir,
+  page: 1,
+};
+
 export default function TransactionsPage() {
   const txs = useTransactions();
-  const [search, setSearch] = useState("");
-  const [typeFilter, setTypeFilter] = useState<string>("all");
-  const [funnelFilter, setFunnelFilter] = useState<string>("all");
-  const [campaignPathFilter, setCampaignPathFilter] = useState<string>("all");
-  const [statusFilter, setStatusFilter] = useState<string>("all");
-  const [sortKey, setSortKey] = useState<SortKey>("event_time");
-  const [sortDir, setSortDir] = useState<SortDir>("desc");
-  const [page, setPage] = useState(1);
+  const [uiState, setUiState, resetUiState] = usePersistedPageState("ui_state_transactions", DEFAULT_TRANSACTIONS_UI_STATE);
+  const { search, typeFilter, funnelFilter, campaignPathFilter, statusFilter, dateFrom, dateTo, sortKey, sortDir, page } = uiState;
+  const updateUiState = (patch: Partial<typeof DEFAULT_TRANSACTIONS_UI_STATE>) => setUiState((current) => ({ ...current, ...patch }));
 
   const campaignPathOptions = useMemo(() => Array.from(new Set(txs.map((t) => t.campaign_path || "unknown"))).sort(), [txs]);
 
@@ -54,6 +63,9 @@ export default function TransactionsPage() {
       if (funnelFilter !== "all" && t.funnel !== funnelFilter) return false;
       if (campaignPathFilter !== "all" && (t.campaign_path || "unknown") !== campaignPathFilter) return false;
       if (statusFilter !== "all" && t.status !== statusFilter) return false;
+      const dateKey = t.event_time.slice(0, 10);
+      if (dateFrom && dateKey < dateFrom) return false;
+      if (dateTo && dateKey > dateTo) return false;
       return true;
     });
     list.sort((a, b) => {
@@ -63,18 +75,15 @@ export default function TransactionsPage() {
       return sortDir === "asc" ? cmp : -cmp;
     });
     return list;
-  }, [txs, search, typeFilter, funnelFilter, campaignPathFilter, statusFilter, sortKey, sortDir]);
+  }, [txs, search, typeFilter, funnelFilter, campaignPathFilter, statusFilter, dateFrom, dateTo, sortKey, sortDir]);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
   const paged = filtered.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
 
   const toggleSort = (key: SortKey) => {
-    if (sortKey === key) setSortDir((d) => (d === "asc" ? "desc" : "asc"));
-    else {
-      setSortKey(key);
-      setSortDir("desc");
-    }
+    if (sortKey === key) updateUiState({ sortDir: sortDir === "asc" ? "desc" : "asc" });
+    else updateUiState({ sortKey: key, sortDir: "desc" });
   };
 
   const sortIcon = (key: SortKey) => {
@@ -83,15 +92,10 @@ export default function TransactionsPage() {
   };
 
   const clearFilters = () => {
-    setSearch("");
-    setTypeFilter("all");
-    setFunnelFilter("all");
-    setCampaignPathFilter("all");
-    setStatusFilter("all");
-    setPage(1);
+    setUiState(DEFAULT_TRANSACTIONS_UI_STATE);
   };
 
-  const hasFilters = search || typeFilter !== "all" || funnelFilter !== "all" || campaignPathFilter !== "all" || statusFilter !== "all";
+  const hasFilters = search || typeFilter !== "all" || funnelFilter !== "all" || campaignPathFilter !== "all" || statusFilter !== "all" || dateFrom || dateTo;
 
   return (
     <AppLayout title="Transactions" description={`${filtered.length} of ${txs.length} transactions`}>
@@ -103,13 +107,12 @@ export default function TransactionsPage() {
               placeholder="Search by email…"
               value={search}
               onChange={(e) => {
-                setSearch(e.target.value);
-                setPage(1);
+                updateUiState({ search: e.target.value, page: 1 });
               }}
               className="pl-8 h-9"
             />
           </div>
-          <Select value={typeFilter} onValueChange={(v) => { setTypeFilter(v); setPage(1); }}>
+          <Select value={typeFilter} onValueChange={(v) => updateUiState({ typeFilter: v, page: 1 })}>
             <SelectTrigger className="h-9 w-[160px]"><SelectValue placeholder="Type" /></SelectTrigger>
             <SelectContent>
               <SelectItem value="all">All types</SelectItem>
@@ -118,7 +121,7 @@ export default function TransactionsPage() {
               ))}
             </SelectContent>
           </Select>
-          <Select value={funnelFilter} onValueChange={(v) => { setFunnelFilter(v); setPage(1); }}>
+          <Select value={funnelFilter} onValueChange={(v) => updateUiState({ funnelFilter: v, page: 1 })}>
             <SelectTrigger className="h-9 w-[140px]"><SelectValue placeholder="Funnel" /></SelectTrigger>
             <SelectContent>
               <SelectItem value="all">All funnels</SelectItem>
@@ -127,7 +130,7 @@ export default function TransactionsPage() {
               ))}
             </SelectContent>
           </Select>
-          <Select value={campaignPathFilter} onValueChange={(v) => { setCampaignPathFilter(v); setPage(1); }}>
+          <Select value={campaignPathFilter} onValueChange={(v) => updateUiState({ campaignPathFilter: v, page: 1 })}>
             <SelectTrigger className="h-9 w-[190px]"><SelectValue placeholder="Campaign path" /></SelectTrigger>
             <SelectContent>
               <SelectItem value="all">All campaign paths</SelectItem>
@@ -136,7 +139,7 @@ export default function TransactionsPage() {
               ))}
             </SelectContent>
           </Select>
-          <Select value={statusFilter} onValueChange={(v) => { setStatusFilter(v); setPage(1); }}>
+          <Select value={statusFilter} onValueChange={(v) => updateUiState({ statusFilter: v, page: 1 })}>
             <SelectTrigger className="h-9 w-[140px]"><SelectValue placeholder="Status" /></SelectTrigger>
             <SelectContent>
               <SelectItem value="all">All statuses</SelectItem>
@@ -145,11 +148,26 @@ export default function TransactionsPage() {
               ))}
             </SelectContent>
           </Select>
+          <Input
+            type="date"
+            value={dateFrom}
+            onChange={(e) => updateUiState({ dateFrom: e.target.value, page: 1 })}
+            className="h-9 w-[150px]"
+          />
+          <Input
+            type="date"
+            value={dateTo}
+            onChange={(e) => updateUiState({ dateTo: e.target.value, page: 1 })}
+            className="h-9 w-[150px]"
+          />
           {hasFilters && (
             <Button variant="ghost" size="sm" onClick={clearFilters} className="h-9">
               <X className="mr-1 h-4 w-4" /> Clear
             </Button>
           )}
+          <Button variant="ghost" size="sm" onClick={resetUiState} className="h-9">
+            Reset filters
+          </Button>
         </div>
 
         <div className="mt-4 overflow-x-auto rounded-lg border border-border">
@@ -207,10 +225,10 @@ export default function TransactionsPage() {
             Page {safePage} of {totalPages}
           </span>
           <div className="flex gap-2">
-            <Button variant="outline" size="sm" disabled={safePage <= 1} onClick={() => setPage((p) => Math.max(1, p - 1))}>
+            <Button variant="outline" size="sm" disabled={safePage <= 1} onClick={() => updateUiState({ page: Math.max(1, page - 1) })}>
               Previous
             </Button>
-            <Button variant="outline" size="sm" disabled={safePage >= totalPages} onClick={() => setPage((p) => Math.min(totalPages, p + 1))}>
+            <Button variant="outline" size="sm" disabled={safePage >= totalPages} onClick={() => updateUiState({ page: Math.min(totalPages, page + 1) })}>
               Next
             </Button>
           </div>
