@@ -21,7 +21,7 @@ function firstQueryValue(value: string | string[] | undefined): string | undefin
 function getHeader(req: ApiRequest, name: string): string | undefined {
   const target = name.toLowerCase();
   const entry = Object.entries(req.headers ?? {}).find(([key]) => key.toLowerCase() === target);
-  return firstQueryValue(entry?.[1])?.trim() || undefined;
+  return firstQueryValue(entry?.[1]) || undefined;
 }
 
 export default async function handler(req: ApiRequest, res: ApiResponse) {
@@ -33,7 +33,7 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
   res.setHeader("Cache-Control", "no-store");
   const result = await handleFunnelFoxProfile({
     profileId: firstQueryValue(req.query?.id) ?? "",
-    secret: process.env.FUNNELFOX_SECRET || getHeader(req, "X-FunnelFox-Secret"),
+    authHeader: getHeader(req, "Authorization"),
   });
   return res.status(result.status).json(result.body);
 }
