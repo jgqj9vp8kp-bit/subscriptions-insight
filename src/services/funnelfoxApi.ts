@@ -1,5 +1,6 @@
 import { normalizeSubscription } from "@/services/subscriptionTransform";
 import type { FunnelFoxListResponse, FunnelFoxSubscriptionRaw, SubscriptionClean } from "@/types/subscriptions";
+import { supabase } from "@/services/supabaseClient";
 
 const DEFAULT_PROXY_ENDPOINT = "/api/funnelfox/subscriptions";
 const DEFAULT_SUBSCRIPTION_DETAILS_ENDPOINT = "/api/funnelfox/subscription";
@@ -236,9 +237,15 @@ export async function listSubscriptions(cursor?: string): Promise<FunnelFoxListR
   return res.json() as Promise<FunnelFoxListResponse>;
 }
 
-function requestHeaders(options?: FunnelFoxRequestOptions): HeadersInit | undefined {
-  const secret = options?.secret?.trim();
-  return secret ? { "X-FunnelFox-Secret": secret } : undefined;
+async function requestHeaders(_options?: FunnelFoxRequestOptions): Promise<HeadersInit | undefined> {
+  if (!supabase) return undefined;
+  try {
+    const { data } = await supabase.auth.getSession();
+    const token = data.session?.access_token;
+    return token ? { Authorization: `Bearer ${token}` } : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export async function listSubscriptionsWithOptions(
@@ -254,7 +261,7 @@ export async function listSubscriptionsWithOptions(
 
   const url = proxyUrl();
   if (cursor) url.searchParams.set("cursor", cursor);
-  const res = await fetch(url.toString(), { headers: requestHeaders(options) });
+  const res = await fetch(url.toString(), { headers: await requestHeaders(options) });
   if (!res.ok) {
     throw new Error(await safeErrorMessage(res, `Could not load FunnelFox subscriptions (HTTP ${res.status}).`));
   }
@@ -264,7 +271,7 @@ export async function listSubscriptionsWithOptions(
 export async function testFunnelFoxConnection(options?: FunnelFoxRequestOptions): Promise<FunnelFoxDebugResponse> {
   const url = proxyUrl();
   url.searchParams.set("debug", "1");
-  const res = await fetch(url.toString(), { headers: requestHeaders(options) });
+  const res = await fetch(url.toString(), { headers: await requestHeaders(options) });
   if (!res.ok) {
     throw new Error(await safeErrorMessage(res, `Could not test FunnelFox connection (HTTP ${res.status}).`));
   }
@@ -274,7 +281,7 @@ export async function testFunnelFoxConnection(options?: FunnelFoxRequestOptions)
 export async function fetchProfileDebug(profileId: string, options?: FunnelFoxRequestOptions): Promise<FunnelFoxProfileDebugResponse> {
   const url = profileDebugUrl();
   url.searchParams.set("id", profileId);
-  const res = await fetch(url.toString(), { headers: requestHeaders(options) });
+  const res = await fetch(url.toString(), { headers: await requestHeaders(options) });
   if (!res.ok) {
     throw new Error(await safeErrorMessage(res, `Could not load FunnelFox profile debug (HTTP ${res.status}).`));
   }
@@ -284,7 +291,7 @@ export async function fetchProfileDebug(profileId: string, options?: FunnelFoxRe
 export async function fetchSubscriptionDebug(subscriptionId: string, options?: FunnelFoxRequestOptions): Promise<unknown> {
   const url = subscriptionDetailsUrl();
   url.searchParams.set("id", subscriptionId);
-  const res = await fetch(url.toString(), { headers: requestHeaders(options) });
+  const res = await fetch(url.toString(), { headers: await requestHeaders(options) });
   if (!res.ok) {
     throw new Error(await safeErrorMessage(res, `Could not load FunnelFox subscription debug (HTTP ${res.status}).`));
   }
@@ -297,7 +304,7 @@ async function fetchSubscriptionDetails(subscriptionId: string, options?: Funnel
 
   let lastError: Error | null = null;
   for (let attempt = 0; attempt <= DETAIL_MAX_RETRIES; attempt += 1) {
-    const res = await fetch(url.toString(), { headers: requestHeaders(options) });
+    const res = await fetch(url.toString(), { headers: await requestHeaders(options) });
     if (res.ok) {
       const payload = (await res.json()) as { data?: FunnelFoxSubscriptionRaw } & FunnelFoxSubscriptionRaw;
       return (payload.data && typeof payload.data === "object" ? payload.data : payload) as FunnelFoxSubscriptionRaw;

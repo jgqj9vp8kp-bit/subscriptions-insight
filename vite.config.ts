@@ -1,13 +1,14 @@
 import { defineConfig, loadEnv } from "vite";
+import type { ViteDevServer } from "vite";
 import react from "@vitejs/plugin-react-swc";
 import path from "path";
 import { componentTagger } from "lovable-tagger";
 import { handleFunnelFoxProfile, handleFunnelFoxProfileDebug, handleFunnelFoxSubscriptionDetails, handleFunnelFoxSubscriptions } from "./api/funnelfox/subscriptionsCore";
 
-function funnelFoxDevProxy(secret?: string) {
+function funnelFoxDevProxy() {
   return {
     name: "funnelfox-dev-proxy",
-    configureServer(server) {
+    configureServer(server: ViteDevServer) {
       server.middlewares.use(async (req, res, next) => {
         const requestUrl = new URL(req.url ?? "/", "http://localhost");
         const isSubscriptionsRoute = requestUrl.pathname === "/api/funnelfox/subscriptions";
@@ -29,26 +30,26 @@ function funnelFoxDevProxy(secret?: string) {
           return;
         }
 
-        const resolvedSecret = secret || req.headers["x-funnelfox-secret"]?.toString().trim();
+        const authHeader = req.headers["authorization"]?.toString();
         const result = profileMatch
           ? await handleFunnelFoxProfile({
               profileId: decodeURIComponent(profileMatch[1]),
-              secret: resolvedSecret,
+              authHeader,
             })
           : isSubscriptionDetailsRoute
             ? await handleFunnelFoxSubscriptionDetails({
                 subscriptionId: requestUrl.searchParams.get("id") ?? "",
-                secret: resolvedSecret,
+                authHeader,
               })
           : isProfileDebugRoute
             ? await handleFunnelFoxProfileDebug({
                 profileId: requestUrl.searchParams.get("id") ?? "",
-                secret: resolvedSecret,
+                authHeader,
               })
           : await handleFunnelFoxSubscriptions({
               cursor: requestUrl.searchParams.get("cursor") ?? undefined,
               debug: ["1", "true"].includes(requestUrl.searchParams.get("debug") ?? ""),
-              secret: resolvedSecret,
+              authHeader,
             });
 
         res.statusCode = result.status;
@@ -61,7 +62,6 @@ function funnelFoxDevProxy(secret?: string) {
 // https://vitejs.dev/config/
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
-  const funnelFoxSecret = env.FUNNELFOX_SECRET || process.env.FUNNELFOX_SECRET;
 
   return {
     server: {
@@ -71,7 +71,7 @@ export default defineConfig(({ mode }) => {
         overlay: false,
       },
     },
-    plugins: [react(), funnelFoxDevProxy(funnelFoxSecret), mode === "development" && componentTagger()].filter(Boolean),
+    plugins: [react(), funnelFoxDevProxy(), mode === "development" && componentTagger()].filter(Boolean),
     resolve: {
       alias: {
         "@": path.resolve(__dirname, "./src"),

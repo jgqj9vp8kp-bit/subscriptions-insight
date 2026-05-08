@@ -44,7 +44,7 @@ function getDebug(req: ApiRequest): boolean {
 function getHeader(req: ApiRequest, name: string): string | undefined {
   const target = name.toLowerCase();
   const entry = Object.entries(req.headers ?? {}).find(([key]) => key.toLowerCase() === target);
-  return firstQueryValue(entry?.[1])?.trim() || undefined;
+  return firstQueryValue(entry?.[1]) || undefined;
 }
 
 export default async function handler(req: ApiRequest, res: ApiResponse) {
@@ -57,7 +57,7 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
   const result = await handleFunnelFoxSubscriptions({
     cursor: getCursor(req),
     debug: getDebug(req),
-    secret: process.env.FUNNELFOX_SECRET || getHeader(req, "X-FunnelFox-Secret"),
+    authHeader: getHeader(req, "Authorization"),
   });
   return res.status(result.status).json(result.body);
 }

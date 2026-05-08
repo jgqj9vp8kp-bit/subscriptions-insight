@@ -6,23 +6,57 @@ const FUNNELFOX_PROFILES_URL = "https://api.funnelfox.io/public/v1/profiles";
 type ProxyOptions = {
   cursor?: string;
   debug?: boolean;
-  secret?: string;
+  authHeader?: string;
 };
 
 type ProfileProxyOptions = {
   profileId: string;
-  secret?: string;
+  authHeader?: string;
 };
 
 type SubscriptionDetailsProxyOptions = {
   subscriptionId: string;
-  secret?: string;
+  authHeader?: string;
 };
 
 type ProxyResult = {
   status: number;
   body: unknown;
 };
+
+async function verifyAuth(authHeader: string | undefined): Promise<ProxyResult | null> {
+  const supabaseUrl = (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || "").trim();
+  const supabaseAnonKey = (process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || "").trim();
+
+  if (!supabaseUrl || !supabaseAnonKey) {
+    return { status: 503, body: { error: "Authentication is not configured on the server." } };
+  }
+
+  const header = (authHeader ?? "").trim();
+  if (!header.toLowerCase().startsWith("bearer ")) {
+    return { status: 401, body: { error: "Authentication required." } };
+  }
+  const token = header.slice(7).trim();
+  if (!token) {
+    return { status: 401, body: { error: "Authentication required." } };
+  }
+
+  try {
+    const res = await fetch(`${supabaseUrl.replace(/\/$/, "")}/auth/v1/user`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        apikey: supabaseAnonKey,
+        Accept: "application/json",
+      },
+    });
+    if (!res.ok) {
+      return { status: 401, body: { error: "Invalid or expired session." } };
+    }
+    return null;
+  } catch {
+    return { status: 503, body: { error: "Authentication check failed." } };
+  }
+}
 
 function extractRows(payload: unknown): unknown[] {
   if (!payload || typeof payload !== "object") return [];
@@ -232,8 +266,10 @@ function profileDebugBody(profileId: string, payload: unknown) {
 }
 
 export async function handleFunnelFoxSubscriptions(options: ProxyOptions): Promise<ProxyResult> {
-  const secret = options.secret ?? process.env.FUNNELFOX_SECRET;
   const debug = Boolean(options.debug);
+  const authError = await verifyAuth(options.authHeader);
+  if (authError) return authError;
+  const secret = process.env.FUNNELFOX_SECRET;
 
   if (!secret) {
     return {
@@ -288,7 +324,9 @@ export async function handleFunnelFoxSubscriptions(options: ProxyOptions): Promi
 }
 
 export async function handleFunnelFoxSubscriptionDetails(options: SubscriptionDetailsProxyOptions): Promise<ProxyResult> {
-  const secret = options.secret ?? process.env.FUNNELFOX_SECRET;
+  const authError = await verifyAuth(options.authHeader);
+  if (authError) return authError;
+  const secret = process.env.FUNNELFOX_SECRET;
   const subscriptionId = options.subscriptionId.trim();
 
   if (!subscriptionId) {
@@ -339,7 +377,9 @@ export async function handleFunnelFoxSubscriptionDetails(options: SubscriptionDe
 }
 
 export async function handleFunnelFoxProfile(options: ProfileProxyOptions): Promise<ProxyResult> {
-  const secret = options.secret ?? process.env.FUNNELFOX_SECRET;
+  const authError = await verifyAuth(options.authHeader);
+  if (authError) return authError;
+  const secret = process.env.FUNNELFOX_SECRET;
   const profileId = options.profileId.trim();
 
   if (!profileId) {
