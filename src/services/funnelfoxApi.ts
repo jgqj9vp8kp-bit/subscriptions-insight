@@ -1,5 +1,6 @@
 import { normalizeSubscription } from "@/services/subscriptionTransform";
 import type { FunnelFoxListResponse, FunnelFoxSubscriptionRaw, SubscriptionClean } from "@/types/subscriptions";
+import { supabase } from "@/services/supabaseClient";
 
 const DEFAULT_PROXY_ENDPOINT = "/api/funnelfox/subscriptions";
 const DEFAULT_SUBSCRIPTION_DETAILS_ENDPOINT = "/api/funnelfox/subscription";
@@ -236,9 +237,15 @@ export async function listSubscriptions(cursor?: string): Promise<FunnelFoxListR
   return res.json() as Promise<FunnelFoxListResponse>;
 }
 
-function requestHeaders(options?: FunnelFoxRequestOptions): HeadersInit | undefined {
-  const secret = options?.secret?.trim();
-  return secret ? { "X-FunnelFox-Secret": secret } : undefined;
+async function requestHeaders(_options?: FunnelFoxRequestOptions): Promise<HeadersInit | undefined> {
+  if (!supabase) return undefined;
+  try {
+    const { data } = await supabase.auth.getSession();
+    const token = data.session?.access_token;
+    return token ? { Authorization: `Bearer ${token}` } : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export async function listSubscriptionsWithOptions(
