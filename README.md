@@ -18,10 +18,10 @@ Only use the Supabase publishable anon key in frontend env. Never expose `servic
 ### Lovable frontend env
 
 ```text
-VITE_SUPABASE_URL=https://your-project.supabase.co
+VITE_SUPABASE_URL=https://wsjbpkderyhdefukppvb.supabase.co
 VITE_SUPABASE_ANON_KEY=your_publishable_anon_key
 VITE_FUNNELFOX_MOCK=false
-VITE_FUNNELFOX_PROXY_URL=https://your-vercel-domain.vercel.app/api/funnelfox/subscriptions
+VITE_FUNNELFOX_PROXY_URL=https://wsjbpkderyhdefukppvb.supabase.co/functions/v1
 ```
 
 Production defaults must stay locked down:
@@ -32,11 +32,29 @@ Production defaults must stay locked down:
 - The temporary FunnelFox key input is hidden in production by default.
 - Raw FunnelFox debug output is hidden in production by default.
 
-### Vercel/serverless API env
+### Supabase Edge Function secret
 
 ```text
 FUNNELFOX_SECRET=your_funnelfox_secret
 ```
+
+Deploy the FunnelFox proxy functions:
+
+```text
+supabase link --project-ref wsjbpkderyhdefukppvb
+supabase functions deploy funnelfox-subscriptions
+supabase functions deploy funnelfox-subscription
+supabase functions deploy funnelfox-profile
+supabase secrets set FUNNELFOX_SECRET=your_funnelfox_secret
+```
+
+Production FunnelFox flow:
+
+```text
+Lovable frontend -> Supabase Edge Functions -> FunnelFox API
+```
+
+The frontend sends the current Supabase Auth bearer token and anon `apikey` to Edge Functions. `FUNNELFOX_SECRET` stays only in Supabase Function secrets.
 
 ### Supabase settings
 

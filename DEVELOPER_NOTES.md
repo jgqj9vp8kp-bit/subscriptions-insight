@@ -43,50 +43,66 @@
 
 ## FunnelFox Backend Requirement
 
-The Import Data page calls `syncAllSubscriptions`, which uses a frontend-safe proxy placeholder. A production backend/serverless function should implement:
+The Import Data page calls `syncAllSubscriptions`, which uses a frontend-safe proxy. Production Lovable deployments should use Supabase Edge Functions:
 
 ```text
-GET /api/funnelfox/subscriptions
+Lovable frontend -> Supabase Edge Functions -> FunnelFox API
 ```
 
-This repository includes two runtimes for the same proxy logic:
+This repository includes multiple proxy runtimes:
 
-- Vercel/serverless deployment: `api/funnelfox/subscriptions.ts`
+- Supabase Edge Functions for production Lovable deployments:
+  - `supabase/functions/funnelfox-subscriptions/index.ts`
+  - `supabase/functions/funnelfox-subscription/index.ts`
+  - `supabase/functions/funnelfox-profile/index.ts`
+- Vercel/serverless routes remain available for backwards compatibility: `api/funnelfox/*.ts`
 - Local Vite dev server: `vite.config.ts` registers a dev-only middleware for `/api/funnelfox/subscriptions`
 
-A plain static Vite build does not execute `api/` files by itself. Production real sync requires a serverless/backend runtime such as Vercel, or an equivalent host that maps `/api/funnelfox/subscriptions` to server-side code.
+A plain static Vite build does not execute `api/` files by itself. Production real sync requires a backend runtime. For Lovable, deploy the Supabase Edge Functions and point the frontend at the Supabase Functions base URL.
 
-The proxy runs server-side, reads the secret from the runtime environment, forwards optional `cursor` pagination, and returns the FunnelFox JSON response to the browser.
+The Edge Function proxy runs server-side, reads the secret from `Deno.env.get("FUNNELFOX_SECRET")`, forwards optional `cursor` pagination, and returns the FunnelFox JSON response to the browser.
 
-Set the server-side environment variable in the deployment platform:
+Set the Supabase Edge Function secret:
 
 ```text
-FUNNELFOX_SECRET=...
+supabase secrets set FUNNELFOX_SECRET=...
 ```
 
 For local or deployed real sync, keep the secret out of `.env` files that are exposed to Vite. Only variables prefixed with `VITE_` are browser-facing, and `FUNNELFOX_SECRET` must never use that prefix.
 
-After the server-side endpoint is available, enable real sync in the frontend environment:
+Deploy the functions:
+
+```text
+supabase link --project-ref wsjbpkderyhdefukppvb
+supabase functions deploy funnelfox-subscriptions
+supabase functions deploy funnelfox-subscription
+supabase functions deploy funnelfox-profile
+```
+
+After the Edge Functions are available, enable real sync in the frontend environment:
 
 ```text
 VITE_FUNNELFOX_MOCK=false
+VITE_FUNNELFOX_PROXY_URL=https://wsjbpkderyhdefukppvb.supabase.co/functions/v1
 ```
 
-The browser will then call same-origin proxy routes:
+The browser maps the Functions base URL to these routes:
 
 ```text
-GET /api/funnelfox/subscriptions
-GET /api/funnelfox/subscription?id=...
-GET /api/funnelfox/profile?id=...
+GET /functions/v1/funnelfox-subscriptions
+GET /functions/v1/funnelfox-subscription?id=...
+GET /functions/v1/funnelfox-profile?id=...
 ```
 
-By default the browser blocks direct calls to `https://api.funnelfox.io` and blocks absolute external proxy URLs. External proxy URLs require `VITE_ALLOW_EXTERNAL_FUNNELFOX_PROXY=true`, and direct FunnelFox API URLs remain blocked.
+The frontend sends the current Supabase Auth bearer token and anon `apikey` to Edge Functions. `FUNNELFOX_SECRET` is never sent from the browser.
 
-The serverless endpoint calls FunnelFox:
+By default the browser blocks direct calls to `https://api.funnelfox.io`. Same-origin `/api/funnelfox/...` routes and Supabase `*.supabase.co/functions/v1` Edge Function URLs are allowed. Other external proxy URLs require `VITE_ALLOW_EXTERNAL_FUNNELFOX_PROXY=true`.
+
+The Edge Function calls FunnelFox:
 
 ```text
 GET https://api.funnelfox.io/public/v1/subscriptions
-Fox-Secret: process.env.FUNNELFOX_SECRET
+Fox-Secret: Deno.env.get("FUNNELFOX_SECRET")
 ```
 
 The endpoint proxies page-by-page requests. The frontend keeps following `pagination.has_more` and passes `pagination.next_cursor` back as the `cursor` query parameter.
@@ -95,7 +111,7 @@ If subscription rows do not include email, product, funnel, or session fields, s
 
 ```text
 GET https://api.funnelfox.io/public/v1/subscriptions/{id}
-Fox-Secret: process.env.FUNNELFOX_SECRET
+Fox-Secret: Deno.env.get("FUNNELFOX_SECRET")
 ```
 
 Duplicate subscriptions are removed before normalization using `id`, then `subscription_id`, then `psp_id`; the most recently updated record is kept. Detail fetches are cached per sync so repeated subscription ids only call FunnelFox once. Detail failures do not fail the whole subscription sync; missing fields stay empty and the UI reports partial enrichment warnings.

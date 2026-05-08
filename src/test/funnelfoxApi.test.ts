@@ -64,6 +64,30 @@ describe("FunnelFox API safety helpers", () => {
     ).toBe("https://proxy.example.com");
   });
 
+  it("allows Supabase Edge Functions base URL and maps to the requested function", () => {
+    const url = resolveFunnelFoxProxyUrl(
+      "https://wsjbpkderyhdefukppvb.supabase.co/functions/v1",
+      "/api/funnelfox/subscriptions",
+      { DEV: false },
+      "https://example.com",
+      "funnelfox-subscriptions",
+    );
+
+    expect(url.toString()).toBe("https://wsjbpkderyhdefukppvb.supabase.co/functions/v1/funnelfox-subscriptions");
+  });
+
+  it("keeps Supabase Edge Function endpoint URLs unchanged", () => {
+    const url = resolveFunnelFoxProxyUrl(
+      "https://wsjbpkderyhdefukppvb.supabase.co/functions/v1/funnelfox-subscription",
+      "/api/funnelfox/subscription",
+      { DEV: false },
+      "https://example.com",
+      "funnelfox-subscription",
+    );
+
+    expect(url.toString()).toBe("https://wsjbpkderyhdefukppvb.supabase.co/functions/v1/funnelfox-subscription");
+  });
+
   it("keeps temporary key input disabled outside development", () => {
     expect(isFunnelFoxTemporaryKeyInputEnabled({ DEV: false })).toBe(false);
     expect(isFunnelFoxTemporaryKeyInputEnabled({ DEV: false, VITE_ENABLE_FUNNELFOX_KEY_INPUT: "true" })).toBe(false);

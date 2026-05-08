@@ -1,10 +1,14 @@
 import { normalizeSubscription } from "@/services/subscriptionTransform";
+import { isSupabaseConfigured, supabase } from "@/services/supabaseClient";
 import type { FunnelFoxListResponse, FunnelFoxSubscriptionRaw, SubscriptionClean } from "@/types/subscriptions";
-import { supabase } from "@/services/supabaseClient";
 
 const DEFAULT_PROXY_ENDPOINT = "/api/funnelfox/subscriptions";
 const DEFAULT_SUBSCRIPTION_DETAILS_ENDPOINT = "/api/funnelfox/subscription";
 const DEFAULT_PROFILE_DEBUG_ENDPOINT = "/api/funnelfox/profile";
+const SUPABASE_FUNCTIONS_BASE_PATH = "/functions/v1";
+const EDGE_SUBSCRIPTIONS_FUNCTION = "funnelfox-subscriptions";
+const EDGE_SUBSCRIPTION_FUNCTION = "funnelfox-subscription";
+const EDGE_PROFILE_FUNCTION = "funnelfox-profile";
 const DETAIL_CONCURRENCY_LIMIT = 5;
 const DETAIL_REQUEST_DELAY_MS = 75;
 const DETAIL_RETRY_DELAY_MS = 750;
@@ -84,36 +88,74 @@ export function resolveFunnelFoxProxyUrl(
   fallbackPath: string,
   env: FunnelFoxRuntimeEnv = import.meta.env,
   origin = window.location.origin,
+  edgeFunctionName?: string,
 ): URL {
   const endpoint = (configuredUrl || fallbackPath).trim();
   const url = new URL(endpoint, origin);
+  const normalizedPath = url.pathname.replace(/\/+$/, "");
+  if (edgeFunctionName && normalizedPath.endsWith(SUPABASE_FUNCTIONS_BASE_PATH)) {
+    url.pathname = `${normalizedPath}/${edgeFunctionName}`;
+  }
+
   const isSameOrigin = url.origin === origin;
   const isFunnelFoxApi = url.hostname === "api.funnelfox.io";
+  const isSupabaseEdgeFunction =
+    url.hostname.endsWith(".supabase.co") &&
+    (url.pathname === SUPABASE_FUNCTIONS_BASE_PATH || url.pathname.startsWith(`${SUPABASE_FUNCTIONS_BASE_PATH}/`));
 
   if (isFunnelFoxApi) {
     throw new Error("Direct browser calls to FunnelFox API are blocked. Use the server-side proxy.");
   }
 
-  if (!isSameOrigin && !isEnabled(env.VITE_ALLOW_EXTERNAL_FUNNELFOX_PROXY)) {
-    throw new Error("External FunnelFox proxy URLs are disabled. Use a same-origin /api/funnelfox proxy.");
+  if (!isSameOrigin && !isSupabaseEdgeFunction && !isEnabled(env.VITE_ALLOW_EXTERNAL_FUNNELFOX_PROXY)) {
+    throw new Error("External FunnelFox proxy URLs are disabled. Use a same-origin /api/funnelfox proxy or Supabase Edge Functions.");
   }
 
   return url;
 }
 
+function isConfiguredSupabaseFunctionsBase(configuredUrl: string | undefined): boolean {
+  if (!configuredUrl?.trim()) return false;
+  const url = new URL(configuredUrl, window.location.origin);
+  return url.pathname.replace(/\/+$/, "").endsWith(SUPABASE_FUNCTIONS_BASE_PATH);
+}
+
 function proxyUrl(): URL {
-  return resolveFunnelFoxProxyUrl(import.meta.env.VITE_FUNNELFOX_PROXY_URL, DEFAULT_PROXY_ENDPOINT);
+  return resolveFunnelFoxProxyUrl(
+    import.meta.env.VITE_FUNNELFOX_PROXY_URL,
+    DEFAULT_PROXY_ENDPOINT,
+    import.meta.env,
+    window.location.origin,
+    EDGE_SUBSCRIPTIONS_FUNCTION,
+  );
 }
 
 function subscriptionDetailsUrl(): URL {
+  const configuredUrl = import.meta.env.VITE_FUNNELFOX_SUBSCRIPTION_DETAILS_URL
+    || (isConfiguredSupabaseFunctionsBase(import.meta.env.VITE_FUNNELFOX_PROXY_URL)
+      ? import.meta.env.VITE_FUNNELFOX_PROXY_URL
+      : undefined);
   return resolveFunnelFoxProxyUrl(
-    import.meta.env.VITE_FUNNELFOX_SUBSCRIPTION_DETAILS_URL,
+    configuredUrl,
     DEFAULT_SUBSCRIPTION_DETAILS_ENDPOINT,
+    import.meta.env,
+    window.location.origin,
+    EDGE_SUBSCRIPTION_FUNCTION,
   );
 }
 
 function profileDebugUrl(): URL {
-  return resolveFunnelFoxProxyUrl(import.meta.env.VITE_FUNNELFOX_PROFILE_DEBUG_URL, DEFAULT_PROFILE_DEBUG_ENDPOINT);
+  const configuredUrl = import.meta.env.VITE_FUNNELFOX_PROFILE_DEBUG_URL
+    || (isConfiguredSupabaseFunctionsBase(import.meta.env.VITE_FUNNELFOX_PROXY_URL)
+      ? import.meta.env.VITE_FUNNELFOX_PROXY_URL
+      : undefined);
+  return resolveFunnelFoxProxyUrl(
+    configuredUrl,
+    DEFAULT_PROFILE_DEBUG_ENDPOINT,
+    import.meta.env,
+    window.location.origin,
+    EDGE_PROFILE_FUNCTION,
+  );
 }
 
 function extractRows(response: FunnelFoxListResponse): FunnelFoxSubscriptionRaw[] {
@@ -230,22 +272,28 @@ export async function listSubscriptions(cursor?: string): Promise<FunnelFoxListR
 
   const url = proxyUrl();
   if (cursor) url.searchParams.set("cursor", cursor);
-  const res = await fetch(url.toString());
+  const res = await fetch(url.toString(), { headers: await requestHeaders() });
   if (!res.ok) {
     throw new Error(await safeErrorMessage(res, `Could not load FunnelFox subscriptions (HTTP ${res.status}).`));
   }
   return res.json() as Promise<FunnelFoxListResponse>;
 }
 
-async function requestHeaders(_options?: FunnelFoxRequestOptions): Promise<HeadersInit | undefined> {
-  if (!supabase) return undefined;
-  try {
-    const { data } = await supabase.auth.getSession();
-    const token = data.session?.access_token;
-    return token ? { Authorization: `Bearer ${token}` } : undefined;
-  } catch {
-    return undefined;
+async function requestHeaders(options?: FunnelFoxRequestOptions): Promise<HeadersInit | undefined> {
+  const headers: Record<string, string> = {};
+  const secret = options?.secret?.trim();
+  if (secret && isFunnelFoxTemporaryKeyInputEnabled()) {
+    headers["X-FunnelFox-Secret"] = secret;
   }
+
+  if (isSupabaseConfigured && supabase) {
+    const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY?.trim();
+    const { data } = await supabase.auth.getSession();
+    if (anonKey) headers.apikey = anonKey;
+    if (data.session?.access_token) headers.Authorization = `Bearer ${data.session.access_token}`;
+  }
+
+  return Object.keys(headers).length ? headers : undefined;
 }
 
 export async function listSubscriptionsWithOptions(
