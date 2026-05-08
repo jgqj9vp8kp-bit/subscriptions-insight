@@ -123,7 +123,7 @@ function isConfiguredSupabaseFunctionsBase(configuredUrl: string | undefined): b
 
 function proxyUrl(): URL {
   return resolveFunnelFoxProxyUrl(
-    import.meta.env.VITE_FUNNELFOX_PROXY_URL,
+    publicRuntimeConfig.funnelFoxProxyUrl,
     DEFAULT_PROXY_ENDPOINT,
     import.meta.env,
     window.location.origin,
@@ -133,8 +133,8 @@ function proxyUrl(): URL {
 
 function subscriptionDetailsUrl(): URL {
   const configuredUrl = import.meta.env.VITE_FUNNELFOX_SUBSCRIPTION_DETAILS_URL
-    || (isConfiguredSupabaseFunctionsBase(import.meta.env.VITE_FUNNELFOX_PROXY_URL)
-      ? import.meta.env.VITE_FUNNELFOX_PROXY_URL
+    || (isConfiguredSupabaseFunctionsBase(publicRuntimeConfig.funnelFoxProxyUrl)
+      ? publicRuntimeConfig.funnelFoxProxyUrl
       : undefined);
   return resolveFunnelFoxProxyUrl(
     configuredUrl,
@@ -147,8 +147,8 @@ function subscriptionDetailsUrl(): URL {
 
 function profileDebugUrl(): URL {
   const configuredUrl = import.meta.env.VITE_FUNNELFOX_PROFILE_DEBUG_URL
-    || (isConfiguredSupabaseFunctionsBase(import.meta.env.VITE_FUNNELFOX_PROXY_URL)
-      ? import.meta.env.VITE_FUNNELFOX_PROXY_URL
+    || (isConfiguredSupabaseFunctionsBase(publicRuntimeConfig.funnelFoxProxyUrl)
+      ? publicRuntimeConfig.funnelFoxProxyUrl
       : undefined);
   return resolveFunnelFoxProxyUrl(
     configuredUrl,
@@ -288,7 +288,7 @@ async function requestHeaders(options?: FunnelFoxRequestOptions): Promise<Header
   }
 
   if (isSupabaseConfigured && supabase) {
-    const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY?.trim();
+    const anonKey = publicRuntimeConfig.supabaseAnonKey;
     const { data } = await supabase.auth.getSession();
     if (anonKey) headers.apikey = anonKey;
     if (data.session?.access_token) headers.Authorization = `Bearer ${data.session.access_token}`;
