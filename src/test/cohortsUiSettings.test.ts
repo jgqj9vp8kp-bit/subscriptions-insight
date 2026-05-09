@@ -52,6 +52,7 @@ const defaults: CohortsUiSettingsDefaults = {
   validWidthKeys: ["__cohort__", "cohort_date", "campaign_path", "trial_users", "net_revenue"],
   validSelectedViewIds: ["default", "revenue"],
   defaultSelectedView: "default",
+  validSortColumnIds: ["__cohort__", "cohort_date", "campaign_path", "trial_users", "net_revenue"],
 };
 
 describe("cohorts UI settings", () => {
@@ -81,6 +82,29 @@ describe("cohorts UI settings", () => {
     expect(loaded?.columnVisibility.campaign_path).toBe(false);
     expect(loaded?.filters.campaignPathFilter).toBe("soulmate-reading");
     expect(loaded?.selectedView).toBe("revenue");
+  });
+
+  it("persists sorting in local UI settings", () => {
+    const payload = buildCohortsUiSettingsPayload(
+      {
+        columnOrder: ["net_revenue", "campaign_path", "cohort_date", "trial_users"],
+        columnWidths: {},
+        columnVisibility: {},
+        selectedView: null,
+        savedViews: [],
+        filters: {},
+        sortColumn: "net_revenue",
+        sortDirection: "desc",
+        updatedAt: "2026-05-09T10:00:00.000Z",
+      },
+      defaults,
+    );
+
+    saveCohortsUiSettingsLocal(payload);
+    const loaded = loadCohortsUiSettingsLocal(defaults);
+
+    expect(loaded?.sortColumn).toBe("net_revenue");
+    expect(loaded?.sortDirection).toBe("desc");
   });
 
   it("uses cloud settings when local storage is empty", () => {

@@ -28,6 +28,8 @@ export type CohortsUiSettingsPayload = {
   selectedView: string | null;
   savedViews: CohortsUiSavedView[];
   filters: Record<string, unknown>;
+  sortColumn: string | null;
+  sortDirection: "asc" | "desc" | null;
   updatedAt: string;
 };
 
@@ -39,6 +41,7 @@ export type CohortsUiSettingsDefaults = {
   validWidthKeys?: readonly string[];
   validSelectedViewIds?: readonly string[];
   defaultSelectedView?: string | null;
+  validSortColumnIds?: readonly string[];
 };
 
 export type CohortsUiSettingsMergeResult = {
@@ -143,6 +146,10 @@ export function sanitizeCohortsUiSettingsPayload(
   const savedViews = sanitizeSavedViews(source.savedViews, defaults);
   const selectedView = typeof source.selectedView === "string" && source.selectedView ? source.selectedView : null;
   const validViewIds = new Set([...(defaults.validSelectedViewIds ?? []), ...savedViews.map((view) => view.id)]);
+  const sortColumn = typeof source.sortColumn === "string" && source.sortColumn ? source.sortColumn : null;
+  const validSortColumns = new Set(defaults.validSortColumnIds ?? defaults.defaultColumnOrder);
+  const sortDirection = source.sortDirection === "asc" || source.sortDirection === "desc" ? source.sortDirection : null;
+  const normalizedSortColumn = sortColumn && validSortColumns.has(sortColumn) && sortDirection ? sortColumn : null;
 
   return {
     version: 1,
@@ -166,6 +173,8 @@ export function sanitizeCohortsUiSettingsPayload(
       source.filters && typeof source.filters === "object" && !Array.isArray(source.filters)
         ? { ...defaults.defaultFilters, ...(source.filters as Record<string, unknown>) }
         : { ...defaults.defaultFilters },
+    sortColumn: normalizedSortColumn,
+    sortDirection: normalizedSortColumn ? sortDirection : null,
     updatedAt,
   };
 }
@@ -181,7 +190,11 @@ export function newerCohortsUiSettings(
 }
 
 export function buildCohortsUiSettingsPayload(
-  input: Omit<CohortsUiSettingsPayload, "version" | "updatedAt"> & { updatedAt?: string },
+  input: Omit<CohortsUiSettingsPayload, "version" | "updatedAt" | "sortColumn" | "sortDirection"> & {
+    updatedAt?: string;
+    sortColumn?: string | null;
+    sortDirection?: "asc" | "desc" | null;
+  },
   defaults: CohortsUiSettingsDefaults,
 ): CohortsUiSettingsPayload {
   const updatedAt = input.updatedAt ?? new Date().toISOString();
@@ -194,6 +207,8 @@ export function buildCohortsUiSettingsPayload(
       selectedView: input.selectedView,
       savedViews: input.savedViews,
       filters: input.filters,
+      sortColumn: input.sortColumn,
+      sortDirection: input.sortDirection,
       updatedAt,
     },
     defaults,
@@ -205,6 +220,8 @@ export function buildCohortsUiSettingsPayload(
     selectedView: input.selectedView,
     savedViews: sanitizeSavedViews(input.savedViews, defaults),
     filters: { ...defaults.defaultFilters, ...input.filters },
+    sortColumn: input.sortColumn ?? null,
+    sortDirection: input.sortDirection ?? null,
     updatedAt,
   };
 }
@@ -218,6 +235,11 @@ export function loadCohortsUiSettingsLocal(defaults: CohortsUiSettingsDefaults):
       const raw = localStorage.getItem(key);
       return raw ? JSON.parse(raw) : null;
     };
+    const rawFilters = readJson(COHORTS_UI_STATE_STORAGE_KEY);
+    const filters =
+      rawFilters && typeof rawFilters === "object" && !Array.isArray(rawFilters)
+        ? (rawFilters as Record<string, unknown>)
+        : {};
 
     return sanitizeCohortsUiSettingsPayload(
       {
@@ -226,7 +248,9 @@ export function loadCohortsUiSettingsLocal(defaults: CohortsUiSettingsDefaults):
         columnVisibility: readJson(COLUMN_VISIBILITY_STORAGE_KEY),
         selectedView: localStorage.getItem(ACTIVE_VIEW_STORAGE_KEY),
         savedViews: readJson(SAVED_VIEWS_STORAGE_KEY),
-        filters: readJson(COHORTS_UI_STATE_STORAGE_KEY),
+        filters,
+        sortColumn: filters?.sortColumn,
+        sortDirection: filters?.sortDirection,
         updatedAt,
       },
       defaults,
@@ -243,7 +267,14 @@ export function saveCohortsUiSettingsLocal(payload: CohortsUiSettingsPayload) {
     localStorage.setItem(COLUMN_WIDTHS_STORAGE_KEY, JSON.stringify(payload.columnWidths));
     localStorage.setItem(COLUMN_VISIBILITY_STORAGE_KEY, JSON.stringify(payload.columnVisibility));
     localStorage.setItem(SAVED_VIEWS_STORAGE_KEY, JSON.stringify(payload.savedViews));
-    localStorage.setItem(COHORTS_UI_STATE_STORAGE_KEY, JSON.stringify(payload.filters));
+    localStorage.setItem(
+      COHORTS_UI_STATE_STORAGE_KEY,
+      JSON.stringify({
+        ...payload.filters,
+        sortColumn: payload.sortColumn,
+        sortDirection: payload.sortDirection,
+      }),
+    );
     localStorage.setItem(COHORTS_UI_SETTINGS_UPDATED_AT_KEY, payload.updatedAt);
     if (payload.selectedView) localStorage.setItem(ACTIVE_VIEW_STORAGE_KEY, payload.selectedView);
     else localStorage.removeItem(ACTIVE_VIEW_STORAGE_KEY);

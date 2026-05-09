@@ -1,5 +1,5 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowDown, ArrowUp, ChevronDown, ChevronRight, GripVertical, Check, Loader2, Plus, Trash2 } from "lucide-react";
+import { ArrowDown, ArrowUp, ArrowUpDown, ChevronDown, ChevronRight, GripVertical, Check, Loader2, Plus, Trash2 } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -50,6 +50,11 @@ import {
   type CohortsUiSettingsDefaults,
   type CohortsUiSettingsPayload,
 } from "@/services/cohortsUiSettings";
+import {
+  nextCohortSortState,
+  sortCohortRows,
+  type CohortSortDirection,
+} from "@/services/cohortSorting";
 
 // Visual-only helpers — no data/logic impact.
 const HEAD_BASE =
@@ -72,6 +77,8 @@ const DEFAULT_COHORTS_UI_STATE = {
   cohortDateFrom: "",
   cohortDateTo: "",
   dateSort: "desc" as "desc" | "asc",
+  sortColumn: null as string | null,
+  sortDirection: null as CohortSortDirection | null,
   expandedCohortIds: [] as string[],
 };
 
@@ -538,7 +545,8 @@ export default function CohortsPage() {
     refundFilter,
     cohortDateFrom,
     cohortDateTo,
-    dateSort,
+    sortColumn,
+    sortDirection,
     expandedCohortIds: expandedCohortIdList,
   } = uiState;
   const expandedCohortIds = useMemo(() => new Set(expandedCohortIdList), [expandedCohortIdList]);
@@ -578,6 +586,7 @@ export default function CohortsPage() {
       validWidthKeys: [COHORT_FIRST_COL_KEY, ...DEFAULT_COLUMN_ORDER],
       validSelectedViewIds: BUILTIN_VIEWS.map((view) => view.id),
       defaultSelectedView: "default",
+      validSortColumnIds: [COHORT_FIRST_COL_KEY, ...DEFAULT_COLUMN_ORDER],
     }),
     [],
   );
@@ -663,6 +672,8 @@ export default function CohortsPage() {
           selectedView: activeViewId,
           savedViews: customViews.map(toCloudSavedView),
           filters: uiState,
+          sortColumn: uiState.sortColumn,
+          sortDirection: uiState.sortDirection,
           updatedAt,
         },
         cohortsUiSettingsDefaults,
@@ -796,7 +807,7 @@ export default function CohortsPage() {
   const trafficByKey = useMemo(() => aggregateTrafficMetrics(trafficMetrics), [trafficMetrics]);
   const funnelOptions = useMemo(() => Array.from(new Set(allCohorts.map((c) => c.funnel))).sort(), [allCohorts]);
   const campaignPathOptions = useMemo(() => Array.from(new Set(allCohorts.map((c) => c.campaign_path))).sort(), [allCohorts]);
-  const cohorts = useMemo(
+  const filteredCohorts = useMemo(
     () =>
       allCohorts.filter((c) => {
         if (funnelFilter !== "all" && c.funnel !== funnelFilter) return false;
@@ -806,11 +817,25 @@ export default function CohortsPage() {
         if (cohortDateFrom && c.cohort_date < cohortDateFrom) return false;
         if (cohortDateTo && c.cohort_date > cohortDateTo) return false;
         return true;
-      }).sort((a, b) => {
-        const cmp = a.cohort_date < b.cohort_date ? -1 : a.cohort_date > b.cohort_date ? 1 : 0;
-        return dateSort === "asc" ? cmp : -cmp;
       }),
-    [allCohorts, funnelFilter, campaignPathFilter, refundFilter, cohortDateFrom, cohortDateTo, dateSort]
+    [allCohorts, funnelFilter, campaignPathFilter, refundFilter, cohortDateFrom, cohortDateTo]
+  );
+  const cohorts = useMemo(
+    () => {
+      if (sortColumn && sortDirection) {
+        return sortCohortRows(
+          filteredCohorts,
+          { sortColumn, sortDirection },
+          (cohort) => trafficForCohort(cohort, trafficByKey),
+        );
+      }
+
+      return [...filteredCohorts].sort((a, b) => {
+        const cmp = a.cohort_date < b.cohort_date ? -1 : a.cohort_date > b.cohort_date ? 1 : 0;
+        return -cmp;
+      });
+    },
+    [filteredCohorts, sortColumn, sortDirection, trafficByKey]
   );
   const hasUsers = useMemo(() => new Set(txs.map((t) => t.user_id)).size > 0, [txs]);
   const toggleExpanded = (cohortId: string) => {
@@ -874,6 +899,7 @@ export default function CohortsPage() {
   const resetToDefault = () => {
     applyView(BUILTIN_VIEWS[0]);
     resetColumnWidths();
+    updateUiState({ sortColumn: null, sortDirection: null });
     markCohortsUiSettingsUpdated();
   };
 
@@ -1035,6 +1061,14 @@ export default function CohortsPage() {
   };
   const dash = <span className="text-muted-foreground/40">—</span>;
   const formatRoas = (value: number) => `${value.toFixed(2)}x`;
+  const sortState = useMemo(() => ({ sortColumn, sortDirection }), [sortColumn, sortDirection]);
+  const onSortColumn = (id: string) => {
+    updateUiState(nextCohortSortState(sortState, id));
+  };
+  const sortIcon = (id: string) => {
+    if (sortColumn !== id || !sortDirection) return <ArrowUpDown className="h-3 w-3 opacity-35" />;
+    return sortDirection === "asc" ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />;
+  };
 
   const renderHeaderCell = (id: CohortColumnId) => (
     <TableHead
@@ -1046,19 +1080,16 @@ export default function CohortsPage() {
       onDragOver={onHeaderDragOver}
       onDrop={() => onHeaderDrop(id)}
     >
-      {id === "cohort_date" ? (
-        <button
-          onClick={() => updateUiState({ dateSort: dateSort === "desc" ? "asc" : "desc" })}
-          className="inline-flex items-center gap-1 hover:text-foreground"
-        >
-          {COLUMN_LABELS[id]} {dateSort === "asc" ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />}
-        </button>
-      ) : (
-        <span className="inline-flex items-center gap-1 cursor-grab active:cursor-grabbing">
-          <GripVertical className="h-3 w-3 opacity-40" />
-          {COLUMN_LABELS[id]}
-        </span>
-      )}
+      <button
+        type="button"
+        onClick={() => onSortColumn(id)}
+        className="inline-flex max-w-full items-center gap-1 hover:text-foreground"
+        aria-label={`Sort by ${COLUMN_LABELS[id]}`}
+      >
+        <GripVertical className="h-3 w-3 shrink-0 cursor-grab opacity-40 active:cursor-grabbing" />
+        <span className="truncate">{COLUMN_LABELS[id]}</span>
+        {sortIcon(id)}
+      </button>
       <div
         role="separator"
         aria-orientation="vertical"
@@ -1578,7 +1609,15 @@ export default function CohortsPage() {
                   className={`${HEAD_BASE} left-0 z-50 shadow-[1px_0_0_0_hsl(var(--border)),0_1px_0_0_hsl(var(--border))] text-left`}
                   style={{ width: columnWidths[COHORT_FIRST_COL_KEY], minWidth: MIN_COLUMN_WIDTH }}
                 >
-                  Cohort
+                  <button
+                    type="button"
+                    onClick={() => onSortColumn(COHORT_FIRST_COL_KEY)}
+                    className="inline-flex max-w-full items-center gap-1 hover:text-foreground"
+                    aria-label="Sort by Cohort"
+                  >
+                    <span className="truncate">Cohort</span>
+                    {sortIcon(COHORT_FIRST_COL_KEY)}
+                  </button>
                   <div
                     role="separator"
                     aria-orientation="vertical"
