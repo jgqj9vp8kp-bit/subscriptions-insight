@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   AlertCircle,
   CheckCircle2,
@@ -850,6 +850,20 @@ export default function ImportPage() {
     }
   }
 
+  function onLoadLocalForecastingSettings() {
+    const curve = loadDefaultRetentionCurve();
+    setRetentionCurveDraft(curve.map(String));
+    setCloudError(null);
+    setCloudMessage("Loaded local Forecasting settings.");
+  }
+
+  function onClearLocalForecastingSettings() {
+    const curve = resetDefaultRetentionCurve();
+    setRetentionCurveDraft(curve.map(String));
+    setCloudError(null);
+    setCloudMessage("Local Forecasting settings cleared. Built-in default curve is active.");
+  }
+
   function parseRetentionCurveDraftValue(value: string): number | null {
     const normalized = value.trim().replace(",", ".");
     if (!normalized) return null;
@@ -963,6 +977,42 @@ export default function ImportPage() {
           </>
         ) : null}
       </>
+    );
+  }
+
+  function renderSavedDataCard({
+    title,
+    localStatus,
+    cloudStatus,
+    messages,
+    actions,
+  }: {
+    title: string;
+    localStatus: ReactNode;
+    cloudStatus: ReactNode;
+    messages?: ReactNode;
+    actions: ReactNode;
+  }) {
+    return (
+      <div className="rounded-md border border-border bg-card/50 p-3">
+        <div className="space-y-3">
+          <div>
+            <div className="text-sm font-medium text-foreground">{title}</div>
+            <div className="mt-2 grid gap-2 text-xs text-muted-foreground">
+              <div className="rounded-md bg-muted/30 px-2.5 py-2">
+                <div className="mb-0.5 font-medium text-foreground">Local cache</div>
+                <div className="min-w-0">{localStatus}</div>
+              </div>
+              <div className="rounded-md bg-muted/30 px-2.5 py-2">
+                <div className="mb-0.5 font-medium text-foreground">Cloud snapshot</div>
+                <div className="min-w-0">{cloudStatus}</div>
+              </div>
+            </div>
+            {messages}
+          </div>
+          <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap">{actions}</div>
+        </div>
+      </div>
     );
   }
 
@@ -1455,250 +1505,164 @@ export default function ImportPage() {
           <Database className="h-4 w-4 text-muted-foreground" />
           <h3 className="text-sm font-semibold text-foreground">Local Saved Data</h3>
         </div>
-        <div className="grid gap-3 xl:grid-cols-4">
-          <div className="rounded-md border border-border p-3">
-            <div className="flex items-start justify-between gap-3">
-              <div className="min-w-0">
-                <div className="text-sm font-medium text-foreground">Saved Palmer dataset</div>
-                <div className="mt-1 text-xs text-muted-foreground">
-                  {palmerCacheInfo ? (
-                    <>
-                      Saved dataset available:{" "}
-                      <span className="font-medium text-foreground">{palmerCacheInfo.file_name}</span>, imported at{" "}
-                      <span className="tabular-nums text-foreground">
-                        {new Date(palmerCacheInfo.imported_at).toLocaleString()}
-                      </span>
-                      , <span className="tabular-nums text-foreground">{palmerCacheInfo.rows_count}</span> rows
-                    </>
-                  ) : (
-                    "No saved Palmer dataset found."
-                  )}
-                </div>
-                <div className="mt-2 text-xs text-muted-foreground">
-                  {renderCloudSnapshotInfo("palmer", "No Palmer cloud snapshot found.")}
-                </div>
-                {palmerCacheMessage && <div className="mt-1 text-xs text-primary">{palmerCacheMessage}</div>}
-                {palmerCacheError && <div className="mt-1 text-xs text-destructive">{palmerCacheError}</div>}
-              </div>
-              <div className="flex shrink-0 flex-wrap justify-end gap-2">
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={onLoadSavedPalmerDataset}
-                  disabled={palmerCacheLoading || !palmerCacheInfo}
-                >
-                  Load saved dataset
+        <div className="grid gap-3 lg:grid-cols-2">
+          {renderSavedDataCard({
+            title: "Palmer dataset",
+            localStatus: palmerCacheInfo ? (
+              <>
+                <span className="font-medium text-foreground">{palmerCacheInfo.file_name}</span>
+                <span>, </span>
+                <span className="tabular-nums text-foreground">{palmerCacheInfo.rows_count}</span>
+                <span> rows, imported </span>
+                <span className="tabular-nums text-foreground">
+                  {new Date(palmerCacheInfo.imported_at).toLocaleString()}
+                </span>
+              </>
+            ) : (
+              "No local cache found."
+            ),
+            cloudStatus: renderCloudSnapshotInfo("palmer", "No cloud snapshot found."),
+            messages: (
+              <>
+                {palmerCacheMessage && <div className="mt-2 text-xs text-primary">{palmerCacheMessage}</div>}
+                {palmerCacheError && <div className="mt-2 text-xs text-destructive">{palmerCacheError}</div>}
+              </>
+            ),
+            actions: (
+              <>
+                <Button type="button" variant="outline" size="sm" onClick={onLoadSavedPalmerDataset} disabled={palmerCacheLoading || !palmerCacheInfo}>
+                  Load local
                 </Button>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  onClick={onClearSavedPalmerDataset}
-                  disabled={palmerCacheLoading || !palmerCacheInfo}
-                >
-                  <Trash2 className="h-3.5 w-3.5" />
-                  Clear
+                <Button type="button" variant="outline" size="sm" onClick={onLoadPalmerFromCloud} disabled={cloudLoading === "palmer" || !cloudSnapshots.palmer}>
+                  Load cloud
                 </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={onSavePalmerToCloud}
-                  disabled={cloudLoading === "palmer" || meta.source !== "palmer_raw" || !transactions.length}
-                >
+                <Button type="button" variant="outline" size="sm" onClick={onSavePalmerToCloud} disabled={cloudLoading === "palmer" || meta.source !== "palmer_raw" || !transactions.length}>
                   {cloudLoading === "palmer" && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-                  Save to cloud
+                  Save cloud
                 </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={onLoadPalmerFromCloud}
-                  disabled={cloudLoading === "palmer" || !cloudSnapshots.palmer}
-                >
-                  Load from cloud
-                </Button>
-              </div>
-            </div>
-          </div>
-
-          <div className="rounded-md border border-border p-3">
-            <div className="flex items-start justify-between gap-3">
-              <div className="min-w-0">
-                <div className="text-sm font-medium text-foreground">Saved FunnelFox subscriptions</div>
-                <div className="mt-1 text-xs text-muted-foreground">
-                  {subscriptionCacheInfo ? (
-                    <>
-                      Saved subscriptions available:{" "}
-                      <span className="tabular-nums text-foreground">{subscriptionCacheInfo.count}</span>, saved at{" "}
-                      <span className="tabular-nums text-foreground">
-                        {new Date(subscriptionCacheInfo.saved_at).toLocaleString()}
-                      </span>
-                    </>
-                  ) : (
-                    "No saved subscriptions cache found."
-                  )}
-                </div>
-                <div className="mt-2 text-xs text-muted-foreground">
-                  {renderCloudSnapshotInfo("funnelfox_subscriptions", "No FunnelFox cloud snapshot found.")}
-                </div>
-              </div>
-              <div className="flex shrink-0 flex-wrap justify-end gap-2">
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={onLoadSavedSubscriptions}
-                  disabled={subscriptionCacheLoading || !subscriptionCacheInfo}
-                >
-                  Load saved subscriptions
-                </Button>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  onClick={onClearSavedSubscriptions}
-                  disabled={subscriptionCacheLoading || !subscriptionCacheInfo}
-                >
+                <Button type="button" variant="ghost" size="sm" onClick={onClearSavedPalmerDataset} disabled={palmerCacheLoading || !palmerCacheInfo}>
                   <Trash2 className="h-3.5 w-3.5" />
-                  Clear
+                  Clear local
                 </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={onSaveSubscriptionsToCloud}
-                  disabled={cloudLoading === "funnelfox_subscriptions" || !subscriptions.length}
-                >
+              </>
+            ),
+          })}
+
+          {renderSavedDataCard({
+            title: "FunnelFox subscriptions",
+            localStatus: subscriptionCacheInfo ? (
+              <>
+                <span className="tabular-nums text-foreground">{subscriptionCacheInfo.count}</span>
+                <span> subscriptions, saved </span>
+                <span className="tabular-nums text-foreground">
+                  {new Date(subscriptionCacheInfo.saved_at).toLocaleString()}
+                </span>
+              </>
+            ) : (
+              "No local cache found."
+            ),
+            cloudStatus: renderCloudSnapshotInfo("funnelfox_subscriptions", "No cloud snapshot found."),
+            actions: (
+              <>
+                <Button type="button" variant="outline" size="sm" onClick={onLoadSavedSubscriptions} disabled={subscriptionCacheLoading || !subscriptionCacheInfo}>
+                  Load local
+                </Button>
+                <Button type="button" variant="outline" size="sm" onClick={onLoadSubscriptionsFromCloud} disabled={cloudLoading === "funnelfox_subscriptions" || !cloudSnapshots.funnelfox_subscriptions}>
+                  Load cloud
+                </Button>
+                <Button type="button" variant="outline" size="sm" onClick={onSaveSubscriptionsToCloud} disabled={cloudLoading === "funnelfox_subscriptions" || !subscriptions.length}>
                   {cloudLoading === "funnelfox_subscriptions" && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-                  Save to cloud
+                  Save cloud
                 </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={onLoadSubscriptionsFromCloud}
-                  disabled={cloudLoading === "funnelfox_subscriptions" || !cloudSnapshots.funnelfox_subscriptions}
-                >
-                  Load from cloud
-                </Button>
-              </div>
-            </div>
-          </div>
-
-          <div className="rounded-md border border-border p-3">
-            <div className="flex items-start justify-between gap-3">
-              <div className="min-w-0">
-                <div className="text-sm font-medium text-foreground">Saved Facebook traffic data</div>
-                <div className="mt-1 text-xs text-muted-foreground">
-                  {trafficCacheInfo ? (
-                    <>
-                      Saved Facebook traffic data available:{" "}
-                      <span className="font-medium tabular-nums text-foreground">{trafficCacheInfo.rows_count}</span>{" "}
-                      rows, imported at{" "}
-                      <span className="tabular-nums text-foreground">
-                        {new Date(trafficCacheInfo.imported_at).toLocaleString()}
-                      </span>
-                      {trafficCacheInfo.year ? (
-                        <>
-                          , year <span className="tabular-nums text-foreground">{trafficCacheInfo.year}</span>
-                        </>
-                      ) : null}
-                      {trafficCacheInfo.google_sheet_url ? (
-                        <div className="mt-1 truncate">
-                          Source: <span className="text-foreground">{trafficCacheInfo.google_sheet_url}</span>
-                        </div>
-                      ) : null}
-                    </>
-                  ) : (
-                    "No saved Facebook traffic data found."
-                  )}
-                </div>
-                <div className="mt-2 text-xs text-muted-foreground">
-                  {renderCloudSnapshotInfo("facebook_traffic", "No Facebook traffic cloud snapshot found.")}
-                </div>
-                {trafficCacheMessage && <div className="mt-1 text-xs text-primary">{trafficCacheMessage}</div>}
-                {trafficCacheError && <div className="mt-1 text-xs text-destructive">{trafficCacheError}</div>}
-              </div>
-              <div className="flex shrink-0 flex-wrap justify-end gap-2">
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={onLoadSavedTrafficData}
-                  disabled={trafficCacheLoading || !trafficCacheInfo}
-                >
-                  {trafficCacheLoading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-                  Load saved traffic data
-                </Button>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  onClick={onClearSavedTrafficData}
-                  disabled={trafficCacheLoading || !trafficCacheInfo}
-                >
+                <Button type="button" variant="ghost" size="sm" onClick={onClearSavedSubscriptions} disabled={subscriptionCacheLoading || !subscriptionCacheInfo}>
                   <Trash2 className="h-3.5 w-3.5" />
-                  Clear
+                  Clear local
                 </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={onSaveTrafficToCloud}
-                  disabled={cloudLoading === "facebook_traffic" || !trafficMetrics.length}
-                >
-                  {cloudLoading === "facebook_traffic" && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-                  Save to cloud
-                </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={onLoadTrafficFromCloud}
-                  disabled={cloudLoading === "facebook_traffic" || !cloudSnapshots.facebook_traffic}
-                >
-                  Load from cloud
-                </Button>
-              </div>
-            </div>
-          </div>
+              </>
+            ),
+          })}
 
-          <div className="rounded-md border border-border p-3">
-            <div className="flex items-start justify-between gap-3">
-              <div className="min-w-0">
-                <div className="text-sm font-medium text-foreground">Saved Forecasting settings</div>
-                <div className="mt-1 text-xs text-muted-foreground">
-                  Local default curve is stored in browser UI settings.
-                </div>
-                <div className="mt-2 text-xs text-muted-foreground">
-                  {renderCloudSnapshotInfo("forecasting_settings", "No forecasting settings cloud snapshot found.")}
-                </div>
-              </div>
-              <div className="flex shrink-0 flex-wrap justify-end gap-2">
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={onSaveForecastingSettingsToCloud}
-                  disabled={cloudLoading === "forecasting_settings"}
-                >
+          {renderSavedDataCard({
+            title: "Facebook traffic",
+            localStatus: trafficCacheInfo ? (
+              <>
+                <span className="tabular-nums text-foreground">{trafficCacheInfo.rows_count}</span>
+                <span> rows, imported </span>
+                <span className="tabular-nums text-foreground">
+                  {new Date(trafficCacheInfo.imported_at).toLocaleString()}
+                </span>
+                {trafficCacheInfo.year ? (
+                  <>
+                    <span>, year </span>
+                    <span className="tabular-nums text-foreground">{trafficCacheInfo.year}</span>
+                  </>
+                ) : null}
+                {trafficCacheInfo.google_sheet_url ? (
+                  <div className="mt-1 truncate">
+                    Source: <span className="text-foreground">{trafficCacheInfo.google_sheet_url}</span>
+                  </div>
+                ) : null}
+              </>
+            ) : (
+              "No local cache found."
+            ),
+            cloudStatus: renderCloudSnapshotInfo("facebook_traffic", "No cloud snapshot found."),
+            messages: (
+              <>
+                {trafficCacheMessage && <div className="mt-2 text-xs text-primary">{trafficCacheMessage}</div>}
+                {trafficCacheError && <div className="mt-2 text-xs text-destructive">{trafficCacheError}</div>}
+              </>
+            ),
+            actions: (
+              <>
+                <Button type="button" variant="outline" size="sm" onClick={onLoadSavedTrafficData} disabled={trafficCacheLoading || !trafficCacheInfo}>
+                  {trafficCacheLoading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                  Load local
+                </Button>
+                <Button type="button" variant="outline" size="sm" onClick={onLoadTrafficFromCloud} disabled={cloudLoading === "facebook_traffic" || !cloudSnapshots.facebook_traffic}>
+                  Load cloud
+                </Button>
+                <Button type="button" variant="outline" size="sm" onClick={onSaveTrafficToCloud} disabled={cloudLoading === "facebook_traffic" || !trafficMetrics.length}>
+                  {cloudLoading === "facebook_traffic" && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                  Save cloud
+                </Button>
+                <Button type="button" variant="ghost" size="sm" onClick={onClearSavedTrafficData} disabled={trafficCacheLoading || !trafficCacheInfo}>
+                  <Trash2 className="h-3.5 w-3.5" />
+                  Clear local
+                </Button>
+              </>
+            ),
+          })}
+
+          {renderSavedDataCard({
+            title: "Forecasting settings",
+            localStatus: (
+              <>
+                Default curve loaded in this browser. M1{" "}
+                <span className="tabular-nums text-foreground">{retentionCurveDraft[0] ?? "35"}%</span>, M12{" "}
+                <span className="tabular-nums text-foreground">{retentionCurveDraft[11] ?? "2"}%</span>
+              </>
+            ),
+            cloudStatus: renderCloudSnapshotInfo("forecasting_settings", "No cloud snapshot found."),
+            actions: (
+              <>
+                <Button type="button" variant="outline" size="sm" onClick={onLoadLocalForecastingSettings}>
+                  Load local
+                </Button>
+                <Button type="button" variant="outline" size="sm" onClick={onLoadForecastingSettingsFromCloud} disabled={cloudLoading === "forecasting_settings" || !cloudSnapshots.forecasting_settings}>
+                  Load cloud
+                </Button>
+                <Button type="button" variant="outline" size="sm" onClick={onSaveForecastingSettingsToCloud} disabled={cloudLoading === "forecasting_settings"}>
                   {cloudLoading === "forecasting_settings" && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-                  Save to cloud
+                  Save cloud
                 </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={onLoadForecastingSettingsFromCloud}
-                  disabled={cloudLoading === "forecasting_settings" || !cloudSnapshots.forecasting_settings}
-                >
-                  Load from cloud
+                <Button type="button" variant="ghost" size="sm" onClick={onClearLocalForecastingSettings}>
+                  <Trash2 className="h-3.5 w-3.5" />
+                  Clear local
                 </Button>
-              </div>
-            </div>
-          </div>
+              </>
+            ),
+          })}
         </div>
         {(cloudMessage || cloudError) && (
           <div className="mt-3 rounded-md border border-border bg-muted/20 p-3 text-xs">
