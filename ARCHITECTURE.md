@@ -17,7 +17,7 @@ The Import Data page is the single source connection center. Palmer upload, Face
 
 Forecasting is a read-only scenario layer over existing cohort data. It uses Cohorts as the factual base, calculates absolute retention from original trial users, and lets the user edit forecast assumptions without mutating Palmer, FunnelFox, traffic, or cohort calculations.
 
-Small page UI state is persisted in localStorage via `src/hooks/usePersistedPageState.ts`. Large data remains outside localStorage: Palmer, FunnelFox, and Facebook traffic datasets use IndexedDB for local reloads and Supabase `data_snapshots` for cross-device restore. API keys/secrets are never persisted.
+Small page UI state is persisted in localStorage via `src/hooks/usePersistedPageState.ts`. Cohorts table settings additionally sync to Supabase `data_snapshots` as `cohorts_ui_settings` so column order, widths, visibility, active preset, and filters can follow the authenticated user across devices. Large data remains outside localStorage: Palmer, FunnelFox, and Facebook traffic datasets use IndexedDB for local reloads and Supabase `data_snapshots` for cross-device restore. API keys/secrets are never persisted.
 
 All analytics routes are protected by Supabase Auth. `/login` is public; Dashboard, Cohorts, Forecasting, Transactions, Users, Subscriptions, and Import Data require an authenticated session. Supabase signup should be disabled in production, and allowed users should be created in Supabase Auth.
 
@@ -41,7 +41,7 @@ Import/sync success
 -> app startup restores IndexedDB first, then latest Supabase snapshot if local cache is missing
 ```
 
-`data_snapshots` stores the latest snapshot per authenticated user and dataset type: `palmer`, `funnelfox_subscriptions`, `facebook_traffic`, and `forecasting_settings`. Row-level security keeps snapshots private to the owning Supabase Auth user.
+`data_snapshots` stores the latest snapshot per authenticated user and dataset type: `palmer`, `funnelfox_subscriptions`, `facebook_traffic`, `forecasting_settings`, and `cohorts_ui_settings`. Row-level security keeps snapshots private to the owning Supabase Auth user.
 
 FunnelFox subscription monitoring is imported separately from Palmer transactions, then joined into cohort reporting by normalized email for subscription-health metrics:
 

@@ -52,6 +52,7 @@ Each authenticated user gets one latest snapshot per `dataset_type`:
 - `funnelfox_subscriptions`
 - `facebook_traffic`
 - `forecasting_settings`
+- `cohorts_ui_settings`
 
 RLS policies require `auth.uid() = user_id` for select, insert, update, and delete. The frontend uses the publishable anon key plus the logged-in Supabase session; no service role key is used in browser code.
 
@@ -63,6 +64,10 @@ Import Data action succeeds
 -> upsert latest Supabase data_snapshots row
 ```
 
+Large snapshots are compressed before they are written to `payload`. `src/services/dataSnapshots.ts` wraps payloads larger than the configured threshold in a small `lz-string-uri-v1` envelope and transparently decompresses them in `loadLatestCloudSnapshot`. This is mainly important for Palmer imports because they include transformed transactions plus raw Palmer rows.
+
+Safe cloud-save diagnostics are allowed, but never log full payloads or raw emails. The snapshot save path logs only whether a user session exists, `dataset_type`, size estimates, compression status, snapshot id, and safe error messages.
+
 Startup restore flow:
 
 ```text
@@ -73,7 +78,32 @@ Protected app mounts
 -> warms IndexedDB with cloud-loaded data
 ```
 
-Use the Local Saved Data section on Import Data to manually Save to cloud or Load from cloud for Palmer, FunnelFox subscriptions, Facebook traffic, and Forecasting settings. Do not store FunnelFox secrets, Supabase service role keys, raw API keys, or other credentials in snapshot payloads.
+Use the Local Saved Data section on Import Data to manually Save to cloud or Load from cloud for Palmer, FunnelFox subscriptions, Facebook traffic, and Forecasting settings. Cohorts view settings are managed from the Cohorts column settings panel and are saved to cloud automatically with a debounce. Do not store FunnelFox secrets, Supabase service role keys, raw API keys, or other credentials in snapshot payloads.
+
+### Cohorts UI Settings Sync
+
+`src/services/cohortsUiSettings.ts` owns validation and local storage keys for Cohorts view settings. It syncs this small payload:
+
+```ts
+{
+  columnOrder,
+  columnWidths,
+  columnVisibility,
+  selectedView,
+  filters,
+  updatedAt
+}
+```
+
+Load rule:
+
+```text
+localStorage first
+-> Supabase cloud snapshot
+-> apply cloud only when cloud.updatedAt is newer or local settings do not exist
+```
+
+When app versions add or remove cohort columns, sanitize the saved payload before applying it: ignore unknown column IDs, remove duplicates, and append missing valid columns at the end.
 
 ## FunnelFox Backend Requirement
 

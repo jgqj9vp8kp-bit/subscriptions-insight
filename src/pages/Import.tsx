@@ -52,6 +52,12 @@ import {
   type RawPalmerRow,
 } from "@/services/palmerTransform";
 import {
+  buildPalmerCloudMetadata,
+  buildPalmerCloudPayload,
+  normalizePalmerCloudPayload,
+  type PalmerCloudPayload,
+} from "@/services/palmerCloudSnapshot";
+import {
   clearPalmerDatasetCache,
   getPalmerCacheInfo,
   loadLastPalmerDatasetFromCache,
@@ -111,6 +117,7 @@ const CLOUD_DATASET_TYPES: DatasetType[] = [
   "funnelfox_subscriptions",
   "facebook_traffic",
   "forecasting_settings",
+  "cohorts_ui_settings",
 ];
 
 const DIAGNOSTIC_LABELS: { key: keyof PalmerImportDiagnostics; label: string }[] = [
@@ -168,6 +175,7 @@ export default function ImportPage() {
     funnelfox_subscriptions: null,
     facebook_traffic: null,
     forecasting_settings: null,
+    cohorts_ui_settings: null,
   });
   const [cloudLoading, setCloudLoading] = useState<DatasetType | null>(null);
   const [cloudMessage, setCloudMessage] = useState<string | null>(null);
@@ -411,11 +419,16 @@ export default function ImportPage() {
           const cloudInfo = await saveCloudSnapshot({
             datasetType: "palmer",
             name: cacheMetadata.file_name,
-            payload: {
-              transactions: rows,
-              rawPalmerRows: rawRows,
+            payload: buildPalmerCloudPayload(rows, rawRows),
+            metadata: {
+              ...cacheMetadata,
+              ...buildPalmerCloudMetadata({
+                transactions: rows,
+                rawPalmerRows: rawRows,
+                fileName: cacheMetadata.file_name,
+                importedAt: cacheMetadata.imported_at,
+              }),
             },
-            metadata: cacheMetadata,
           });
           if (cloudInfo) {
             setCloudSnapshots((current) => ({ ...current, palmer: cloudInfo }));
@@ -547,6 +560,19 @@ export default function ImportPage() {
       );
       setPalmerCacheInfo(cached.metadata);
       setPalmerCacheMessage("Loaded saved Palmer dataset");
+      try {
+        const cloudInfo = await saveCloudSnapshot({
+          datasetType: "palmer",
+          name: cached.metadata.file_name,
+          payload: buildPalmerCloudPayload(cached.transactions, cached.rawPalmerRows),
+          metadata: cached.metadata,
+        });
+        if (cloudInfo) setCloudSnapshots((current) => ({ ...current, palmer: cloudInfo }));
+      } catch (error) {
+        setPalmerCacheMessage(
+          `Loaded saved Palmer dataset. Cloud save failed: ${error instanceof Error ? error.message : "Unknown error"}`,
+        );
+      }
       toast({ title: "Loaded saved Palmer dataset", description: `${cached.metadata.rows_count} rows restored.` });
     } catch (error) {
       setPalmerCacheError(error instanceof Error ? error.message : "Could not load saved Palmer dataset.");
@@ -614,19 +640,19 @@ export default function ImportPage() {
       setCloudLoading("palmer");
       setCloudMessage(null);
       setCloudError(null);
+      const metadata = buildPalmerCloudMetadata({
+        transactions,
+        rawPalmerRows,
+        fileName: meta.fileName || "Palmer import",
+        importedAt: meta.importedAt ?? new Date().toISOString(),
+      });
       const cloudInfo = await saveCloudSnapshot({
         datasetType: "palmer",
         name: meta.fileName || "Palmer import",
-        payload: {
-          transactions,
-          rawPalmerRows,
-        },
+        payload: buildPalmerCloudPayload(transactions, rawPalmerRows),
         metadata: {
-          file_name: meta.fileName || "Palmer import",
-          imported_at: meta.importedAt ?? new Date().toISOString(),
-          rows_count: meta.rawRowCount ?? (rawPalmerRows.length || transactions.length),
-          transactions_count: transactions.length,
-          source: "palmer_import",
+          ...metadata,
+          rows_count: meta.rawRowCount ?? metadata.rows_count,
         },
       });
       if (!cloudInfo) {
@@ -647,9 +673,10 @@ export default function ImportPage() {
       setCloudLoading("palmer");
       setCloudMessage(null);
       setCloudError(null);
-      const snapshot = await loadLatestCloudSnapshot<{ transactions?: Transaction[]; rawPalmerRows?: RawPalmerRow[] }>("palmer");
-      const cloudTransactions = snapshot?.payload.transactions;
-      if (!snapshot || !cloudTransactions?.length) {
+      const snapshot = await loadLatestCloudSnapshot<PalmerCloudPayload>("palmer");
+      const payload = normalizePalmerCloudPayload(snapshot?.payload);
+      const cloudTransactions = payload?.transactions;
+      if (!snapshot || !payload || !cloudTransactions.length) {
         setCloudMessage("No Palmer cloud snapshot found.");
         return;
       }
@@ -661,17 +688,17 @@ export default function ImportPage() {
           importMode: "palmer_raw",
           fileName: String(snapshot.metadata.file_name ?? snapshot.name ?? "Palmer import"),
         },
-        snapshot.payload.rawPalmerRows ?? [],
+        payload.rawPalmerRows ?? [],
       );
       const cacheMetadata = await savePalmerDatasetToCache(
         {
           transactions: cloudTransactions,
-          rawPalmerRows: snapshot.payload.rawPalmerRows ?? [],
+          rawPalmerRows: payload.rawPalmerRows ?? [],
         },
         {
           file_name: String(snapshot.metadata.file_name ?? snapshot.name ?? "Palmer import"),
           imported_at: String(snapshot.metadata.imported_at ?? snapshot.updated_at),
-          rows_count: Number(snapshot.metadata.rows_count ?? snapshot.payload.rawPalmerRows?.length ?? cloudTransactions.length),
+          rows_count: Number(snapshot.metadata.rows_count ?? payload.rawPalmerRows?.length ?? cloudTransactions.length),
           transactions_count: Number(snapshot.metadata.transactions_count ?? cloudTransactions.length),
         },
       );

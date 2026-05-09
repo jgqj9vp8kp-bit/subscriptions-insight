@@ -191,7 +191,19 @@ IndexedDB cache miss after login
 -> warm IndexedDB cache for future reloads
 ```
 
-Snapshot types are `palmer`, `funnelfox_subscriptions`, `facebook_traffic`, and `forecasting_settings`. The app stores dataset payloads and metadata only; it never stores API secrets.
+Snapshot types are `palmer`, `funnelfox_subscriptions`, `facebook_traffic`, `forecasting_settings`, and `cohorts_ui_settings`. The app stores dataset payloads, small UI settings, and metadata only; it never stores API secrets.
+
+Large snapshot payloads are compressed before upload and decompressed after download. Palmer cloud snapshots use this path so large `transactions + rawPalmerRows` imports can be restored on another device without re-uploading the source file.
+
+Cohorts UI settings use the same snapshot table:
+
+```text
+Cohorts localStorage settings
+-> debounced Supabase data_snapshots upsert
+-> new device loads cloud settings when local settings are missing or older
+```
+
+The settings payload contains column order, widths, visibility, selected view, filters, and `updatedAt`. Unknown column IDs are ignored, duplicate IDs are removed, and newly added columns are appended to the saved order.
 
 Cancellation fields are normalized as:
 

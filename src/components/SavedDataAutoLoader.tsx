@@ -8,6 +8,10 @@ import {
   type PalmerDatasetCachePayload,
 } from "@/services/palmerCache";
 import {
+  normalizePalmerCloudPayload,
+  type PalmerCloudPayload,
+} from "@/services/palmerCloudSnapshot";
+import {
   loadSubscriptionsFromCache,
   saveSubscriptionsToCache,
   type SubscriptionCachePayload,
@@ -18,19 +22,12 @@ import {
   type TrafficCachePayload,
 } from "@/services/trafficCache";
 import { useDataStore } from "@/store/dataStore";
-import type { RawPalmerRow } from "@/services/palmerTransform";
 import type { TrafficMetric } from "@/services/trafficImport";
-import type { Transaction } from "@/services/types";
 import type { SubscriptionClean } from "@/types/subscriptions";
 
 type AutoLoadStatus = "idle" | "loading" | "loaded" | "warning";
 
 type RestoreSource = "local cache" | "cloud";
-
-type PalmerCloudPayload = {
-  transactions?: Transaction[];
-  rawPalmerRows?: RawPalmerRow[];
-};
 
 type SubscriptionsCloudPayload = {
   subscriptions?: SubscriptionClean[];
@@ -87,17 +84,18 @@ export function SavedDataAutoLoader() {
             warnings.push("Palmer cloud snapshot");
             return null;
           });
-          const transactions = cloud?.payload.transactions;
+          const payload = normalizePalmerCloudPayload(cloud?.payload);
+          const transactions = payload?.transactions;
           if (transactions?.length) {
             cached = {
               transactions,
               users: [],
               cohorts: [],
-              rawPalmerRows: cloud.payload.rawPalmerRows,
+              rawPalmerRows: payload.rawPalmerRows,
               metadata: {
                 file_name: String(cloud.metadata.file_name ?? cloud.name ?? "Palmer import"),
                 imported_at: String(cloud.metadata.imported_at ?? cloud.updated_at),
-                rows_count: Number(cloud.metadata.rows_count ?? cloud.payload.rawPalmerRows?.length ?? transactions.length),
+                rows_count: Number(cloud.metadata.rows_count ?? payload.rawPalmerRows?.length ?? transactions.length),
                 transactions_count: Number(cloud.metadata.transactions_count ?? transactions.length),
                 cohorts_count: Number(cloud.metadata.cohorts_count ?? 0),
                 users_count: Number(cloud.metadata.users_count ?? 0),
@@ -105,7 +103,7 @@ export function SavedDataAutoLoader() {
               },
             };
             void savePalmerDatasetToCache(
-              { transactions, rawPalmerRows: cloud.payload.rawPalmerRows },
+              { transactions, rawPalmerRows: payload.rawPalmerRows },
               cached.metadata,
             ).catch((error) => console.warn("Could not warm Palmer IndexedDB cache.", error));
             source = "cloud";

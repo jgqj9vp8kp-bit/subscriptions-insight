@@ -1,6 +1,12 @@
+import { compressToEncodedURIComponent, decompressFromEncodedURIComponent } from "lz-string";
 import { supabase } from "@/services/supabaseClient";
 
-export type DatasetType = "palmer" | "funnelfox_subscriptions" | "facebook_traffic" | "forecasting_settings";
+export type DatasetType =
+  | "palmer"
+  | "funnelfox_subscriptions"
+  | "facebook_traffic"
+  | "forecasting_settings"
+  | "cohorts_ui_settings";
 
 export type CloudSnapshotInfo = {
   id: string;
@@ -22,13 +28,91 @@ export type SaveCloudSnapshotInput<TPayload> = {
   metadata?: Record<string, unknown>;
 };
 
-function jsonSizeKb(value: unknown): number {
+const SNAPSHOT_COMPRESSION_THRESHOLD_KB = 256;
+const SNAPSHOT_COMPRESSION_ALGORITHM = "lz-string-uri-v1";
+
+type CompressedSnapshotPayload = {
+  __subengine_compressed: true;
+  algorithm: typeof SNAPSHOT_COMPRESSION_ALGORITHM;
+  data: string;
+  original_size_kb: number;
+  compressed_size_kb: number;
+};
+
+export function jsonSizeKb(value: unknown): number {
   try {
     const json = JSON.stringify(value);
     const bytes = new TextEncoder().encode(json).length;
     return Math.round((bytes / 1024) * 10) / 10;
   } catch {
     return 0;
+  }
+}
+
+function stringSizeKb(value: string): number {
+  const bytes = new TextEncoder().encode(value).length;
+  return Math.round((bytes / 1024) * 10) / 10;
+}
+
+function isCompressedSnapshotPayload(value: unknown): value is CompressedSnapshotPayload {
+  return Boolean(value)
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && (value as Record<string, unknown>).__subengine_compressed === true
+    && (value as Record<string, unknown>).algorithm === SNAPSHOT_COMPRESSION_ALGORITHM
+    && typeof (value as Record<string, unknown>).data === "string";
+}
+
+export function prepareSnapshotPayload<TPayload>(
+  payload: TPayload,
+  thresholdKb = SNAPSHOT_COMPRESSION_THRESHOLD_KB,
+): {
+  payload: TPayload | CompressedSnapshotPayload;
+  metadata: Record<string, unknown>;
+} {
+  const json = JSON.stringify(payload);
+  const originalSizeKb = stringSizeKb(json);
+
+  if (originalSizeKb < thresholdKb) {
+    return {
+      payload,
+      metadata: {
+        payload_size_kb: originalSizeKb,
+        payload_compressed: false,
+      },
+    };
+  }
+
+  const compressed = compressToEncodedURIComponent(json);
+  const compressedSizeKb = stringSizeKb(compressed);
+
+  return {
+    payload: {
+      __subengine_compressed: true,
+      algorithm: SNAPSHOT_COMPRESSION_ALGORITHM,
+      data: compressed,
+      original_size_kb: originalSizeKb,
+      compressed_size_kb: compressedSizeKb,
+    },
+    metadata: {
+      payload_size_kb: originalSizeKb,
+      compressed_payload_size_kb: compressedSizeKb,
+      payload_compressed: true,
+      compression_algorithm: SNAPSHOT_COMPRESSION_ALGORITHM,
+    },
+  };
+}
+
+export function resolveSnapshotPayload<TPayload>(payload: unknown): TPayload | null {
+  if (!isCompressedSnapshotPayload(payload)) return payload as TPayload;
+
+  try {
+    const decompressed = decompressFromEncodedURIComponent(payload.data);
+    if (!decompressed) return null;
+    return JSON.parse(decompressed) as TPayload;
+  } catch (error) {
+    console.warn("Could not decompress cloud snapshot payload.", error);
+    return null;
   }
 }
 
@@ -54,16 +138,26 @@ export async function saveCloudSnapshot<TPayload>({
   payload,
   metadata = {},
 }: SaveCloudSnapshotInput<TPayload>): Promise<CloudSnapshotInfo | null> {
-  const client = ensureSupabase();
   const userId = await currentUserId();
-  if (!userId) return null;
+  if (!userId) {
+    throw new Error("Cannot save cloud snapshot because no authenticated Supabase user is available.");
+  }
+  const client = ensureSupabase();
 
-  const payloadSizeKb = jsonSizeKb(payload);
+  const prepared = prepareSnapshotPayload(payload);
   const nextMetadata = {
     ...metadata,
-    payload_size_kb: payloadSizeKb,
+    ...prepared.metadata,
     saved_at: new Date().toISOString(),
   };
+
+  console.info("Saving cloud snapshot", {
+    user_id_exists: Boolean(userId),
+    dataset_type: datasetType,
+    payload_size_kb: nextMetadata.payload_size_kb,
+    compressed_payload_size_kb: nextMetadata.compressed_payload_size_kb,
+    payload_compressed: nextMetadata.payload_compressed,
+  });
 
   const { data, error } = await client
     .from("data_snapshots")
@@ -72,7 +166,7 @@ export async function saveCloudSnapshot<TPayload>({
         user_id: userId,
         dataset_type: datasetType,
         name,
-        payload,
+        payload: prepared.payload,
         metadata: nextMetadata,
       },
       { onConflict: "user_id,dataset_type" },
@@ -81,8 +175,22 @@ export async function saveCloudSnapshot<TPayload>({
     .single();
 
   if (error) {
-    throw new Error(`Could not save ${datasetType} cloud snapshot (${payloadSizeKb} KB): ${error.message}`);
+    console.warn("Cloud snapshot save failed", {
+      dataset_type: datasetType,
+      error_message: error.message,
+      payload_size_kb: nextMetadata.payload_size_kb,
+      compressed_payload_size_kb: nextMetadata.compressed_payload_size_kb,
+    });
+    throw new Error(
+      `Could not save ${datasetType} cloud snapshot (${nextMetadata.payload_size_kb} KB): ${error.message}`,
+    );
   }
+
+  console.info("Cloud snapshot saved", {
+    dataset_type: datasetType,
+    snapshot_id: data?.id,
+    updated_at: data?.updated_at,
+  });
 
   return data as CloudSnapshotInfo;
 }
@@ -107,7 +215,18 @@ export async function loadLatestCloudSnapshot<TPayload = unknown>(
     throw new Error(`Could not load ${datasetType} cloud snapshot: ${error.message}`);
   }
 
-  return data as CloudSnapshot<TPayload> | null;
+  if (!data) return null;
+
+  const payload = resolveSnapshotPayload<TPayload>(data.payload);
+  if (!payload) {
+    console.warn("Cloud snapshot payload is invalid or corrupted", {
+      dataset_type: datasetType,
+      snapshot_id: data.id,
+    });
+    return null;
+  }
+
+  return { ...data, payload } as CloudSnapshot<TPayload>;
 }
 
 export async function getCloudSnapshotInfo(datasetType: DatasetType): Promise<CloudSnapshotInfo | null> {

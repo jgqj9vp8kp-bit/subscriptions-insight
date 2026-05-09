@@ -17,10 +17,14 @@
 - Supabase Auth email/password login with protected analytics/import routes
 - Temporary sessionStorage-only local admin login fallback for local development/demo when Supabase is not configured
 - Supabase DB `data_snapshots` persistence for cross-device Palmer, FunnelFox, Facebook traffic, and Forecasting settings restore
+- Supabase cloud sync for Cohorts table UI settings, including column order, widths, visibility, active view, and filters
+- Transparent compression for large Supabase cloud snapshot payloads, especially Palmer imports
 
 ### Changed
 - Data connection controls were centralized on Import Data; Cohorts and Subscriptions now stay analytics/table-only.
 - Startup data restore now checks IndexedDB first and falls back to authenticated Supabase cloud snapshots when local cache is missing.
+- Cohorts column settings now sanitize saved column IDs so unknown columns are ignored, duplicates are removed, and new columns are appended.
+- Palmer cloud save/load now uses a versioned payload shape with transformed transactions, optional raw rows, row/user/cohort metadata, and safe save diagnostics.
 - Dashboard, Cohorts, Users, Transactions, Subscriptions, Forecasting, and Import Data preserve small UI settings across navigation.
 - Cohort calculations now use trial timestamp instead of calendar date
 - Amount parsing fixed (cents -> USD)

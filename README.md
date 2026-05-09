@@ -72,4 +72,4 @@ Apply database migrations before relying on cross-device data restore:
 supabase db push
 ```
 
-The `data_snapshots` table stores the latest Palmer, FunnelFox subscriptions, Facebook traffic, and Forecasting settings snapshots per authenticated user. RLS restricts each user to their own rows. IndexedDB remains the fast local cache; Supabase DB is the cross-device fallback/source of truth. Do not store API secrets in snapshots.
+The `data_snapshots` table stores the latest Palmer, FunnelFox subscriptions, Facebook traffic, Forecasting settings, and Cohorts UI settings snapshots per authenticated user. RLS restricts each user to their own rows. IndexedDB remains the fast local cache for large datasets; Supabase DB is the cross-device fallback/source of truth. Do not store API secrets in snapshots.
