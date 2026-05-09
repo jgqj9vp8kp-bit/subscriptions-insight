@@ -32,19 +32,21 @@ import { normalizeCampaignPath, type TrafficMetric } from "@/services/trafficImp
 import type { CohortRow, PlanBreakdownRow } from "@/services/types";
 import { useDataStore } from "@/store/dataStore";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
-import { loadLatestCloudSnapshot, saveCloudSnapshot } from "@/services/dataSnapshots";
 import {
   ACTIVE_VIEW_STORAGE_KEY,
-  COHORTS_UI_SETTINGS_DATASET_TYPE,
   COLUMN_ORDER_STORAGE_KEY,
   COLUMN_VISIBILITY_STORAGE_KEY,
   COLUMN_WIDTHS_STORAGE_KEY,
+  SAVED_VIEWS_STORAGE_KEY,
   buildCohortsUiSettingsPayload,
+  loadCohortsUiSettingsCloud,
   markCohortsUiSettingsUpdated,
-  newerCohortsUiSettings,
+  mergeCohortsUiSettings,
   readLocalCohortsUiSettings,
+  saveCohortsUiSettingsCloud,
   sanitizeCohortsUiSettingsPayload,
   writeLocalCohortsUiSettings,
+  type CohortsUiSavedView,
   type CohortsUiSettingsDefaults,
   type CohortsUiSettingsPayload,
 } from "@/services/cohortsUiSettings";
@@ -58,7 +60,6 @@ const CELL_NUM = `${CELL_BASE} text-right tabular-nums whitespace-nowrap text-sm
 const CELL_TXT = `${CELL_BASE} text-xs text-muted-foreground whitespace-nowrap`;
 // Left border marks the start of a logical section.
 const SECTION_DIVIDER = "border-l border-border/60";
-const SAVED_VIEWS_STORAGE_KEY = "cohorts_saved_views_v1";
 const MIN_COLUMN_WIDTH = 80;
 const COHORT_FIRST_COL_KEY = "__cohort__";
 
@@ -350,6 +351,7 @@ interface SavedView {
   name: string;
   order: CohortColumnId[];
   visibility: Record<CohortColumnId, boolean>;
+  widths?: Record<string, number>;
   builtin?: boolean;
 }
 
@@ -473,7 +475,21 @@ function loadCustomViews(): SavedView[] {
     const raw = localStorage.getItem(SAVED_VIEWS_STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed)) return parsed.filter((v) => v && v.id && v.name && Array.isArray(v.order));
+    if (Array.isArray(parsed)) {
+      return parsed.flatMap((v) => {
+        if (!v || !v.id || !v.name) return [];
+        const order = Array.isArray(v.order) ? v.order : Array.isArray(v.columnOrder) ? v.columnOrder : null;
+        const visibility = v.visibility ?? v.columnVisibility;
+        if (!order || !visibility) return [];
+        return [{
+          id: v.id,
+          name: v.name,
+          order,
+          visibility,
+          widths: v.widths ?? v.columnWidths,
+        } as SavedView];
+      });
+    }
   } catch {
     /* noop */
   }
@@ -483,9 +499,30 @@ function loadCustomViews(): SavedView[] {
 function persistCustomViews(views: SavedView[]) {
   try {
     localStorage.setItem(SAVED_VIEWS_STORAGE_KEY, JSON.stringify(views));
+    markCohortsUiSettingsUpdated();
   } catch (error) {
     console.warn("Unable to persist cohort saved views", error);
   }
+}
+
+function toCloudSavedView(view: SavedView): CohortsUiSavedView {
+  return {
+    id: view.id,
+    name: view.name,
+    columnOrder: view.order,
+    columnVisibility: view.visibility,
+    columnWidths: view.widths,
+  };
+}
+
+function fromCloudSavedView(view: CohortsUiSavedView): SavedView {
+  return {
+    id: view.id,
+    name: view.name,
+    order: view.columnOrder as CohortColumnId[],
+    visibility: view.columnVisibility as Record<CohortColumnId, boolean>,
+    widths: view.columnWidths,
+  };
 }
 
 export default function CohortsPage() {
@@ -539,6 +576,8 @@ export default function CohortsPage() {
       defaultColumnVisibility: defaultColumnVisibility(),
       defaultFilters: DEFAULT_COHORTS_UI_STATE,
       validWidthKeys: [COHORT_FIRST_COL_KEY, ...DEFAULT_COLUMN_ORDER],
+      validSelectedViewIds: BUILTIN_VIEWS.map((view) => view.id),
+      defaultSelectedView: "default",
     }),
     [],
   );
@@ -605,6 +644,8 @@ export default function CohortsPage() {
       setColumnOrder(sanitized.columnOrder as CohortColumnId[]);
       setColumnVisibility(sanitized.columnVisibility as Record<CohortColumnId, boolean>);
       setColumnWidths(sanitized.columnWidths);
+      const nextCustomViews = sanitized.savedViews.map(fromCloudSavedView);
+      setCustomViews(nextCustomViews);
       setUiState({ ...DEFAULT_COHORTS_UI_STATE, ...sanitized.filters });
       setActiveViewId(sanitized.selectedView);
       return true;
@@ -620,26 +661,18 @@ export default function CohortsPage() {
           columnWidths,
           columnVisibility,
           selectedView: activeViewId,
+          savedViews: customViews.map(toCloudSavedView),
           filters: uiState,
           updatedAt,
         },
         cohortsUiSettingsDefaults,
       ),
-    [activeViewId, cohortsUiSettingsDefaults, columnOrder, columnVisibility, columnWidths, uiState],
+    [activeViewId, cohortsUiSettingsDefaults, columnOrder, columnVisibility, columnWidths, customViews, uiState],
   );
 
   const saveCohortsUiSettingsToCloud = useCallback(
     async (payload = buildCurrentCohortsUiSettings()) => {
-      const info = await saveCloudSnapshot({
-        datasetType: COHORTS_UI_SETTINGS_DATASET_TYPE,
-        name: "Cohorts UI settings",
-        payload,
-        metadata: {
-          updated_at: payload.updatedAt,
-          column_count: payload.columnOrder.length,
-        },
-      });
-      return info;
+      return saveCohortsUiSettingsCloud(payload);
     },
     [buildCurrentCohortsUiSettings],
   );
@@ -665,8 +698,7 @@ export default function CohortsPage() {
     try {
       setCohortsUiCloudLoading(true);
       setCohortsUiCloudError(null);
-      const snapshot = await loadLatestCloudSnapshot<CohortsUiSettingsPayload>(COHORTS_UI_SETTINGS_DATASET_TYPE);
-      const payload = sanitizeCohortsUiSettingsPayload(snapshot?.payload, cohortsUiSettingsDefaults);
+      const payload = await loadCohortsUiSettingsCloud(cohortsUiSettingsDefaults);
       if (!payload) {
         setCohortsUiCloudMessage("No valid Cohorts cloud view found.");
         return;
@@ -689,25 +721,22 @@ export default function CohortsPage() {
     async function restoreCohortsUiSettings() {
       try {
         const local = readLocalCohortsUiSettings(cohortsUiSettingsDefaults);
-        const cloudSnapshot = await loadLatestCloudSnapshot<CohortsUiSettingsPayload>(
-          COHORTS_UI_SETTINGS_DATASET_TYPE,
-        ).catch((error) => {
+        const cloud = await loadCohortsUiSettingsCloud(cohortsUiSettingsDefaults).catch((error) => {
           console.warn("Could not load Cohorts UI settings cloud snapshot.", error);
           return null;
         });
-        const cloud = sanitizeCohortsUiSettingsPayload(cloudSnapshot?.payload, cohortsUiSettingsDefaults);
         if (!mounted) return;
 
-        const newer = newerCohortsUiSettings(local, cloud);
-        if (newer === "cloud" && cloud) {
-          applyCohortsUiSettings(cloud);
+        const merged = mergeCohortsUiSettings(local, cloud);
+        if (merged.source === "cloud" && merged.settings) {
+          applyCohortsUiSettings(merged.settings);
           setCohortsUiCloudMessage("Cohorts view loaded from cloud.");
-        } else if (newer === "local" && local && cloud) {
-          void saveCohortsUiSettingsToCloud(local).catch((error) =>
+        } else if (merged.source === "local" && merged.settings && cloud) {
+          void saveCohortsUiSettingsToCloud(merged.settings).catch((error) =>
             console.warn("Could not sync local Cohorts UI settings to cloud.", error),
           );
-        } else if (newer === "local" && local && !cloud) {
-          void saveCohortsUiSettingsToCloud(local).catch((error) =>
+        } else if (merged.source === "local" && merged.settings && !cloud) {
+          void saveCohortsUiSettingsToCloud(merged.settings).catch((error) =>
             console.warn("Could not save local Cohorts UI settings to cloud.", error),
           );
         }
@@ -735,11 +764,18 @@ export default function CohortsPage() {
 
     const payload = buildCurrentCohortsUiSettings();
     writeLocalCohortsUiSettings(payload);
+    setCohortsUiCloudMessage("Saved locally");
+    setCohortsUiCloudError(null);
 
     const timer = window.setTimeout(() => {
-      void saveCohortsUiSettingsToCloud(payload).catch((error) => {
-        console.warn("Could not debounce-save Cohorts UI settings to cloud.", error);
-      });
+      void saveCohortsUiSettingsToCloud(payload)
+        .then((info) => {
+          if (info) setCohortsUiCloudMessage("Synced to cloud");
+        })
+        .catch((error) => {
+          console.warn("Could not debounce-save Cohorts UI settings to cloud.", error);
+          setCohortsUiCloudError("Cloud sync failed");
+        });
     }, 800);
 
     return () => window.clearTimeout(timer);
@@ -826,6 +862,10 @@ export default function CohortsPage() {
     setColumnVisibility(view.visibility);
     persistColumnOrder(view.order);
     persistVisibility(view.visibility);
+    if (view.widths) {
+      setColumnWidths(view.widths);
+      persistColumnWidths(view.widths);
+    }
     setActiveViewId(view.id);
     try { localStorage.setItem(ACTIVE_VIEW_STORAGE_KEY, view.id); } catch { /* noop */ }
     markCohortsUiSettingsUpdated();
@@ -845,6 +885,7 @@ export default function CohortsPage() {
       name,
       order: [...columnOrder],
       visibility: { ...columnVisibility },
+      widths: { ...columnWidths },
     };
     const next = [...customViews, view];
     setCustomViews(next);
@@ -1433,9 +1474,38 @@ export default function CohortsPage() {
                   </Button>
                 </div>
                 <div className="border-t border-border p-2">
-                  <Button type="button" variant="ghost" size="sm" className="w-full h-8" onClick={resetToDefault}>
-                    Reset to Default
+                  <div className="grid grid-cols-2 gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="h-8 text-xs"
+                      onClick={onSaveCohortsViewToCloud}
+                      disabled={cohortsUiCloudLoading}
+                    >
+                      {cohortsUiCloudLoading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                      Save settings to cloud
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="h-8 text-xs"
+                      onClick={onLoadCohortsViewFromCloud}
+                      disabled={cohortsUiCloudLoading}
+                    >
+                      Load settings from cloud
+                    </Button>
+                  </div>
+                  <Button type="button" variant="ghost" size="sm" className="mt-2 w-full h-8" onClick={resetToDefault}>
+                    Reset to default
                   </Button>
+                  {(cohortsUiCloudMessage || cohortsUiCloudError) && (
+                    <div className="mt-2 text-xs">
+                      {cohortsUiCloudMessage && <div className="text-primary">{cohortsUiCloudMessage}</div>}
+                      {cohortsUiCloudError && <div className="text-destructive">{cohortsUiCloudError}</div>}
+                    </div>
+                  )}
                 </div>
               </PopoverContent>
             </Popover>
@@ -1472,7 +1542,7 @@ export default function CohortsPage() {
                       disabled={cohortsUiCloudLoading}
                     >
                       {cohortsUiCloudLoading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-                      Save view to cloud
+                      Save settings to cloud
                     </Button>
                     <Button
                       type="button"
@@ -1482,7 +1552,7 @@ export default function CohortsPage() {
                       onClick={onLoadCohortsViewFromCloud}
                       disabled={cohortsUiCloudLoading}
                     >
-                      Load view from cloud
+                      Load settings from cloud
                     </Button>
                   </div>
                   <Button type="button" variant="ghost" size="sm" className="h-8 w-full text-xs" onClick={resetToDefault}>
