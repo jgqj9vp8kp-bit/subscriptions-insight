@@ -85,7 +85,16 @@ import {
   saveDefaultRetentionCurve,
   resetDefaultRetentionCurve,
 } from "@/services/forecastingSettings";
+import {
+  getCloudSnapshotInfos,
+  loadLatestCloudSnapshot,
+  saveCloudSnapshot,
+  type CloudSnapshotInfo,
+  type DatasetType,
+} from "@/services/dataSnapshots";
 import type { Transaction } from "@/services/types";
+import type { SubscriptionClean } from "@/types/subscriptions";
+import type { TrafficMetric } from "@/services/trafficImport";
 
 const NONE = "__none__";
 
@@ -96,6 +105,13 @@ const DEFAULT_IMPORT_UI_STATE = {
   trafficSheetUrl: "",
   trafficYear: String(new Date().getFullYear()),
 };
+
+const CLOUD_DATASET_TYPES: DatasetType[] = [
+  "palmer",
+  "funnelfox_subscriptions",
+  "facebook_traffic",
+  "forecasting_settings",
+];
 
 const DIAGNOSTIC_LABELS: { key: keyof PalmerImportDiagnostics; label: string }[] = [
   { key: "totalRows", label: "Total rows" },
@@ -117,6 +133,9 @@ export default function ImportPage() {
   const { toast } = useToast();
   const fileRef = useRef<HTMLInputElement>(null);
   const meta = useDataStore((s) => s.meta);
+  const transactions = useDataStore((s) => s.transactions);
+  const rawPalmerRows = useDataStore((s) => s.rawPalmerRows);
+  const trafficMetrics = useDataStore((s) => s.trafficMetrics);
   const trafficMeta = useDataStore((s) => s.trafficMeta);
   const subscriptions = useDataStore((s) => s.subscriptions);
   const setImported = useDataStore((s) => s.setImported);
@@ -144,6 +163,15 @@ export default function ImportPage() {
   const [trafficCacheLoading, setTrafficCacheLoading] = useState(false);
   const [trafficCacheMessage, setTrafficCacheMessage] = useState<string | null>(null);
   const [trafficCacheError, setTrafficCacheError] = useState<string | null>(null);
+  const [cloudSnapshots, setCloudSnapshots] = useState<Record<DatasetType, CloudSnapshotInfo | null>>({
+    palmer: null,
+    funnelfox_subscriptions: null,
+    facebook_traffic: null,
+    forecasting_settings: null,
+  });
+  const [cloudLoading, setCloudLoading] = useState<DatasetType | null>(null);
+  const [cloudMessage, setCloudMessage] = useState<string | null>(null);
+  const [cloudError, setCloudError] = useState<string | null>(null);
   const [funnelFoxSecret, setFunnelFoxSecret] = useState("");
   const [testingFunnelFox, setTestingFunnelFox] = useState(false);
   const [syncingFunnelFox, setSyncingFunnelFox] = useState(false);
@@ -157,14 +185,16 @@ export default function ImportPage() {
   const temporaryKeyInputEnabled = isFunnelFoxTemporaryKeyInputEnabled();
 
   const refreshLocalCacheInfo = useCallback(async () => {
-    const [palmerInfo, funnelFoxInfo, trafficInfo] = await Promise.all([
+    const [palmerInfo, funnelFoxInfo, trafficInfo, cloudInfo] = await Promise.all([
       getPalmerCacheInfo().catch(() => null),
       getSubscriptionsCacheInfo().catch(() => null),
       getTrafficCacheInfo().catch(() => null),
+      getCloudSnapshotInfos(CLOUD_DATASET_TYPES).catch(() => null),
     ]);
     setPalmerCacheInfo(palmerInfo);
     setSubscriptionCacheInfo(funnelFoxInfo);
     setTrafficCacheInfo(trafficInfo);
+    if (cloudInfo) setCloudSnapshots(cloudInfo);
   }, []);
 
   useEffect(() => {
@@ -262,6 +292,23 @@ export default function ImportPage() {
       });
       setTrafficCacheInfo(cacheMetadata);
       setTrafficCacheMessage("Saved imported Facebook traffic data locally.");
+      try {
+        const cloudInfo = await saveCloudSnapshot({
+          datasetType: "facebook_traffic",
+          name: "Facebook traffic",
+          payload: { trafficMetrics: rows },
+          metadata: cacheMetadata,
+        });
+        if (cloudInfo) {
+          setCloudSnapshots((current) => ({ ...current, facebook_traffic: cloudInfo }));
+        }
+      } catch (error) {
+        setTrafficCacheMessage(
+          `Saved imported Facebook traffic data locally. Cloud save failed: ${
+            error instanceof Error ? error.message : "Unknown error"
+          }`,
+        );
+      }
       toast({
         title: "Facebook traffic imported",
         description: `Loaded ${rows.length} traffic rows from Google Sheets and saved them locally.`,
@@ -360,6 +407,26 @@ export default function ImportPage() {
           `Saved imported dataset locally: ${cacheMetadata.file_name}, ${cacheMetadata.rows_count} rows.`,
         );
         setPalmerCacheInfo(cacheMetadata);
+        try {
+          const cloudInfo = await saveCloudSnapshot({
+            datasetType: "palmer",
+            name: cacheMetadata.file_name,
+            payload: {
+              transactions: rows,
+              rawPalmerRows: rawRows,
+            },
+            metadata: cacheMetadata,
+          });
+          if (cloudInfo) {
+            setCloudSnapshots((current) => ({ ...current, palmer: cloudInfo }));
+          }
+        } catch (error) {
+          setCacheSavedMessage(
+            `Saved imported dataset locally. Cloud save failed: ${
+              error instanceof Error ? error.message : "Unknown error"
+            }`,
+          );
+        }
       } catch (error) {
         setCacheSavedMessage(null);
         toast({
@@ -420,13 +487,27 @@ export default function ImportPage() {
         last_sync_at: new Date().toISOString(),
       });
       setSubscriptionCacheInfo(cacheMetadata);
+      let cloudWarning: string | null = null;
+      try {
+        const cloudInfo = await saveCloudSnapshot({
+          datasetType: "funnelfox_subscriptions",
+          name: "FunnelFox subscriptions",
+          payload: { subscriptions: rows },
+          metadata: cacheMetadata,
+        });
+        if (cloudInfo) {
+          setCloudSnapshots((current) => ({ ...current, funnelfox_subscriptions: cloudInfo }));
+        }
+      } catch (error) {
+        cloudWarning = ` Cloud save failed: ${error instanceof Error ? error.message : "Unknown error"}.`;
+      }
       const coverage = diagnostics.total_subscriptions
         ? ((diagnostics.total_subscriptions - diagnostics.missing_email_after_details) / diagnostics.total_subscriptions) * 100
         : 0;
       const failedDetailRequests = diagnostics.warnings.length;
       setFunnelFoxSyncMessage(
         rows.length
-          ? `${failedDetailRequests ? "Sync completed with partial enrichment warnings" : "Sync completed"}. Total subscriptions loaded: ${diagnostics.total_subscriptions}. Raw subscriptions: ${diagnostics.raw_subscriptions_count}. Duplicates removed: ${diagnostics.duplicates_removed}. Email coverage: ${diagnostics.total_subscriptions - diagnostics.missing_email_after_details}/${diagnostics.total_subscriptions} (${formatPct(coverage)}). Missing emails: ${diagnostics.missing_email_after_details}. Failed detail/profile requests: ${failedDetailRequests}.`
+          ? `${failedDetailRequests ? "Sync completed with partial enrichment warnings" : "Sync completed"}. Total subscriptions loaded: ${diagnostics.total_subscriptions}. Raw subscriptions: ${diagnostics.raw_subscriptions_count}. Duplicates removed: ${diagnostics.duplicates_removed}. Email coverage: ${diagnostics.total_subscriptions - diagnostics.missing_email_after_details}/${diagnostics.total_subscriptions} (${formatPct(coverage)}). Missing emails: ${diagnostics.missing_email_after_details}. Failed detail/profile requests: ${failedDetailRequests}.${cloudWarning ?? ""}`
           : "Mock mode is active or the backend proxy returned no subscriptions.",
       );
       toast({
@@ -524,6 +605,251 @@ export default function ImportPage() {
     }
   }
 
+  async function onSavePalmerToCloud() {
+    try {
+      if (meta.source !== "palmer_raw") {
+        setCloudMessage("Import a Palmer dataset before saving it to cloud.");
+        return;
+      }
+      setCloudLoading("palmer");
+      setCloudMessage(null);
+      setCloudError(null);
+      const cloudInfo = await saveCloudSnapshot({
+        datasetType: "palmer",
+        name: meta.fileName || "Palmer import",
+        payload: {
+          transactions,
+          rawPalmerRows,
+        },
+        metadata: {
+          file_name: meta.fileName || "Palmer import",
+          imported_at: meta.importedAt ?? new Date().toISOString(),
+          rows_count: meta.rawRowCount ?? (rawPalmerRows.length || transactions.length),
+          transactions_count: transactions.length,
+          source: "palmer_import",
+        },
+      });
+      if (!cloudInfo) {
+        setCloudMessage("Sign in with Supabase to save Palmer data to cloud.");
+        return;
+      }
+      setCloudSnapshots((current) => ({ ...current, palmer: cloudInfo }));
+      setCloudMessage("Palmer dataset saved to cloud.");
+    } catch (error) {
+      setCloudError(error instanceof Error ? error.message : "Could not save Palmer dataset to cloud.");
+    } finally {
+      setCloudLoading(null);
+    }
+  }
+
+  async function onLoadPalmerFromCloud() {
+    try {
+      setCloudLoading("palmer");
+      setCloudMessage(null);
+      setCloudError(null);
+      const snapshot = await loadLatestCloudSnapshot<{ transactions?: Transaction[]; rawPalmerRows?: RawPalmerRow[] }>("palmer");
+      const cloudTransactions = snapshot?.payload.transactions;
+      if (!snapshot || !cloudTransactions?.length) {
+        setCloudMessage("No Palmer cloud snapshot found.");
+        return;
+      }
+
+      setImported(
+        cloudTransactions,
+        {
+          source: "palmer_raw",
+          importMode: "palmer_raw",
+          fileName: String(snapshot.metadata.file_name ?? snapshot.name ?? "Palmer import"),
+        },
+        snapshot.payload.rawPalmerRows ?? [],
+      );
+      const cacheMetadata = await savePalmerDatasetToCache(
+        {
+          transactions: cloudTransactions,
+          rawPalmerRows: snapshot.payload.rawPalmerRows ?? [],
+        },
+        {
+          file_name: String(snapshot.metadata.file_name ?? snapshot.name ?? "Palmer import"),
+          imported_at: String(snapshot.metadata.imported_at ?? snapshot.updated_at),
+          rows_count: Number(snapshot.metadata.rows_count ?? snapshot.payload.rawPalmerRows?.length ?? cloudTransactions.length),
+          transactions_count: Number(snapshot.metadata.transactions_count ?? cloudTransactions.length),
+        },
+      );
+      setPalmerCacheInfo(cacheMetadata);
+      setCloudSnapshots((current) => ({ ...current, palmer: snapshot }));
+      setCloudMessage("Palmer dataset loaded from cloud.");
+    } catch (error) {
+      setCloudError(error instanceof Error ? error.message : "Could not load Palmer dataset from cloud.");
+    } finally {
+      setCloudLoading(null);
+    }
+  }
+
+  async function onSaveSubscriptionsToCloud() {
+    try {
+      setCloudLoading("funnelfox_subscriptions");
+      setCloudMessage(null);
+      setCloudError(null);
+      const cacheMetadata = subscriptionCacheInfo ?? {
+        saved_at: new Date().toISOString(),
+        count: subscriptions.length,
+        source: "funnelfox" as const,
+        email_coverage: subscriptions.length
+          ? (subscriptions.filter((subscription) => Boolean(subscription.email)).length / subscriptions.length) * 100
+          : 0,
+        last_sync_at: new Date().toISOString(),
+      };
+      const cloudInfo = await saveCloudSnapshot({
+        datasetType: "funnelfox_subscriptions",
+        name: "FunnelFox subscriptions",
+        payload: { subscriptions },
+        metadata: cacheMetadata,
+      });
+      if (!cloudInfo) {
+        setCloudMessage("Sign in with Supabase to save FunnelFox subscriptions to cloud.");
+        return;
+      }
+      setCloudSnapshots((current) => ({ ...current, funnelfox_subscriptions: cloudInfo }));
+      setCloudMessage("FunnelFox subscriptions saved to cloud.");
+    } catch (error) {
+      setCloudError(error instanceof Error ? error.message : "Could not save FunnelFox subscriptions to cloud.");
+    } finally {
+      setCloudLoading(null);
+    }
+  }
+
+  async function onLoadSubscriptionsFromCloud() {
+    try {
+      setCloudLoading("funnelfox_subscriptions");
+      setCloudMessage(null);
+      setCloudError(null);
+      const snapshot = await loadLatestCloudSnapshot<{ subscriptions?: SubscriptionClean[] }>("funnelfox_subscriptions");
+      const cloudSubscriptions = snapshot?.payload.subscriptions;
+      if (!snapshot || !cloudSubscriptions?.length) {
+        setCloudMessage("No FunnelFox subscriptions cloud snapshot found.");
+        return;
+      }
+
+      setSubscriptions(cloudSubscriptions);
+      const cacheMetadata = await saveSubscriptionsToCache(cloudSubscriptions, {
+        saved_at: String(snapshot.metadata.saved_at ?? snapshot.updated_at),
+        last_sync_at: String(snapshot.metadata.last_sync_at ?? snapshot.updated_at),
+      });
+      setSubscriptionCacheInfo(cacheMetadata);
+      setCloudSnapshots((current) => ({ ...current, funnelfox_subscriptions: snapshot }));
+      setCloudMessage("FunnelFox subscriptions loaded from cloud.");
+    } catch (error) {
+      setCloudError(error instanceof Error ? error.message : "Could not load FunnelFox subscriptions from cloud.");
+    } finally {
+      setCloudLoading(null);
+    }
+  }
+
+  async function onSaveTrafficToCloud() {
+    try {
+      setCloudLoading("facebook_traffic");
+      setCloudMessage(null);
+      setCloudError(null);
+      const metadata = trafficCacheInfo ?? {
+        source: "facebook_traffic" as const,
+        imported_at: trafficMeta.importedAt ?? new Date().toISOString(),
+        rows_count: trafficMetrics.length,
+      };
+      const cloudInfo = await saveCloudSnapshot({
+        datasetType: "facebook_traffic",
+        name: "Facebook traffic",
+        payload: { trafficMetrics },
+        metadata,
+      });
+      if (!cloudInfo) {
+        setCloudMessage("Sign in with Supabase to save Facebook traffic data to cloud.");
+        return;
+      }
+      setCloudSnapshots((current) => ({ ...current, facebook_traffic: cloudInfo }));
+      setCloudMessage("Facebook traffic data saved to cloud.");
+    } catch (error) {
+      setCloudError(error instanceof Error ? error.message : "Could not save Facebook traffic data to cloud.");
+    } finally {
+      setCloudLoading(null);
+    }
+  }
+
+  async function onLoadTrafficFromCloud() {
+    try {
+      setCloudLoading("facebook_traffic");
+      setCloudMessage(null);
+      setCloudError(null);
+      const snapshot = await loadLatestCloudSnapshot<{ trafficMetrics?: TrafficMetric[] }>("facebook_traffic");
+      const cloudTrafficMetrics = snapshot?.payload.trafficMetrics;
+      if (!snapshot || !cloudTrafficMetrics?.length) {
+        setCloudMessage("No Facebook traffic cloud snapshot found.");
+        return;
+      }
+
+      setTrafficMetrics(cloudTrafficMetrics);
+      const cacheMetadata = await saveTrafficDataToCache(cloudTrafficMetrics, {
+        source: "facebook_traffic",
+        google_sheet_url: typeof snapshot.metadata.google_sheet_url === "string" ? snapshot.metadata.google_sheet_url : undefined,
+        imported_at: String(snapshot.metadata.imported_at ?? snapshot.updated_at),
+        rows_count: Number(snapshot.metadata.rows_count ?? cloudTrafficMetrics.length),
+        year: typeof snapshot.metadata.year === "number" ? snapshot.metadata.year : undefined,
+      });
+      setTrafficCacheInfo(cacheMetadata);
+      setCloudSnapshots((current) => ({ ...current, facebook_traffic: snapshot }));
+      setCloudMessage("Facebook traffic data loaded from cloud.");
+    } catch (error) {
+      setCloudError(error instanceof Error ? error.message : "Could not load Facebook traffic data from cloud.");
+    } finally {
+      setCloudLoading(null);
+    }
+  }
+
+  async function onSaveForecastingSettingsToCloud() {
+    try {
+      setCloudLoading("forecasting_settings");
+      setCloudMessage(null);
+      setCloudError(null);
+      const retentionCurve = loadDefaultRetentionCurve();
+      const cloudInfo = await saveCloudSnapshot({
+        datasetType: "forecasting_settings",
+        name: "Forecasting settings",
+        payload: { retention_curve: retentionCurve },
+        metadata: { retention_months: retentionCurve.length },
+      });
+      if (!cloudInfo) {
+        setCloudMessage("Sign in with Supabase to save forecasting settings to cloud.");
+        return;
+      }
+      setCloudSnapshots((current) => ({ ...current, forecasting_settings: cloudInfo }));
+      setCloudMessage("Forecasting settings saved to cloud.");
+    } catch (error) {
+      setCloudError(error instanceof Error ? error.message : "Could not save forecasting settings to cloud.");
+    } finally {
+      setCloudLoading(null);
+    }
+  }
+
+  async function onLoadForecastingSettingsFromCloud() {
+    try {
+      setCloudLoading("forecasting_settings");
+      setCloudMessage(null);
+      setCloudError(null);
+      const snapshot = await loadLatestCloudSnapshot<{ retention_curve?: number[] }>("forecasting_settings");
+      if (!snapshot?.payload.retention_curve) {
+        setCloudMessage("No forecasting settings cloud snapshot found.");
+        return;
+      }
+      const saved = saveDefaultRetentionCurve(snapshot.payload.retention_curve);
+      setRetentionCurveDraft(saved.map(String));
+      setCloudSnapshots((current) => ({ ...current, forecasting_settings: snapshot }));
+      setCloudMessage("Forecasting settings loaded from cloud.");
+    } catch (error) {
+      setCloudError(error instanceof Error ? error.message : "Could not load forecasting settings from cloud.");
+    } finally {
+      setCloudLoading(null);
+    }
+  }
+
   function parseRetentionCurveDraftValue(value: string): number | null {
     const normalized = value.trim().replace(",", ".");
     if (!normalized) return null;
@@ -550,7 +876,7 @@ export default function ImportPage() {
     setRetentionCurveDraft((current) => current.map((item, itemIndex) => (itemIndex === index ? String(parsed) : item)));
   }
 
-  function onSaveForecastingSettings() {
+  async function onSaveForecastingSettings() {
     const parsed = retentionCurveDraft.map(parseRetentionCurveDraftValue);
     if (parsed.some((value) => value == null)) {
       setRetentionCurveMessage("Enter valid retention values from 0 to 100 before saving.");
@@ -558,13 +884,86 @@ export default function ImportPage() {
     }
     const saved = saveDefaultRetentionCurve(parsed as number[]);
     setRetentionCurveDraft(saved.map(String));
-    setRetentionCurveMessage("Forecasting default retention curve saved.");
+    try {
+      const cloudInfo = await saveCloudSnapshot({
+        datasetType: "forecasting_settings",
+        name: "Forecasting settings",
+        payload: { retention_curve: saved },
+        metadata: {
+          retention_months: saved.length,
+        },
+      });
+      if (!cloudInfo) {
+        setRetentionCurveMessage("Forecasting default retention curve saved locally. Sign in with Supabase to save it to cloud.");
+        return;
+      }
+      setCloudSnapshots((current) => ({ ...current, forecasting_settings: cloudInfo }));
+      setRetentionCurveMessage("Forecasting default retention curve saved.");
+    } catch (error) {
+      setRetentionCurveMessage(
+        `Forecasting settings saved locally. Cloud save failed: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`,
+      );
+    }
   }
 
-  function onResetForecastingSettings() {
+  async function onResetForecastingSettings() {
     const reset = resetDefaultRetentionCurve();
     setRetentionCurveDraft(reset.map(String));
-    setRetentionCurveMessage("Forecasting default retention curve reset to default values.");
+    try {
+      const cloudInfo = await saveCloudSnapshot({
+        datasetType: "forecasting_settings",
+        name: "Forecasting settings",
+        payload: { retention_curve: reset },
+        metadata: {
+          retention_months: reset.length,
+          reset_to_builtin: true,
+        },
+      });
+      if (!cloudInfo) {
+        setRetentionCurveMessage("Forecasting default retention curve reset locally. Sign in with Supabase to save it to cloud.");
+        return;
+      }
+      setCloudSnapshots((current) => ({ ...current, forecasting_settings: cloudInfo }));
+      setRetentionCurveMessage("Forecasting default retention curve reset to default values.");
+    } catch (error) {
+      setRetentionCurveMessage(
+        `Forecasting settings reset locally. Cloud save failed: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`,
+      );
+    }
+  }
+
+  function renderCloudSnapshotInfo(datasetType: DatasetType, emptyLabel: string) {
+    const info = cloudSnapshots[datasetType];
+    if (!info) return emptyLabel;
+
+    const size = typeof info.metadata.payload_size_kb === "number" ? info.metadata.payload_size_kb : null;
+    const count =
+      typeof info.metadata.rows_count === "number"
+        ? info.metadata.rows_count
+        : typeof info.metadata.count === "number"
+          ? info.metadata.count
+          : null;
+
+    return (
+      <>
+        Last cloud snapshot:{" "}
+        <span className="tabular-nums text-foreground">{new Date(info.updated_at).toLocaleString()}</span>
+        {count != null ? (
+          <>
+            , <span className="tabular-nums text-foreground">{count}</span> rows
+          </>
+        ) : null}
+        {size != null ? (
+          <>
+            , <span className="tabular-nums text-foreground">{size} KB</span>
+          </>
+        ) : null}
+      </>
+    );
   }
 
   return (
@@ -1056,7 +1455,7 @@ export default function ImportPage() {
           <Database className="h-4 w-4 text-muted-foreground" />
           <h3 className="text-sm font-semibold text-foreground">Local Saved Data</h3>
         </div>
-        <div className="grid gap-3 xl:grid-cols-3">
+        <div className="grid gap-3 xl:grid-cols-4">
           <div className="rounded-md border border-border p-3">
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0">
@@ -1074,6 +1473,9 @@ export default function ImportPage() {
                   ) : (
                     "No saved Palmer dataset found."
                   )}
+                </div>
+                <div className="mt-2 text-xs text-muted-foreground">
+                  {renderCloudSnapshotInfo("palmer", "No Palmer cloud snapshot found.")}
                 </div>
                 {palmerCacheMessage && <div className="mt-1 text-xs text-primary">{palmerCacheMessage}</div>}
                 {palmerCacheError && <div className="mt-1 text-xs text-destructive">{palmerCacheError}</div>}
@@ -1098,6 +1500,25 @@ export default function ImportPage() {
                   <Trash2 className="h-3.5 w-3.5" />
                   Clear
                 </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={onSavePalmerToCloud}
+                  disabled={cloudLoading === "palmer" || meta.source !== "palmer_raw" || !transactions.length}
+                >
+                  {cloudLoading === "palmer" && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                  Save to cloud
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={onLoadPalmerFromCloud}
+                  disabled={cloudLoading === "palmer" || !cloudSnapshots.palmer}
+                >
+                  Load from cloud
+                </Button>
               </div>
             </div>
           </div>
@@ -1119,6 +1540,9 @@ export default function ImportPage() {
                     "No saved subscriptions cache found."
                   )}
                 </div>
+                <div className="mt-2 text-xs text-muted-foreground">
+                  {renderCloudSnapshotInfo("funnelfox_subscriptions", "No FunnelFox cloud snapshot found.")}
+                </div>
               </div>
               <div className="flex shrink-0 flex-wrap justify-end gap-2">
                 <Button
@@ -1139,6 +1563,25 @@ export default function ImportPage() {
                 >
                   <Trash2 className="h-3.5 w-3.5" />
                   Clear
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={onSaveSubscriptionsToCloud}
+                  disabled={cloudLoading === "funnelfox_subscriptions" || !subscriptions.length}
+                >
+                  {cloudLoading === "funnelfox_subscriptions" && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                  Save to cloud
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={onLoadSubscriptionsFromCloud}
+                  disabled={cloudLoading === "funnelfox_subscriptions" || !cloudSnapshots.funnelfox_subscriptions}
+                >
+                  Load from cloud
                 </Button>
               </div>
             </div>
@@ -1172,6 +1615,9 @@ export default function ImportPage() {
                     "No saved Facebook traffic data found."
                   )}
                 </div>
+                <div className="mt-2 text-xs text-muted-foreground">
+                  {renderCloudSnapshotInfo("facebook_traffic", "No Facebook traffic cloud snapshot found.")}
+                </div>
                 {trafficCacheMessage && <div className="mt-1 text-xs text-primary">{trafficCacheMessage}</div>}
                 {trafficCacheError && <div className="mt-1 text-xs text-destructive">{trafficCacheError}</div>}
               </div>
@@ -1196,10 +1642,70 @@ export default function ImportPage() {
                   <Trash2 className="h-3.5 w-3.5" />
                   Clear
                 </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={onSaveTrafficToCloud}
+                  disabled={cloudLoading === "facebook_traffic" || !trafficMetrics.length}
+                >
+                  {cloudLoading === "facebook_traffic" && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                  Save to cloud
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={onLoadTrafficFromCloud}
+                  disabled={cloudLoading === "facebook_traffic" || !cloudSnapshots.facebook_traffic}
+                >
+                  Load from cloud
+                </Button>
+              </div>
+            </div>
+          </div>
+
+          <div className="rounded-md border border-border p-3">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="text-sm font-medium text-foreground">Saved Forecasting settings</div>
+                <div className="mt-1 text-xs text-muted-foreground">
+                  Local default curve is stored in browser UI settings.
+                </div>
+                <div className="mt-2 text-xs text-muted-foreground">
+                  {renderCloudSnapshotInfo("forecasting_settings", "No forecasting settings cloud snapshot found.")}
+                </div>
+              </div>
+              <div className="flex shrink-0 flex-wrap justify-end gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={onSaveForecastingSettingsToCloud}
+                  disabled={cloudLoading === "forecasting_settings"}
+                >
+                  {cloudLoading === "forecasting_settings" && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                  Save to cloud
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={onLoadForecastingSettingsFromCloud}
+                  disabled={cloudLoading === "forecasting_settings" || !cloudSnapshots.forecasting_settings}
+                >
+                  Load from cloud
+                </Button>
               </div>
             </div>
           </div>
         </div>
+        {(cloudMessage || cloudError) && (
+          <div className="mt-3 rounded-md border border-border bg-muted/20 p-3 text-xs">
+            {cloudMessage && <div className="text-primary">{cloudMessage}</div>}
+            {cloudError && <div className="text-destructive">{cloudError}</div>}
+          </div>
+        )}
       </Card>
     </AppLayout>
   );

@@ -1,11 +1,46 @@
 import { useEffect, useRef, useState } from "react";
 import { Loader2 } from "lucide-react";
-import { loadLastPalmerDatasetFromCache } from "@/services/palmerCache";
-import { loadSubscriptionsFromCache } from "@/services/subscriptionCache";
-import { loadLastTrafficDataFromCache } from "@/services/trafficCache";
+import { loadLatestCloudSnapshot } from "@/services/dataSnapshots";
+import { saveDefaultRetentionCurve } from "@/services/forecastingSettings";
+import {
+  loadLastPalmerDatasetFromCache,
+  savePalmerDatasetToCache,
+  type PalmerDatasetCachePayload,
+} from "@/services/palmerCache";
+import {
+  loadSubscriptionsFromCache,
+  saveSubscriptionsToCache,
+  type SubscriptionCachePayload,
+} from "@/services/subscriptionCache";
+import {
+  loadLastTrafficDataFromCache,
+  saveTrafficDataToCache,
+  type TrafficCachePayload,
+} from "@/services/trafficCache";
 import { useDataStore } from "@/store/dataStore";
+import type { RawPalmerRow } from "@/services/palmerTransform";
+import type { TrafficMetric } from "@/services/trafficImport";
+import type { Transaction } from "@/services/types";
+import type { SubscriptionClean } from "@/types/subscriptions";
 
 type AutoLoadStatus = "idle" | "loading" | "loaded" | "warning";
+
+type PalmerCloudPayload = {
+  transactions?: Transaction[];
+  rawPalmerRows?: RawPalmerRow[];
+};
+
+type SubscriptionsCloudPayload = {
+  subscriptions?: SubscriptionClean[];
+};
+
+type TrafficCloudPayload = {
+  trafficMetrics?: TrafficMetric[];
+};
+
+type ForecastingCloudPayload = {
+  retention_curve?: number[];
+};
 
 export function SavedDataAutoLoader() {
   const didRun = useRef(false);
@@ -28,42 +63,161 @@ export function SavedDataAutoLoader() {
       const warnings: string[] = [];
       let loadedCount = 0;
 
-      const [palmerResult, subscriptionsResult, trafficResult] = await Promise.allSettled([
-        loadLastPalmerDatasetFromCache(),
-        loadSubscriptionsFromCache(),
-        loadLastTrafficDataFromCache(),
-      ]);
+      try {
+        let cached: PalmerDatasetCachePayload | null = null;
+        try {
+          cached = await loadLastPalmerDatasetFromCache();
+        } catch (error) {
+          console.warn("Could not read Palmer IndexedDB cache.", error);
+          warnings.push("Palmer local cache");
+        }
 
-      if (!mounted) return;
+        if (!cached) {
+          const cloud = await loadLatestCloudSnapshot<PalmerCloudPayload>("palmer").catch((error) => {
+            console.warn("Could not read Palmer cloud snapshot.", error);
+            warnings.push("Palmer cloud snapshot");
+            return null;
+          });
+          const transactions = cloud?.payload.transactions;
+          if (transactions?.length) {
+            cached = {
+              transactions,
+              users: [],
+              cohorts: [],
+              rawPalmerRows: cloud.payload.rawPalmerRows,
+              metadata: {
+                file_name: String(cloud.metadata.file_name ?? cloud.name ?? "Palmer import"),
+                imported_at: String(cloud.metadata.imported_at ?? cloud.updated_at),
+                rows_count: Number(cloud.metadata.rows_count ?? cloud.payload.rawPalmerRows?.length ?? transactions.length),
+                transactions_count: Number(cloud.metadata.transactions_count ?? transactions.length),
+                cohorts_count: Number(cloud.metadata.cohorts_count ?? 0),
+                users_count: Number(cloud.metadata.users_count ?? 0),
+                source: "palmer_import",
+              },
+            };
+            void savePalmerDatasetToCache(
+              { transactions, rawPalmerRows: cloud.payload.rawPalmerRows },
+              cached.metadata,
+            ).catch((error) => console.warn("Could not warm Palmer IndexedDB cache.", error));
+          }
+        }
 
-      if (palmerResult.status === "fulfilled" && palmerResult.value) {
-        const cached = palmerResult.value;
-        setImported(
-          cached.transactions,
-          {
-            source: "palmer_raw",
-            importMode: "palmer_raw",
-            fileName: cached.metadata.file_name,
-          },
-          cached.rawPalmerRows ?? [],
-        );
-        loadedCount += 1;
-      } else if (palmerResult.status === "rejected") {
+        if (cached && mounted) {
+          setImported(
+            cached.transactions,
+            {
+              source: "palmer_raw",
+              importMode: "palmer_raw",
+              fileName: cached.metadata.file_name,
+            },
+            cached.rawPalmerRows ?? [],
+          );
+          loadedCount += 1;
+        }
+      } catch (error) {
+        console.warn("Could not restore Palmer dataset.", error);
         warnings.push("Palmer dataset");
       }
 
-      if (subscriptionsResult.status === "fulfilled" && subscriptionsResult.value) {
-        setSubscriptions(subscriptionsResult.value.subscriptions);
-        loadedCount += 1;
-      } else if (subscriptionsResult.status === "rejected") {
+      try {
+        let cached: SubscriptionCachePayload | null = null;
+        try {
+          cached = await loadSubscriptionsFromCache();
+        } catch (error) {
+          console.warn("Could not read FunnelFox IndexedDB cache.", error);
+          warnings.push("FunnelFox local cache");
+        }
+
+        if (!cached) {
+          const cloud = await loadLatestCloudSnapshot<SubscriptionsCloudPayload>("funnelfox_subscriptions").catch((error) => {
+            console.warn("Could not read FunnelFox cloud snapshot.", error);
+            warnings.push("FunnelFox cloud snapshot");
+            return null;
+          });
+          const subscriptions = cloud?.payload.subscriptions;
+          if (subscriptions?.length) {
+            cached = {
+              subscriptions,
+              metadata: {
+                saved_at: String(cloud.metadata.saved_at ?? cloud.updated_at),
+                count: Number(cloud.metadata.count ?? subscriptions.length),
+                source: "funnelfox",
+                email_coverage: Number(cloud.metadata.email_coverage ?? 0),
+                last_sync_at: String(cloud.metadata.last_sync_at ?? cloud.updated_at),
+              },
+            };
+            void saveSubscriptionsToCache(subscriptions, cached.metadata).catch((error) =>
+              console.warn("Could not warm FunnelFox IndexedDB cache.", error),
+            );
+          }
+        }
+
+        if (cached && mounted) {
+          setSubscriptions(cached.subscriptions);
+          loadedCount += 1;
+        }
+      } catch (error) {
+        console.warn("Could not restore FunnelFox subscriptions.", error);
         warnings.push("FunnelFox subscriptions");
       }
 
-      if (trafficResult.status === "fulfilled" && trafficResult.value) {
-        setTrafficMetrics(trafficResult.value.trafficMetrics);
-        loadedCount += 1;
-      } else if (trafficResult.status === "rejected") {
+      try {
+        let cached: TrafficCachePayload | null = null;
+        try {
+          cached = await loadLastTrafficDataFromCache();
+        } catch (error) {
+          console.warn("Could not read Facebook traffic IndexedDB cache.", error);
+          warnings.push("Facebook traffic local cache");
+        }
+
+        if (!cached) {
+          const cloud = await loadLatestCloudSnapshot<TrafficCloudPayload>("facebook_traffic").catch((error) => {
+            console.warn("Could not read Facebook traffic cloud snapshot.", error);
+            warnings.push("Facebook traffic cloud snapshot");
+            return null;
+          });
+          const trafficMetrics = cloud?.payload.trafficMetrics;
+          if (trafficMetrics?.length) {
+            cached = {
+              trafficMetrics,
+              metadata: {
+                source: "facebook_traffic",
+                google_sheet_url: typeof cloud.metadata.google_sheet_url === "string" ? cloud.metadata.google_sheet_url : undefined,
+                imported_at: String(cloud.metadata.imported_at ?? cloud.updated_at),
+                rows_count: Number(cloud.metadata.rows_count ?? trafficMetrics.length),
+                matched_rows_count:
+                  typeof cloud.metadata.matched_rows_count === "number" ? cloud.metadata.matched_rows_count : undefined,
+                year: typeof cloud.metadata.year === "number" ? cloud.metadata.year : undefined,
+              },
+            };
+            void saveTrafficDataToCache(trafficMetrics, cached.metadata).catch((error) =>
+              console.warn("Could not warm Facebook traffic IndexedDB cache.", error),
+            );
+          }
+        }
+
+        if (cached && mounted) {
+          setTrafficMetrics(cached.trafficMetrics);
+          loadedCount += 1;
+        }
+      } catch (error) {
+        console.warn("Could not restore Facebook traffic.", error);
         warnings.push("Facebook traffic");
+      }
+
+      try {
+        const cloud = await loadLatestCloudSnapshot<ForecastingCloudPayload>("forecasting_settings").catch((error) => {
+          console.warn("Could not read forecasting settings cloud snapshot.", error);
+          warnings.push("Forecasting settings cloud snapshot");
+          return null;
+        });
+        if (cloud?.payload.retention_curve) {
+          saveDefaultRetentionCurve(cloud.payload.retention_curve);
+          loadedCount += 1;
+        }
+      } catch (error) {
+        console.warn("Could not restore forecasting settings.", error);
+        warnings.push("Forecasting settings");
       }
 
       if (!mounted) return;

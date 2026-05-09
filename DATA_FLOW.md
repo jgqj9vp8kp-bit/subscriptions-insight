@@ -182,6 +182,17 @@ Pagination should follow `pagination.has_more` and `pagination.next_cursor`.
 
 Subscriptions are cached locally in IndexedDB, not localStorage, because the dataset is too large for browser key-value storage.
 
+Cross-device persistence uses Supabase DB snapshots:
+
+```text
+IndexedDB cache miss after login
+-> Supabase data_snapshots latest row for auth.uid()
+-> restore Zustand data
+-> warm IndexedDB cache for future reloads
+```
+
+Snapshot types are `palmer`, `funnelfox_subscriptions`, `facebook_traffic`, and `forecasting_settings`. The app stores dataset payloads and metadata only; it never stores API secrets.
+
 Cancellation fields are normalized as:
 
 - status containing `cancel` -> cancelled

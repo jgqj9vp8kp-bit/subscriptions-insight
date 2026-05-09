@@ -39,7 +39,41 @@
 - FunnelFox mock mode returns no subscriptions until a backend proxy is configured.
 - Set `VITE_FUNNELFOX_MOCK=false` only after a backend proxy exists; the browser still must not receive `FUNNELFOX_SECRET`.
 - FunnelFox subscriptions are cached in IndexedDB, not localStorage.
+- IndexedDB is the fast local cache, while Supabase `data_snapshots` is the cross-device source of truth for imported Palmer data, FunnelFox subscription snapshots, Facebook traffic data, and forecasting default settings.
 - localStorage is only for small UI state such as filters, column settings, selected views, and forecast assumptions.
+
+## Supabase Dataset Snapshots
+
+The migration `supabase/migrations/202605090001_create_data_snapshots.sql` creates `public.data_snapshots`.
+
+Each authenticated user gets one latest snapshot per `dataset_type`:
+
+- `palmer`
+- `funnelfox_subscriptions`
+- `facebook_traffic`
+- `forecasting_settings`
+
+RLS policies require `auth.uid() = user_id` for select, insert, update, and delete. The frontend uses the publishable anon key plus the logged-in Supabase session; no service role key is used in browser code.
+
+Import/sync flow:
+
+```text
+Import Data action succeeds
+-> save parsed data to IndexedDB
+-> upsert latest Supabase data_snapshots row
+```
+
+Startup restore flow:
+
+```text
+Protected app mounts
+-> SavedDataAutoLoader reads IndexedDB caches
+-> if a cache is missing, loads latest Supabase snapshot
+-> restores Zustand
+-> warms IndexedDB with cloud-loaded data
+```
+
+Use the Local Saved Data section on Import Data to manually Save to cloud or Load from cloud for Palmer, FunnelFox subscriptions, Facebook traffic, and Forecasting settings. Do not store FunnelFox secrets, Supabase service role keys, raw API keys, or other credentials in snapshot payloads.
 
 ## FunnelFox Backend Requirement
 

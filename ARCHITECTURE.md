@@ -17,7 +17,7 @@ The Import Data page is the single source connection center. Palmer upload, Face
 
 Forecasting is a read-only scenario layer over existing cohort data. It uses Cohorts as the factual base, calculates absolute retention from original trial users, and lets the user edit forecast assumptions without mutating Palmer, FunnelFox, traffic, or cohort calculations.
 
-Small page UI state is persisted in localStorage via `src/hooks/usePersistedPageState.ts`. Large data remains outside localStorage: Palmer/FunnelFox datasets use IndexedDB or in-memory Zustand state, and API keys/secrets are never persisted.
+Small page UI state is persisted in localStorage via `src/hooks/usePersistedPageState.ts`. Large data remains outside localStorage: Palmer, FunnelFox, and Facebook traffic datasets use IndexedDB for local reloads and Supabase `data_snapshots` for cross-device restore. API keys/secrets are never persisted.
 
 All analytics routes are protected by Supabase Auth. `/login` is public; Dashboard, Cohorts, Forecasting, Transactions, Users, Subscriptions, and Import Data require an authenticated session. Supabase signup should be disabled in production, and allowed users should be created in Supabase Auth.
 
@@ -31,6 +31,17 @@ Raw Palmer export
 -> UI
 
 The import page can still accept a clean template CSV. In that mode, `applyMapping` maps user-provided columns into the shared `Transaction` shape. In Palmer mode, raw rows are preserved and transformed through the Palmer pipeline before they enter analytics.
+
+Imported datasets are saved in two layers:
+
+```text
+Import/sync success
+-> IndexedDB local cache
+-> Supabase data_snapshots row scoped by auth.uid()
+-> app startup restores IndexedDB first, then latest Supabase snapshot if local cache is missing
+```
+
+`data_snapshots` stores the latest snapshot per authenticated user and dataset type: `palmer`, `funnelfox_subscriptions`, `facebook_traffic`, and `forecasting_settings`. Row-level security keeps snapshots private to the owning Supabase Auth user.
 
 FunnelFox subscription monitoring is imported separately from Palmer transactions, then joined into cohort reporting by normalized email for subscription-health metrics:
 

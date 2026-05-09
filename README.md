@@ -63,3 +63,13 @@ The frontend sends the current Supabase Auth bearer token and anon `apikey` to E
 - Add production Redirect URLs.
 - Create allowed users manually in Supabase Auth.
 - Use only the publishable anon key in the frontend.
+
+### Supabase dataset persistence
+
+Apply database migrations before relying on cross-device data restore:
+
+```text
+supabase db push
+```
+
+The `data_snapshots` table stores the latest Palmer, FunnelFox subscriptions, Facebook traffic, and Forecasting settings snapshots per authenticated user. RLS restricts each user to their own rows. IndexedDB remains the fast local cache; Supabase DB is the cross-device fallback/source of truth. Do not store API secrets in snapshots.

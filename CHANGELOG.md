@@ -16,9 +16,11 @@
 - Import Data forecasting settings for editable default fallback retention curve
 - Supabase Auth email/password login with protected analytics/import routes
 - Temporary sessionStorage-only local admin login fallback for local development/demo when Supabase is not configured
+- Supabase DB `data_snapshots` persistence for cross-device Palmer, FunnelFox, Facebook traffic, and Forecasting settings restore
 
 ### Changed
 - Data connection controls were centralized on Import Data; Cohorts and Subscriptions now stay analytics/table-only.
+- Startup data restore now checks IndexedDB first and falls back to authenticated Supabase cloud snapshots when local cache is missing.
 - Dashboard, Cohorts, Users, Transactions, Subscriptions, Forecasting, and Import Data preserve small UI settings across navigation.
 - Cohort calculations now use trial timestamp instead of calendar date
 - Amount parsing fixed (cents -> USD)
