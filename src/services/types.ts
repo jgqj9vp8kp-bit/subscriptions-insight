@@ -41,11 +41,14 @@ export interface Transaction {
   cohort_date?: string;
   cohort_id?: string;
   transaction_day?: number | null;
+  metadata?: Record<string, unknown>;
+  raw?: Record<string, unknown>;
 }
 
 export interface UserAggregate {
   user_id: string;
   email: string;
+  country_code: string | null;
   funnel: Funnel;
   first_trial_date: string | null;
   plan_price: number | null;

@@ -444,6 +444,53 @@ describe("Palmer transformation", () => {
     expect(users[0].plan_assignment_reason).toBeNull();
   });
 
+  it("extracts and normalizes country from metadata.ff_country_code", () => {
+    const rows = transformPalmerRows([
+      {
+        id: "country_trial",
+        user_id: "u_country",
+        email: "country@example.com",
+        created_at: "2026-01-01T10:00:00Z",
+        amount: "100",
+        status: "SETTLED",
+        metadata: JSON.stringify({ ff_country_code: "us" }),
+      },
+    ]);
+
+    expect(computeUsers(rows)[0].country_code).toBe("US");
+  });
+
+  it("falls back to direct ff_country_code column for user country", () => {
+    const rows = transformPalmerRows([
+      {
+        id: "country_trial",
+        user_id: "u_country",
+        email: "country@example.com",
+        created_at: "2026-01-01T10:00:00Z",
+        amount: "100",
+        status: "SETTLED",
+        ff_country_code: " ca ",
+      },
+    ]);
+
+    expect(computeUsers(rows)[0].country_code).toBe("CA");
+  });
+
+  it("keeps missing user country as null", () => {
+    const rows = transformPalmerRows([
+      {
+        id: "country_missing",
+        user_id: "u_country_missing",
+        email: "country-missing@example.com",
+        created_at: "2026-01-01T10:00:00Z",
+        amount: "100",
+        status: "SETTLED",
+      },
+    ]);
+
+    expect(computeUsers(rows)[0].country_code).toBeNull();
+  });
+
   it("allows an upsell before the first non-upsell trial", () => {
     const rows = transformPalmerRows([
       {

@@ -25,7 +25,14 @@ import { formatDateKey, toDateKey } from "@/services/dateKeys";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
 import type { Transaction, UserAggregate } from "@/services/types";
 
-type SortKey = "first_trial_date" | "total_revenue" | "user_ltv" | "renewal_count" | "has_refund" | "total_refund_usd";
+type SortKey =
+  | "country_code"
+  | "first_trial_date"
+  | "total_revenue"
+  | "user_ltv"
+  | "renewal_count"
+  | "has_refund"
+  | "total_refund_usd";
 type FirstSubFilter = "all" | "has" | "none";
 type RefundFilter = "all" | "has" | "none";
 type UserWithCampaignPath = UserAggregate & { campaign_path: string };
@@ -33,6 +40,7 @@ type UserWithCampaignPath = UserAggregate & { campaign_path: string };
 const DEFAULT_USERS_UI_STATE = {
   search: "",
   campaignPathFilter: "all",
+  countryFilter: "all",
   firstSubFilter: "all" as FirstSubFilter,
   refundFilter: "all" as RefundFilter,
   firstTrialFrom: "",
@@ -81,7 +89,17 @@ function normalizeCampaignPathLabel(path: string | undefined): string {
 export default function UsersPage() {
   const txs = useTransactions();
   const [uiState, setUiState, resetUiState] = usePersistedPageState("ui_state_users", DEFAULT_USERS_UI_STATE);
-  const { search, campaignPathFilter, firstSubFilter, refundFilter, firstTrialFrom, firstTrialTo, sortKey, sortDir } = uiState;
+  const {
+    search,
+    campaignPathFilter,
+    countryFilter,
+    firstSubFilter,
+    refundFilter,
+    firstTrialFrom,
+    firstTrialTo,
+    sortKey,
+    sortDir,
+  } = uiState;
   const updateUiState = (patch: Partial<typeof DEFAULT_USERS_UI_STATE>) => setUiState((current) => ({ ...current, ...patch }));
 
   const users: UserAggregate[] = useMemo(() => computeUsers(txs), [txs]);
@@ -98,6 +116,10 @@ export default function UsersPage() {
     () => Array.from(new Set(usersWithCampaignPath.map((user) => user.campaign_path || "unknown"))).sort(),
     [usersWithCampaignPath]
   );
+  const countryOptions = useMemo(
+    () => Array.from(new Set(usersWithCampaignPath.map((user) => user.country_code).filter(Boolean) as string[])).sort(),
+    [usersWithCampaignPath]
+  );
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -107,6 +129,7 @@ export default function UsersPage() {
     const list = usersWithCampaignPath.filter((u) => {
       if (q && !u.email.toLowerCase().includes(q) && !u.user_id.toLowerCase().includes(q)) return false;
       if (campaignPathFilter !== "all" && u.campaign_path !== campaignPathFilter) return false;
+      if (countryFilter !== "all" && u.country_code !== countryFilter) return false;
       if (firstSubFilter === "has" && !u.has_first_subscription) return false;
       if (firstSubFilter === "none" && u.has_first_subscription) return false;
       if (refundFilter === "has" && !u.has_refund) return false;
@@ -123,11 +146,16 @@ export default function UsersPage() {
     list.sort((a, b) => {
       const av = sortKey === "first_trial_date" ? toDateKey(a.first_trial_date) : a[sortKey] ?? "";
       const bv = sortKey === "first_trial_date" ? toDateKey(b.first_trial_date) : b[sortKey] ?? "";
+      const aMissing = av === "" || av == null;
+      const bMissing = bv === "" || bv == null;
+      if (aMissing && bMissing) return 0;
+      if (aMissing) return 1;
+      if (bMissing) return -1;
       const cmp = av < bv ? -1 : av > bv ? 1 : 0;
       return sortDir === "asc" ? cmp : -cmp;
     });
     return list;
-  }, [usersWithCampaignPath, search, campaignPathFilter, firstSubFilter, refundFilter, firstTrialFrom, firstTrialTo, sortKey, sortDir]);
+  }, [usersWithCampaignPath, search, campaignPathFilter, countryFilter, firstSubFilter, refundFilter, firstTrialFrom, firstTrialTo, sortKey, sortDir]);
 
   const hasFirstTrialFilter = Boolean(firstTrialFrom || firstTrialTo);
 
@@ -159,6 +187,15 @@ export default function UsersPage() {
               <SelectItem value="all">All campaign paths</SelectItem>
               {campaignPathOptions.map((path) => (
                 <SelectItem key={path} value={path}>{path}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Select value={countryFilter} onValueChange={(value) => updateUiState({ countryFilter: value })}>
+            <SelectTrigger className="h-9 w-[170px]"><SelectValue placeholder="Country" /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All countries</SelectItem>
+              {countryOptions.map((country) => (
+                <SelectItem key={country} value={country}>{country}</SelectItem>
               ))}
             </SelectContent>
           </Select>
@@ -223,6 +260,11 @@ export default function UsersPage() {
               <TableRow>
                 <TableHead>Email</TableHead>
                 <TableHead>Campaign path</TableHead>
+                <TableHead>
+                  <button onClick={() => toggleSort("country_code")} className="inline-flex items-center gap-1 hover:text-foreground">
+                    Country {icon("country_code")}
+                  </button>
+                </TableHead>
                 <TableHead>First trial</TableHead>
                 <TableHead className="text-right">
                   <button onClick={() => toggleSort("total_revenue")} className="inline-flex items-center gap-1 hover:text-foreground">
@@ -258,6 +300,7 @@ export default function UsersPage() {
                 <TableRow key={u.user_id}>
                   <TableCell className="text-sm">{u.email || "—"}</TableCell>
                   <TableCell className="text-xs text-muted-foreground whitespace-nowrap">{u.campaign_path || "unknown"}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground tabular-nums">{u.country_code || "—"}</TableCell>
                   <TableCell className="text-xs text-muted-foreground tabular-nums">
                     {u.first_trial_date ? formatDateKey(u.first_trial_date) : "—"}
                   </TableCell>
@@ -284,7 +327,7 @@ export default function UsersPage() {
               ))}
               {filtered.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={10} className="text-center text-sm text-muted-foreground py-10">
+                  <TableCell colSpan={11} className="text-center text-sm text-muted-foreground py-10">
                     No users match your filters.
                   </TableCell>
                 </TableRow>

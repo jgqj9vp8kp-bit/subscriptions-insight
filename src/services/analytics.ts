@@ -1,5 +1,6 @@
 import type { CohortRow, PlanBreakdownRow, Transaction, UserAggregate } from "./types";
 import type { SubscriptionClean } from "@/types/subscriptions";
+import { countryCodeForUserTransactions } from "@/services/userCountry";
 import {
   DEFAULT_MAX_RENEWAL_COLUMNS,
   MAX_SUPPORTED_RENEWAL_COLUMNS,
@@ -322,6 +323,7 @@ export function computeUsers(txs: Transaction[]): UserAggregate[] {
       return {
         user_id,
         email: sorted.find((t) => t.email)?.email || "",
+        country_code: countryCodeForUserTransactions(sorted),
         funnel: sorted[0].funnel,
         first_trial_date: trial ? trial.event_time : null,
         plan_price: planPrice,

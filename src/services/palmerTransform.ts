@@ -153,7 +153,20 @@ export function parseMetadata(rowOrMetadata: RawPalmerRow | unknown): PalmerMeta
   const merged: PalmerMetadata = { ...parsed };
   // Direct columns win alongside JSON metadata because Palmer exports may
   // flatten marketing fields instead of nesting them under `metadata`.
-  for (const key of ["ff_funnel_id", "ff_campaign_path", "ff_billing_reason", "initialUrl", "email", "utm_campaign", "utm_content", "utm_source"]) {
+  for (const key of [
+    "ff_funnel_id",
+    "ff_campaign_path",
+    "ff_billing_reason",
+    "ff_country_code",
+    "country",
+    "country_code",
+    "ip_country",
+    "initialUrl",
+    "email",
+    "utm_campaign",
+    "utm_content",
+    "utm_source",
+  ]) {
     const direct = valueFrom(source, [key]);
     if (direct) merged[key] = direct;
   }
@@ -275,6 +288,11 @@ export function normalizePalmerRows(rows: RawPalmerRow[]): Transaction[] {
       campaign_id: valueFrom(row, FIELD_ALIASES.campaign_id) || String(metadata.utm_campaign ?? ""),
       billing_reason: String(metadata.ff_billing_reason ?? ""),
       classification_reason: fallbackType ? `${status} Palmer status` : "awaiting user-level classification",
+      metadata,
+      raw: {
+        metadata,
+        ff_country_code: valueFrom(row, ["ff_country_code"]),
+      },
     };
   });
 }
