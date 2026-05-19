@@ -1,4 +1,5 @@
 import type { CohortRow } from "@/services/types";
+import { renewalLevelFromColumnId } from "@/services/dataSettings";
 import { normalizeCampaignPath, type TrafficMetric } from "@/services/trafficImport";
 
 export type TrafficAggregate = TrafficMetric & {
@@ -15,12 +16,42 @@ export type CohortTraffic = {
   ctr: number | null;
 };
 
+export function trialCostFromSpend(spend: number | null | undefined, trialUsers: number): number | null {
+  if (spend == null || !Number.isFinite(spend) || !Number.isFinite(trialUsers) || trialUsers <= 0) return null;
+  const value = spend / trialUsers;
+  return Number.isFinite(value) ? value : null;
+}
+
+export function trialCostForCohort(row: Pick<CohortRow, "trial_users">, traffic: Pick<CohortTraffic, "spend"> | null): number | null {
+  return trialCostFromSpend(traffic?.spend, row.trial_users);
+}
+
+export function renewalUsersForLevel(
+  row: Partial<Pick<CohortRow, "renewal_2_users" | "renewal_3_users" | "renewal_4_users" | "renewal_5_users" | "renewal_6_users" | "renewal_users_by_level">>,
+  level: number,
+): number {
+  const fromMap = row.renewal_users_by_level?.[level];
+  if (typeof fromMap === "number") return fromMap;
+  const key = `renewal_${level}_users` as keyof typeof row;
+  const value = row[key];
+  return typeof value === "number" ? value : 0;
+}
+
+export function renewalUsersForColumn(row: Parameters<typeof renewalUsersForLevel>[0], columnId: string): number | null {
+  const level = renewalLevelFromColumnId(columnId);
+  return level == null ? null : renewalUsersForLevel(row, level);
+}
+
 export interface CohortReportTotals {
   totalTrialUsers: number;
   totalUpsellUsers: number;
   totalFirstSubscriptionUsers: number;
   totalRenewal2Users: number;
   totalRenewal3Users: number;
+  totalRenewal4Users: number;
+  totalRenewal5Users: number;
+  totalRenewal6Users: number;
+  renewalTotalsByLevel: Record<number, number>;
   totalRenewalUsers: number;
   totalRefundUsers: number;
   totalActiveUsers: number;
@@ -49,6 +80,7 @@ export interface CohortReportTotals {
   trafficSpend: number;
   hasTrafficSpend: boolean;
   hasCompleteTrafficSpend: boolean;
+  trialCost: number | null;
   profit: number;
   profitD7: number;
   profit1m: number;
@@ -140,6 +172,24 @@ export function computeCohortReportTotals(
   const totalFirstSubscriptionUsers = sum((c) => c.first_subscription_users);
   const totalRenewal2Users = sum((c) => c.renewal_2_users);
   const totalRenewal3Users = sum((c) => c.renewal_3_users);
+  const totalRenewal4Users = sum((c) => c.renewal_4_users);
+  const totalRenewal5Users = sum((c) => c.renewal_5_users);
+  const totalRenewal6Users = sum((c) => c.renewal_6_users);
+  const renewalTotalsByLevel: Record<number, number> = {};
+  for (const cohort of cohorts) {
+    const levels = new Set<number>([
+      ...Object.keys(cohort.renewal_users_by_level ?? {}).map(Number),
+      2,
+      3,
+      4,
+      5,
+      6,
+    ]);
+    levels.forEach((level) => {
+      if (!Number.isFinite(level)) return;
+      renewalTotalsByLevel[level] = (renewalTotalsByLevel[level] ?? 0) + renewalUsersForLevel(cohort, level);
+    });
+  }
   const totalRenewalUsers = sum((c) => c.renewal_users);
   const totalRefundUsers = new Set(cohorts.flatMap((c) => c.refunded_user_ids)).size;
   const totalActiveUsers = new Set(cohorts.flatMap((c) => c.active_user_ids)).size;
@@ -167,6 +217,10 @@ export function computeCohortReportTotals(
     totalFirstSubscriptionUsers,
     totalRenewal2Users,
     totalRenewal3Users,
+    totalRenewal4Users,
+    totalRenewal5Users,
+    totalRenewal6Users,
+    renewalTotalsByLevel,
     totalRenewalUsers,
     totalRefundUsers,
     totalActiveUsers,
@@ -195,6 +249,7 @@ export function computeCohortReportTotals(
     trafficSpend: totalTrafficSpend,
     hasTrafficSpend,
     hasCompleteTrafficSpend,
+    trialCost: trialCostFromSpend(hasTrafficSpend ? totalTrafficSpend : null, totalTrialUsers),
     profit: netRevenue - totalTrafficSpend,
     profitD7: totalRevenueD7 - totalTrafficSpend,
     profit1m: totalRevenueD30 - totalTrafficSpend,

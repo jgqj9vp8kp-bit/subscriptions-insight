@@ -44,6 +44,9 @@ import {
   mergeCohortsUiSettings,
   readLocalCohortsUiSettings,
   saveCohortsUiSettingsCloud,
+  sanitizeColumnOrder,
+  sanitizeColumnVisibility,
+  sanitizeColumnWidths,
   sanitizeCohortsUiSettingsPayload,
   writeLocalCohortsUiSettings,
   type CohortsUiSavedView,
@@ -55,6 +58,13 @@ import {
   sortCohortRows,
   type CohortSortDirection,
 } from "@/services/cohortSorting";
+import { renewalUsersForColumn, renewalUsersForLevel, trialCostForCohort, trialCostFromSpend } from "@/services/cohortReporting";
+import {
+  MAX_RENEWAL_COLUMNS_CHANGED_EVENT,
+  loadMaxRenewalColumns,
+  renewalColumnIds,
+  renewalLevelFromColumnId,
+} from "@/services/dataSettings";
 
 // Visual-only helpers — no data/logic impact.
 const HEAD_BASE =
@@ -82,7 +92,7 @@ const DEFAULT_COHORTS_UI_STATE = {
   expandedCohortIds: [] as string[],
 };
 
-const DEFAULT_COLUMN_ORDER = [
+const COLUMN_ORDER_BEFORE_RENEWALS = [
   "cohort_date",
   "campaign_path",
   "funnel",
@@ -104,8 +114,9 @@ const DEFAULT_COLUMN_ORDER = [
   "trial_to_first_subscription_cr",
   "first_subscription_to_renewal_2_cr",
   "renewal_2_to_renewal_3_cr",
-  "renewal_2_users",
-  "renewal_3_users",
+] as const;
+
+const COLUMN_ORDER_AFTER_RENEWALS = [
   "renewal_users",
   "refund_users",
   "amount_refunded",
@@ -117,6 +128,7 @@ const DEFAULT_COLUMN_ORDER = [
   "revenue_d30",
   "revenue_d60",
   "traffic_spend",
+  "trial_cost",
   "profit",
   "profit_d7",
   "profit_1m",
@@ -132,9 +144,19 @@ const DEFAULT_COLUMN_ORDER = [
   "roas_2m",
 ] as const;
 
-type CohortColumnId = (typeof DEFAULT_COLUMN_ORDER)[number];
+type CohortColumnId = string;
 
-const COLUMN_LABELS: Record<CohortColumnId, string> = {
+function buildDefaultColumnOrder(maxRenewalColumns: number): CohortColumnId[] {
+  return [
+    ...COLUMN_ORDER_BEFORE_RENEWALS,
+    ...renewalColumnIds(maxRenewalColumns),
+    ...COLUMN_ORDER_AFTER_RENEWALS,
+  ];
+}
+
+const DEFAULT_COLUMN_ORDER = buildDefaultColumnOrder(6);
+
+const STATIC_COLUMN_LABELS: Record<string, string> = {
   cohort_date: "Cohort date",
   campaign_path: "Campaign path",
   funnel: "Funnel",
@@ -158,6 +180,9 @@ const COLUMN_LABELS: Record<CohortColumnId, string> = {
   renewal_2_to_renewal_3_cr: "Renewal 2 → 3 CR",
   renewal_2_users: "Renewal 2",
   renewal_3_users: "Renewal 3",
+  renewal_4_users: "Renewal 4",
+  renewal_5_users: "Renewal 5",
+  renewal_6_users: "Renewal 6",
   renewal_users: "Total Renewals",
   refund_users: "Refund Users",
   amount_refunded: "Amount Refunded",
@@ -169,6 +194,7 @@ const COLUMN_LABELS: Record<CohortColumnId, string> = {
   revenue_d30: "Rev 1M",
   revenue_d60: "Rev 2M",
   traffic_spend: "Spend",
+  trial_cost: "Trial Cost",
   profit: "Profit",
   profit_d7: "Profit D7",
   profit_1m: "Profit 1M",
@@ -184,7 +210,13 @@ const COLUMN_LABELS: Record<CohortColumnId, string> = {
   roas_2m: "ROAS 2M",
 };
 
-const COLUMN_MIN_WIDTHS: Record<CohortColumnId, number> = {
+function columnLabel(id: CohortColumnId): string {
+  const renewalLevel = renewalLevelFromColumnId(id);
+  if (renewalLevel != null) return `Renewal ${renewalLevel}`;
+  return STATIC_COLUMN_LABELS[id] ?? id;
+}
+
+const COLUMN_MIN_WIDTHS: Record<string, number> = {
   cohort_date: 120,
   campaign_path: 160,
   funnel: 110,
@@ -208,6 +240,9 @@ const COLUMN_MIN_WIDTHS: Record<CohortColumnId, number> = {
   renewal_2_to_renewal_3_cr: 130,
   renewal_2_users: 90,
   renewal_3_users: 90,
+  renewal_4_users: 90,
+  renewal_5_users: 90,
+  renewal_6_users: 90,
   renewal_users: 110,
   refund_users: 100,
   amount_refunded: 120,
@@ -219,6 +254,7 @@ const COLUMN_MIN_WIDTHS: Record<CohortColumnId, number> = {
   revenue_d30: 90,
   revenue_d60: 90,
   traffic_spend: 90,
+  trial_cost: 90,
   profit: 90,
   profit_d7: 100,
   profit_1m: 100,
@@ -235,27 +271,30 @@ const COLUMN_MIN_WIDTHS: Record<CohortColumnId, number> = {
 };
 
 // Compact defaults — tighter than before for higher data density.
-const DEFAULT_COLUMN_WIDTHS: Record<string, number> = (() => {
+function buildDefaultColumnWidths(defaultColumnOrder: readonly string[]): Record<string, number> {
   const out: Record<string, number> = { [COHORT_FIRST_COL_KEY]: 150 };
-  for (const id of DEFAULT_COLUMN_ORDER) {
+  for (const id of defaultColumnOrder) {
     const isText = id === "cohort_date" || id === "campaign_path" || id === "funnel";
-    out[id] = isText ? Math.max(130, COLUMN_MIN_WIDTHS[id]) : Math.max(MIN_COLUMN_WIDTH, Math.min(100, COLUMN_MIN_WIDTHS[id]));
+    const minWidth = COLUMN_MIN_WIDTHS[id] ?? 90;
+    out[id] = isText ? Math.max(130, minWidth) : Math.max(MIN_COLUMN_WIDTH, Math.min(100, minWidth));
   }
   return out;
-})();
+}
 
-function loadInitialColumnWidths(): Record<string, number> {
+const DEFAULT_COLUMN_WIDTHS = buildDefaultColumnWidths(DEFAULT_COLUMN_ORDER);
+
+function loadInitialColumnWidths(defaultColumnWidths = DEFAULT_COLUMN_WIDTHS): Record<string, number> {
   try {
     const saved = localStorage.getItem(COLUMN_WIDTHS_STORAGE_KEY);
-    if (!saved) return { ...DEFAULT_COLUMN_WIDTHS };
+    if (!saved) return { ...defaultColumnWidths };
     const parsed = JSON.parse(saved);
     if (parsed && typeof parsed === "object") {
-      return { ...DEFAULT_COLUMN_WIDTHS, ...parsed };
+      return { ...defaultColumnWidths, ...parsed };
     }
   } catch {
     // fall through
   }
-  return { ...DEFAULT_COLUMN_WIDTHS };
+  return { ...defaultColumnWidths };
 }
 
 function persistColumnWidths(widths: Record<string, number>) {
@@ -290,20 +329,20 @@ function heatStyle(value: number, max: number): React.CSSProperties {
   };
 }
 
-function isValidColumnOrder(value: unknown): value is CohortColumnId[] {
-  if (!Array.isArray(value) || value.length !== DEFAULT_COLUMN_ORDER.length) return false;
+function isValidColumnOrder(value: unknown, defaultColumnOrder = DEFAULT_COLUMN_ORDER): value is CohortColumnId[] {
+  if (!Array.isArray(value) || value.length !== defaultColumnOrder.length) return false;
   const ids = new Set(value);
-  return ids.size === DEFAULT_COLUMN_ORDER.length && DEFAULT_COLUMN_ORDER.every((id) => ids.has(id));
+  return ids.size === defaultColumnOrder.length && defaultColumnOrder.every((id) => ids.has(id));
 }
 
-function loadInitialColumnOrder(): CohortColumnId[] {
+function loadInitialColumnOrder(defaultColumnOrder = DEFAULT_COLUMN_ORDER): CohortColumnId[] {
   try {
     const saved = localStorage.getItem(COLUMN_ORDER_STORAGE_KEY);
-    if (!saved) return [...DEFAULT_COLUMN_ORDER];
+    if (!saved) return [...defaultColumnOrder];
     const parsed = JSON.parse(saved);
-    return isValidColumnOrder(parsed) ? parsed : [...DEFAULT_COLUMN_ORDER];
+    return sanitizeColumnOrder(isValidColumnOrder(parsed, defaultColumnOrder) ? parsed : parsed, defaultColumnOrder);
   } catch {
-    return [...DEFAULT_COLUMN_ORDER];
+    return [...defaultColumnOrder];
   }
 }
 
@@ -319,21 +358,21 @@ function persistColumnOrder(order: CohortColumnId[]) {
 // ---- Column visibility ----
 const DEFAULT_HIDDEN: CohortColumnId[] = [];
 
-function defaultColumnVisibility(): Record<CohortColumnId, boolean> {
-  return Object.fromEntries(DEFAULT_COLUMN_ORDER.map((id) => [id, !DEFAULT_HIDDEN.includes(id)])) as Record<
+function defaultColumnVisibility(defaultColumnOrder = DEFAULT_COLUMN_ORDER): Record<CohortColumnId, boolean> {
+  return Object.fromEntries(defaultColumnOrder.map((id) => [id, !DEFAULT_HIDDEN.includes(id)])) as Record<
     CohortColumnId,
     boolean
   >;
 }
 
-function loadInitialVisibility(): Record<CohortColumnId, boolean> {
-  const base = defaultColumnVisibility();
+function loadInitialVisibility(defaultColumnOrder = DEFAULT_COLUMN_ORDER): Record<CohortColumnId, boolean> {
+  const base = defaultColumnVisibility(defaultColumnOrder);
   try {
     const saved = localStorage.getItem(COLUMN_VISIBILITY_STORAGE_KEY);
     if (!saved) return base;
     const parsed = JSON.parse(saved);
     if (parsed && typeof parsed === "object") {
-      for (const id of DEFAULT_COLUMN_ORDER) {
+      for (const id of defaultColumnOrder) {
         if (typeof parsed[id] === "boolean") base[id] = parsed[id];
       }
     }
@@ -440,42 +479,46 @@ function trafficForCohort(row: CohortRow, trafficByKey: Map<string, TrafficAggre
   };
 }
 
-function buildVisibility(visibleIds: CohortColumnId[]): Record<CohortColumnId, boolean> {
+function buildVisibility(visibleIds: CohortColumnId[], defaultColumnOrder = DEFAULT_COLUMN_ORDER): Record<CohortColumnId, boolean> {
   const v = {} as Record<CohortColumnId, boolean>;
-  for (const id of DEFAULT_COLUMN_ORDER) v[id] = visibleIds.includes(id);
+  for (const id of defaultColumnOrder) v[id] = visibleIds.includes(id);
   return v;
 }
 
-const BUILTIN_VIEWS: SavedView[] = [
-  {
-    id: "default",
-    name: "Default",
-    order: [...DEFAULT_COLUMN_ORDER],
-    visibility: Object.fromEntries(DEFAULT_COLUMN_ORDER.map((id) => [id, true])) as Record<CohortColumnId, boolean>,
-    builtin: true,
-  },
-  {
-    id: "revenue",
-    name: "Revenue",
-    order: [...DEFAULT_COLUMN_ORDER],
-    visibility: buildVisibility(["gross_revenue", "net_revenue", "revenue_d0", "revenue_d7", "revenue_d30", "revenue_d60", "traffic_spend", "profit", "profit_d7", "profit_1m", "profit_2m"]),
-    builtin: true,
-  },
-  {
-    id: "cancellations",
-    name: "Cancellations",
-    order: [...DEFAULT_COLUMN_ORDER],
-    visibility: buildVisibility(["cancelled_users", "user_cancelled_users", "auto_cancelled_users", "cancellation_rate"]),
-    builtin: true,
-  },
-  {
-    id: "active_subs",
-    name: "Active Subs",
-    order: [...DEFAULT_COLUMN_ORDER],
-    visibility: buildVisibility(["active_subscriptions", "active_subscriptions_rate"]),
-    builtin: true,
-  },
-];
+function buildBuiltinViews(defaultColumnOrder: readonly string[]): SavedView[] {
+  return [
+    {
+      id: "default",
+      name: "Default",
+      order: [...defaultColumnOrder],
+      visibility: Object.fromEntries(defaultColumnOrder.map((id) => [id, true])) as Record<CohortColumnId, boolean>,
+      builtin: true,
+    },
+    {
+      id: "revenue",
+      name: "Revenue",
+      order: [...defaultColumnOrder],
+      visibility: buildVisibility(["gross_revenue", "net_revenue", "revenue_d0", "revenue_d7", "revenue_d30", "revenue_d60", "traffic_spend", "trial_cost", "profit", "profit_d7", "profit_1m", "profit_2m"], defaultColumnOrder),
+      builtin: true,
+    },
+    {
+      id: "cancellations",
+      name: "Cancellations",
+      order: [...defaultColumnOrder],
+      visibility: buildVisibility(["cancelled_users", "user_cancelled_users", "auto_cancelled_users", "cancellation_rate"], defaultColumnOrder),
+      builtin: true,
+    },
+    {
+      id: "active_subs",
+      name: "Active Subs",
+      order: [...defaultColumnOrder],
+      visibility: buildVisibility(["active_subscriptions", "active_subscriptions_rate"], defaultColumnOrder),
+      builtin: true,
+    },
+  ];
+}
+
+const BUILTIN_VIEWS = buildBuiltinViews(DEFAULT_COLUMN_ORDER);
 
 function loadCustomViews(): SavedView[] {
   try {
@@ -560,15 +603,20 @@ export default function CohortsPage() {
   };
   const [columnsPopoverOpen, setColumnsPopoverOpen] = useState(false);
   const [viewsPopoverOpen, setViewsPopoverOpen] = useState(false);
-  const [columnOrder, setColumnOrder] = useState<CohortColumnId[]>(loadInitialColumnOrder);
-  const [columnVisibility, setColumnVisibility] = useState<Record<CohortColumnId, boolean>>(loadInitialVisibility);
+  const [maxRenewalColumns, setMaxRenewalColumns] = useState(loadMaxRenewalColumns);
+  const defaultColumnOrder = useMemo(() => buildDefaultColumnOrder(maxRenewalColumns), [maxRenewalColumns]);
+  const defaultColumnWidths = useMemo(() => buildDefaultColumnWidths(defaultColumnOrder), [defaultColumnOrder]);
+  const defaultVisibility = useMemo(() => defaultColumnVisibility(defaultColumnOrder), [defaultColumnOrder]);
+  const builtinViews = useMemo(() => buildBuiltinViews(defaultColumnOrder), [defaultColumnOrder]);
+  const [columnOrder, setColumnOrder] = useState<CohortColumnId[]>(() => loadInitialColumnOrder(buildDefaultColumnOrder(loadMaxRenewalColumns())));
+  const [columnVisibility, setColumnVisibility] = useState<Record<CohortColumnId, boolean>>(() => loadInitialVisibility(buildDefaultColumnOrder(loadMaxRenewalColumns())));
   const [customViews, setCustomViews] = useState<SavedView[]>(loadCustomViews);
   const [activeViewId, setActiveViewId] = useState<string | null>(() => {
     try { return localStorage.getItem(ACTIVE_VIEW_STORAGE_KEY); } catch { return null; }
   });
   const [newViewName, setNewViewName] = useState("");
   const dragColRef = useRef<CohortColumnId | null>(null);
-  const [columnWidths, setColumnWidths] = useState<Record<string, number>>(loadInitialColumnWidths);
+  const [columnWidths, setColumnWidths] = useState<Record<string, number>>(() => loadInitialColumnWidths(buildDefaultColumnWidths(buildDefaultColumnOrder(loadMaxRenewalColumns()))));
   const resizingRef = useRef<{ key: string; startX: number; startWidth: number } | null>(null);
   const [cohortsUiCloudReady, setCohortsUiCloudReady] = useState(false);
   const [cohortsUiCloudLoading, setCohortsUiCloudLoading] = useState(false);
@@ -579,26 +627,26 @@ export default function CohortsPage() {
 
   const cohortsUiSettingsDefaults = useMemo<CohortsUiSettingsDefaults>(
     () => ({
-      defaultColumnOrder: DEFAULT_COLUMN_ORDER,
-      defaultColumnWidths: DEFAULT_COLUMN_WIDTHS,
-      defaultColumnVisibility: defaultColumnVisibility(),
+      defaultColumnOrder,
+      defaultColumnWidths,
+      defaultColumnVisibility: defaultVisibility,
       defaultFilters: DEFAULT_COHORTS_UI_STATE,
-      validWidthKeys: [COHORT_FIRST_COL_KEY, ...DEFAULT_COLUMN_ORDER],
-      validSelectedViewIds: BUILTIN_VIEWS.map((view) => view.id),
+      validWidthKeys: [COHORT_FIRST_COL_KEY, ...defaultColumnOrder],
+      validSelectedViewIds: builtinViews.map((view) => view.id),
       defaultSelectedView: "default",
-      validSortColumnIds: [COHORT_FIRST_COL_KEY, ...DEFAULT_COLUMN_ORDER],
+      validSortColumnIds: [COHORT_FIRST_COL_KEY, ...defaultColumnOrder],
     }),
-    [],
+    [builtinViews, defaultColumnOrder, defaultColumnWidths, defaultVisibility],
   );
 
   const startResize = useCallback((key: string, e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    const startWidth = columnWidths[key] ?? DEFAULT_COLUMN_WIDTHS[key] ?? 100;
+    const startWidth = columnWidths[key] ?? defaultColumnWidths[key] ?? 100;
     resizingRef.current = { key, startX: e.clientX, startWidth };
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
-  }, [columnWidths]);
+  }, [columnWidths, defaultColumnWidths]);
 
   useEffect(() => {
     const onMove = (e: MouseEvent) => {
@@ -627,21 +675,21 @@ export default function CohortsPage() {
 
   const autoFitColumn = useCallback((key: string) => {
     setColumnWidths((cur) => {
-      const next = { ...cur, [key]: DEFAULT_COLUMN_WIDTHS[key] ?? 100 };
+      const next = { ...cur, [key]: defaultColumnWidths[key] ?? 100 };
       persistColumnWidths(next);
       return next;
     });
-  }, []);
+  }, [defaultColumnWidths]);
 
   const resetColumnWidths = useCallback(() => {
-    setColumnWidths({ ...DEFAULT_COLUMN_WIDTHS });
+    setColumnWidths({ ...defaultColumnWidths });
     try {
       localStorage.removeItem(COLUMN_WIDTHS_STORAGE_KEY);
       markCohortsUiSettingsUpdated();
     } catch (error) {
       console.warn("Unable to reset cohort column widths", error);
     }
-  }, []);
+  }, [defaultColumnWidths]);
 
   const applyCohortsUiSettings = useCallback(
     (payload: CohortsUiSettingsPayload) => {
@@ -792,6 +840,33 @@ export default function CohortsPage() {
     return () => window.clearTimeout(timer);
   }, [buildCurrentCohortsUiSettings, cohortsUiCloudReady, saveCohortsUiSettingsToCloud]);
 
+  useEffect(() => {
+    const syncMaxRenewalColumns = () => setMaxRenewalColumns(loadMaxRenewalColumns());
+    const onCustomEvent = (event: Event) => {
+      const next = (event as CustomEvent).detail;
+      setMaxRenewalColumns(loadMaxRenewalColumns() || next);
+    };
+
+    window.addEventListener("storage", syncMaxRenewalColumns);
+    window.addEventListener(MAX_RENEWAL_COLUMNS_CHANGED_EVENT, onCustomEvent);
+    return () => {
+      window.removeEventListener("storage", syncMaxRenewalColumns);
+      window.removeEventListener(MAX_RENEWAL_COLUMNS_CHANGED_EVENT, onCustomEvent);
+    };
+  }, []);
+
+  useEffect(() => {
+    setColumnOrder((current) => sanitizeColumnOrder(current, defaultColumnOrder));
+    setColumnVisibility((current) => sanitizeColumnVisibility(current, defaultVisibility, defaultColumnOrder));
+    setColumnWidths((current) =>
+      sanitizeColumnWidths(current, defaultColumnWidths, [COHORT_FIRST_COL_KEY, ...defaultColumnOrder]),
+    );
+    if (sortColumn && !defaultColumnOrder.includes(sortColumn)) {
+      markCohortsUiSettingsUpdated();
+      setUiState((current) => ({ ...current, sortColumn: null, sortDirection: null }));
+    }
+  }, [defaultColumnOrder, defaultColumnWidths, defaultVisibility, setUiState, sortColumn]);
+
   const trafficSourceOptions = useMemo(() => Array.from(new Set(txs.map((t) => t.traffic_source))).sort(), [txs]);
   const campaignIdOptions = useMemo(() => Array.from(new Set(txs.map((t) => t.campaign_id || "unknown"))).sort(), [txs]);
   const sourceFilteredTxs = useMemo(
@@ -803,7 +878,10 @@ export default function CohortsPage() {
       }),
     [txs, trafficSourceFilter, campaignIdFilter]
   );
-  const allCohorts = useMemo(() => computeCohorts(sourceFilteredTxs, subscriptions), [sourceFilteredTxs, subscriptions]);
+  const allCohorts = useMemo(
+    () => computeCohorts(sourceFilteredTxs, subscriptions, { maxRenewalDepth: maxRenewalColumns }),
+    [sourceFilteredTxs, subscriptions, maxRenewalColumns],
+  );
   const trafficByKey = useMemo(() => aggregateTrafficMetrics(trafficMetrics), [trafficMetrics]);
   const funnelOptions = useMemo(() => Array.from(new Set(allCohorts.map((c) => c.funnel))).sort(), [allCohorts]);
   const campaignPathOptions = useMemo(() => Array.from(new Set(allCohorts.map((c) => c.campaign_path))).sort(), [allCohorts]);
@@ -858,7 +936,7 @@ export default function CohortsPage() {
     });
   };
   const resetColumnOrder = () => {
-    const next = [...DEFAULT_COLUMN_ORDER];
+    const next = [...defaultColumnOrder];
     setColumnOrder(next);
     try {
       localStorage.removeItem(COLUMN_ORDER_STORAGE_KEY);
@@ -868,7 +946,7 @@ export default function CohortsPage() {
     resetColumnWidths();
   };
 
-  const allViews = useMemo<SavedView[]>(() => [...BUILTIN_VIEWS, ...customViews], [customViews]);
+  const allViews = useMemo<SavedView[]>(() => [...builtinViews, ...customViews], [builtinViews, customViews]);
   const activeView = useMemo(() => allViews.find((v) => v.id === activeViewId) ?? null, [allViews, activeViewId]);
 
   const setVisibility = (id: CohortColumnId, value: boolean) => {
@@ -883,13 +961,18 @@ export default function CohortsPage() {
   };
 
   const applyView = (view: SavedView) => {
-    setColumnOrder(view.order);
-    setColumnVisibility(view.visibility);
-    persistColumnOrder(view.order);
-    persistVisibility(view.visibility);
+    const order = sanitizeColumnOrder(view.order, defaultColumnOrder);
+    const visibility = sanitizeColumnVisibility(view.visibility, defaultVisibility, defaultColumnOrder);
+    const widths = view.widths
+      ? sanitizeColumnWidths(view.widths, defaultColumnWidths, [COHORT_FIRST_COL_KEY, ...defaultColumnOrder])
+      : null;
+    setColumnOrder(order);
+    setColumnVisibility(visibility);
+    persistColumnOrder(order);
+    persistVisibility(visibility);
     if (view.widths) {
-      setColumnWidths(view.widths);
-      persistColumnWidths(view.widths);
+      setColumnWidths(widths ?? defaultColumnWidths);
+      persistColumnWidths(widths ?? defaultColumnWidths);
     }
     setActiveViewId(view.id);
     try { localStorage.setItem(ACTIVE_VIEW_STORAGE_KEY, view.id); } catch { /* noop */ }
@@ -897,7 +980,7 @@ export default function CohortsPage() {
   };
 
   const resetToDefault = () => {
-    applyView(BUILTIN_VIEWS[0]);
+    applyView(builtinViews[0]);
     resetColumnWidths();
     updateUiState({ sortColumn: null, sortDirection: null });
     markCohortsUiSettingsUpdated();
@@ -973,8 +1056,17 @@ export default function CohortsPage() {
     const totalTrialUsers = sum((c) => c.trial_users);
     const totalUpsellUsers = sum((c) => c.upsell_users);
     const totalFirstSubscriptionUsers = sum((c) => c.first_subscription_users);
-    const totalRenewal2Users = sum((c) => c.renewal_2_users);
-    const totalRenewal3Users = sum((c) => c.renewal_3_users);
+    const renewalTotalsByLevel = Object.fromEntries(
+      renewalColumnIds(maxRenewalColumns).map((id) => {
+        const level = renewalLevelFromColumnId(id) ?? 0;
+        return [level, sum((c) => renewalUsersForLevel(c, level))];
+      }),
+    );
+    const totalRenewal2Users = renewalTotalsByLevel[2] ?? 0;
+    const totalRenewal3Users = renewalTotalsByLevel[3] ?? 0;
+    const totalRenewal4Users = renewalTotalsByLevel[4] ?? 0;
+    const totalRenewal5Users = renewalTotalsByLevel[5] ?? 0;
+    const totalRenewal6Users = renewalTotalsByLevel[6] ?? 0;
     const totalRenewalUsers = sum((c) => c.renewal_users);
     const totalRefundUsers = new Set(cohorts.flatMap((c) => c.refunded_user_ids)).size;
     const totalActiveUsers = new Set(cohorts.flatMap((c) => c.active_user_ids)).size;
@@ -1001,6 +1093,10 @@ export default function CohortsPage() {
       totalFirstSubscriptionUsers,
       totalRenewal2Users,
       totalRenewal3Users,
+      totalRenewal4Users,
+      totalRenewal5Users,
+      totalRenewal6Users,
+      renewalTotalsByLevel,
       totalRenewalUsers,
       totalRefundUsers,
       totalActiveUsers,
@@ -1029,6 +1125,7 @@ export default function CohortsPage() {
       trafficSpend: totalTrafficSpend,
       hasTrafficSpend,
       hasCompleteTrafficSpend,
+      trialCost: trialCostFromSpend(hasTrafficSpend ? totalTrafficSpend : null, totalTrialUsers),
       profit: netRevenue - totalTrafficSpend,
       profitD7: totalRevenueD7 - totalTrafficSpend,
       profit1m: totalRevenueD30 - totalTrafficSpend,
@@ -1045,7 +1142,7 @@ export default function CohortsPage() {
       firstSubscriptionToRenewal2Cr: totalFirstSubscriptionUsers ? (totalRenewal2Users / totalFirstSubscriptionUsers) * 100 : 0,
       renewal2ToRenewal3Cr: totalRenewal2Users ? (totalRenewal3Users / totalRenewal2Users) * 100 : 0,
     };
-  }, [cohorts, trafficByKey]);
+  }, [cohorts, trafficByKey, maxRenewalColumns]);
 
   const headerClassFor = (id: CohortColumnId) =>
     `${TEXT_COLUMNS.has(id) ? `${HEAD_BASE} text-left` : HEAD_NUM} ${SECTION_DIVIDER_COLUMNS.has(id) ? SECTION_DIVIDER : ""}`;
@@ -1084,10 +1181,10 @@ export default function CohortsPage() {
         type="button"
         onClick={() => onSortColumn(id)}
         className="inline-flex max-w-full items-center gap-1 hover:text-foreground"
-        aria-label={`Sort by ${COLUMN_LABELS[id]}`}
+        aria-label={`Sort by ${columnLabel(id)}`}
       >
         <GripVertical className="h-3 w-3 shrink-0 cursor-grab opacity-40 active:cursor-grabbing" />
-        <span className="truncate">{COLUMN_LABELS[id]}</span>
+        <span className="truncate">{columnLabel(id)}</span>
         {sortIcon(id)}
       </button>
       <div
@@ -1104,6 +1201,8 @@ export default function CohortsPage() {
   const renderCohortCell = (id: CohortColumnId, c: CohortRow) => {
     const className = cellClassFor(id);
     const traffic = trafficForCohort(c, trafficByKey);
+    const renewalUsers = renewalUsersForColumn(c, id);
+    if (renewalUsers != null) return <TableCell key={id} className={className}>{renewalUsers}</TableCell>;
     switch (id) {
       case "cohort_date":
         return <TableCell key={id} className={`${className} tabular-nums`}>{c.cohort_date}</TableCell>;
@@ -1147,10 +1246,6 @@ export default function CohortsPage() {
         return <TableCell key={id} className={`${className} font-medium`} style={heatStyle(c.first_subscription_to_renewal_2_cr, maxRenewal2CR)}>{formatPct(c.first_subscription_to_renewal_2_cr)}</TableCell>;
       case "renewal_2_to_renewal_3_cr":
         return <TableCell key={id} className={`${className} font-medium`} style={heatStyle(c.renewal_2_to_renewal_3_cr, maxRenewal3CR)}>{formatPct(c.renewal_2_to_renewal_3_cr)}</TableCell>;
-      case "renewal_2_users":
-        return <TableCell key={id} className={className}>{c.renewal_2_users}</TableCell>;
-      case "renewal_3_users":
-        return <TableCell key={id} className={className}>{c.renewal_3_users}</TableCell>;
       case "renewal_users":
         return <TableCell key={id} className={className}>{c.renewal_users}</TableCell>;
       case "refund_users":
@@ -1173,6 +1268,10 @@ export default function CohortsPage() {
         return <TableCell key={id} className={className}>{formatCurrency(c.revenue_d60)}</TableCell>;
       case "traffic_spend":
         return <TableCell key={id} className={className}>{traffic ? formatCurrency(traffic.spend) : dash}</TableCell>;
+      case "trial_cost": {
+        const trialCost = trialCostForCohort(c, traffic);
+        return <TableCell key={id} className={className}>{trialCost != null ? formatCurrency(trialCost) : dash}</TableCell>;
+      }
       case "profit":
         return <TableCell key={id} className={className}>{traffic ? formatCurrency(c.net_revenue - traffic.spend) : dash}</TableCell>;
       case "profit_d7":
@@ -1202,8 +1301,11 @@ export default function CohortsPage() {
     }
   };
 
-  const renderPlanCell = (id: CohortColumnId, plan: PlanBreakdownRow) => {
+  const renderPlanCell = (id: CohortColumnId, plan: PlanBreakdownRow, cohort: CohortRow) => {
     const className = cellClassFor(id, true);
+    const traffic = trafficForCohort(cohort, trafficByKey);
+    const renewalUsers = renewalUsersForColumn(plan, id);
+    if (renewalUsers != null) return <TableCell key={id} className={className}>{renewalUsers}</TableCell>;
     switch (id) {
       case "cohort_date":
       case "campaign_path":
@@ -1245,10 +1347,6 @@ export default function CohortsPage() {
         return <TableCell key={id} className={className}>{formatPct(plan.first_subscription_to_renewal_2_cr)}</TableCell>;
       case "renewal_2_to_renewal_3_cr":
         return <TableCell key={id} className={className}>{formatPct(plan.renewal_2_to_renewal_3_cr)}</TableCell>;
-      case "renewal_2_users":
-        return <TableCell key={id} className={className}>{plan.renewal_2_users}</TableCell>;
-      case "renewal_3_users":
-        return <TableCell key={id} className={className}>{plan.renewal_3_users}</TableCell>;
       case "renewal_users":
         return <TableCell key={id} className={className}>{plan.renewal_users}</TableCell>;
       case "refund_users":
@@ -1269,6 +1367,10 @@ export default function CohortsPage() {
         return <TableCell key={id} className={className}>{formatCurrency(plan.revenue_d30)}</TableCell>;
       case "revenue_d60":
         return <TableCell key={id} className={className}>{formatCurrency(plan.revenue_d60)}</TableCell>;
+      case "trial_cost": {
+        const trialCost = trialCostFromSpend(traffic?.spend, plan.trial_users);
+        return <TableCell key={id} className={className}>{trialCost != null ? formatCurrency(trialCost) : dash}</TableCell>;
+      }
       case "traffic_spend":
       case "profit":
       case "profit_d7":
@@ -1289,6 +1391,10 @@ export default function CohortsPage() {
 
   const renderTotalCell = (id: CohortColumnId) => {
     const className = cellClassFor(id);
+    const renewalLevel = renewalLevelFromColumnId(id);
+    if (renewalLevel != null) {
+      return <TableCell key={id} className={className}>{totals.renewalTotalsByLevel[renewalLevel] ?? 0}</TableCell>;
+    }
     switch (id) {
       case "cohort_date":
       case "campaign_path":
@@ -1330,10 +1436,6 @@ export default function CohortsPage() {
         return <TableCell key={id} className={className}>{formatPct(totals.firstSubscriptionToRenewal2Cr)}</TableCell>;
       case "renewal_2_to_renewal_3_cr":
         return <TableCell key={id} className={className}>{formatPct(totals.renewal2ToRenewal3Cr)}</TableCell>;
-      case "renewal_2_users":
-        return <TableCell key={id} className={className}>{totals.totalRenewal2Users}</TableCell>;
-      case "renewal_3_users":
-        return <TableCell key={id} className={className}>{totals.totalRenewal3Users}</TableCell>;
       case "renewal_users":
         return <TableCell key={id} className={className}>{totals.totalRenewalUsers}</TableCell>;
       case "refund_users":
@@ -1356,6 +1458,8 @@ export default function CohortsPage() {
         return <TableCell key={id} className={className}>{formatCurrency(totals.revenueD60)}</TableCell>;
       case "traffic_spend":
         return <TableCell key={id} className={className}>{totals.hasTrafficSpend ? formatCurrency(totals.trafficSpend) : dash}</TableCell>;
+      case "trial_cost":
+        return <TableCell key={id} className={className}>{totals.trialCost != null ? formatCurrency(totals.trialCost) : dash}</TableCell>;
       case "profit":
         return <TableCell key={id} className={className}>{totals.hasCompleteTrafficSpend ? formatCurrency(totals.profit) : dash}</TableCell>;
       case "profit_d7":
@@ -1558,7 +1662,7 @@ export default function CohortsPage() {
                         checked={columnVisibility[id] !== false}
                         onCheckedChange={(c) => setVisibility(id, c === true)}
                       />
-                      <span>{COLUMN_LABELS[id]}</span>
+                      <span>{columnLabel(id)}</span>
                     </label>
                   ))}
                 </div>
@@ -1679,7 +1783,7 @@ export default function CohortsPage() {
                           >
                             {formatCurrency(plan.price)}
                           </TableCell>
-                          {visibleColumnOrder.map((id) => renderPlanCell(id, plan))}
+                          {visibleColumnOrder.map((id) => renderPlanCell(id, plan, c))}
                         </TableRow>
                       ))}
                   </Fragment>

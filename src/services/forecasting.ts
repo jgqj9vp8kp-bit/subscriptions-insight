@@ -22,6 +22,42 @@ export interface ForecastPriceOptions {
 
 const round2 = (value: number) => Math.round(value * 100) / 100;
 
+export type ForecastCacSource = "actual" | "manual" | "missing";
+
+export function actualCacFromSpend(spend: number | null | undefined, trialUsers: number): number | null {
+  if (spend == null || !Number.isFinite(spend) || !Number.isFinite(trialUsers) || trialUsers <= 0) return null;
+  const value = spend / trialUsers;
+  return Number.isFinite(value) ? value : null;
+}
+
+export function resolveForecastCac(params: {
+  actualSpend: number | null | undefined;
+  trialUsers: number;
+  manualCac: unknown;
+  manualOverride: boolean;
+}): { actualCac: number | null; cac: number | null; source: ForecastCacSource } {
+  const actualCac = actualCacFromSpend(params.actualSpend, params.trialUsers);
+  if (params.manualOverride) {
+    const manual = Number(String(params.manualCac ?? "").trim().replace(",", "."));
+    if (Number.isFinite(manual) && manual >= 0) return { actualCac, cac: manual, source: "manual" };
+  }
+  if (actualCac == null) return { actualCac, cac: null, source: "missing" };
+  return { actualCac, cac: actualCac, source: "actual" };
+}
+
+export function projectedSpendFromCac(trialUsers: number, cac: number | null | undefined): number | null {
+  if (cac == null || !Number.isFinite(cac) || !Number.isFinite(trialUsers) || trialUsers < 0) return null;
+  return trialUsers * cac;
+}
+
+export function forecastProfit(netRevenue: number, projectedSpend: number | null | undefined): number {
+  return netRevenue - (projectedSpend ?? 0);
+}
+
+export function forecastRoas(netRevenue: number, projectedSpend: number | null | undefined): number | null {
+  return projectedSpend && projectedSpend > 0 ? netRevenue / projectedSpend : null;
+}
+
 function grossAmount(tx: Transaction): number {
   return Number.isFinite(tx.gross_amount_usd) ? tx.gross_amount_usd : tx.amount_usd;
 }

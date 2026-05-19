@@ -1,4 +1,5 @@
 import type { CohortRow } from "@/services/types";
+import { renewalUsersForColumn, trialCostForCohort } from "@/services/cohortReporting";
 
 export type CohortSortDirection = "asc" | "desc";
 
@@ -47,6 +48,9 @@ export function getCohortSortValue(
   columnId: string,
   traffic: CohortSortTraffic = null,
 ): string | number | null {
+  const renewalUsers = renewalUsersForColumn(cohort, columnId);
+  if (renewalUsers != null) return renewalUsers;
+
   switch (columnId) {
     case "__cohort__":
       return cohort.cohort_id;
@@ -60,6 +64,8 @@ export function getCohortSortValue(
       return cohort.funnel;
     case "traffic_spend":
       return traffic ? traffic.spend : null;
+    case "trial_cost":
+      return trialCostForCohort(cohort, traffic);
     case "profit":
       return traffic ? cohort.net_revenue - traffic.spend : null;
     case "profit_d7":

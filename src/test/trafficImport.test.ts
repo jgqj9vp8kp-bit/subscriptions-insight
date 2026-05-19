@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { normalizeCampaignPath, normalizeTrafficDate, parseTrafficMetrics, parseTrafficNumber } from "@/services/trafficImport";
+import {
+  googleSheetTrafficCsvUrl,
+  normalizeCampaignPath,
+  normalizeTrafficDate,
+  parseGoogleSheetReference,
+  parseGoogleSheetTabsFromHtml,
+  parseTrafficMetrics,
+  parseTrafficNumber,
+} from "@/services/trafficImport";
 
 describe("traffic import", () => {
   it("parses comma decimal and spaced numbers", () => {
@@ -49,5 +57,30 @@ describe("traffic import", () => {
       ctr: 1.2,
       source: "facebook",
     });
+  });
+
+  it("parses Google Sheet id and gid from shared URLs", () => {
+    const ref = parseGoogleSheetReference(
+      "https://docs.google.com/spreadsheets/d/abc_123-XYZ/edit?gid=123456#gid=123456",
+    );
+
+    expect(ref).toEqual({ sheetId: "abc_123-XYZ", gid: "123456" });
+    expect(googleSheetTrafficCsvUrl("https://docs.google.com/spreadsheets/d/abc_123-XYZ/edit?gid=123456")).toBe(
+      "https://docs.google.com/spreadsheets/d/abc_123-XYZ/export?format=csv&gid=123456",
+    );
+    expect(googleSheetTrafficCsvUrl("https://docs.google.com/spreadsheets/d/abc_123-XYZ/edit?gid=1", "2")).toBe(
+      "https://docs.google.com/spreadsheets/d/abc_123-XYZ/export?format=csv&gid=2",
+    );
+  });
+
+  it("extracts sheet tabs from Google Sheets html metadata", () => {
+    const tabs = parseGoogleSheetTabsFromHtml(
+      '{"id":0,"name":"March traffic"},{"id":987654,"name":"April \\"FB\\" traffic"}',
+    );
+
+    expect(tabs).toEqual([
+      { gid: "0", name: "March traffic" },
+      { gid: "987654", name: 'April "FB" traffic' },
+    ]);
   });
 });

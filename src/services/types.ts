@@ -77,6 +77,10 @@ export interface PlanBreakdownRow {
   first_subscription_users: number;
   renewal_2_users: number;
   renewal_3_users: number;
+  renewal_4_users: number;
+  renewal_5_users: number;
+  renewal_6_users: number;
+  renewal_users_by_level?: Record<number, number>;
   renewal_users: number;
   refund_users: number;
   trial_to_upsell_cr: number;
@@ -121,6 +125,10 @@ export interface CohortRow {
   first_subscription_users: number;
   renewal_2_users: number;
   renewal_3_users: number;
+  renewal_4_users: number;
+  renewal_5_users: number;
+  renewal_6_users: number;
+  renewal_users_by_level?: Record<number, number>;
   renewal_users: number;
   refund_users: number;
   refunded_user_ids: string[];

@@ -13,6 +13,23 @@ export interface TrafficMetric {
   source: "facebook";
 }
 
+export interface GoogleSheetReference {
+  sheetId: string;
+  gid: string | null;
+}
+
+export interface GoogleSheetTab {
+  name: string;
+  gid: string;
+}
+
+export interface TrafficImportResult {
+  rows: TrafficMetric[];
+  sheetId: string;
+  gid: string;
+  tabName?: string;
+}
+
 const HEADER_ALIASES = {
   date: ["date", "дата"],
   campaign_path: ["ff_campaign_path", "campaign_path", "campaign path", "ff campaign path"],
@@ -32,6 +49,28 @@ function normalizeHeader(value: string): string {
 function columnFor(headers: string[], aliases: readonly string[]): string | null {
   const normalizedAliases = aliases.map(normalizeHeader);
   return headers.find((header) => normalizedAliases.includes(normalizeHeader(header))) ?? null;
+}
+
+function parseGoogleSheetGid(input: string): string | null {
+  const gidMatch = input.match(/(?:[?#&]|^)gid=(\d+)/);
+  return gidMatch ? gidMatch[1] : null;
+}
+
+function decodeGoogleSheetName(value: string): string {
+  try {
+    return JSON.parse(`"${value}"`) as string;
+  } catch {
+    return value.replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+  }
+}
+
+function uniqueTabs(tabs: GoogleSheetTab[]): GoogleSheetTab[] {
+  const seen = new Set<string>();
+  return tabs.filter((tab) => {
+    if (!tab.gid || seen.has(tab.gid)) return false;
+    seen.add(tab.gid);
+    return true;
+  });
 }
 
 export function normalizeCampaignPath(value: string | null | undefined): string {
@@ -81,17 +120,83 @@ export function normalizeTrafficDate(value: unknown, year: number): string {
   return `${year}-01-01`;
 }
 
-export function googleSheetTrafficCsvUrl(input: string): string | null {
+export function parseGoogleSheetReference(input: string): GoogleSheetReference | null {
   const trimmed = input.trim();
   if (!trimmed) return null;
-  if (trimmed.includes("/export?") || trimmed.endsWith(".csv")) return trimmed;
 
   const idMatch = trimmed.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
   const id = idMatch ? idMatch[1] : trimmed.match(/^[a-zA-Z0-9-_]{20,}$/) ? trimmed : null;
   if (!id) return null;
-  const gidMatch = trimmed.match(/[#?&]gid=(\d+)/);
-  const gid = gidMatch ? gidMatch[1] : "0";
-  return `https://docs.google.com/spreadsheets/d/${id}/export?format=csv&gid=${gid}`;
+
+  return { sheetId: id, gid: parseGoogleSheetGid(trimmed) };
+}
+
+export function googleSheetTrafficCsvUrl(input: string, gidOverride?: string | null): string | null {
+  const trimmed = input.trim();
+  if (!trimmed) return null;
+
+  const explicitGid = gidOverride?.trim();
+  if (explicitGid && !/^\d+$/.test(explicitGid)) {
+    throw new Error("Invalid Google Sheet gid. Use the numeric gid from the sheet URL.");
+  }
+
+  const ref = parseGoogleSheetReference(trimmed);
+  if (!ref) {
+    if (!explicitGid && (trimmed.includes("/export?") || trimmed.endsWith(".csv"))) return trimmed;
+    return null;
+  }
+
+  const gid = explicitGid || ref.gid || "0";
+  return `https://docs.google.com/spreadsheets/d/${ref.sheetId}/export?format=csv&gid=${gid}`;
+}
+
+export function parseGoogleSheetTabsFromHtml(html: string): GoogleSheetTab[] {
+  const tabs: GoogleSheetTab[] = [];
+  const namedSheetPatterns = [
+    /\{"id":(\d+),"name":"((?:[^"\\]|\\.)+)"/g,
+    /"sheetId":(\d+),"title":"((?:[^"\\]|\\.)+)"/g,
+  ];
+
+  for (const pattern of namedSheetPatterns) {
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(html))) {
+      tabs.push({ gid: match[1], name: decodeGoogleSheetName(match[2]) });
+    }
+  }
+
+  const anchorPattern = /gid=(\d+)[^>]*>([^<]+)</g;
+  let anchorMatch: RegExpExecArray | null;
+  while ((anchorMatch = anchorPattern.exec(html))) {
+    const name = anchorMatch[2].trim();
+    if (name) tabs.push({ gid: anchorMatch[1], name });
+  }
+
+  const gidPattern = /gid=(\d+)/g;
+  let gidMatch: RegExpExecArray | null;
+  while ((gidMatch = gidPattern.exec(html))) {
+    tabs.push({ gid: gidMatch[1], name: `gid ${gidMatch[1]}` });
+  }
+
+  return uniqueTabs(tabs);
+}
+
+export async function fetchGoogleSheetTrafficTabs(input: string): Promise<GoogleSheetTab[]> {
+  const ref = parseGoogleSheetReference(input);
+  if (!ref) throw new Error("Could not parse Google Sheet URL.");
+
+  const res = await fetch(`https://docs.google.com/spreadsheets/d/${ref.sheetId}/edit?usp=sharing`);
+  if (!res.ok) {
+    throw new Error(
+      `Could not load Google Sheet tabs (HTTP ${res.status}). Make sure the sheet is shared as "Anyone with the link can view".`,
+    );
+  }
+
+  const html = await res.text();
+  const tabs = parseGoogleSheetTabsFromHtml(html);
+  if (!tabs.length) {
+    throw new Error("Could not detect tabs for this Google Sheet. Enter the tab gid manually.");
+  }
+  return tabs;
 }
 
 export function parseTrafficMetrics(parsed: ParsedSheet, year: number): TrafficMetric[] {
@@ -128,13 +233,47 @@ export function parseTrafficMetrics(parsed: ParsedSheet, year: number): TrafficM
     .filter((row) => row.date && row.campaign_path);
 }
 
-export async function fetchTrafficMetricsFromGoogleSheet(url: string, year: number): Promise<TrafficMetric[]> {
-  const csvUrl = googleSheetTrafficCsvUrl(url);
+export async function fetchFacebookTrafficImportFromGoogleSheet(
+  url: string,
+  year: number,
+  options: { gid?: string | null; tabName?: string } = {},
+): Promise<TrafficImportResult> {
+  const ref = parseGoogleSheetReference(url);
+  if (!ref) throw new Error("Could not parse Google Sheet URL.");
+
+  const gid = options.gid?.trim() || ref.gid || "0";
+  if (!/^\d+$/.test(gid)) throw new Error("Invalid Google Sheet gid. Use the numeric gid from the sheet URL.");
+
+  const csvUrl = googleSheetTrafficCsvUrl(url, gid);
   if (!csvUrl) throw new Error("Could not parse Google Sheet URL.");
   const res = await fetch(csvUrl);
   if (!res.ok) {
-    throw new Error(`Could not load Facebook traffic sheet (HTTP ${res.status}).`);
+    throw new Error(
+      `Could not load Facebook traffic sheet tab gid ${gid} (HTTP ${res.status}). Make sure the sheet and tab are shared as "Anyone with the link can view".`,
+    );
   }
   const text = await res.text();
-  return parseTrafficMetrics(parseCSVText(text), year);
+  if (!text.trim()) throw new Error(`Google Sheet tab gid ${gid} returned an empty CSV.`);
+
+  const parsed = parseCSVText(text);
+  if (!parsed.headers.length || !parsed.rows.length) {
+    throw new Error(`Google Sheet tab gid ${gid} did not contain any traffic rows.`);
+  }
+
+  const rows = parseTrafficMetrics(parsed, year);
+  if (!rows.length) {
+    throw new Error(`Google Sheet tab gid ${gid} did not contain any usable traffic rows.`);
+  }
+
+  return {
+    rows,
+    sheetId: ref.sheetId,
+    gid,
+    tabName: options.tabName,
+  };
+}
+
+export async function fetchTrafficMetricsFromGoogleSheet(url: string, year: number): Promise<TrafficMetric[]> {
+  const result = await fetchFacebookTrafficImportFromGoogleSheet(url, year);
+  return result.rows;
 }

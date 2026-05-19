@@ -2,7 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   buildForecastPriceOptions,
   defaultPriceSelection,
+  forecastProfit,
+  forecastRoas,
+  projectedSpendFromCac,
   priceSourceLabel,
+  resolveForecastCac,
   reconcilePriceSelection,
   resolveSelectedPrice,
   weightedAveragePrice,
@@ -155,5 +159,56 @@ describe("Forecasting price options", () => {
     expect(options.upsellOptions).toEqual([]);
     expect(defaultPriceSelection(options.upsellOptions)).toBe("default");
     expect(resolveSelectedPrice(options.upsellOptions, "default", 0, 14.98, "transactions")).toBe(14.98);
+  });
+});
+
+describe("Forecasting CAC", () => {
+  it("auto-fills CAC from spend divided by trial users", () => {
+    expect(resolveForecastCac({
+      actualSpend: 250,
+      trialUsers: 20,
+      manualCac: "",
+      manualOverride: false,
+    })).toEqual({
+      actualCac: 12.5,
+      cac: 12.5,
+      source: "actual",
+    });
+  });
+
+  it("uses manual CAC override", () => {
+    expect(resolveForecastCac({
+      actualSpend: 250,
+      trialUsers: 20,
+      manualCac: "9.75",
+      manualOverride: true,
+    })).toEqual({
+      actualCac: 12.5,
+      cac: 9.75,
+      source: "manual",
+    });
+  });
+
+  it("resets to actual CAC by disabling manual override", () => {
+    expect(resolveForecastCac({
+      actualSpend: 250,
+      trialUsers: 20,
+      manualCac: "9.75",
+      manualOverride: false,
+    })).toMatchObject({
+      cac: 12.5,
+      source: "actual",
+    });
+  });
+
+  it("calculates projected spend from trial users and CAC", () => {
+    expect(projectedSpendFromCac(20, 9.75)).toBe(195);
+  });
+
+  it("calculates profit and ROAS from projected spend", () => {
+    const projectedSpend = projectedSpendFromCac(20, 10);
+
+    expect(forecastProfit(500, projectedSpend)).toBe(300);
+    expect(forecastRoas(500, projectedSpend)).toBe(2.5);
   });
 });

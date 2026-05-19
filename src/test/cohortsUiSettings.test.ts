@@ -271,4 +271,60 @@ describe("cohorts UI settings", () => {
       "trial_users",
     ]);
   });
+
+  it("ignores saved view Renewal columns above the current max", () => {
+    const max6Defaults: CohortsUiSettingsDefaults = {
+      ...defaults,
+      defaultColumnOrder: ["cohort_date", "renewal_2_users", "renewal_3_users", "renewal_6_users", "net_revenue"],
+      defaultColumnVisibility: {
+        cohort_date: true,
+        renewal_2_users: true,
+        renewal_3_users: true,
+        renewal_6_users: true,
+        net_revenue: true,
+      },
+    };
+
+    expect(sanitizeColumnOrder(["renewal_10_users", "net_revenue"], max6Defaults.defaultColumnOrder)).toEqual([
+      "net_revenue",
+      "cohort_date",
+      "renewal_2_users",
+      "renewal_3_users",
+      "renewal_6_users",
+    ]);
+  });
+
+  it("appends new Renewal columns when the max increases", () => {
+    const max12Order = [
+      "cohort_date",
+      "renewal_2_users",
+      "renewal_3_users",
+      "renewal_4_users",
+      "renewal_5_users",
+      "renewal_6_users",
+      "renewal_7_users",
+      "renewal_8_users",
+      "renewal_9_users",
+      "renewal_10_users",
+      "renewal_11_users",
+      "renewal_12_users",
+      "net_revenue",
+    ];
+
+    expect(sanitizeColumnOrder(["cohort_date", "renewal_2_users", "net_revenue"], max12Order)).toEqual([
+      "cohort_date",
+      "renewal_2_users",
+      "net_revenue",
+      "renewal_3_users",
+      "renewal_4_users",
+      "renewal_5_users",
+      "renewal_6_users",
+      "renewal_7_users",
+      "renewal_8_users",
+      "renewal_9_users",
+      "renewal_10_users",
+      "renewal_11_users",
+      "renewal_12_users",
+    ]);
+  });
 });

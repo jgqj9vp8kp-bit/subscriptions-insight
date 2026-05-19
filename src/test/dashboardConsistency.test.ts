@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { aggregateTrafficMetrics, computeCohortReportTotals } from "@/services/cohortReporting";
+import { aggregateTrafficMetrics, computeCohortReportTotals, trialCostFromSpend } from "@/services/cohortReporting";
 import type { CohortRow } from "@/services/types";
 import type { TrafficMetric } from "@/services/trafficImport";
 
@@ -31,6 +31,9 @@ function cohort(overrides: Partial<CohortRow>): CohortRow {
     first_subscription_users: 0,
     renewal_2_users: 0,
     renewal_3_users: 0,
+    renewal_4_users: 0,
+    renewal_5_users: 0,
+    renewal_6_users: 0,
     renewal_users: 0,
     refund_users: 0,
     refunded_user_ids: [],
@@ -65,6 +68,18 @@ function cohort(overrides: Partial<CohortRow>): CohortRow {
 }
 
 describe("dashboard cohort consistency", () => {
+  it("calculates trial cost from spend and trial users", () => {
+    expect(trialCostFromSpend(124.8, 10)).toBeCloseTo(12.48);
+  });
+
+  it("does not calculate trial cost for zero trial users", () => {
+    expect(trialCostFromSpend(100, 0)).toBeNull();
+  });
+
+  it("does not calculate trial cost when spend is missing", () => {
+    expect(trialCostFromSpend(null, 10)).toBeNull();
+  });
+
   it("uses the same total semantics as the Cohorts total row", () => {
     const cohorts = [
       cohort({
@@ -120,6 +135,7 @@ describe("dashboard cohort consistency", () => {
     expect(totals.netRevenue).toBe(150);
     expect(totals.totalTrialUsers).toBe(15);
     expect(totals.trafficSpend).toBe(100);
+    expect(totals.trialCost).toBeCloseTo(100 / 15);
     expect(totals.hasTrafficSpend).toBe(true);
     expect(totals.hasCompleteTrafficSpend).toBe(true);
     expect(totals.profit).toBe(50);

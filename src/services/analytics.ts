@@ -1,12 +1,30 @@
 import type { CohortRow, PlanBreakdownRow, Transaction, UserAggregate } from "./types";
 import type { SubscriptionClean } from "@/types/subscriptions";
+import {
+  DEFAULT_MAX_RENEWAL_COLUMNS,
+  MAX_SUPPORTED_RENEWAL_COLUMNS,
+  sanitizeMaxRenewalColumns,
+} from "@/services/dataSettings";
 
 const DAY = 24 * 60 * 60 * 1000;
+export const DEFAULT_MAX_RENEWAL_DEPTH = DEFAULT_MAX_RENEWAL_COLUMNS;
+const STATIC_RENEWAL_LEVELS = [2, 3, 4, 5, 6] as const;
+type StaticRenewalLevel = (typeof STATIC_RENEWAL_LEVELS)[number];
+const RENEWAL_USER_FIELD_BY_LEVEL: Record<StaticRenewalLevel, "renewal_2_users" | "renewal_3_users" | "renewal_4_users" | "renewal_5_users" | "renewal_6_users"> = {
+  2: "renewal_2_users",
+  3: "renewal_3_users",
+  4: "renewal_4_users",
+  5: "renewal_5_users",
+  6: "renewal_6_users",
+};
+type StaticRenewalCounts = Record<(typeof RENEWAL_USER_FIELD_BY_LEVEL)[StaticRenewalLevel], number>;
 
 /** Money sums should ignore failed_payment rows (they were never collected). */
 const isMoneyMoving = (t: Transaction) => t.status !== "failed";
 const isRenewalType = (t: Transaction) =>
   t.transaction_type === "renewal_2" || t.transaction_type === "renewal_3" || t.transaction_type === "renewal";
+const isSubscriptionSequencePayment = (t: Transaction) =>
+  t.status === "success" && (t.transaction_type === "first_subscription" || isRenewalType(t));
 const grossAmount = (t: Transaction) => t.gross_amount_usd ?? (t.amount_usd > 0 ? t.amount_usd : 0);
 const refundAmount = (t: Transaction) => t.refund_amount_usd ?? (t.amount_usd < 0 ? Math.abs(t.amount_usd) : 0);
 const netAmount = (t: Transaction) => t.net_amount_usd ?? grossAmount(t) - refundAmount(t);
@@ -45,6 +63,10 @@ interface MutablePlanBreakdown {
   first_subscription_users: number;
   renewal_2_users: number;
   renewal_3_users: number;
+  renewal_4_users: number;
+  renewal_5_users: number;
+  renewal_6_users: number;
+  renewal_users_by_level: Record<number, number>;
   renewal_users: number;
   refund_users: number;
   gross_revenue: number;
@@ -70,6 +92,10 @@ function createPlanBreakdown(price: number): MutablePlanBreakdown {
     first_subscription_users: 0,
     renewal_2_users: 0,
     renewal_3_users: 0,
+    renewal_4_users: 0,
+    renewal_5_users: 0,
+    renewal_6_users: 0,
+    renewal_users_by_level: {},
     renewal_users: 0,
     refund_users: 0,
     gross_revenue: 0,
@@ -103,6 +129,10 @@ function finalizePlanBreakdown(row: MutablePlanBreakdown): PlanBreakdownRow {
     first_subscription_users: row.first_subscription_users,
     renewal_2_users: row.renewal_2_users,
     renewal_3_users: row.renewal_3_users,
+    renewal_4_users: row.renewal_4_users,
+    renewal_5_users: row.renewal_5_users,
+    renewal_6_users: row.renewal_6_users,
+    renewal_users_by_level: { ...row.renewal_users_by_level },
     renewal_users: row.renewal_users,
     refund_users: row.refund_users,
     trial_to_upsell_cr: row.trial_users ? (row.upsell_users / row.trial_users) * 100 : 0,
@@ -130,6 +160,10 @@ export interface Kpis {
   trialToUpsellCR: number;
   trialToFirstSubscriptionCR: number;
   averageLtv: number;
+}
+
+export interface ComputeCohortsOptions {
+  maxRenewalDepth?: number;
 }
 
 export function computeKpis(txs: Transaction[]): Kpis {
@@ -354,6 +388,60 @@ function failedTransactionsByEmail(txs: Transaction[]): Map<string, Transaction[
   return result;
 }
 
+function subscriptionSequenceLevelsForUser(
+  list: Transaction[],
+  cohortTs: number,
+  maxRenewalDepth = DEFAULT_MAX_RENEWAL_DEPTH,
+): Set<number> {
+  const payments = list
+    .filter((tx) => {
+      if (!isSubscriptionSequencePayment(tx)) return false;
+      const txMs = new Date(tx.event_time).getTime();
+      return Number.isFinite(txMs) && txMs >= cohortTs;
+    })
+    .sort((a, b) => (a.event_time < b.event_time ? -1 : a.event_time > b.event_time ? 1 : a.transaction_id.localeCompare(b.transaction_id)));
+
+  const levels = new Set<number>();
+  payments.forEach((_, index) => {
+    const level = index + 1;
+    if (level <= maxRenewalDepth) levels.add(level);
+  });
+  return levels;
+}
+
+function renewalLevelsThrough(maxRenewalDepth: number): number[] {
+  const max = Math.min(MAX_SUPPORTED_RENEWAL_COLUMNS, Math.max(1, Math.floor(maxRenewalDepth)));
+  return Array.from({ length: Math.max(0, max - 1) }, (_, index) => index + 2);
+}
+
+function incrementRenewalCountsByLevel(target: Record<number, number>, levels: Set<number>, maxRenewalDepth: number) {
+  for (const level of renewalLevelsThrough(maxRenewalDepth)) {
+    if (levels.has(level)) target[level] = (target[level] ?? 0) + 1;
+  }
+}
+
+function createRenewalCountsByLevel(maxRenewalDepth: number): Record<number, number> {
+  return Object.fromEntries(renewalLevelsThrough(maxRenewalDepth).map((level) => [level, 0]));
+}
+
+function createStaticRenewalCounts(): StaticRenewalCounts {
+  return {
+    renewal_2_users: 0,
+    renewal_3_users: 0,
+    renewal_4_users: 0,
+    renewal_5_users: 0,
+    renewal_6_users: 0,
+  };
+}
+
+function staticRenewalCountsFromLevels(countsByLevel: Record<number, number>): StaticRenewalCounts {
+  const counts = createStaticRenewalCounts();
+  for (const level of STATIC_RENEWAL_LEVELS) {
+    counts[RENEWAL_USER_FIELD_BY_LEVEL[level]] = countsByLevel[level] ?? 0;
+  }
+  return counts;
+}
+
 function hasFailedTransactionNearCancellation(failedTxs: Transaction[], cancelledAtMs: number): boolean {
   const windowStartMs = cancelledAtMs - CANCELLATION_FAILURE_WINDOW_MS;
   return failedTxs.some((tx) => {
@@ -417,7 +505,11 @@ function subscriptionFlagsByEmail(txs: Transaction[], subscriptions: Subscriptio
   return result;
 }
 
-export function computeCohorts(txs: Transaction[], subscriptions: SubscriptionClean[] = []): CohortRow[] {
+export function computeCohorts(
+  txs: Transaction[],
+  subscriptions: SubscriptionClean[] = [],
+  options: ComputeCohortsOptions = {},
+): CohortRow[] {
   // Cohort membership is anchored to the exact trial timestamp; the displayed
   // date is only a label. This keeps D0/D7/D30 windows aligned per user.
   const trials = txs.filter((t) => t.transaction_type === "trial" && t.status === "success");
@@ -450,6 +542,7 @@ export function computeCohorts(txs: Transaction[], subscriptions: SubscriptionCl
     userTxs.set(t.user_id, list);
   }
   const subscriptionFlags = subscriptionFlagsByEmail(txs, subscriptions);
+  const maxRenewalDepth = sanitizeMaxRenewalColumns(options.maxRenewalDepth ?? DEFAULT_MAX_RENEWAL_DEPTH);
 
   const rows: CohortRow[] = [];
   groups.forEach((group, cohort_id) => {
@@ -457,8 +550,7 @@ export function computeCohorts(txs: Transaction[], subscriptions: SubscriptionCl
     const trial_users = userIds.length;
     let upsell_users = 0;
     let first_subscription_users = 0;
-    let renewal_2_users = 0;
-    let renewal_3_users = 0;
+    const renewalUserCountsByLevel = createRenewalCountsByLevel(maxRenewalDepth);
     let renewal_users = 0;
     const refundedUserIds = new Set<string>();
     const activeUserIds = new Set<string>();
@@ -484,10 +576,11 @@ export function computeCohorts(txs: Transaction[], subscriptions: SubscriptionCl
       if (initialPlanTransaction) {
         planBreakdown.set(planPrice, plan!);
       }
-      let hasUpsell = false, hasSub = false, hasRenewal2 = false, hasRenewal3 = false, hasRenewal = false;
+      let hasUpsell = false;
       let userRefundAmount = 0;
       const userCohort = cohortByUser.get(uid);
       if (!userCohort) continue;
+      const subscriptionLevels = subscriptionSequenceLevelsForUser(list, userCohort.ts, maxRenewalDepth);
       for (const t of list) {
         const dt = (new Date(t.event_time).getTime() - userCohort.ts) / DAY;
         if (dt < 0) continue;
@@ -524,15 +617,11 @@ export function computeCohorts(txs: Transaction[], subscriptions: SubscriptionCl
         }
         if (isRenewalType(t)) renewal_revenue += net;
         if (t.transaction_type === "upsell" && t.status === "success") hasUpsell = true;
-        if (t.transaction_type === "first_subscription" && t.status === "success") hasSub = true;
-        if (t.transaction_type === "renewal_2" && t.status === "success") hasRenewal2 = true;
-        if (t.transaction_type === "renewal_3" && t.status === "success") hasRenewal3 = true;
-        if (isRenewalType(t) && t.status === "success") hasRenewal = true;
       }
+      const hasRenewal = renewalLevelsThrough(maxRenewalDepth).some((level) => subscriptionLevels.has(level));
       if (hasUpsell) upsell_users += 1;
-      if (hasSub) first_subscription_users += 1;
-      if (hasRenewal2) renewal_2_users += 1;
-      if (hasRenewal3) renewal_3_users += 1;
+      if (subscriptionLevels.has(1)) first_subscription_users += 1;
+      incrementRenewalCountsByLevel(renewalUserCountsByLevel, subscriptionLevels, maxRenewalDepth);
       if (hasRenewal) renewal_users += 1;
       if (subFlags?.active) activeUserIds.add(uid);
       if (subFlags?.activeSubscription) activeSubscriptionUserIds.add(uid);
@@ -551,9 +640,8 @@ export function computeCohorts(txs: Transaction[], subscriptions: SubscriptionCl
         else if (subFlags?.userCancel) plan.user_cancelled_users += 1;
         else if (subFlags?.autoCancel) plan.auto_cancelled_users += 1;
         if (hasUpsell) plan.upsell_users += 1;
-        if (hasSub) plan.first_subscription_users += 1;
-        if (hasRenewal2) plan.renewal_2_users += 1;
-        if (hasRenewal3) plan.renewal_3_users += 1;
+        if (subscriptionLevels.has(1)) plan.first_subscription_users += 1;
+        incrementRenewalCountsByLevel(plan.renewal_users_by_level, subscriptionLevels, maxRenewalDepth);
         if (hasRenewal) plan.renewal_users += 1;
         if (userRefundAmount > 0) plan.refund_users += 1;
       }
@@ -566,6 +654,10 @@ export function computeCohorts(txs: Transaction[], subscriptions: SubscriptionCl
     const auto_cancelled_users = autoCancelledUserIds.size;
     const cancelled_active_users = cancelledActiveUserIds.size;
     const netRevenue = gross_revenue - amount_refunded;
+    const renewalUserCounts = staticRenewalCountsFromLevels(renewalUserCountsByLevel);
+    planBreakdown.forEach((plan) => {
+      Object.assign(plan, staticRenewalCountsFromLevels(plan.renewal_users_by_level));
+    });
 
     rows.push({
       cohort_id,
@@ -592,8 +684,8 @@ export function computeCohorts(txs: Transaction[], subscriptions: SubscriptionCl
       cancelled_active_user_ids: Array.from(cancelledActiveUserIds),
       upsell_users,
       first_subscription_users,
-      renewal_2_users,
-      renewal_3_users,
+      ...renewalUserCounts,
+      renewal_users_by_level: { ...renewalUserCountsByLevel },
       renewal_users,
       refund_users,
       refunded_user_ids: Array.from(refundedUserIds),
@@ -612,8 +704,8 @@ export function computeCohorts(txs: Transaction[], subscriptions: SubscriptionCl
       net_ltv: round2(netRevenue / trial_users),
       trial_to_upsell_cr: (upsell_users / trial_users) * 100,
       trial_to_first_subscription_cr: (first_subscription_users / trial_users) * 100,
-      first_subscription_to_renewal_2_cr: first_subscription_users ? (renewal_2_users / first_subscription_users) * 100 : 0,
-      renewal_2_to_renewal_3_cr: renewal_2_users ? (renewal_3_users / renewal_2_users) * 100 : 0,
+      first_subscription_to_renewal_2_cr: first_subscription_users ? ((renewalUserCountsByLevel[2] ?? 0) / first_subscription_users) * 100 : 0,
+      renewal_2_to_renewal_3_cr: renewalUserCountsByLevel[2] ? ((renewalUserCountsByLevel[3] ?? 0) / renewalUserCountsByLevel[2]) * 100 : 0,
       revenue_d0: round2(revenue_d0),
       revenue_d7: round2(revenue_d7),
       revenue_d14: round2(revenue_d14),

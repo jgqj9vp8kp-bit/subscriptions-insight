@@ -77,7 +77,12 @@ import {
   type SubscriptionCacheMetadata,
 } from "@/services/subscriptionCache";
 import { formatPct } from "@/services/analytics";
-import { fetchTrafficMetricsFromGoogleSheet } from "@/services/trafficImport";
+import {
+  fetchFacebookTrafficImportFromGoogleSheet,
+  fetchGoogleSheetTrafficTabs,
+  parseGoogleSheetReference,
+  type GoogleSheetTab,
+} from "@/services/trafficImport";
 import {
   clearTrafficDataCache,
   getTrafficCacheInfo,
@@ -91,6 +96,12 @@ import {
   saveDefaultRetentionCurve,
   resetDefaultRetentionCurve,
 } from "@/services/forecastingSettings";
+import {
+  MAX_RENEWAL_COLUMN_OPTIONS,
+  loadMaxRenewalColumns,
+  saveMaxRenewalColumns,
+  sanitizeMaxRenewalColumns,
+} from "@/services/dataSettings";
 import {
   getCloudSnapshotInfos,
   loadLatestCloudSnapshot,
@@ -110,6 +121,7 @@ const DEFAULT_IMPORT_UI_STATE = {
   sheetUrl: "",
   trafficSheetUrl: "",
   trafficYear: String(new Date().getFullYear()),
+  trafficGid: "",
 };
 
 const CLOUD_DATASET_TYPES: DatasetType[] = [
@@ -151,7 +163,7 @@ export default function ImportPage() {
   const resetToMock = useDataStore((s) => s.resetToMock);
 
   const [uiState, setUiState] = usePersistedPageState("ui_state_import_data", DEFAULT_IMPORT_UI_STATE);
-  const { tab, importMode, sheetUrl, trafficSheetUrl, trafficYear } = uiState;
+  const { tab, importMode, sheetUrl, trafficSheetUrl, trafficYear, trafficGid } = uiState;
   const updateUiState = (patch: Partial<typeof DEFAULT_IMPORT_UI_STATE>) => setUiState((current) => ({ ...current, ...patch }));
   const [parsed, setParsed] = useState<ParsedSheet | null>(null);
   const [mapping, setMapping] = useState<ColumnMapping>({});
@@ -170,6 +182,9 @@ export default function ImportPage() {
   const [trafficCacheLoading, setTrafficCacheLoading] = useState(false);
   const [trafficCacheMessage, setTrafficCacheMessage] = useState<string | null>(null);
   const [trafficCacheError, setTrafficCacheError] = useState<string | null>(null);
+  const [trafficTabs, setTrafficTabs] = useState<GoogleSheetTab[]>([]);
+  const [trafficTabsLoading, setTrafficTabsLoading] = useState(false);
+  const [trafficTabsError, setTrafficTabsError] = useState<string | null>(null);
   const [cloudSnapshots, setCloudSnapshots] = useState<Record<DatasetType, CloudSnapshotInfo | null>>({
     palmer: null,
     funnelfox_subscriptions: null,
@@ -189,6 +204,8 @@ export default function ImportPage() {
   const [funnelFoxSyncError, setFunnelFoxSyncError] = useState<string | null>(null);
   const [retentionCurveDraft, setRetentionCurveDraft] = useState<string[]>(() => loadDefaultRetentionCurve().map(String));
   const [retentionCurveMessage, setRetentionCurveMessage] = useState<string | null>(null);
+  const [maxRenewalColumns, setMaxRenewalColumns] = useState(loadMaxRenewalColumns);
+  const [dataSettingsMessage, setDataSettingsMessage] = useState<string | null>(null);
 
   const temporaryKeyInputEnabled = isFunnelFoxTemporaryKeyInputEnabled();
 
@@ -230,6 +247,13 @@ export default function ImportPage() {
     const coverage = total ? (withEmail / total) * 100 : 0;
     return { total, withEmail, missingEmail, coverage };
   }, [subscriptions]);
+
+  const trafficSheetRef = useMemo(() => parseGoogleSheetReference(trafficSheetUrl), [trafficSheetUrl]);
+  const effectiveTrafficGid = trafficGid.trim() || trafficSheetRef?.gid || "0";
+  const selectedTrafficTab = useMemo(
+    () => trafficTabs.find((sheetTab) => sheetTab.gid === effectiveTrafficGid),
+    [trafficTabs, effectiveTrafficGid],
+  );
 
   function funnelFoxSecretOptions() {
     if (!temporaryKeyInputEnabled) return undefined;
@@ -285,6 +309,32 @@ export default function ImportPage() {
     }
   }
 
+  function onTrafficSheetUrlChange(value: string) {
+    const ref = parseGoogleSheetReference(value);
+    updateUiState({ trafficSheetUrl: value, trafficGid: ref?.gid ?? "" });
+    setTrafficTabs([]);
+    setTrafficTabsError(null);
+  }
+
+  async function onLoadTrafficTabs() {
+    if (!trafficSheetUrl.trim()) return;
+    try {
+      setTrafficTabsLoading(true);
+      setTrafficTabsError(null);
+      const tabs = await fetchGoogleSheetTrafficTabs(trafficSheetUrl);
+      setTrafficTabs(tabs);
+      const selected = tabs.find((sheetTab) => sheetTab.gid === effectiveTrafficGid);
+      if (!selected && tabs[0]) {
+        updateUiState({ trafficGid: tabs[0].gid });
+      }
+    } catch (error) {
+      setTrafficTabs([]);
+      setTrafficTabsError(error instanceof Error ? error.message : "Could not load Google Sheet tabs.");
+    } finally {
+      setTrafficTabsLoading(false);
+    }
+  }
+
   async function onImportFacebookTraffic() {
     if (!trafficSheetUrl.trim()) return;
     try {
@@ -292,10 +342,17 @@ export default function ImportPage() {
       setTrafficCacheMessage(null);
       setTrafficCacheError(null);
       const year = Number(trafficYear) || new Date().getFullYear();
-      const rows = await fetchTrafficMetricsFromGoogleSheet(trafficSheetUrl, year);
+      const importResult = await fetchFacebookTrafficImportFromGoogleSheet(trafficSheetUrl, year, {
+        gid: effectiveTrafficGid,
+        tabName: selectedTrafficTab?.name,
+      });
+      const rows = importResult.rows;
       setTrafficMetrics(rows);
       const cacheMetadata = await saveTrafficDataToCache(rows, {
         google_sheet_url: trafficSheetUrl.trim(),
+        sheet_id: importResult.sheetId,
+        gid: importResult.gid,
+        tab_name: importResult.tabName,
         year,
       });
       setTrafficCacheInfo(cacheMetadata);
@@ -817,6 +874,9 @@ export default function ImportPage() {
       const cacheMetadata = await saveTrafficDataToCache(cloudTrafficMetrics, {
         source: "facebook_traffic",
         google_sheet_url: typeof snapshot.metadata.google_sheet_url === "string" ? snapshot.metadata.google_sheet_url : undefined,
+        sheet_id: typeof snapshot.metadata.sheet_id === "string" ? snapshot.metadata.sheet_id : undefined,
+        gid: typeof snapshot.metadata.gid === "string" ? snapshot.metadata.gid : undefined,
+        tab_name: typeof snapshot.metadata.tab_name === "string" ? snapshot.metadata.tab_name : undefined,
         imported_at: String(snapshot.metadata.imported_at ?? snapshot.updated_at),
         rows_count: Number(snapshot.metadata.rows_count ?? cloudTrafficMetrics.length),
         year: typeof snapshot.metadata.year === "number" ? snapshot.metadata.year : undefined,
@@ -837,18 +897,19 @@ export default function ImportPage() {
       setCloudMessage(null);
       setCloudError(null);
       const retentionCurve = loadDefaultRetentionCurve();
+      const sanitizedMaxRenewalColumns = saveMaxRenewalColumns(maxRenewalColumns);
       const cloudInfo = await saveCloudSnapshot({
         datasetType: "forecasting_settings",
-        name: "Forecasting settings",
-        payload: { retention_curve: retentionCurve },
-        metadata: { retention_months: retentionCurve.length },
+        name: "Forecasting and data settings",
+        payload: { retention_curve: retentionCurve, max_renewal_columns: sanitizedMaxRenewalColumns },
+        metadata: { retention_months: retentionCurve.length, max_renewal_columns: sanitizedMaxRenewalColumns },
       });
       if (!cloudInfo) {
         setCloudMessage("Sign in with Supabase to save forecasting settings to cloud.");
         return;
       }
       setCloudSnapshots((current) => ({ ...current, forecasting_settings: cloudInfo }));
-      setCloudMessage("Forecasting settings saved to cloud.");
+      setCloudMessage("Forecasting and data settings saved to cloud.");
     } catch (error) {
       setCloudError(error instanceof Error ? error.message : "Could not save forecasting settings to cloud.");
     } finally {
@@ -861,15 +922,21 @@ export default function ImportPage() {
       setCloudLoading("forecasting_settings");
       setCloudMessage(null);
       setCloudError(null);
-      const snapshot = await loadLatestCloudSnapshot<{ retention_curve?: number[] }>("forecasting_settings");
-      if (!snapshot?.payload.retention_curve) {
-        setCloudMessage("No forecasting settings cloud snapshot found.");
+      const snapshot = await loadLatestCloudSnapshot<{ retention_curve?: number[]; max_renewal_columns?: number }>("forecasting_settings");
+      if (!snapshot?.payload.retention_curve && snapshot?.payload.max_renewal_columns == null) {
+        setCloudMessage("No forecasting or data settings cloud snapshot found.");
         return;
       }
-      const saved = saveDefaultRetentionCurve(snapshot.payload.retention_curve);
-      setRetentionCurveDraft(saved.map(String));
+      if (snapshot.payload.retention_curve) {
+        const saved = saveDefaultRetentionCurve(snapshot.payload.retention_curve);
+        setRetentionCurveDraft(saved.map(String));
+      }
+      if (snapshot.payload.max_renewal_columns != null) {
+        const savedMax = saveMaxRenewalColumns(snapshot.payload.max_renewal_columns);
+        setMaxRenewalColumns(savedMax);
+      }
       setCloudSnapshots((current) => ({ ...current, forecasting_settings: snapshot }));
-      setCloudMessage("Forecasting settings loaded from cloud.");
+      setCloudMessage("Forecasting and data settings loaded from cloud.");
     } catch (error) {
       setCloudError(error instanceof Error ? error.message : "Could not load forecasting settings from cloud.");
     } finally {
@@ -880,8 +947,9 @@ export default function ImportPage() {
   function onLoadLocalForecastingSettings() {
     const curve = loadDefaultRetentionCurve();
     setRetentionCurveDraft(curve.map(String));
+    setMaxRenewalColumns(loadMaxRenewalColumns());
     setCloudError(null);
-    setCloudMessage("Loaded local Forecasting settings.");
+    setCloudMessage("Loaded local Forecasting and data settings.");
   }
 
   function onClearLocalForecastingSettings() {
@@ -889,6 +957,43 @@ export default function ImportPage() {
     setRetentionCurveDraft(curve.map(String));
     setCloudError(null);
     setCloudMessage("Local Forecasting settings cleared. Built-in default curve is active.");
+  }
+
+  async function saveDataSettingsToCloud(nextMaxRenewalColumns = maxRenewalColumns) {
+    const retentionCurve = loadDefaultRetentionCurve();
+    const sanitizedMaxRenewalColumns = saveMaxRenewalColumns(nextMaxRenewalColumns);
+    setMaxRenewalColumns(sanitizedMaxRenewalColumns);
+    const cloudInfo = await saveCloudSnapshot({
+      datasetType: "forecasting_settings",
+      name: "Forecasting and data settings",
+      payload: { retention_curve: retentionCurve, max_renewal_columns: sanitizedMaxRenewalColumns },
+      metadata: {
+        retention_months: retentionCurve.length,
+        max_renewal_columns: sanitizedMaxRenewalColumns,
+      },
+    });
+    if (cloudInfo) setCloudSnapshots((current) => ({ ...current, forecasting_settings: cloudInfo }));
+    return cloudInfo;
+  }
+
+  async function onChangeMaxRenewalColumns(value: string) {
+    const next = saveMaxRenewalColumns(value);
+    setMaxRenewalColumns(next);
+    setDataSettingsMessage("Max Renewal Columns saved locally.");
+    try {
+      const cloudInfo = await saveDataSettingsToCloud(next);
+      setDataSettingsMessage(
+        cloudInfo
+          ? "Max Renewal Columns saved locally and to cloud."
+          : "Max Renewal Columns saved locally. Sign in with Supabase to save it to cloud.",
+      );
+    } catch (error) {
+      setDataSettingsMessage(
+        `Max Renewal Columns saved locally. Cloud save failed: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`,
+      );
+    }
   }
 
   function parseRetentionCurveDraftValue(value: string): number | null {
@@ -925,13 +1030,16 @@ export default function ImportPage() {
     }
     const saved = saveDefaultRetentionCurve(parsed as number[]);
     setRetentionCurveDraft(saved.map(String));
+    const sanitizedMaxRenewalColumns = saveMaxRenewalColumns(maxRenewalColumns);
+    setMaxRenewalColumns(sanitizedMaxRenewalColumns);
     try {
       const cloudInfo = await saveCloudSnapshot({
         datasetType: "forecasting_settings",
-        name: "Forecasting settings",
-        payload: { retention_curve: saved },
+        name: "Forecasting and data settings",
+        payload: { retention_curve: saved, max_renewal_columns: sanitizedMaxRenewalColumns },
         metadata: {
           retention_months: saved.length,
+          max_renewal_columns: sanitizedMaxRenewalColumns,
         },
       });
       if (!cloudInfo) {
@@ -939,7 +1047,7 @@ export default function ImportPage() {
         return;
       }
       setCloudSnapshots((current) => ({ ...current, forecasting_settings: cloudInfo }));
-      setRetentionCurveMessage("Forecasting default retention curve saved.");
+      setRetentionCurveMessage("Forecasting default retention curve and data settings saved.");
     } catch (error) {
       setRetentionCurveMessage(
         `Forecasting settings saved locally. Cloud save failed: ${
@@ -952,13 +1060,16 @@ export default function ImportPage() {
   async function onResetForecastingSettings() {
     const reset = resetDefaultRetentionCurve();
     setRetentionCurveDraft(reset.map(String));
+    const sanitizedMaxRenewalColumns = saveMaxRenewalColumns(maxRenewalColumns);
+    setMaxRenewalColumns(sanitizedMaxRenewalColumns);
     try {
       const cloudInfo = await saveCloudSnapshot({
         datasetType: "forecasting_settings",
-        name: "Forecasting settings",
-        payload: { retention_curve: reset },
+        name: "Forecasting and data settings",
+        payload: { retention_curve: reset, max_renewal_columns: sanitizedMaxRenewalColumns },
         metadata: {
           retention_months: reset.length,
+          max_renewal_columns: sanitizedMaxRenewalColumns,
           reset_to_builtin: true,
         },
       });
@@ -1351,15 +1462,15 @@ export default function ImportPage() {
           <FileSpreadsheet className="h-4 w-4 text-muted-foreground" />
           <h3 className="text-sm font-semibold text-foreground">Facebook Traffic Import</h3>
         </div>
-        <div className="grid gap-3 md:grid-cols-[1fr_120px_auto]">
+        <div className="grid gap-3 lg:grid-cols-[minmax(260px,1fr)_110px_180px_120px_auto_auto]">
           <div className="space-y-1.5">
             <Label htmlFor="facebook-traffic-url" className="text-xs text-muted-foreground">
-              Google Sheet URL or CSV export URL
+              Google Sheet URL
             </Label>
             <Input
               id="facebook-traffic-url"
               value={trafficSheetUrl}
-              onChange={(e) => updateUiState({ trafficSheetUrl: e.target.value })}
+              onChange={(e) => onTrafficSheetUrlChange(e.target.value)}
               placeholder="https://docs.google.com/spreadsheets/d/..."
               className="h-9"
             />
@@ -1376,6 +1487,57 @@ export default function ImportPage() {
               className="h-9"
             />
           </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="facebook-traffic-tab" className="text-xs text-muted-foreground">
+              Sheet tab
+            </Label>
+            <Select value={effectiveTrafficGid} onValueChange={(value) => updateUiState({ trafficGid: value })}>
+              <SelectTrigger id="facebook-traffic-tab" className="h-9">
+                <SelectValue placeholder="gid 0" />
+              </SelectTrigger>
+              <SelectContent>
+                {trafficTabs.length ? (
+                  <>
+                    {!trafficTabs.some((sheetTab) => sheetTab.gid === effectiveTrafficGid) && (
+                      <SelectItem value={effectiveTrafficGid}>gid {effectiveTrafficGid}</SelectItem>
+                    )}
+                    {trafficTabs.map((sheetTab) => (
+                      <SelectItem key={sheetTab.gid} value={sheetTab.gid}>
+                        {sheetTab.name} · gid {sheetTab.gid}
+                      </SelectItem>
+                    ))}
+                  </>
+                ) : (
+                  <SelectItem value={effectiveTrafficGid}>gid {effectiveTrafficGid}</SelectItem>
+                )}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="facebook-traffic-gid" className="text-xs text-muted-foreground">
+              gid
+            </Label>
+            <Input
+              id="facebook-traffic-gid"
+              value={trafficGid || trafficSheetRef?.gid || ""}
+              onChange={(e) => updateUiState({ trafficGid: e.target.value })}
+              placeholder="0"
+              inputMode="numeric"
+              className="h-9"
+            />
+          </div>
+          <div className="flex items-end">
+            <Button
+              type="button"
+              variant="outline"
+              className="h-9"
+              onClick={onLoadTrafficTabs}
+              disabled={trafficTabsLoading || !trafficSheetUrl.trim()}
+            >
+              {trafficTabsLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+              Load tabs
+            </Button>
+          </div>
           <div className="flex items-end">
             <Button
               type="button"
@@ -1391,6 +1553,15 @@ export default function ImportPage() {
         <p className="mt-2 text-xs text-muted-foreground">
           Date values like DD.MM use the selected year. Campaign paths are matched after lowercasing and removing a leading slash.
         </p>
+        {trafficTabsError && <div className="mt-2 text-xs text-destructive">{trafficTabsError}</div>}
+        {trafficTabs.length > 0 && (
+          <div className="mt-2 text-xs text-muted-foreground">
+            Loaded {trafficTabs.length} tabs. Selected{" "}
+            <span className="font-medium text-foreground">
+              {selectedTrafficTab ? `${selectedTrafficTab.name} · gid ${selectedTrafficTab.gid}` : `gid ${effectiveTrafficGid}`}
+            </span>.
+          </div>
+        )}
         {trafficMeta.importedAt && (
           <div className="mt-3 text-xs text-muted-foreground">
             Current Facebook traffic data:{" "}
@@ -1480,6 +1651,42 @@ export default function ImportPage() {
             ({formatPct(subscriptionEmailDiagnostics.coverage)}), missing{" "}
             <span className="font-medium tabular-nums text-foreground">{subscriptionEmailDiagnostics.missingEmail}</span>.
           </div>
+        )}
+      </Card>
+
+      <Card className="mt-3 p-4 shadow-card">
+        <div className="mb-3">
+          <h3 className="text-sm font-semibold text-foreground">Data Settings</h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Controls how many ordered subscription renewal levels Cohorts calculates and displays.
+          </p>
+        </div>
+        <div className="grid gap-3 sm:grid-cols-[220px_minmax(260px,1fr)] sm:items-end">
+          <div className="space-y-1.5">
+            <Label htmlFor="max-renewal-columns" className="text-xs text-muted-foreground">
+              Max Renewal Columns
+            </Label>
+            <Select value={String(maxRenewalColumns)} onValueChange={onChangeMaxRenewalColumns}>
+              <SelectTrigger id="max-renewal-columns" className="h-9">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {MAX_RENEWAL_COLUMN_OPTIONS.map((option) => (
+                  <SelectItem key={option} value={String(option)}>
+                    {option}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="text-xs text-muted-foreground">
+            Current Cohorts columns: Renewal 2
+            {maxRenewalColumns > 2 ? ` through Renewal ${maxRenewalColumns}` : ""}.
+            Invalid saved values fall back to {sanitizeMaxRenewalColumns(null)}.
+          </div>
+        </div>
+        {dataSettingsMessage && (
+          <div className="mt-3 text-xs text-primary">{dataSettingsMessage}</div>
         )}
       </Card>
 
@@ -1624,6 +1831,15 @@ export default function ImportPage() {
                     <span className="tabular-nums text-foreground">{trafficCacheInfo.year}</span>
                   </>
                 ) : null}
+                {(trafficCacheInfo.tab_name || trafficCacheInfo.gid) ? (
+                  <div className="mt-1 truncate">
+                    Tab:{" "}
+                    <span className="text-foreground">
+                      {trafficCacheInfo.tab_name ?? "Selected tab"}
+                      {trafficCacheInfo.gid ? ` · gid ${trafficCacheInfo.gid}` : ""}
+                    </span>
+                  </div>
+                ) : null}
                 {trafficCacheInfo.google_sheet_url ? (
                   <div className="mt-1 truncate">
                     Source: <span className="text-foreground">{trafficCacheInfo.google_sheet_url}</span>
@@ -1667,7 +1883,8 @@ export default function ImportPage() {
               <>
                 Default curve loaded in this browser. M1{" "}
                 <span className="tabular-nums text-foreground">{retentionCurveDraft[0] ?? "35"}%</span>, M12{" "}
-                <span className="tabular-nums text-foreground">{retentionCurveDraft[11] ?? "2"}%</span>
+                <span className="tabular-nums text-foreground">{retentionCurveDraft[11] ?? "2"}%</span>, max renewal{" "}
+                <span className="tabular-nums text-foreground">{maxRenewalColumns}</span>
               </>
             ),
             cloudStatus: renderCloudSnapshotInfo("forecasting_settings", "No cloud snapshot found."),

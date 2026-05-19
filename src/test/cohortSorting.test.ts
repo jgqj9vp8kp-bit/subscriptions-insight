@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   compareCohortSortValues,
+  getCohortSortValue,
   nextCohortSortState,
   sortCohortGroups,
   sortCohortRows,
@@ -35,6 +36,10 @@ function cohort(overrides: Partial<CohortRow>): CohortRow {
     first_subscription_users: 0,
     renewal_2_users: 0,
     renewal_3_users: 0,
+    renewal_4_users: 0,
+    renewal_5_users: 0,
+    renewal_6_users: 0,
+    renewal_users_by_level: {},
     renewal_users: 0,
     refund_users: 0,
     refunded_user_ids: [],
@@ -80,6 +85,30 @@ describe("cohort sorting", () => {
       .toEqual(["a", "c", "b"]);
     expect(sortCohortRows(rows, { sortColumn: "trial_users", sortDirection: "asc" }).map((row) => row.cohort_id))
       .toEqual(["b", "c", "a"]);
+  });
+
+  it("calculates trial cost from traffic spend and cohort trial users", () => {
+    expect(
+      getCohortSortValue(
+        cohort({ trial_users: 10 }),
+        "trial_cost",
+        { spend: 124.8, cac: 0, trial_count: 0, clicks: 0, cpc: 0, cpm: null, ctr: null },
+      ),
+    ).toBeCloseTo(12.48);
+  });
+
+  it("returns no trial cost when trial users are zero", () => {
+    expect(
+      getCohortSortValue(
+        cohort({ trial_users: 0 }),
+        "trial_cost",
+        { spend: 100, cac: 0, trial_count: 0, clicks: 0, cpc: 0, cpm: null, ctr: null },
+      ),
+    ).toBeNull();
+  });
+
+  it("returns no trial cost when spend is missing", () => {
+    expect(getCohortSortValue(cohort({ trial_users: 10 }), "trial_cost", null)).toBeNull();
   });
 
   it("sorts text columns alphabetically", () => {
@@ -143,6 +172,37 @@ describe("cohort sorting", () => {
 
     expect(sorted[0].parent.cohort_id).toBe("b");
     expect(sorted[0].children).toEqual(["b-29.99"]);
+  });
+
+  it("sorts by trial cost", () => {
+    const rows = [
+      cohort({ cohort_id: "high", trial_users: 4 }),
+      cohort({ cohort_id: "missing", trial_users: 8 }),
+      cohort({ cohort_id: "low", trial_users: 10 }),
+    ];
+    const traffic = new Map([
+      ["high", { spend: 80, cac: 0, trial_count: 0, clicks: 0, cpc: 0, cpm: null, ctr: null }],
+      ["low", { spend: 50, cac: 0, trial_count: 0, clicks: 0, cpc: 0, cpm: null, ctr: null }],
+    ]);
+
+    expect(
+      sortCohortRows(
+        rows,
+        { sortColumn: "trial_cost", sortDirection: "desc" },
+        (row) => traffic.get(row.cohort_id) ?? null,
+      ).map((row) => row.cohort_id),
+    ).toEqual(["high", "low", "missing"]);
+  });
+
+  it("sorts dynamic Renewal columns by renewal level counts", () => {
+    const rows = [
+      cohort({ cohort_id: "low", renewal_users_by_level: { 10: 1 } }),
+      cohort({ cohort_id: "high", renewal_users_by_level: { 10: 4 } }),
+      cohort({ cohort_id: "none", renewal_users_by_level: { 10: 0 } }),
+    ];
+
+    expect(sortCohortRows(rows, { sortColumn: "renewal_10_users", sortDirection: "desc" }).map((row) => row.cohort_id))
+      .toEqual(["high", "low", "none"]);
   });
 
   it("cycles header clicks through default, reverse, and cleared sorting states", () => {

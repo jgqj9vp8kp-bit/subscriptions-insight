@@ -8,6 +8,9 @@ const CACHE_KEY = "latest";
 export interface TrafficCacheMetadata {
   source: "facebook_traffic";
   google_sheet_url?: string;
+  sheet_id?: string;
+  gid?: string;
+  tab_name?: string;
   imported_at: string;
   rows_count: number;
   matched_rows_count?: number;
@@ -70,6 +73,9 @@ function buildMetadata(
     imported_at: metadata.imported_at ?? new Date().toISOString(),
     rows_count: metadata.rows_count ?? trafficMetrics.length,
     google_sheet_url: metadata.google_sheet_url,
+    sheet_id: metadata.sheet_id,
+    gid: metadata.gid,
+    tab_name: metadata.tab_name,
     matched_rows_count: metadata.matched_rows_count,
     year: metadata.year,
     date_range: metadata.date_range ?? dateRange(trafficMetrics),

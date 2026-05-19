@@ -32,8 +32,12 @@ import { loadDefaultRetentionCurve } from "@/services/forecastingSettings";
 import {
   buildForecastPriceOptions,
   defaultPriceSelection,
+  forecastProfit,
+  forecastRoas,
+  projectedSpendFromCac,
   priceSourceLabel,
   resolveSelectedPrice,
+  resolveForecastCac,
   type ForecastPriceOption,
   type PriceSelection,
 } from "@/services/forecasting";
@@ -56,6 +60,7 @@ type ForecastInputs = {
   refundRate: string;
   stripeFee: string;
   fbFee: string;
+  cac: string;
 };
 
 type MonthlyForecastRow = {
@@ -65,6 +70,7 @@ type MonthlyForecastRow = {
   subscriptionRevenue: number;
   cumulativeGrossRevenue: number;
   cumulativeNetRevenue: number;
+  projectedSpend: number | null;
   cumulativeLtv: number;
   cumulativeProfit: number;
   roas: number | null;
@@ -85,6 +91,7 @@ const DEFAULT_FORECAST_INPUTS: ForecastInputs = {
   refundRate: "0",
   stripeFee: "0",
   fbFee: "0",
+  cac: "",
 };
 
 const DEFAULT_FORECASTING_UI_STATE = {
@@ -98,6 +105,7 @@ const DEFAULT_FORECASTING_UI_STATE = {
   trialPriceSelection: "default" as PriceSelection,
   subscriptionPriceSelection: "default" as PriceSelection,
   upsellValueSelection: "default" as PriceSelection,
+  cacSource: "actual" as "actual" | "manual",
   lastAutoFillKey: "",
 };
 
@@ -266,7 +274,7 @@ function sourceClass(source: RetentionSource): string {
 
 function buildForecastRows(
   trialUsers: number,
-  spend: number,
+  cac: number | null,
   retention: RetentionInput[],
   inputs: ForecastInputs,
 ): MonthlyForecastRow[] {
@@ -280,6 +288,7 @@ function buildForecastRows(
   const trialRevenue = trialUsers * trialPrice;
   const upsellRevenue = trialUsers * (upsellRate / 100) * upsellValue;
   const feeMultiplier = Math.max(0, 1 - (refundRate + stripeFee + fbFee) / 100);
+  const projectedSpend = projectedSpendFromCac(trialUsers, cac);
 
   let cumulativeSubscriptionRevenue = 0;
   return retention.map((month) => {
@@ -296,9 +305,10 @@ function buildForecastRows(
       subscriptionRevenue,
       cumulativeGrossRevenue,
       cumulativeNetRevenue,
+      projectedSpend,
       cumulativeLtv: trialUsers ? cumulativeNetRevenue / trialUsers : 0,
-      cumulativeProfit: cumulativeNetRevenue - spend,
-      roas: spend > 0 ? cumulativeNetRevenue / spend : null,
+      cumulativeProfit: forecastProfit(cumulativeNetRevenue, projectedSpend),
+      roas: forecastRoas(cumulativeNetRevenue, projectedSpend),
     };
   });
 }
@@ -323,11 +333,17 @@ export default function ForecastingPage() {
     trialPriceSelection: rawTrialPriceSelection,
     subscriptionPriceSelection: rawSubscriptionPriceSelection,
     upsellValueSelection: rawUpsellValueSelection,
+    cacSource: rawCacSource,
     lastAutoFillKey,
   } = uiState;
+  const normalizedForecastInputs = useMemo<ForecastInputs>(
+    () => ({ ...DEFAULT_FORECAST_INPUTS, ...forecastInputs }),
+    [forecastInputs],
+  );
   const trialPriceSelection = (rawTrialPriceSelection ?? "default") as PriceSelection;
   const subscriptionPriceSelection = (rawSubscriptionPriceSelection ?? "default") as PriceSelection;
   const upsellValueSelection = (rawUpsellValueSelection ?? "default") as PriceSelection;
+  const cacSource = rawCacSource === "manual" ? "manual" : "actual";
   const selectedIds = useMemo(() => new Set(selectedIdList), [selectedIdList]);
   const updateUiState = (patch: Partial<typeof DEFAULT_FORECASTING_UI_STATE>) => setUiState((current) => ({ ...current, ...patch }));
   const [scenarioName, setScenarioName] = useState("");
@@ -362,8 +378,9 @@ export default function ForecastingPage() {
   );
 
   const actualSummary = useMemo(() => {
-    const spend = sum(effectiveSelectedCohorts.map((cohort) => trafficByKey.get(cohortTrafficKey(cohort))?.spend ?? 0));
-    const fbTrialCount = sum(effectiveSelectedCohorts.map((cohort) => trafficByKey.get(cohortTrafficKey(cohort))?.trial_count ?? 0));
+    const trafficRows = effectiveSelectedCohorts.map((cohort) => trafficByKey.get(cohortTrafficKey(cohort))).filter(Boolean) as TrafficAggregate[];
+    const spend = sum(trafficRows.map((traffic) => traffic.spend));
+    const fbTrialCount = sum(trafficRows.map((traffic) => traffic.trial_count));
     const trialUsers = sum(effectiveSelectedCohorts.map((cohort) => cohort.trial_users));
     const grossRevenue = sum(effectiveSelectedCohorts.map((cohort) => cohort.gross_revenue));
     const netRevenue = sum(effectiveSelectedCohorts.map((cohort) => cohort.net_revenue));
@@ -372,6 +389,7 @@ export default function ForecastingPage() {
     return {
       trialUsers,
       spend,
+      hasActualSpend: trafficRows.length > 0,
       fbTrialCount,
       grossRevenue,
       netRevenue,
@@ -379,7 +397,7 @@ export default function ForecastingPage() {
       revD7: sum(effectiveSelectedCohorts.map((cohort) => cohort.revenue_d7)),
       rev1M: sum(effectiveSelectedCohorts.map((cohort) => cohort.revenue_d30)),
       rev2M: sum(effectiveSelectedCohorts.map((cohort) => cohort.revenue_d60)),
-      cac: fbTrialCount ? spend / fbTrialCount : 0,
+      cac: trafficRows.length > 0 && trialUsers ? spend / trialUsers : null,
       campaignPaths: Array.from(new Set(effectiveSelectedCohorts.map((cohort) => cohort.campaign_path))).join(", "),
       cohortDates: effectiveSelectedCohorts.map((cohort) => cohort.cohort_date).sort(),
       upsellRate: trialUsers ? (upsellUsers / trialUsers) * 100 : 0,
@@ -391,6 +409,23 @@ export default function ForecastingPage() {
     () => buildForecastPriceOptions(txs, selectedCohortIds),
     [selectedCohortIds, txs],
   );
+
+  const cacState = useMemo(
+    () =>
+      resolveForecastCac({
+        actualSpend: actualSummary.hasActualSpend ? actualSummary.spend : null,
+        trialUsers: actualSummary.trialUsers,
+        manualCac: normalizedForecastInputs.cac,
+        manualOverride: cacSource === "manual",
+      }),
+    [actualSummary.hasActualSpend, actualSummary.spend, actualSummary.trialUsers, cacSource, normalizedForecastInputs.cac],
+  );
+  const cacInputValue = cacSource === "manual"
+    ? inputString(normalizedForecastInputs.cac)
+    : cacState.actualCac == null
+      ? ""
+      : String(round2(cacState.actualCac));
+  const forecastSpend = projectedSpendFromCac(actualSummary.trialUsers, cacState.cac);
 
   const autoRetention = useMemo(() => {
     const actual = retentionPercentagesForCohorts(txs, Array.from(selectedCohortIds));
@@ -427,22 +462,23 @@ export default function ForecastingPage() {
     const nextSubscriptionSelection = defaultPriceSelection(priceOptions.subscriptionOptions);
     const nextUpsellSelection = defaultPriceSelection(priceOptions.upsellOptions);
     setUiState((current) => {
+      const currentInputs = { ...DEFAULT_FORECAST_INPUTS, ...current.forecastInputs };
       const nextTrialPrice = resolveSelectedPrice(
         priceOptions.trialOptions,
         nextTrialSelection,
-        parseNumberInput(current.forecastInputs.trialPrice),
+        parseNumberInput(currentInputs.trialPrice),
         DEFAULT_TRIAL_PRICE,
       );
       const nextSubscriptionPrice = resolveSelectedPrice(
         priceOptions.subscriptionOptions,
         nextSubscriptionSelection,
-        parseNumberInput(current.forecastInputs.subscriptionPrice),
+        parseNumberInput(currentInputs.subscriptionPrice),
         DEFAULT_SUBSCRIPTION_PRICE,
       );
       const nextUpsellValue = resolveSelectedPrice(
         priceOptions.upsellOptions,
         nextUpsellSelection,
-        parseNumberInput(current.forecastInputs.upsellValue),
+        parseNumberInput(currentInputs.upsellValue),
         DEFAULT_UPSELL_VALUE,
         "transactions",
       );
@@ -453,7 +489,7 @@ export default function ForecastingPage() {
         subscriptionPriceSelection: nextSubscriptionSelection,
         upsellValueSelection: nextUpsellSelection,
         forecastInputs: {
-          ...current.forecastInputs,
+          ...currentInputs,
           trialPrice: String(round2(nextTrialPrice)),
           subscriptionPrice: String(round2(nextSubscriptionPrice)),
           upsellRate: String(round2(actualSummary.upsellRate)),
@@ -477,8 +513,8 @@ export default function ForecastingPage() {
   ]);
 
   const forecastRows = useMemo(
-    () => buildForecastRows(actualSummary.trialUsers, actualSummary.spend, retentionInputs, forecastInputs),
-    [actualSummary.trialUsers, actualSummary.spend, forecastInputs, retentionInputs],
+    () => buildForecastRows(actualSummary.trialUsers, cacState.cac, retentionInputs, normalizedForecastInputs),
+    [actualSummary.trialUsers, cacState.cac, normalizedForecastInputs, retentionInputs],
   );
 
   const forecastOutput = useMemo(() => {
@@ -491,16 +527,53 @@ export default function ForecastingPage() {
   const setForecastInput = (key: keyof ForecastInputs, value: string) => {
     setUiState((current) => ({
       ...current,
-      forecastInputs: { ...current.forecastInputs, [key]: stripExtraLeadingZero(value) },
+      forecastInputs: { ...DEFAULT_FORECAST_INPUTS, ...current.forecastInputs, [key]: stripExtraLeadingZero(value) },
     }));
   };
 
   const commitForecastInput = (key: keyof ForecastInputs) => {
+    setUiState((current) => {
+      const currentInputs = { ...DEFAULT_FORECAST_INPUTS, ...current.forecastInputs };
+      return {
+        ...current,
+        forecastInputs: {
+          ...currentInputs,
+          [key]: String(parseNumberInput(currentInputs[key])),
+        },
+      };
+    });
+  };
+
+  const setCacInput = (value: string) => {
     setUiState((current) => ({
       ...current,
+      cacSource: "manual",
+      forecastInputs: { ...DEFAULT_FORECAST_INPUTS, ...current.forecastInputs, cac: stripExtraLeadingZero(value) },
+    }));
+  };
+
+  const commitCacInput = () => {
+    setUiState((current) => {
+      const currentInputs = { ...DEFAULT_FORECAST_INPUTS, ...current.forecastInputs };
+      return {
+        ...current,
+        cacSource: "manual",
+        forecastInputs: {
+          ...currentInputs,
+          cac: currentInputs.cac.trim() ? String(parseNumberInput(currentInputs.cac)) : "",
+        },
+      };
+    });
+  };
+
+  const resetCacToActual = () => {
+    setUiState((current) => ({
+      ...current,
+      cacSource: "actual",
       forecastInputs: {
+        ...DEFAULT_FORECAST_INPUTS,
         ...current.forecastInputs,
-        [key]: String(parseNumberInput(current.forecastInputs[key])),
+        cac: "",
       },
     }));
   };
@@ -514,13 +587,14 @@ export default function ForecastingPage() {
     weightBy: "users" | "transactions" = "users",
   ) => {
     setUiState((current) => {
-      const currentValue = inputString(current.forecastInputs[field]);
+      const currentInputs = { ...DEFAULT_FORECAST_INPUTS, ...current.forecastInputs };
+      const currentValue = inputString(currentInputs[field]);
       const resolvedPrice = resolveSelectedPrice(options, selection, parseNumberInput(currentValue), fallbackPrice, weightBy);
       return {
         ...current,
         [selectionKey]: selection,
         forecastInputs: {
-          ...current.forecastInputs,
+          ...currentInputs,
           [field]: selection === "custom" ? currentValue : String(round2(resolvedPrice)),
         },
       };
@@ -535,11 +609,13 @@ export default function ForecastingPage() {
       trialPriceSelection: nextTrialSelection,
       subscriptionPriceSelection: nextSubscriptionSelection,
       upsellValueSelection: nextUpsellSelection,
+      cacSource: "actual",
       forecastInputs: {
-        ...forecastInputs,
-        trialPrice: String(round2(resolveSelectedPrice(priceOptions.trialOptions, nextTrialSelection, parseNumberInput(forecastInputs.trialPrice), DEFAULT_TRIAL_PRICE))),
-        subscriptionPrice: String(round2(resolveSelectedPrice(priceOptions.subscriptionOptions, nextSubscriptionSelection, parseNumberInput(forecastInputs.subscriptionPrice), DEFAULT_SUBSCRIPTION_PRICE))),
-        upsellValue: String(round2(resolveSelectedPrice(priceOptions.upsellOptions, nextUpsellSelection, parseNumberInput(forecastInputs.upsellValue), DEFAULT_UPSELL_VALUE, "transactions"))),
+        ...normalizedForecastInputs,
+        cac: "",
+        trialPrice: String(round2(resolveSelectedPrice(priceOptions.trialOptions, nextTrialSelection, parseNumberInput(normalizedForecastInputs.trialPrice), DEFAULT_TRIAL_PRICE))),
+        subscriptionPrice: String(round2(resolveSelectedPrice(priceOptions.subscriptionOptions, nextSubscriptionSelection, parseNumberInput(normalizedForecastInputs.subscriptionPrice), DEFAULT_SUBSCRIPTION_PRICE))),
+        upsellValue: String(round2(resolveSelectedPrice(priceOptions.upsellOptions, nextUpsellSelection, parseNumberInput(normalizedForecastInputs.upsellValue), DEFAULT_UPSELL_VALUE, "transactions"))),
         upsellRate: String(round2(actualSummary.upsellRate)),
         refundRate: String(round2(actualSummary.refundRate)),
       },
@@ -586,7 +662,10 @@ export default function ForecastingPage() {
       name,
       saved_at: new Date().toISOString(),
       cohort_ids: Array.from(selectedCohortIds),
-      inputs: forecastInputs,
+      inputs: normalizedForecastInputs,
+      cac_source: cacState.source,
+      actual_cac: cacState.actualCac,
+      forecast_spend: forecastSpend,
       retention: retentionInputs,
       outputs: forecastOutput,
     };
@@ -650,7 +729,7 @@ export default function ForecastingPage() {
         {selection === "custom" ? (
           <Input
             {...numericInputProps()}
-            value={inputString(forecastInputs[field])}
+            value={inputString(normalizedForecastInputs[field])}
             onChange={(event) => setForecastInput(field, event.target.value)}
             onBlur={() => commitForecastInput(field)}
             onFocus={(event) => event.currentTarget.select()}
@@ -658,7 +737,7 @@ export default function ForecastingPage() {
           />
         ) : (
           <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-sm tabular-nums text-foreground">
-            {formatCurrency(parseNumberInput(forecastInputs[field]))}
+            {formatCurrency(parseNumberInput(normalizedForecastInputs[field]))}
           </div>
         )}
         <div className="text-[11px] text-muted-foreground">
@@ -688,6 +767,9 @@ export default function ForecastingPage() {
       )}
     </div>
   );
+
+  const cacSourceLabel = cacState.source === "manual" ? "Manual" : cacState.source === "actual" ? "Actual" : "Missing";
+  const cacSourceClass = cacState.source === "manual" ? "text-primary" : cacState.source === "actual" ? "text-success" : "text-warning";
 
   return (
     <AppLayout title="Forecasting" description="Editable LTV forecast from cohort retention">
@@ -788,6 +870,43 @@ export default function ForecastingPage() {
                 DEFAULT_UPSELL_VALUE,
                 "transactions",
               )}
+              <div className="rounded-md border border-border p-3 sm:col-span-2">
+                <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_auto] md:items-end">
+                  <div className="min-w-0 space-y-1.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <Label htmlFor="forecast-cac" className="text-xs text-muted-foreground">CAC</Label>
+                      <span className={`rounded-full bg-muted/50 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide ${cacSourceClass}`}>
+                        {cacSourceLabel}
+                      </span>
+                    </div>
+                    <div className="relative">
+                      <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">$</span>
+                      <Input
+                        id="forecast-cac"
+                        {...numericInputProps()}
+                        value={cacInputValue}
+                        onChange={(event) => setCacInput(event.target.value)}
+                        onBlur={commitCacInput}
+                        onFocus={(event) => event.currentTarget.select()}
+                        placeholder="No CAC data from traffic"
+                        className="h-9 pl-7 tabular-nums"
+                      />
+                    </div>
+                  </div>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-9 w-full whitespace-nowrap px-3 text-xs md:w-auto"
+                    onClick={resetCacToActual}
+                  >
+                    Reset to actual CAC
+                  </Button>
+                </div>
+                <div className="mt-1.5 truncate text-[11px] text-muted-foreground">
+                  {cacState.actualCac == null ? "No CAC data from traffic" : `Actual ${formatCurrency(cacState.actualCac)}`}
+                </div>
+              </div>
               {[
                 ["upsellRate", "Upsell Rate %"],
                 ["refundRate", "Refund Rate %"],
@@ -798,7 +917,7 @@ export default function ForecastingPage() {
                   <Label className="text-xs text-muted-foreground">{label}</Label>
                   <Input
                     {...numericInputProps()}
-                    value={inputString(forecastInputs[key as keyof ForecastInputs])}
+                    value={inputString(normalizedForecastInputs[key as keyof ForecastInputs])}
                     onChange={(event) => setForecastInput(key as keyof ForecastInputs, event.target.value)}
                     onBlur={() => commitForecastInput(key as keyof ForecastInputs)}
                     onFocus={(event) => event.currentTarget.select()}
@@ -818,9 +937,10 @@ export default function ForecastingPage() {
         <div className="space-y-4">
           <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
             <KpiCard label="Trial Users" value={String(actualSummary.trialUsers)} icon={<TrendingUp className="h-4 w-4" />} />
-            <KpiCard label="Spend" value={formatCurrency(actualSummary.spend)} icon={<TrendingUp className="h-4 w-4" />} />
+            <KpiCard label="Actual Spend" value={actualSummary.hasActualSpend ? formatCurrency(actualSummary.spend) : "—"} icon={<TrendingUp className="h-4 w-4" />} />
+            <KpiCard label="Forecast Spend" value={forecastSpend == null ? "—" : formatCurrency(forecastSpend)} icon={<TrendingUp className="h-4 w-4" />} />
             <KpiCard label="Net Rev" value={formatCurrency(actualSummary.netRevenue)} icon={<TrendingUp className="h-4 w-4" />} accent="success" />
-            <KpiCard label="CAC" value={actualSummary.cac ? formatCurrency(actualSummary.cac) : "—"} icon={<TrendingUp className="h-4 w-4" />} />
+            <KpiCard label="CAC" value={cacState.cac == null ? "—" : formatCurrency(cacState.cac)} icon={<TrendingUp className="h-4 w-4" />} />
             <KpiCard label="Gross Rev" value={formatCurrency(actualSummary.grossRevenue)} icon={<TrendingUp className="h-4 w-4" />} />
             <KpiCard label="Rev D7" value={formatCurrency(actualSummary.revD7)} icon={<TrendingUp className="h-4 w-4" />} />
             <KpiCard label="Rev 1M" value={formatCurrency(actualSummary.rev1M)} icon={<TrendingUp className="h-4 w-4" />} />
@@ -926,6 +1046,7 @@ export default function ForecastingPage() {
                     <TableHead className="text-right">Subscription Revenue</TableHead>
                     <TableHead className="text-right">Cumulative Gross Revenue</TableHead>
                     <TableHead className="text-right">Cumulative Net Revenue</TableHead>
+                    <TableHead className="text-right">Projected Spend</TableHead>
                     <TableHead className="text-right">Cumulative LTV</TableHead>
                     <TableHead className="text-right">Cumulative Profit</TableHead>
                     <TableHead className="text-right">ROAS</TableHead>
@@ -940,6 +1061,7 @@ export default function ForecastingPage() {
                       <TableCell className="text-right tabular-nums">{formatCurrency(row.subscriptionRevenue)}</TableCell>
                       <TableCell className="text-right tabular-nums">{formatCurrency(row.cumulativeGrossRevenue)}</TableCell>
                       <TableCell className="text-right tabular-nums">{formatCurrency(row.cumulativeNetRevenue)}</TableCell>
+                      <TableCell className="text-right tabular-nums">{row.projectedSpend == null ? "—" : formatCurrency(row.projectedSpend)}</TableCell>
                       <TableCell className="text-right tabular-nums">{formatCurrency(row.cumulativeLtv)}</TableCell>
                       <TableCell className="text-right tabular-nums">{formatCurrency(row.cumulativeProfit)}</TableCell>
                       <TableCell className="text-right tabular-nums">{row.roas == null ? "—" : `${row.roas.toFixed(2)}x`}</TableCell>
