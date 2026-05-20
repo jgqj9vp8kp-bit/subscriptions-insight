@@ -1,5 +1,6 @@
 import type { CohortRow } from "@/services/types";
 import { renewalUsersForColumn, trialCostForCohort } from "@/services/cohortReporting";
+import { normalizeCohortDateKey } from "@/services/cohortFiltering";
 
 export type CohortSortDirection = "asc" | "desc";
 
@@ -55,7 +56,8 @@ export function getCohortSortValue(
     case "__cohort__":
       return cohort.cohort_id;
     case "cohort_date": {
-      const timestamp = Date.parse(cohort.cohort_date);
+      const normalized = normalizeCohortDateKey(cohort.cohort_date);
+      const timestamp = normalized ? Date.parse(`${normalized}T00:00:00.000Z`) : NaN;
       return Number.isFinite(timestamp) ? timestamp : null;
     }
     case "campaign_path":

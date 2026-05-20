@@ -11,6 +11,7 @@ import {
   buildTrialsByDay,
   buildTrialsUpsellsByDay,
   buildUpsellsByDay,
+  getCashRevenueByDateRange,
   type DashboardCohort,
 } from "@/services/dashboard";
 import type { Transaction } from "@/services/types";
@@ -299,6 +300,107 @@ describe("dashboard data builders", () => {
     expect(buildUpsellsByDay(rows)).toEqual([
       { date: "2026-03-18", upsell_users: 2, upsell_revenue: 49.95 },
     ]);
+  });
+
+  it("sums successful cash revenue transaction types by event date", () => {
+    const rows = [
+      transaction({ transaction_id: "trial", transaction_type: "trial", gross_amount_usd: 9.99 }),
+      transaction({ transaction_id: "upsell", transaction_type: "upsell", gross_amount_usd: 19.99 }),
+      transaction({ transaction_id: "first-sub", transaction_type: "first_subscription", gross_amount_usd: 29.99 }),
+      transaction({ transaction_id: "renewal-2", transaction_type: "renewal_2", gross_amount_usd: 39.99 }),
+      transaction({ transaction_id: "renewal-3", transaction_type: "renewal_3", gross_amount_usd: 49.99 }),
+      transaction({ transaction_id: "renewal", transaction_type: "renewal", gross_amount_usd: 59.99 }),
+    ];
+
+    expect(getCashRevenueByDateRange(rows).cashRevenue).toBe(209.94);
+    expect(getCashRevenueByDateRange(rows).transactionCount).toBe(6);
+  });
+
+  it("excludes failed, unknown, and refund-only rows from cash revenue", () => {
+    const rows = [
+      transaction({ transaction_id: "success", transaction_type: "trial", gross_amount_usd: 9.99 }),
+      transaction({ transaction_id: "failed", transaction_type: "trial", status: "failed", gross_amount_usd: 29.99 }),
+      transaction({ transaction_id: "unknown", transaction_type: "unknown", status: "success", gross_amount_usd: 39.99 }),
+      transaction({ transaction_id: "refund", transaction_type: "refund", status: "success", gross_amount_usd: -9.99 }),
+    ];
+
+    const summary = getCashRevenueByDateRange(rows);
+
+    expect(summary.cashRevenue).toBe(9.99);
+    expect(summary.cashNetRevenue).toBe(0);
+    expect(summary.refunds).toBe(9.99);
+  });
+
+  it("filters cash revenue by transaction date, funnel, campaign path, and source", () => {
+    const rows = [
+      transaction({
+        transaction_id: "included",
+        event_time: "2026-04-30T23:30:00-05:00",
+        transaction_type: "trial",
+        gross_amount_usd: 10,
+        funnel: "soulmate",
+        campaign_path: "alpha",
+        traffic_source: "facebook",
+      }),
+      transaction({
+        transaction_id: "outside-date",
+        event_time: "2026-05-01T00:30:00+03:00",
+        transaction_type: "trial",
+        gross_amount_usd: 20,
+        funnel: "soulmate",
+        campaign_path: "alpha",
+        traffic_source: "facebook",
+      }),
+      transaction({
+        transaction_id: "outside-funnel",
+        event_time: "2026-04-15T10:00:00Z",
+        transaction_type: "trial",
+        gross_amount_usd: 30,
+        funnel: "past_life",
+        campaign_path: "alpha",
+        traffic_source: "facebook",
+      }),
+      transaction({
+        transaction_id: "outside-campaign",
+        event_time: "2026-04-15T10:00:00Z",
+        transaction_type: "trial",
+        gross_amount_usd: 40,
+        funnel: "soulmate",
+        campaign_path: "beta",
+        traffic_source: "facebook",
+      }),
+      transaction({
+        transaction_id: "outside-source",
+        event_time: "2026-04-15T10:00:00Z",
+        transaction_type: "trial",
+        gross_amount_usd: 50,
+        funnel: "soulmate",
+        campaign_path: "alpha",
+        traffic_source: "tiktok",
+      }),
+    ];
+
+    const summary = getCashRevenueByDateRange(rows, {
+      dateFrom: "2026-04-01",
+      dateTo: "2026-04-30",
+      funnelFilter: "soulmate",
+      campaignPathFilter: "alpha",
+      sourceFilter: "facebook",
+    });
+
+    expect(summary.cashRevenue).toBe(10);
+  });
+
+  it("keeps cash revenue distinct from cohort revenue", () => {
+    const cash = getCashRevenueByDateRange([
+      transaction({ transaction_id: "trial", event_time: "2026-04-15T10:00:00Z", transaction_type: "trial", gross_amount_usd: 10 }),
+      transaction({ transaction_id: "renewal", event_time: "2026-04-20T10:00:00Z", transaction_type: "renewal", gross_amount_usd: 90 }),
+    ]);
+    const cohortKpis = buildDashboardKpis([cohort({ cohort_id: "april", cohort_date: "2026-04-01", gross_revenue: 10, net_revenue: 10 })]);
+
+    expect(cash.cashRevenue).toBe(100);
+    expect(kpiValue(cohortKpis, "Gross Rev")).toBe(10);
+    expect(cash.cashRevenue - (kpiValue(cohortKpis, "Gross Rev") ?? 0)).toBe(90);
   });
 
   it("builds trial composition rows with upsells as a subset of trial users", () => {

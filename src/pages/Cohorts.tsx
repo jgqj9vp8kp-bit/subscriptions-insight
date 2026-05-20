@@ -65,6 +65,7 @@ import {
   renewalColumnIds,
   renewalLevelFromColumnId,
 } from "@/services/dataSettings";
+import { filterCohortsWithDiagnostics, normalizeCohortDateKey } from "@/services/cohortFiltering";
 
 // Visual-only helpers — no data/logic impact.
 const HEAD_BASE =
@@ -885,19 +886,23 @@ export default function CohortsPage() {
   const trafficByKey = useMemo(() => aggregateTrafficMetrics(trafficMetrics), [trafficMetrics]);
   const funnelOptions = useMemo(() => Array.from(new Set(allCohorts.map((c) => c.funnel))).sort(), [allCohorts]);
   const campaignPathOptions = useMemo(() => Array.from(new Set(allCohorts.map((c) => c.campaign_path))).sort(), [allCohorts]);
-  const filteredCohorts = useMemo(
+  const filteredCohortResult = useMemo(
     () =>
-      allCohorts.filter((c) => {
-        if (funnelFilter !== "all" && c.funnel !== funnelFilter) return false;
-        if (campaignPathFilter !== "all" && c.campaign_path !== campaignPathFilter) return false;
-        if (refundFilter === "has" && c.refund_users === 0) return false;
-        if (refundFilter === "none" && c.refund_users > 0) return false;
-        if (cohortDateFrom && c.cohort_date < cohortDateFrom) return false;
-        if (cohortDateTo && c.cohort_date > cohortDateTo) return false;
-        return true;
+      filterCohortsWithDiagnostics(allCohorts, {
+        funnelFilter,
+        campaignPathFilter,
+        refundFilter,
+        cohortDateFrom,
+        cohortDateTo,
       }),
-    [allCohorts, funnelFilter, campaignPathFilter, refundFilter, cohortDateFrom, cohortDateTo]
+    [allCohorts, funnelFilter, campaignPathFilter, refundFilter, cohortDateFrom, cohortDateTo],
   );
+  const filteredCohorts = filteredCohortResult.cohorts;
+
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    console.debug("[Cohorts filters]", filteredCohortResult.diagnostics);
+  }, [filteredCohortResult.diagnostics]);
   const cohorts = useMemo(
     () => {
       if (sortColumn && sortDirection) {
@@ -909,8 +914,12 @@ export default function CohortsPage() {
       }
 
       return [...filteredCohorts].sort((a, b) => {
-        const cmp = a.cohort_date < b.cohort_date ? -1 : a.cohort_date > b.cohort_date ? 1 : 0;
-        return -cmp;
+        const aDate = normalizeCohortDateKey(a.cohort_date);
+        const bDate = normalizeCohortDateKey(b.cohort_date);
+        if (aDate && bDate) return bDate.localeCompare(aDate);
+        if (aDate) return -1;
+        if (bDate) return 1;
+        return b.cohort_date.localeCompare(a.cohort_date);
       });
     },
     [filteredCohorts, sortColumn, sortDirection, trafficByKey]

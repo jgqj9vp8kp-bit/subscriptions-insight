@@ -133,6 +133,17 @@ describe("cohort sorting", () => {
       .toEqual(["b", "c", "a"]);
   });
 
+  it("sorts normalized date formats without timezone drift", () => {
+    const rows = [
+      cohort({ cohort_id: "start", cohort_date: "01.04.2026" }),
+      cohort({ cohort_id: "end", cohort_date: "2026-04-30T23:30:00-05:00" }),
+      cohort({ cohort_id: "middle", cohort_date: "2026-04-15" }),
+    ];
+
+    expect(sortCohortRows(rows, { sortColumn: "cohort_date", sortDirection: "asc" }).map((row) => row.cohort_id))
+      .toEqual(["start", "middle", "end"]);
+  });
+
   it("keeps null and missing values at the bottom in either direction", () => {
     expect(compareCohortSortValues(null, 1, "desc")).toBe(1);
     expect(compareCohortSortValues(1, null, "asc")).toBe(-1);

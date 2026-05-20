@@ -58,6 +58,7 @@ import {
   buildRevenueTrend,
   buildRoasTrend,
   buildTrialsUpsellsByDay,
+  getCashRevenueByDateRange,
   type DashboardKpi,
 } from "@/services/dashboard";
 import { useDataStore } from "@/store/dataStore";
@@ -72,6 +73,8 @@ const DEFAULT_DASHBOARD_UI_STATE = {
 };
 
 const EXECUTIVE_KPIS = [
+  "Cash Revenue",
+  "Cash Net Revenue",
   "Net Rev",
   "Spend",
   "ROAS 1M",
@@ -82,6 +85,8 @@ const EXECUTIVE_KPIS = [
 ];
 
 const KPI_TOOLTIPS: Record<string, string> = {
+  "Cash Revenue": "Cash Revenue is based on transaction dates and matches PSP/Primer reporting.",
+  "Cash Net Revenue": "Transaction-date Cash Revenue minus refund amounts in the selected period.",
   "Gross Rev": "Sum of cohort gross revenue.",
   "Net Rev": "Gross revenue minus refunds.",
   Spend: "Matched traffic spend for filtered cohorts.",
@@ -95,6 +100,8 @@ const KPI_TOOLTIPS: Record<string, string> = {
 };
 
 const KPI_ICONS: Record<string, JSX.Element> = {
+  "Cash Revenue": <DollarSign className="h-4 w-4" />,
+  "Cash Net Revenue": <DollarSign className="h-4 w-4" />,
   "Gross Rev": <DollarSign className="h-4 w-4" />,
   "Net Rev": <DollarSign className="h-4 w-4" />,
   Spend: <Receipt className="h-4 w-4" />,
@@ -108,6 +115,8 @@ const KPI_ICONS: Record<string, JSX.Element> = {
 };
 
 const KPI_ACCENTS: Record<string, "primary" | "accent" | "warning" | "success"> = {
+  "Cash Revenue": "success",
+  "Cash Net Revenue": "success",
   "Gross Rev": "primary",
   "Net Rev": "success",
   Spend: "primary",
@@ -324,11 +333,25 @@ export default function Dashboard() {
     [cohorts, trafficByKey],
   );
 
+  const cashRevenueSummary = useMemo(
+    () =>
+      getCashRevenueByDateRange(txs, {
+        dateFrom: cohortDateFrom,
+        dateTo: cohortDateTo,
+        funnelFilter,
+        campaignPathFilter,
+        sourceFilter,
+      }),
+    [campaignPathFilter, cohortDateFrom, cohortDateTo, funnelFilter, sourceFilter, txs],
+  );
+
   const kpiMap = useMemo(() => {
     const map = new Map<string, DashboardKpi>();
     buildDashboardKpis(dashboardCohorts).forEach((kpi) => map.set(kpi.label, kpi));
+    map.set("Cash Revenue", { label: "Cash Revenue", value: cashRevenueSummary.cashRevenue, type: "currency" });
+    map.set("Cash Net Revenue", { label: "Cash Net Revenue", value: cashRevenueSummary.cashNetRevenue, type: "currency" });
     return map;
-  }, [dashboardCohorts]);
+  }, [cashRevenueSummary, dashboardCohorts]);
   const revenueTrend = useMemo(() => buildRevenueTrend(dashboardCohorts), [dashboardCohorts]);
   const roasTrend = useMemo(() => buildRoasTrend(dashboardCohorts), [dashboardCohorts]);
   const baseFunnelChart = useMemo(() => buildFunnelChart(dashboardCohorts), [dashboardCohorts]);
@@ -414,6 +437,9 @@ export default function Dashboard() {
       renewal3Cr: renewal2Users ? (renewal3Users / renewal2Users) * 100 : 0,
     };
   }, [dashboardCohorts]);
+
+  const cohortGrossRevenue = useMemo(() => sum(dashboardCohorts, (cohort) => cohort.gross_revenue), [dashboardCohorts]);
+  const cashCohortDifference = cashRevenueSummary.cashRevenue - cohortGrossRevenue;
 
   const executiveKpis = useMemo(
     () => EXECUTIVE_KPIS.map((label) => kpiMap.get(label)).filter(Boolean) as DashboardKpi[],
@@ -524,6 +550,22 @@ export default function Dashboard() {
               accent={KPI_ACCENTS[kpi.label] ?? "primary"}
             />
           ))}
+        </div>
+      </section>
+
+      <section className="mt-5 space-y-3">
+        <SectionHeader
+          title="Revenue Reconciliation"
+          description="Cash Revenue uses transaction event dates; cohort revenue uses cohort membership windows."
+        />
+        <div className="grid gap-3 md:grid-cols-3">
+          <MetricCard label="Cohort Revenue" value={formatCurrency(cohortGrossRevenue)} hint="Gross Rev from visible cohorts" />
+          <MetricCard
+            label="Cash Revenue"
+            value={formatCurrency(cashRevenueSummary.cashRevenue)}
+            hint="Transaction-date PSP/Primer revenue"
+          />
+          <MetricCard label="Difference" value={formatCurrency(cashCohortDifference)} hint="Cash Revenue minus Cohort Revenue" />
         </div>
       </section>
 

@@ -71,6 +71,21 @@ export interface DailyCancellationsRow {
   total_cancelled: number;
 }
 
+export interface CashRevenueFilters {
+  dateFrom?: string;
+  dateTo?: string;
+  funnelFilter?: string;
+  campaignPathFilter?: string;
+  sourceFilter?: string;
+}
+
+export interface CashRevenueSummary {
+  cashRevenue: number;
+  cashNetRevenue: number;
+  refunds: number;
+  transactionCount: number;
+}
+
 type DashboardTotals = {
   grossRevenue: number;
   netRevenue: number;
@@ -136,6 +151,56 @@ function refundTransactionAmount(transaction: Transaction): number {
 
 function isSuccessfulTransaction(transaction: Transaction): boolean {
   return transaction.status === "success";
+}
+
+const CASH_REVENUE_TRANSACTION_TYPES = new Set<Transaction["transaction_type"]>([
+  "trial",
+  "upsell",
+  "first_subscription",
+  "renewal_2",
+  "renewal_3",
+  "renewal",
+]);
+
+function isCashRevenueTransaction(transaction: Transaction): boolean {
+  return isSuccessfulTransaction(transaction) && CASH_REVENUE_TRANSACTION_TYPES.has(transaction.transaction_type);
+}
+
+function matchesCashRevenueFilters(transaction: Transaction, filters: CashRevenueFilters): boolean {
+  const eventDate = dateKey(transaction.event_time);
+  if (!eventDate) return false;
+  if (filters.dateFrom && eventDate < filters.dateFrom) return false;
+  if (filters.dateTo && eventDate > filters.dateTo) return false;
+  if (filters.funnelFilter && filters.funnelFilter !== "all" && transaction.funnel !== filters.funnelFilter) return false;
+  if (filters.campaignPathFilter && filters.campaignPathFilter !== "all" && transaction.campaign_path !== filters.campaignPathFilter) {
+    return false;
+  }
+  if (filters.sourceFilter && filters.sourceFilter !== "all" && transaction.traffic_source !== filters.sourceFilter) return false;
+  return true;
+}
+
+export function getCashRevenueByDateRange(
+  transactions: Transaction[],
+  filters: CashRevenueFilters = {},
+): CashRevenueSummary {
+  let cashRevenue = 0;
+  let refunds = 0;
+  let transactionCount = 0;
+
+  for (const transaction of transactions) {
+    if (!matchesCashRevenueFilters(transaction, filters)) continue;
+    refunds += refundTransactionAmount(transaction);
+    if (!isCashRevenueTransaction(transaction)) continue;
+    cashRevenue += grossTransactionAmount(transaction);
+    transactionCount += 1;
+  }
+
+  return {
+    cashRevenue: round2(cashRevenue),
+    cashNetRevenue: round2(cashRevenue - refunds),
+    refunds: round2(refunds),
+    transactionCount,
+  };
 }
 
 function sum(cohorts: DashboardCohort[], pick: (cohort: DashboardCohort) => number | null | undefined): number {
