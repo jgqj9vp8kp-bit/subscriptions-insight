@@ -286,11 +286,16 @@ function groupByDate(cohorts: DashboardCohort[]): Map<string, DashboardCohort[]>
 export function buildDashboardKpis(cohorts: DashboardCohort[]): DashboardKpi[] {
   const totals = summarizeDashboardCohorts(cohorts);
   return [
-    { label: "Gross Rev", value: totals.grossRevenue, type: "currency" },
-    { label: "Net Rev", value: totals.netRevenue, type: "currency" },
-    { label: "Spend", value: totals.spend, type: "currency" },
-    { label: "ROAS 1M", value: totals.roas1m, type: "ratio" },
-    { label: "Trial Users", value: totals.trialUsers, type: "number" },
+    { label: "Cohort Gross Rev", value: totals.grossRevenue, type: "currency" },
+    { label: "Cohort Net Rev", value: totals.netRevenue, type: "currency" },
+    { label: "Cohort Rev D7", value: totals.revenueD7, type: "currency" },
+    { label: "Cohort Rev 1M", value: totals.revenueD30, type: "currency" },
+    { label: "Cohort Rev 2M", value: totals.revenueD60, type: "currency" },
+    { label: "Cohort Trial Users", value: totals.trialUsers, type: "number" },
+    { label: "Cohort Spend", value: totals.spend, type: "currency" },
+    { label: "Cohort ROAS D7", value: totals.roasD7, type: "ratio" },
+    { label: "Cohort ROAS 1M", value: totals.roas1m, type: "ratio" },
+    { label: "Cohort ROAS 2M", value: totals.roas2m, type: "ratio" },
     { label: "First Sub", value: totals.firstSubscriptionUsers, type: "number" },
     { label: "Trial → Sub CR", value: totals.trialToSubCr, type: "percent" },
     { label: "Active Subs", value: totals.activeSubscriptions, type: "number" },

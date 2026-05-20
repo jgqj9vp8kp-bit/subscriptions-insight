@@ -72,21 +72,31 @@ const DEFAULT_DASHBOARD_UI_STATE = {
   cohortDateTo: "",
 };
 
-const EXECUTIVE_KPIS = [
+const PROJECT_KPIS = [
   "Cash Revenue",
   "Cash Net Revenue",
-  "Net Rev",
-  "Spend",
-  "ROAS 1M",
-  "Trial Users",
-  "Trial → Sub CR",
-  "Active Subs",
-  "Cancellation Rate",
+];
+
+const COHORT_KPIS = [
+  "Cohort Gross Rev",
+  "Cohort Net Rev",
+  "Cohort Trial Users",
+  "Cohort Spend",
 ];
 
 const KPI_TOOLTIPS: Record<string, string> = {
   "Cash Revenue": "Cash Revenue is based on transaction dates and matches PSP/Primer reporting.",
   "Cash Net Revenue": "Transaction-date Cash Revenue minus refund amounts in the selected period.",
+  "Cohort Gross Rev": "Gross revenue from visible cohorts.",
+  "Cohort Net Rev": "Gross revenue minus refunds from visible cohorts.",
+  "Cohort Rev D7": "Cohort revenue through day 7.",
+  "Cohort Rev 1M": "Cohort revenue through day 30.",
+  "Cohort Rev 2M": "Cohort revenue through day 60.",
+  "Cohort Trial Users": "Trial users across filtered cohorts.",
+  "Cohort Spend": "Matched traffic spend for filtered cohorts.",
+  "Cohort ROAS D7": "Cohort Rev D7 divided by matched cohort spend.",
+  "Cohort ROAS 1M": "Cohort Rev 1M divided by matched cohort spend.",
+  "Cohort ROAS 2M": "Cohort Rev 2M divided by matched cohort spend.",
   "Gross Rev": "Sum of cohort gross revenue.",
   "Net Rev": "Gross revenue minus refunds.",
   Spend: "Matched traffic spend for filtered cohorts.",
@@ -102,6 +112,16 @@ const KPI_TOOLTIPS: Record<string, string> = {
 const KPI_ICONS: Record<string, JSX.Element> = {
   "Cash Revenue": <DollarSign className="h-4 w-4" />,
   "Cash Net Revenue": <DollarSign className="h-4 w-4" />,
+  "Cohort Gross Rev": <DollarSign className="h-4 w-4" />,
+  "Cohort Net Rev": <DollarSign className="h-4 w-4" />,
+  "Cohort Rev D7": <DollarSign className="h-4 w-4" />,
+  "Cohort Rev 1M": <DollarSign className="h-4 w-4" />,
+  "Cohort Rev 2M": <DollarSign className="h-4 w-4" />,
+  "Cohort Trial Users": <UsersIcon className="h-4 w-4" />,
+  "Cohort Spend": <Receipt className="h-4 w-4" />,
+  "Cohort ROAS D7": <Target className="h-4 w-4" />,
+  "Cohort ROAS 1M": <Target className="h-4 w-4" />,
+  "Cohort ROAS 2M": <Target className="h-4 w-4" />,
   "Gross Rev": <DollarSign className="h-4 w-4" />,
   "Net Rev": <DollarSign className="h-4 w-4" />,
   Spend: <Receipt className="h-4 w-4" />,
@@ -117,6 +137,16 @@ const KPI_ICONS: Record<string, JSX.Element> = {
 const KPI_ACCENTS: Record<string, "primary" | "accent" | "warning" | "success"> = {
   "Cash Revenue": "success",
   "Cash Net Revenue": "success",
+  "Cohort Gross Rev": "primary",
+  "Cohort Net Rev": "success",
+  "Cohort Rev D7": "primary",
+  "Cohort Rev 1M": "primary",
+  "Cohort Rev 2M": "primary",
+  "Cohort Trial Users": "accent",
+  "Cohort Spend": "primary",
+  "Cohort ROAS D7": "success",
+  "Cohort ROAS 1M": "success",
+  "Cohort ROAS 2M": "success",
   "Gross Rev": "primary",
   "Net Rev": "success",
   Spend: "primary",
@@ -441,8 +471,12 @@ export default function Dashboard() {
   const cohortGrossRevenue = useMemo(() => sum(dashboardCohorts, (cohort) => cohort.gross_revenue), [dashboardCohorts]);
   const cashCohortDifference = cashRevenueSummary.cashRevenue - cohortGrossRevenue;
 
-  const executiveKpis = useMemo(
-    () => EXECUTIVE_KPIS.map((label) => kpiMap.get(label)).filter(Boolean) as DashboardKpi[],
+  const projectKpis = useMemo(
+    () => PROJECT_KPIS.map((label) => kpiMap.get(label)).filter(Boolean) as DashboardKpi[],
+    [kpiMap],
+  );
+  const cohortKpis = useMemo(
+    () => COHORT_KPIS.map((label) => kpiMap.get(label)).filter(Boolean) as DashboardKpi[],
     [kpiMap],
   );
 
@@ -537,9 +571,32 @@ export default function Dashboard() {
       )}
 
       <section className="space-y-3">
-        <h2 className="text-sm font-semibold text-foreground">Executive Summary</h2>
+        <SectionHeader
+          title="Project Metrics"
+          description="Project Metrics use transaction event dates and are intended for PSP / cashflow reconciliation."
+        />
         <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-4">
-          {executiveKpis.map((kpi) => (
+          {projectKpis.map((kpi) => (
+            <KpiCard
+              key={kpi.label}
+              label={kpi.label}
+              value={formatKpiValue(kpi)}
+              tooltip={KPI_TOOLTIPS[kpi.label]}
+              delta="Δ —"
+              icon={KPI_ICONS[kpi.label]}
+              accent={KPI_ACCENTS[kpi.label] ?? "primary"}
+            />
+          ))}
+        </div>
+      </section>
+
+      <section className="mt-5 space-y-3">
+        <SectionHeader
+          title="Cohort Metrics"
+          description="Cohort Metrics use cohort_date and show performance of users acquired in the selected period."
+        />
+        <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-4">
+          {cohortKpis.map((kpi) => (
             <KpiCard
               key={kpi.label}
               label={kpi.label}
@@ -556,16 +613,16 @@ export default function Dashboard() {
       <section className="mt-5 space-y-3">
         <SectionHeader
           title="Revenue Reconciliation"
-          description="Cash Revenue uses transaction event dates; cohort revenue uses cohort membership windows."
+          description="Difference exists because Cash Revenue is based on transaction date, while Cohort Gross Rev is based on cohort membership."
         />
         <div className="grid gap-3 md:grid-cols-3">
-          <MetricCard label="Cohort Revenue" value={formatCurrency(cohortGrossRevenue)} hint="Gross Rev from visible cohorts" />
           <MetricCard
             label="Cash Revenue"
             value={formatCurrency(cashRevenueSummary.cashRevenue)}
             hint="Transaction-date PSP/Primer revenue"
           />
-          <MetricCard label="Difference" value={formatCurrency(cashCohortDifference)} hint="Cash Revenue minus Cohort Revenue" />
+          <MetricCard label="Cohort Gross Rev" value={formatCurrency(cohortGrossRevenue)} hint="Gross Rev from visible cohorts" />
+          <MetricCard label="Difference" value={formatCurrency(cashCohortDifference)} hint="Cash Revenue minus Cohort Gross Rev" />
         </div>
       </section>
 
@@ -645,9 +702,9 @@ export default function Dashboard() {
             ) : <ChartEmptyState />}
           </Card>
           <div className="grid gap-3">
-            <MetricCard label="Rev D7" value={formatCurrency(summary.revenueD7)} />
-            <MetricCard label="Rev 1M" value={formatCurrency(summary.revenueD30)} />
-            <MetricCard label="Rev 2M" value={formatCurrency(summary.revenueD60)} />
+            <MetricCard label="Cohort Rev D7" value={formatCurrency(summary.revenueD7)} />
+            <MetricCard label="Cohort Rev 1M" value={formatCurrency(summary.revenueD30)} />
+            <MetricCard label="Cohort Rev 2M" value={formatCurrency(summary.revenueD60)} />
           </div>
         </div>
       </section>
@@ -659,9 +716,9 @@ export default function Dashboard() {
           <MetricCard label="FB Trial Count" value={summary.fbTrialCount ? summary.fbTrialCount.toLocaleString() : "—"} />
           <MetricCard label="Clicks" value={summary.clicks ? summary.clicks.toLocaleString() : "—"} />
           <MetricCard label="CPC" value={summary.cpc == null ? "—" : formatCurrency(summary.cpc)} />
-          <MetricCard label="ROAS D7" value={formatRoas(summary.roasD7)} />
-          <MetricCard label="ROAS 1M" value={formatRoas(summary.roas1M)} />
-          <MetricCard label="ROAS 2M" value={formatRoas(summary.roas2M)} />
+          <MetricCard label="Cohort ROAS D7" value={formatRoas(summary.roasD7)} />
+          <MetricCard label="Cohort ROAS 1M" value={formatRoas(summary.roas1M)} />
+          <MetricCard label="Cohort ROAS 2M" value={formatRoas(summary.roas2M)} />
         </div>
         <Card className="p-4 shadow-card">
           {roasTrend.length ? (

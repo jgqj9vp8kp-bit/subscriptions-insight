@@ -204,9 +204,9 @@ describe("dashboard data builders", () => {
   it("builds KPI totals from cohort revenue fields", () => {
     const kpis = buildDashboardKpis(cohorts);
 
-    expect(kpiValue(kpis, "Gross Rev")).toBe(1500);
-    expect(kpiValue(kpis, "Net Rev")).toBe(1350);
-    expect(kpiValue(kpis, "Trial Users")).toBe(150);
+    expect(kpiValue(kpis, "Cohort Gross Rev")).toBe(1500);
+    expect(kpiValue(kpis, "Cohort Net Rev")).toBe(1350);
+    expect(kpiValue(kpis, "Cohort Trial Users")).toBe(150);
     expect(kpiValue(kpis, "First Sub")).toBe(75);
   });
 
@@ -214,7 +214,7 @@ describe("dashboard data builders", () => {
     const kpis = buildDashboardKpis(cohorts);
     const trend = buildRevenueTrend(cohorts);
 
-    expect(kpiValue(kpis, "Spend")).toBe(450);
+    expect(kpiValue(kpis, "Cohort Spend")).toBe(450);
     expect(trend).toEqual([
       { date: "2026-03-18", gross_rev: 1000, net_rev: 900, spend: 300 },
       { date: "2026-03-19", gross_rev: 500, net_rev: 450, spend: 150 },
@@ -225,7 +225,10 @@ describe("dashboard data builders", () => {
     const kpis = buildDashboardKpis(cohorts);
     const trend = buildRoasTrend(cohorts);
 
-    expect(kpiValue(kpis, "ROAS 1M")).toBe(2);
+    expect(kpiValue(kpis, "Cohort ROAS 1M")).toBe(2);
+    expect(kpiValue(kpis, "Cohort Rev D7")).toBe(450);
+    expect(kpiValue(kpis, "Cohort Rev 1M")).toBe(900);
+    expect(kpiValue(kpis, "Cohort Rev 2M")).toBe(1125);
     expect(trend).toEqual([
       { date: "2026-03-18", roas_d7: 1, roas_1m: 2, roas_2m: 2.5 },
       { date: "2026-03-19", roas_d7: 1, roas_1m: 2, roas_2m: 2.5 },
@@ -271,7 +274,7 @@ describe("dashboard data builders", () => {
     expect(buildRoasTrend([cohort({ cohort_date: "2026-03-18", revenue_d30: 100, traffic_spend: 0 })])).toEqual([
       { date: "2026-03-18", roas_d7: null, roas_1m: null, roas_2m: null },
     ]);
-    expect(kpiValue(buildDashboardKpis([cohort({ revenue_d30: 100, traffic_spend: 0 })]), "ROAS 1M")).toBeNull();
+    expect(kpiValue(buildDashboardKpis([cohort({ revenue_d30: 100, traffic_spend: 0 })]), "Cohort ROAS 1M")).toBeNull();
   });
 
   it("counts unique first successful non-upsell trial users by real event date", () => {
@@ -399,8 +402,8 @@ describe("dashboard data builders", () => {
     const cohortKpis = buildDashboardKpis([cohort({ cohort_id: "april", cohort_date: "2026-04-01", gross_revenue: 10, net_revenue: 10 })]);
 
     expect(cash.cashRevenue).toBe(100);
-    expect(kpiValue(cohortKpis, "Gross Rev")).toBe(10);
-    expect(cash.cashRevenue - (kpiValue(cohortKpis, "Gross Rev") ?? 0)).toBe(90);
+    expect(kpiValue(cohortKpis, "Cohort Gross Rev")).toBe(10);
+    expect(cash.cashRevenue - (kpiValue(cohortKpis, "Cohort Gross Rev") ?? 0)).toBe(90);
   });
 
   it("builds trial composition rows with upsells as a subset of trial users", () => {
