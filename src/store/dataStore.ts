@@ -6,8 +6,8 @@ import type { PalmerImportDiagnostics, RawPalmerRow } from "@/services/palmerTra
 import type { SubscriptionClean } from "@/types/subscriptions";
 import type { TrafficMetric } from "@/services/trafficImport";
 
-export type DataSource = "mock" | "csv" | "google_sheet" | "palmer_raw";
-export type ImportMode = "clean_template" | "palmer_raw";
+export type DataSource = "mock" | "csv" | "google_sheet" | "palmer_raw" | "transaction_warehouse";
+export type ImportMode = "clean_template" | "palmer_raw" | "warehouse";
 
 interface ImportMeta {
   source: DataSource;

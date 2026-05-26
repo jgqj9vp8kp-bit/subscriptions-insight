@@ -109,6 +109,14 @@ import {
   type CloudSnapshotInfo,
   type DatasetType,
 } from "@/services/dataSnapshots";
+import {
+  importTransactionsToWarehouse,
+  isTransactionWarehouseEnabled,
+  listImportBatches,
+  type ImportBatchInfo,
+  type WarehouseImportSummary,
+} from "@/services/transactionWarehouse";
+import { refreshLocalAnalyticsCacheFromWarehouse } from "@/services/analyticsAdapters";
 import type { Transaction } from "@/services/types";
 import type { SubscriptionClean } from "@/types/subscriptions";
 import type { TrafficMetric } from "@/services/trafficImport";
@@ -168,6 +176,7 @@ export default function ImportPage() {
   const [parsed, setParsed] = useState<ParsedSheet | null>(null);
   const [mapping, setMapping] = useState<ColumnMapping>({});
   const [sourceLabel, setSourceLabel] = useState<string>("");
+  const [sourceFileSize, setSourceFileSize] = useState<number | undefined>(undefined);
   const [sourceKind, setSourceKind] = useState<"csv" | "google_sheet">("csv");
   const [loading, setLoading] = useState(false);
   const [cacheSavedMessage, setCacheSavedMessage] = useState<string | null>(null);
@@ -206,21 +215,29 @@ export default function ImportPage() {
   const [retentionCurveMessage, setRetentionCurveMessage] = useState<string | null>(null);
   const [maxRenewalColumns, setMaxRenewalColumns] = useState(loadMaxRenewalColumns);
   const [dataSettingsMessage, setDataSettingsMessage] = useState<string | null>(null);
+  const [warehouseHistory, setWarehouseHistory] = useState<ImportBatchInfo[]>([]);
+  const [warehouseLoading, setWarehouseLoading] = useState(false);
+  const [warehouseMessage, setWarehouseMessage] = useState<string | null>(null);
+  const [warehouseError, setWarehouseError] = useState<string | null>(null);
+  const [warehouseSummary, setWarehouseSummary] = useState<WarehouseImportSummary | null>(null);
 
   const temporaryKeyInputEnabled = isFunnelFoxTemporaryKeyInputEnabled();
+  const warehouseEnabled = isTransactionWarehouseEnabled();
 
   const refreshLocalCacheInfo = useCallback(async () => {
-    const [palmerInfo, funnelFoxInfo, trafficInfo, cloudInfo] = await Promise.all([
+    const [palmerInfo, funnelFoxInfo, trafficInfo, cloudInfo, importBatches] = await Promise.all([
       getPalmerCacheInfo().catch(() => null),
       getSubscriptionsCacheInfo().catch(() => null),
       getTrafficCacheInfo().catch(() => null),
       getCloudSnapshotInfos(CLOUD_DATASET_TYPES).catch(() => null),
+      warehouseEnabled ? listImportBatches(10).catch(() => null) : Promise.resolve(null),
     ]);
     setPalmerCacheInfo(palmerInfo);
     setSubscriptionCacheInfo(funnelFoxInfo);
     setTrafficCacheInfo(trafficInfo);
     if (cloudInfo) setCloudSnapshots(cloudInfo);
-  }, []);
+    if (importBatches) setWarehouseHistory(importBatches);
+  }, [warehouseEnabled]);
 
   useEffect(() => {
     void refreshLocalCacheInfo();
@@ -261,7 +278,7 @@ export default function ImportPage() {
     return secret ? { secret } : undefined;
   }
 
-  function handleParsed(p: ParsedSheet, label: string, kind: "csv" | "google_sheet") {
+  function handleParsed(p: ParsedSheet, label: string, kind: "csv" | "google_sheet", fileSize?: number) {
     if (!p.headers.length || !p.rows.length) {
       toast({
         title: "Empty file",
@@ -273,6 +290,7 @@ export default function ImportPage() {
     setParsed(p);
     setMapping(autoMap(p.headers));
     setSourceLabel(label);
+    setSourceFileSize(fileSize);
     setSourceKind(kind);
   }
 
@@ -280,7 +298,7 @@ export default function ImportPage() {
     try {
       setLoading(true);
       const p = await parseCSVFile(file);
-      handleParsed(p, file.name, "csv");
+      handleParsed(p, file.name, "csv", file.size);
     } catch (e) {
       toast({
         title: "Could not parse CSV",
@@ -509,6 +527,35 @@ export default function ImportPage() {
       setCacheSavedMessage(null);
     }
 
+    if (warehouseEnabled) {
+      try {
+        setWarehouseLoading(true);
+        setWarehouseMessage(null);
+        setWarehouseError(null);
+        const summary = await importTransactionsToWarehouse({
+          rows,
+          rawRows: importMode === "palmer_raw" ? rawRows : parsed.rows,
+          filename: sourceKind === "csv" ? sourceLabel : undefined,
+          fileSize: sourceFileSize,
+          source: importMode === "palmer_raw" ? "palmer_csv" : "primer_csv",
+          sourceKind,
+          importedFrom: sourceLabel,
+          importMode,
+        });
+        setWarehouseSummary(summary);
+        setWarehouseMessage(
+          `Warehouse updated: ${summary.inserted} inserted, ${summary.updated} updated, ${summary.skipped} skipped, ${summary.failed} failed.`,
+        );
+        await refreshLocalCacheInfo();
+      } catch (error) {
+        setWarehouseError(error instanceof Error ? error.message : "Could not save transactions to warehouse.");
+      } finally {
+        setWarehouseLoading(false);
+      }
+    } else {
+      setWarehouseMessage("Transaction warehouse is disabled or Supabase is not configured. Local import completed.");
+    }
+
     toast({
       title: "Import complete",
       description: `Loaded ${rows.length} transactions from ${
@@ -517,6 +564,43 @@ export default function ImportPage() {
     });
     setParsed(null);
     setMapping({});
+    setSourceFileSize(undefined);
+  }
+
+  async function onRefreshWarehouseHistory() {
+    if (!warehouseEnabled) return;
+    try {
+      setWarehouseLoading(true);
+      setWarehouseError(null);
+      const batches = await listImportBatches(10);
+      setWarehouseHistory(batches);
+      setWarehouseMessage("Import history refreshed.");
+    } catch (error) {
+      setWarehouseError(error instanceof Error ? error.message : "Could not refresh import history.");
+    } finally {
+      setWarehouseLoading(false);
+    }
+  }
+
+  async function onRefreshLocalCacheFromWarehouse() {
+    try {
+      setWarehouseLoading(true);
+      setWarehouseError(null);
+      const rows = await refreshLocalAnalyticsCacheFromWarehouse();
+      setWarehouseMessage(`Loaded ${rows.length} transactions from Supabase into the local analytics cache.`);
+      toast({
+        title: "Local cache refreshed",
+        description: `Analytics now use ${rows.length} transactions loaded from the transaction warehouse.`,
+      });
+    } catch (error) {
+      setWarehouseError(error instanceof Error ? error.message : "Could not refresh local cache from warehouse.");
+    } finally {
+      setWarehouseLoading(false);
+    }
+  }
+
+  async function onRecalculateAnalyticsFromDb() {
+    await onRefreshLocalCacheFromWarehouse();
   }
 
   async function onTestFunnelFoxConnection() {
@@ -1358,6 +1442,7 @@ export default function ImportPage() {
                   onClick={() => {
                     setParsed(null);
                     setMapping({});
+                    setSourceFileSize(undefined);
                   }}
                 >
                   Cancel
@@ -1456,6 +1541,129 @@ export default function ImportPage() {
           </Button>
         </Card>
       </div>
+
+      <Card className="mt-3 p-4 shadow-card">
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <Database className="h-4 w-4 text-muted-foreground" />
+            <div>
+              <h3 className="text-sm font-semibold text-foreground">Transaction Warehouse</h3>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                Supabase stores imports additively, deduped by transaction_id, while IndexedDB remains a cache.
+              </p>
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={onRefreshWarehouseHistory}
+              disabled={warehouseLoading || !warehouseEnabled}
+            >
+              {warehouseLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+              Refresh history
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={onRefreshLocalCacheFromWarehouse}
+              disabled={warehouseLoading || !warehouseEnabled}
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+              Refresh local cache from DB
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              onClick={onRecalculateAnalyticsFromDb}
+              disabled={warehouseLoading || !warehouseEnabled}
+            >
+              <Database className="h-3.5 w-3.5" />
+              Recalculate analytics from DB
+            </Button>
+          </div>
+        </div>
+
+        {!warehouseEnabled && (
+          <div className="rounded-md border border-warning/30 bg-warning/5 p-3 text-xs text-muted-foreground">
+            Transaction warehouse is unavailable. Check Supabase configuration or VITE_USE_TRANSACTION_WAREHOUSE.
+          </div>
+        )}
+
+        {warehouseSummary && (
+          <div className="mb-3 grid gap-2 text-xs sm:grid-cols-5">
+            {[
+              ["Total", warehouseSummary.totalRows],
+              ["Inserted", warehouseSummary.inserted],
+              ["Updated", warehouseSummary.updated],
+              ["Skipped", warehouseSummary.skipped],
+              ["Failed", warehouseSummary.failed],
+            ].map(([label, value]) => (
+              <div key={label} className="rounded-md border border-border bg-muted/20 p-2">
+                <div className="text-muted-foreground">{label}</div>
+                <div className="mt-1 font-mono text-sm font-semibold text-foreground">{value}</div>
+              </div>
+            ))}
+            <div className="sm:col-span-5 text-muted-foreground">
+              Checksum <span className="font-mono text-foreground">{warehouseSummary.checksum.slice(0, 16)}</span>
+              {warehouseSummary.duplicateFile ? " matched a previous import." : " recorded for this import."}
+            </div>
+          </div>
+        )}
+
+        {(warehouseMessage || warehouseError) && (
+          <div className="mb-3 rounded-md border border-border bg-muted/20 p-3 text-xs">
+            {warehouseMessage && <div className="text-primary">{warehouseMessage}</div>}
+            {warehouseError && <div className="text-destructive">{warehouseError}</div>}
+          </div>
+        )}
+
+        <div className="overflow-x-auto rounded-md border border-border">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Imported at</TableHead>
+                <TableHead>Filename</TableHead>
+                <TableHead>Source</TableHead>
+                <TableHead className="text-right">Inserted</TableHead>
+                <TableHead className="text-right">Updated</TableHead>
+                <TableHead className="text-right">Skipped</TableHead>
+                <TableHead>Status</TableHead>
+                <TableHead>Checksum</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {warehouseHistory.map((batch) => (
+                <TableRow key={batch.id}>
+                  <TableCell className="whitespace-nowrap text-xs tabular-nums">
+                    {new Date(batch.imported_at).toLocaleString()}
+                  </TableCell>
+                  <TableCell className="max-w-[180px] truncate text-xs" title={batch.filename ?? undefined}>
+                    {batch.filename ?? "Import"}
+                  </TableCell>
+                  <TableCell className="text-xs">{batch.source}</TableCell>
+                  <TableCell className="text-right text-xs tabular-nums">{batch.rows_inserted}</TableCell>
+                  <TableCell className="text-right text-xs tabular-nums">{batch.rows_updated}</TableCell>
+                  <TableCell className="text-right text-xs tabular-nums">{batch.rows_skipped}</TableCell>
+                  <TableCell className="text-xs">{batch.status}</TableCell>
+                  <TableCell className="max-w-[140px] truncate font-mono text-[11px]" title={batch.checksum ?? undefined}>
+                    {batch.checksum ? batch.checksum.slice(0, 16) : "—"}
+                  </TableCell>
+                </TableRow>
+              ))}
+              {!warehouseHistory.length && (
+                <TableRow>
+                  <TableCell colSpan={8} className="py-6 text-center text-xs text-muted-foreground">
+                    No warehouse imports recorded yet.
+                  </TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
+        </div>
+      </Card>
 
       <Card className="mt-3 p-4 shadow-card">
         <div className="mb-3 flex items-center gap-2">

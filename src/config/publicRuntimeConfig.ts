@@ -5,6 +5,7 @@ export const publicRuntimeConfig = {
   supabaseUrl: import.meta.env.VITE_SUPABASE_URL?.trim() || SUPABASE_URL_FALLBACK,
   supabaseAnonKey: import.meta.env.VITE_SUPABASE_ANON_KEY?.trim() || SUPABASE_ANON_KEY_FALLBACK,
   funnelFoxMock: import.meta.env.VITE_FUNNELFOX_MOCK ?? "false",
+  useTransactionWarehouse: import.meta.env.VITE_USE_TRANSACTION_WAREHOUSE !== "false",
   funnelFoxProxyUrl:
     import.meta.env.VITE_FUNNELFOX_PROXY_URL?.trim() || `${SUPABASE_URL_FALLBACK}/functions/v1`,
 };
