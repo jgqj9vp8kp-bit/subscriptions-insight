@@ -156,6 +156,17 @@ const DIAGNOSTIC_LABELS: { key: keyof PalmerImportDiagnostics; label: string }[]
   { key: "fallbackUnknownUserCount", label: "Fallback unknown_user count" },
 ];
 
+function importBatchDateRange(batch: ImportBatchInfo): string {
+  const metadata = batch.metadata;
+  const dateRange = metadata && typeof metadata.date_range === "object" && metadata.date_range !== null
+    ? metadata.date_range as Record<string, unknown>
+    : null;
+  const from = typeof dateRange?.from === "string" ? dateRange.from : null;
+  const to = typeof dateRange?.to === "string" ? dateRange.to : null;
+  if (!from || !to) return "—";
+  return from === to ? from : `${from} → ${to}`;
+}
+
 export default function ImportPage() {
   const { toast } = useToast();
   const fileRef = useRef<HTMLInputElement>(null);
@@ -543,8 +554,9 @@ export default function ImportPage() {
           importMode,
         });
         setWarehouseSummary(summary);
+        const warehouseRows = await refreshLocalAnalyticsCacheFromWarehouse();
         setWarehouseMessage(
-          `Warehouse updated: ${summary.inserted} inserted, ${summary.updated} updated, ${summary.skipped} skipped, ${summary.failed} failed.`,
+          `Warehouse updated: ${summary.inserted} inserted, ${summary.updated} updated, ${summary.skipped} skipped, ${summary.failed} failed. Analytics now use ${warehouseRows.length} merged DB transactions.`,
         );
         await refreshLocalCacheInfo();
       } catch (error) {
@@ -1549,7 +1561,7 @@ export default function ImportPage() {
             <div>
               <h3 className="text-sm font-semibold text-foreground">Transaction Warehouse</h3>
               <p className="mt-0.5 text-xs text-muted-foreground">
-                Supabase stores imports additively, deduped by transaction_id, while IndexedDB remains a cache.
+                New CSV uploads extend the database and do not replace previous imports.
               </p>
             </div>
           </div>
@@ -1593,9 +1605,11 @@ export default function ImportPage() {
         )}
 
         {warehouseSummary && (
-          <div className="mb-3 grid gap-2 text-xs sm:grid-cols-5">
+          <div className="mb-3 grid gap-2 text-xs sm:grid-cols-4 lg:grid-cols-7">
             {[
               ["Total", warehouseSummary.totalRows],
+              ["Estimated new", warehouseSummary.inserted],
+              ["Potential duplicates", warehouseSummary.potentialDuplicates],
               ["Inserted", warehouseSummary.inserted],
               ["Updated", warehouseSummary.updated],
               ["Skipped", warehouseSummary.skipped],
@@ -1606,9 +1620,24 @@ export default function ImportPage() {
                 <div className="mt-1 font-mono text-sm font-semibold text-foreground">{value}</div>
               </div>
             ))}
-            <div className="sm:col-span-5 text-muted-foreground">
-              Checksum <span className="font-mono text-foreground">{warehouseSummary.checksum.slice(0, 16)}</span>
-              {warehouseSummary.duplicateFile ? " matched a previous import." : " recorded for this import."}
+            <div className="sm:col-span-4 lg:col-span-7 space-y-1 text-muted-foreground">
+              <div>
+                Last imported date range:{" "}
+                <span className="font-mono text-foreground">
+                  {warehouseSummary.dateRange
+                    ? warehouseSummary.dateRange.from === warehouseSummary.dateRange.to
+                      ? warehouseSummary.dateRange.from
+                      : `${warehouseSummary.dateRange.from} → ${warehouseSummary.dateRange.to}`
+                    : "—"}
+                </span>
+              </div>
+              <div>
+                Checksum <span className="font-mono text-foreground">{warehouseSummary.checksum.slice(0, 16)}</span>
+                {warehouseSummary.duplicateFile ? " matched a previous import." : " recorded for this import."}
+              </div>
+              {warehouseSummary.overlapsExisting && (
+                <div className="font-medium text-warning">Import overlaps with existing transactions.</div>
+              )}
             </div>
           </div>
         )}
@@ -1626,6 +1655,7 @@ export default function ImportPage() {
               <TableRow>
                 <TableHead>Imported at</TableHead>
                 <TableHead>Filename</TableHead>
+                <TableHead>Date range</TableHead>
                 <TableHead>Source</TableHead>
                 <TableHead className="text-right">Inserted</TableHead>
                 <TableHead className="text-right">Updated</TableHead>
@@ -1643,6 +1673,9 @@ export default function ImportPage() {
                   <TableCell className="max-w-[180px] truncate text-xs" title={batch.filename ?? undefined}>
                     {batch.filename ?? "Import"}
                   </TableCell>
+                  <TableCell className="whitespace-nowrap text-xs tabular-nums">
+                    {importBatchDateRange(batch)}
+                  </TableCell>
                   <TableCell className="text-xs">{batch.source}</TableCell>
                   <TableCell className="text-right text-xs tabular-nums">{batch.rows_inserted}</TableCell>
                   <TableCell className="text-right text-xs tabular-nums">{batch.rows_updated}</TableCell>
@@ -1655,7 +1688,7 @@ export default function ImportPage() {
               ))}
               {!warehouseHistory.length && (
                 <TableRow>
-                  <TableCell colSpan={8} className="py-6 text-center text-xs text-muted-foreground">
+                  <TableCell colSpan={9} className="py-6 text-center text-xs text-muted-foreground">
                     No warehouse imports recorded yet.
                   </TableCell>
                 </TableRow>

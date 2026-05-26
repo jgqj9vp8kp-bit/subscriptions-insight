@@ -5,9 +5,11 @@ import {
   fallbackTransactionId,
   normalizeForWarehouse,
   prepareWarehouseRecords,
+  summarizeDateRange,
   summarizeWarehouseUpsert,
   type WarehouseTransactionRecord,
 } from "@/services/transactionWarehouse";
+import { computeKpis } from "@/services/analytics";
 import type { Transaction } from "@/services/types";
 
 function tx(overrides: Partial<Transaction> = {}): Transaction {
@@ -108,7 +110,13 @@ describe("transaction warehouse import logic", () => {
       },
     );
 
-    expect(summary).toEqual({ inserted: 1, updated: 1, skipped: 1 });
+    expect(summary).toEqual({
+      inserted: 1,
+      updated: 1,
+      skipped: 1,
+      potentialDuplicates: 2,
+      overlapsExisting: true,
+    });
     expect(upserted.map((record) => record.transaction_id).sort()).toEqual(["tx_new", "tx_update"]);
   });
 
@@ -130,5 +138,63 @@ describe("transaction warehouse import logic", () => {
     });
 
     expect(upsertSizes).toEqual([TRANSACTION_WAREHOUSE_CHUNK_SIZE, 25]);
+  });
+
+  it("tracks the imported event date range for partial CSV files", async () => {
+    const records = await Promise.all([
+      normalizeForWarehouse(tx({ transaction_id: "tx_1", event_time: "2026-05-15T12:00:00.000Z" }), undefined, "batch_1", "palmer_csv"),
+      normalizeForWarehouse(tx({ transaction_id: "tx_2", event_time: "2026-05-01T12:00:00.000Z" }), undefined, "batch_1", "palmer_csv"),
+    ]);
+
+    expect(summarizeDateRange(records)).toEqual({
+      from: "2026-05-01",
+      to: "2026-05-15",
+    });
+  });
+
+  it("merges three partial imports into one append-only warehouse without duplicate history loss", async () => {
+    const warehouse = new Map<string, WarehouseTransactionRecord>();
+    const runImport = async (rows: Transaction[], batchId: string) => {
+      const records = await Promise.all(
+        rows.map((row) => normalizeForWarehouse(row, undefined, batchId, "palmer_csv")),
+      );
+      return summarizeWarehouseUpsert(records, {
+        async fetchExisting(ids) {
+          return ids
+            .map((id) => warehouse.get(id))
+            .filter((record): record is WarehouseTransactionRecord => Boolean(record))
+            .map((record) => ({
+              transaction_id: record.transaction_id,
+              normalized_payload: record.normalized_payload,
+            }));
+        },
+        async upsertTransactions(upsertRecords) {
+          for (const record of upsertRecords) warehouse.set(record.transaction_id, record);
+        },
+      });
+    };
+
+    await expect(runImport([
+      tx({ transaction_id: "may_01", event_time: "2026-05-01T10:00:00.000Z", amount_usd: 1, gross_amount_usd: 1, net_amount_usd: 1 }),
+      tx({ transaction_id: "may_10", event_time: "2026-05-10T10:00:00.000Z", amount_usd: 29.99, gross_amount_usd: 29.99, net_amount_usd: 29.99 }),
+      tx({ transaction_id: "may_15", event_time: "2026-05-15T10:00:00.000Z", amount_usd: 29.99, gross_amount_usd: 29.99, net_amount_usd: 29.99 }),
+    ], "batch_1")).resolves.toMatchObject({ inserted: 3, updated: 0, skipped: 0, overlapsExisting: false });
+
+    await expect(runImport([
+      tx({ transaction_id: "may_10", event_time: "2026-05-10T10:00:00.000Z", amount_usd: 29.99, gross_amount_usd: 29.99, net_amount_usd: 29.99 }),
+      tx({ transaction_id: "may_15", event_time: "2026-05-15T10:00:00.000Z", amount_usd: 49.99, gross_amount_usd: 49.99, net_amount_usd: 49.99 }),
+      tx({ transaction_id: "may_25", event_time: "2026-05-25T10:00:00.000Z", amount_usd: 29.99, gross_amount_usd: 29.99, net_amount_usd: 29.99 }),
+    ], "batch_2")).resolves.toMatchObject({ inserted: 1, updated: 1, skipped: 1, potentialDuplicates: 2, overlapsExisting: true });
+
+    await expect(runImport([
+      tx({ transaction_id: "may_25", event_time: "2026-05-25T10:00:00.000Z", amount_usd: 29.99, gross_amount_usd: 29.99, net_amount_usd: 29.99 }),
+      tx({ transaction_id: "jun_01", event_time: "2026-06-01T10:00:00.000Z", amount_usd: 29.99, gross_amount_usd: 29.99, net_amount_usd: 29.99 }),
+    ], "batch_3")).resolves.toMatchObject({ inserted: 1, updated: 0, skipped: 1, potentialDuplicates: 1, overlapsExisting: true });
+
+    expect(Array.from(warehouse.keys()).sort()).toEqual(["jun_01", "may_01", "may_10", "may_15", "may_25"]);
+    expect((warehouse.get("may_15")?.normalized_payload as Transaction).amount_usd).toBe(49.99);
+
+    const mergedTransactions = Array.from(warehouse.values()).map((record) => record.normalized_payload as Transaction);
+    expect(computeKpis(mergedTransactions).totalRevenue).toBe(140.96);
   });
 });

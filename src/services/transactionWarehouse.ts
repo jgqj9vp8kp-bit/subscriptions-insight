@@ -31,8 +31,16 @@ export interface WarehouseImportSummary {
   updated: number;
   skipped: number;
   failed: number;
+  potentialDuplicates: number;
+  dateRange: DateRangeSummary | null;
+  overlapsExisting: boolean;
   duplicateFile: boolean;
   errors: string[];
+}
+
+export interface DateRangeSummary {
+  from: string;
+  to: string;
 }
 
 export interface WarehouseImportInput {
@@ -71,6 +79,7 @@ export interface WarehouseTransactionRecord {
 
 type ExistingWarehouseRecord = {
   transaction_id: string;
+  event_time?: string | null;
   normalized_payload: Record<string, unknown> | null;
 };
 
@@ -97,6 +106,25 @@ type BatchClient = {
     fileSize?: number;
   }) => Promise<void>;
 };
+
+function dateKey(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toISOString().slice(0, 10);
+}
+
+export function summarizeDateRange(records: Pick<WarehouseTransactionRecord, "event_time">[]): DateRangeSummary | null {
+  const dates = records
+    .map((record) => dateKey(record.event_time))
+    .filter((value): value is string => Boolean(value))
+    .sort();
+  if (!dates.length) return null;
+  return {
+    from: dates[0],
+    to: dates[dates.length - 1],
+  };
+}
 
 export function isTransactionWarehouseEnabled(): boolean {
   return USE_TRANSACTION_WAREHOUSE && Boolean(supabase);
@@ -249,7 +277,7 @@ export async function prepareWarehouseRecords(input: {
 export async function summarizeWarehouseUpsert(
   records: WarehouseTransactionRecord[],
   client: UpsertClient,
-): Promise<{ inserted: number; updated: number; skipped: number }> {
+): Promise<{ inserted: number; updated: number; skipped: number; potentialDuplicates: number; overlapsExisting: boolean }> {
   const existingRows = new Map<string, ExistingWarehouseRecord>();
   for (const idChunk of chunk(records.map((record) => record.transaction_id), TRANSACTION_WAREHOUSE_CHUNK_SIZE)) {
     const rows = await client.fetchExisting(idChunk);
@@ -259,6 +287,7 @@ export async function summarizeWarehouseUpsert(
   let inserted = 0;
   let updated = 0;
   let skipped = 0;
+  let potentialDuplicates = 0;
   const changedRecords: WarehouseTransactionRecord[] = [];
 
   for (const record of records) {
@@ -268,6 +297,7 @@ export async function summarizeWarehouseUpsert(
       changedRecords.push(record);
       continue;
     }
+    potentialDuplicates += 1;
     if (canonicalStringify(existing.normalized_payload ?? {}) === canonicalStringify(record.normalized_payload)) {
       skipped += 1;
       continue;
@@ -280,7 +310,13 @@ export async function summarizeWarehouseUpsert(
     await client.upsertTransactions(recordChunk);
   }
 
-  return { inserted, updated, skipped };
+  return {
+    inserted,
+    updated,
+    skipped,
+    potentialDuplicates,
+    overlapsExisting: potentialDuplicates > 0,
+  };
 }
 
 function createSupabaseUpsertClient(): UpsertClient {
@@ -290,7 +326,7 @@ function createSupabaseUpsertClient(): UpsertClient {
       if (!transactionIds.length) return [];
       const { data, error } = await client
         .from("transactions")
-        .select("transaction_id,normalized_payload")
+        .select("transaction_id,event_time,normalized_payload")
         .in("transaction_id", transactionIds)
         .is("deleted_at", null);
       if (error) throw new Error(`Could not inspect existing transactions: ${error.message}`);
@@ -372,6 +408,12 @@ export async function importTransactionsToWarehouse(input: WarehouseImportInput)
   const checksum = await checksumRows(input.rawRows ?? input.rows.map((row) => row as unknown as Record<string, unknown>));
   const batchClient = createSupabaseBatchClient();
   const previousBatch = await batchClient.findBatchByChecksum(checksum);
+  const importMetadata = {
+    import_mode: input.importMode,
+    source_kind: input.sourceKind,
+    imported_from: input.importedFrom,
+    chunk_size: TRANSACTION_WAREHOUSE_CHUNK_SIZE,
+  };
   let batchId: string | null = null;
 
   try {
@@ -380,12 +422,7 @@ export async function importTransactionsToWarehouse(input: WarehouseImportInput)
       filename: input.filename,
       checksum,
       rowsTotal: input.rows.length,
-      metadata: {
-        import_mode: input.importMode,
-        source_kind: input.sourceKind,
-        imported_from: input.importedFrom,
-        chunk_size: TRANSACTION_WAREHOUSE_CHUNK_SIZE,
-      },
+      metadata: importMetadata,
     });
 
     if (input.filename) {
@@ -403,6 +440,7 @@ export async function importTransactionsToWarehouse(input: WarehouseImportInput)
       source,
     });
     const upsertSummary = await summarizeWarehouseUpsert(prepared.records, createSupabaseUpsertClient());
+    const dateRange = summarizeDateRange(prepared.records);
     const summary: WarehouseImportSummary = {
       batchId,
       checksum,
@@ -411,6 +449,9 @@ export async function importTransactionsToWarehouse(input: WarehouseImportInput)
       updated: upsertSummary.updated,
       skipped: upsertSummary.skipped,
       failed: prepared.failed,
+      potentialDuplicates: upsertSummary.potentialDuplicates,
+      dateRange,
+      overlapsExisting: upsertSummary.overlapsExisting,
       duplicateFile: Boolean(previousBatch),
       errors: prepared.errors,
     };
@@ -422,7 +463,11 @@ export async function importTransactionsToWarehouse(input: WarehouseImportInput)
       status: prepared.failed ? "failed" : "completed",
       notes: prepared.failed ? prepared.errors.slice(0, 5).join("\n") : null,
       metadata: {
+        ...importMetadata,
         duplicate_checksum_batch_id: previousBatch?.id,
+        date_range: dateRange,
+        overlaps_existing_transactions: summary.overlapsExisting,
+        potential_duplicate_rows: summary.potentialDuplicates,
         failed_rows: prepared.failed,
         errors: prepared.errors.slice(0, 25),
       },
