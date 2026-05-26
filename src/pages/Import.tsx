@@ -110,6 +110,7 @@ import {
   type DatasetType,
 } from "@/services/dataSnapshots";
 import {
+  getWarehouseTransactionCount,
   importTransactionsToWarehouse,
   isTransactionWarehouseEnabled,
   listImportBatches,
@@ -231,23 +232,26 @@ export default function ImportPage() {
   const [warehouseMessage, setWarehouseMessage] = useState<string | null>(null);
   const [warehouseError, setWarehouseError] = useState<string | null>(null);
   const [warehouseSummary, setWarehouseSummary] = useState<WarehouseImportSummary | null>(null);
+  const [warehouseTransactionCount, setWarehouseTransactionCount] = useState<number | null>(null);
 
   const temporaryKeyInputEnabled = isFunnelFoxTemporaryKeyInputEnabled();
   const warehouseEnabled = isTransactionWarehouseEnabled();
 
   const refreshLocalCacheInfo = useCallback(async () => {
-    const [palmerInfo, funnelFoxInfo, trafficInfo, cloudInfo, importBatches] = await Promise.all([
+    const [palmerInfo, funnelFoxInfo, trafficInfo, cloudInfo, importBatches, warehouseCount] = await Promise.all([
       getPalmerCacheInfo().catch(() => null),
       getSubscriptionsCacheInfo().catch(() => null),
       getTrafficCacheInfo().catch(() => null),
       getCloudSnapshotInfos(CLOUD_DATASET_TYPES).catch(() => null),
       warehouseEnabled ? listImportBatches(10).catch(() => null) : Promise.resolve(null),
+      warehouseEnabled ? getWarehouseTransactionCount().catch(() => null) : Promise.resolve(null),
     ]);
     setPalmerCacheInfo(palmerInfo);
     setSubscriptionCacheInfo(funnelFoxInfo);
     setTrafficCacheInfo(trafficInfo);
     if (cloudInfo) setCloudSnapshots(cloudInfo);
     if (importBatches) setWarehouseHistory(importBatches);
+    setWarehouseTransactionCount(warehouseCount);
   }, [warehouseEnabled]);
 
   useEffect(() => {
@@ -275,6 +279,12 @@ export default function ImportPage() {
     const coverage = total ? (withEmail / total) * 100 : 0;
     return { total, withEmail, missingEmail, coverage };
   }, [subscriptions]);
+
+  const currentDatasetSource = warehouseTransactionCount != null && warehouseTransactionCount > 0
+    ? "Transaction warehouse"
+    : meta.source.replace("_", " ");
+  const currentDatasetRows = warehouseTransactionCount ?? meta.rowCount;
+  const analyticsCacheIsWarehouse = meta.source === "transaction_warehouse";
 
   const trafficSheetRef = useMemo(() => parseGoogleSheetReference(trafficSheetUrl), [trafficSheetUrl]);
   const effectiveTrafficGid = trafficGid.trim() || trafficSheetRef?.gid || "0";
@@ -1476,14 +1486,20 @@ export default function ImportPage() {
           <dl className="space-y-2 text-xs">
             <div className="flex items-center justify-between">
               <dt className="text-muted-foreground">Source</dt>
-              <dd className="font-medium capitalize text-foreground">
-                {meta.source.replace("_", " ")}
-              </dd>
+              <dd className="font-medium capitalize text-foreground">{currentDatasetSource}</dd>
             </div>
             <div className="flex items-center justify-between">
               <dt className="text-muted-foreground">Rows</dt>
-              <dd className="font-medium tabular-nums text-foreground">{meta.rowCount}</dd>
+              <dd className="font-medium tabular-nums text-foreground">{currentDatasetRows}</dd>
             </div>
+            {warehouseTransactionCount != null && warehouseTransactionCount > 0 && (
+              <div className="flex items-center justify-between">
+                <dt className="text-muted-foreground">Analytics cache</dt>
+                <dd className="font-medium tabular-nums text-foreground">
+                  {analyticsCacheIsWarehouse ? meta.rowCount : `${meta.rowCount} local`}
+                </dd>
+              </div>
+            )}
             {meta.fileName && (
               <div className="flex items-center justify-between gap-2">
                 <dt className="text-muted-foreground">File</dt>

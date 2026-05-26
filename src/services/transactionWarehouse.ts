@@ -5,6 +5,7 @@ import type { TrafficSource, Transaction } from "@/services/types";
 
 export const USE_TRANSACTION_WAREHOUSE = publicRuntimeConfig.useTransactionWarehouse;
 export const TRANSACTION_WAREHOUSE_CHUNK_SIZE = 1000;
+export const TRANSACTION_WAREHOUSE_SELECT_PAGE_SIZE = 1000;
 
 export type ImportBatchStatus = "processing" | "completed" | "failed";
 
@@ -496,21 +497,44 @@ export async function listImportBatches(limit = 20): Promise<ImportBatchInfo[]> 
   return (data ?? []) as ImportBatchInfo[];
 }
 
-export async function loadWarehouseTransactions(options: { limit?: number; offset?: number } = {}): Promise<Transaction[]> {
+export async function getWarehouseTransactionCount(): Promise<number> {
   const client = ensureSupabase();
-  const limit = options.limit ?? 10000;
-  const offset = options.offset ?? 0;
-  const { data, error } = await client
+  const { count, error } = await client
     .from("transactions")
-    .select("normalized_payload")
-    .is("deleted_at", null)
-    .order("event_time", { ascending: false })
-    .range(offset, offset + limit - 1);
-  if (error) throw new Error(`Could not load warehouse transactions: ${error.message}`);
+    .select("id", { count: "exact", head: true })
+    .is("deleted_at", null);
+  if (error) throw new Error(`Could not count warehouse transactions: ${error.message}`);
+  return count ?? 0;
+}
 
-  const rows = (data ?? [])
-    .map((record) => record.normalized_payload)
-    .filter((payload): payload is Transaction => Boolean(payload && typeof payload === "object"));
+export async function loadWarehouseTransactions(options: { limit?: number; offset?: number; pageSize?: number } = {}): Promise<Transaction[]> {
+  const client = ensureSupabase();
+  const pageSize = options.pageSize ?? TRANSACTION_WAREHOUSE_SELECT_PAGE_SIZE;
+  const offset = options.offset ?? 0;
+  const rows: Transaction[] = [];
+  let pageOffset = offset;
+
+  while (options.limit == null || rows.length < options.limit) {
+    const remaining = options.limit == null ? pageSize : Math.min(pageSize, options.limit - rows.length);
+    if (remaining <= 0) break;
+
+    const { data, error } = await client
+      .from("transactions")
+      .select("normalized_payload")
+      .is("deleted_at", null)
+      .order("event_time", { ascending: false })
+      .range(pageOffset, pageOffset + remaining - 1);
+    if (error) throw new Error(`Could not load warehouse transactions: ${error.message}`);
+
+    const pageRows = (data ?? [])
+      .map((record) => record.normalized_payload)
+      .filter((payload): payload is Transaction => Boolean(payload && typeof payload === "object"));
+
+    rows.push(...pageRows);
+    if (pageRows.length < remaining) break;
+    pageOffset += remaining;
+  }
+
   return addCohortFields(rows);
 }
 
@@ -520,7 +544,7 @@ export async function getWarehouseAggregationSummary(): Promise<{
   activeSubscriptions: number;
   refunds: number;
 }> {
-  const txs = await loadWarehouseTransactions({ limit: 10000 });
+  const txs = await loadWarehouseTransactions();
   const cashRevenue = txs
     .filter((tx) => tx.status !== "failed")
     .reduce((sum, tx) => sum + (tx.net_amount_usd ?? tx.amount_usd), 0);
