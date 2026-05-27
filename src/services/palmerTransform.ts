@@ -98,6 +98,22 @@ function between(value: number, min: number, max: number): boolean {
   return value >= min && value <= max;
 }
 
+function transactionTypePriority(type: TransactionType): number {
+  if (type === "trial") return 0;
+  if (type === "upsell") return 1;
+  if (type === "first_subscription") return 2;
+  if (type === "renewal_2" || type === "renewal_3" || type === "renewal") return 3;
+  return 4;
+}
+
+function transactionLifecycleSort(a: Transaction, b: Transaction): number {
+  const byTime = new Date(a.event_time).getTime() - new Date(b.event_time).getTime();
+  if (byTime !== 0) return byTime;
+  const byType = transactionTypePriority(a.transaction_type) - transactionTypePriority(b.transaction_type);
+  if (byType !== 0) return byType;
+  return a.transaction_id.localeCompare(b.transaction_id);
+}
+
 export function normalizeAmount(raw: unknown): number {
   const source = String(raw ?? "").trim();
   const cleaned = source.replace(/[^0-9.-]/g, "");
@@ -309,7 +325,7 @@ export function classifyUserTransactions(rows: Transaction[]): Transaction[] {
 
   const classified: Transaction[] = [];
   byUser.forEach((list) => {
-    const sorted = [...list].sort((a, b) => new Date(a.event_time).getTime() - new Date(b.event_time).getTime());
+    const sorted = [...list].sort(transactionLifecycleSort);
     let trialTs: number | null = null;
     let firstSubscriptionTs: number | null = null;
     let renewal2Ts: number | null = null;

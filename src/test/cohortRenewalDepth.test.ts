@@ -134,6 +134,48 @@ describe("cohort renewal depth", () => {
     expect(cohort.renewal_6_users).toBe(0);
   });
 
+  it("counts renewals after multiple partial imports are merged", () => {
+    const cohort = cohortFor([
+      tx("partial", "trial", "2026-03-01T00:00:00Z"),
+      tx("partial", "first_subscription", "2026-03-08T00:00:00Z"),
+      tx("partial", "renewal_2", "2026-03-15T00:00:00Z"),
+      tx("partial", "renewal_3", "2026-03-22T00:00:00Z"),
+    ]);
+
+    expect(cohort.first_subscription_users).toBe(1);
+    expect(cohort.renewal_2_users).toBe(1);
+    expect(cohort.renewal_3_users).toBe(1);
+    expect(cohort.renewal_4_users).toBe(0);
+  });
+
+  it("dedupes overlapping imports before renewal sequencing", () => {
+    const cohort = cohortFor([
+      tx("overlap", "trial", "2026-03-01T00:00:00Z"),
+      tx("overlap", "first_subscription", "2026-03-08T00:00:00Z", { transaction_id: "overlap-first-sub" }),
+      tx("overlap", "first_subscription", "2026-03-08T00:00:00Z", { transaction_id: "overlap-first-sub" }),
+      tx("overlap", "renewal_2", "2026-03-15T00:00:00Z"),
+      tx("overlap", "renewal_3", "2026-03-22T00:00:00Z"),
+    ]);
+
+    expect(cohort.first_subscription_users).toBe(1);
+    expect(cohort.renewal_2_users).toBe(1);
+    expect(cohort.renewal_3_users).toBe(1);
+    expect(cohort.renewal_4_users).toBe(0);
+  });
+
+  it("dedupes missing transaction ids by email, amount, and event time", () => {
+    const cohort = cohortFor([
+      tx("fallback-dupe", "trial", "2026-03-01T00:00:00Z"),
+      tx("fallback-dupe", "first_subscription", "2026-03-08T00:00:00Z", { transaction_id: "" }),
+      tx("fallback-dupe", "first_subscription", "2026-03-08T00:00:00Z", { transaction_id: "" }),
+      tx("fallback-dupe", "renewal_2", "2026-03-15T00:00:00Z"),
+    ]);
+
+    expect(cohort.first_subscription_users).toBe(1);
+    expect(cohort.renewal_2_users).toBe(1);
+    expect(cohort.renewal_3_users).toBe(0);
+  });
+
   it("excludes failed renewals from renewal order", () => {
     const cohort = cohortFor([
       tx("failed", "trial", "2026-03-01T00:00:00Z"),

@@ -3,13 +3,14 @@ import {
   TRANSACTION_WAREHOUSE_CHUNK_SIZE,
   checksumRows,
   fallbackTransactionId,
+  hydrateWarehouseTransactionsForAnalytics,
   normalizeForWarehouse,
   prepareWarehouseRecords,
   summarizeDateRange,
   summarizeWarehouseUpsert,
   type WarehouseTransactionRecord,
 } from "@/services/transactionWarehouse";
-import { computeKpis } from "@/services/analytics";
+import { computeCohorts, computeKpis } from "@/services/analytics";
 import type { Transaction } from "@/services/types";
 
 function tx(overrides: Partial<Transaction> = {}): Transaction {
@@ -196,5 +197,69 @@ describe("transaction warehouse import logic", () => {
 
     const mergedTransactions = Array.from(warehouse.values()).map((record) => record.normalized_payload as Transaction);
     expect(computeKpis(mergedTransactions).totalRevenue).toBe(140.96);
+  });
+
+  it("reclassifies Palmer warehouse rows from the full merged history before renewal analytics", async () => {
+    const partialImportRows = [
+      tx({
+        transaction_id: "part_1_trial",
+        user_id: "partial_user",
+        email: "partial@example.com",
+        event_time: "2026-05-01T00:00:00.000Z",
+        amount_usd: 1,
+        gross_amount_usd: 1,
+        net_amount_usd: 1,
+        transaction_type: "trial",
+      }),
+      tx({
+        transaction_id: "part_1_first_subscription",
+        user_id: "partial_user",
+        email: "partial@example.com",
+        event_time: "2026-05-08T00:00:00.000Z",
+        amount_usd: 29.99,
+        gross_amount_usd: 29.99,
+        net_amount_usd: 29.99,
+        transaction_type: "first_subscription",
+      }),
+      tx({
+        transaction_id: "part_2_first_row_was_misclassified_as_trial",
+        user_id: "partial_user",
+        email: "partial@example.com",
+        event_time: "2026-05-15T00:00:00.000Z",
+        amount_usd: 29.99,
+        gross_amount_usd: 29.99,
+        net_amount_usd: 29.99,
+        transaction_type: "trial",
+      }),
+      tx({
+        transaction_id: "part_2_second_row_was_misclassified_as_first_sub",
+        user_id: "partial_user",
+        email: "partial@example.com",
+        event_time: "2026-05-22T00:00:00.000Z",
+        amount_usd: 29.99,
+        gross_amount_usd: 29.99,
+        net_amount_usd: 29.99,
+        transaction_type: "first_subscription",
+      }),
+    ];
+    const records = await Promise.all(
+      partialImportRows.map((row) => normalizeForWarehouse(row, undefined, "batch_partial", "palmer_csv")),
+    );
+
+    const hydrated = hydrateWarehouseTransactionsForAnalytics(
+      records.map((record) => ({
+        source: record.source,
+        normalized_payload: record.normalized_payload,
+      })),
+    );
+    const hydratedById = new Map(hydrated.map((row) => [row.transaction_id, row]));
+    const cohort = computeCohorts(hydrated, [], { maxRenewalDepth: 4 })[0];
+
+    expect(hydratedById.get("part_2_first_row_was_misclassified_as_trial")?.transaction_type).toBe("renewal_2");
+    expect(hydratedById.get("part_2_second_row_was_misclassified_as_first_sub")?.transaction_type).toBe("renewal_3");
+    expect(cohort.first_subscription_users).toBe(1);
+    expect(cohort.renewal_2_users).toBe(1);
+    expect(cohort.renewal_3_users).toBe(1);
+    expect(cohort.renewal_4_users).toBe(0);
   });
 });

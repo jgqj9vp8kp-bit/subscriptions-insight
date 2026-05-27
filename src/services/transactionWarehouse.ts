@@ -1,6 +1,6 @@
 import { publicRuntimeConfig } from "@/config/publicRuntimeConfig";
 import { supabase } from "@/services/supabaseClient";
-import { addCohortFields } from "@/services/palmerTransform";
+import { addCohortFields, classifyUserTransactions } from "@/services/palmerTransform";
 import type { TrafficSource, Transaction } from "@/services/types";
 
 export const USE_TRANSACTION_WAREHOUSE = publicRuntimeConfig.useTransactionWarehouse;
@@ -81,6 +81,11 @@ export interface WarehouseTransactionRecord {
 type ExistingWarehouseRecord = {
   transaction_id: string;
   event_time?: string | null;
+  normalized_payload: Record<string, unknown> | null;
+};
+
+type WarehouseLoadedRecord = {
+  source: string | null;
   normalized_payload: Record<string, unknown> | null;
 };
 
@@ -511,31 +516,51 @@ export async function loadWarehouseTransactions(options: { limit?: number; offse
   const client = ensureSupabase();
   const pageSize = options.pageSize ?? TRANSACTION_WAREHOUSE_SELECT_PAGE_SIZE;
   const offset = options.offset ?? 0;
-  const rows: Transaction[] = [];
+  const records: WarehouseLoadedRecord[] = [];
   let pageOffset = offset;
 
-  while (options.limit == null || rows.length < options.limit) {
-    const remaining = options.limit == null ? pageSize : Math.min(pageSize, options.limit - rows.length);
+  while (options.limit == null || records.length < options.limit) {
+    const remaining = options.limit == null ? pageSize : Math.min(pageSize, options.limit - records.length);
     if (remaining <= 0) break;
 
     const { data, error } = await client
       .from("transactions")
-      .select("normalized_payload")
+      .select("source,normalized_payload")
       .is("deleted_at", null)
       .order("event_time", { ascending: false })
       .range(pageOffset, pageOffset + remaining - 1);
     if (error) throw new Error(`Could not load warehouse transactions: ${error.message}`);
 
-    const pageRows = (data ?? [])
-      .map((record) => record.normalized_payload)
-      .filter((payload): payload is Transaction => Boolean(payload && typeof payload === "object"));
+    const pageRows = ((data ?? []) as WarehouseLoadedRecord[])
+      .filter((record) => Boolean(record.normalized_payload && typeof record.normalized_payload === "object"));
 
-    rows.push(...pageRows);
+    records.push(...pageRows);
     if (pageRows.length < remaining) break;
     pageOffset += remaining;
   }
 
-  return addCohortFields(rows);
+  return hydrateWarehouseTransactionsForAnalytics(records);
+}
+
+export function hydrateWarehouseTransactionsForAnalytics(records: WarehouseLoadedRecord[]): Transaction[] {
+  const palmerRows: Transaction[] = [];
+  const otherRows: Transaction[] = [];
+
+  for (const record of records) {
+    const payload = record.normalized_payload;
+    if (!payload || typeof payload !== "object") continue;
+    const tx = payload as unknown as Transaction;
+    if (record.source === "palmer_csv") {
+      palmerRows.push(tx);
+    } else {
+      otherRows.push(tx);
+    }
+  }
+
+  return [
+    ...classifyUserTransactions(palmerRows),
+    ...addCohortFields(otherRows),
+  ].sort((a, b) => (a.event_time < b.event_time ? 1 : a.event_time > b.event_time ? -1 : a.transaction_id.localeCompare(b.transaction_id)));
 }
 
 export async function getWarehouseAggregationSummary(): Promise<{

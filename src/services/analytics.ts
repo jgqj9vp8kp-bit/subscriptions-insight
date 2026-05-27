@@ -51,6 +51,34 @@ const planNameFromPrice = (price: number | null) => (price == null ? "Unknown" :
 const normalizeEmailKey = (email: string | null | undefined) => email?.trim().toLowerCase() || "";
 const transactionDay = (t: Transaction, daysFromCohort: number) =>
   typeof t.transaction_day === "number" ? t.transaction_day : Math.floor(daysFromCohort);
+const transactionTypePriority = (type: string) => {
+  if (type === "trial") return 0;
+  if (type === "upsell") return 1;
+  if (type === "first_subscription") return 2;
+  if (type === "renewal_2" || type === "renewal_3" || type === "renewal") return 3;
+  return 4;
+};
+const transactionSortKey = (tx: Transaction) =>
+  `${tx.event_time}|${String(transactionTypePriority(tx.transaction_type)).padStart(2, "0")}|${tx.transaction_id}`;
+const transactionDedupeKey = (tx: Transaction) => {
+  const id = tx.transaction_id?.trim();
+  if (id) return `id:${id}`;
+  const email = tx.email?.trim().toLowerCase() ?? "";
+  const amount = grossAmount(tx).toFixed(2);
+  return `fallback:${email}|${amount}|${tx.event_time}`;
+};
+
+export function dedupeTransactionsForAnalytics(txs: Transaction[]): Transaction[] {
+  const byKey = new Map<string, Transaction>();
+  for (const tx of txs) {
+    byKey.set(transactionDedupeKey(tx), tx);
+  }
+  return Array.from(byKey.values()).sort((a, b) => {
+    const aKey = transactionSortKey(a);
+    const bKey = transactionSortKey(b);
+    return aKey < bKey ? -1 : aKey > bKey ? 1 : 0;
+  });
+}
 
 interface MutablePlanBreakdown {
   price: number;
@@ -401,7 +429,11 @@ function subscriptionSequenceLevelsForUser(
       const txMs = new Date(tx.event_time).getTime();
       return Number.isFinite(txMs) && txMs >= cohortTs;
     })
-    .sort((a, b) => (a.event_time < b.event_time ? -1 : a.event_time > b.event_time ? 1 : a.transaction_id.localeCompare(b.transaction_id)));
+    .sort((a, b) => {
+      const aKey = transactionSortKey(a);
+      const bKey = transactionSortKey(b);
+      return aKey < bKey ? -1 : aKey > bKey ? 1 : 0;
+    });
 
   const levels = new Set<number>();
   payments.forEach((_, index) => {
@@ -512,9 +544,10 @@ export function computeCohorts(
   subscriptions: SubscriptionClean[] = [],
   options: ComputeCohortsOptions = {},
 ): CohortRow[] {
+  const analyticsTxs = dedupeTransactionsForAnalytics(txs);
   // Cohort membership is anchored to the exact trial timestamp; the displayed
   // date is only a label. This keeps D0/D7/D30 windows aligned per user.
-  const trials = txs.filter((t) => t.transaction_type === "trial" && t.status === "success");
+  const trials = analyticsTxs.filter((t) => t.transaction_type === "trial" && t.status === "success");
   const cohortByUser = new Map<string, { id: string; date: string; funnel: Transaction["funnel"]; campaignPath: string; ts: number }>();
   for (const t of [...trials].sort((a, b) => (a.event_time < b.event_time ? -1 : 1))) {
     if (cohortByUser.has(t.user_id)) continue;
@@ -538,12 +571,12 @@ export function computeCohorts(
   });
 
   const userTxs = new Map<string, Transaction[]>();
-  for (const t of txs) {
+  for (const t of analyticsTxs) {
     const list = userTxs.get(t.user_id) ?? [];
     list.push(t);
     userTxs.set(t.user_id, list);
   }
-  const subscriptionFlags = subscriptionFlagsByEmail(txs, subscriptions);
+  const subscriptionFlags = subscriptionFlagsByEmail(analyticsTxs, subscriptions);
   const maxRenewalDepth = sanitizeMaxRenewalColumns(options.maxRenewalDepth ?? DEFAULT_MAX_RENEWAL_DEPTH);
 
   const rows: CohortRow[] = [];
