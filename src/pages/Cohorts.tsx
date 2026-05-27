@@ -66,7 +66,8 @@ import {
   renewalLevelFromColumnId,
 } from "@/services/dataSettings";
 import { filterCohortsWithDiagnostics, normalizeCohortDateKey } from "@/services/cohortFiltering";
-import { countryUserCountsForTransactions, normalizeCountryCode } from "@/services/userCountry";
+import { buildCohortGeoOptions } from "@/services/cohortGeo";
+import { normalizeCountryCode } from "@/services/userCountry";
 
 // Visual-only helpers — no data/logic impact.
 const HEAD_BASE =
@@ -899,7 +900,6 @@ export default function CohortsPage() {
       }),
     [txs, trafficSourceFilter, campaignIdFilter]
   );
-  const countryOptions = useMemo(() => countryUserCountsForTransactions(sourceFilteredTxs), [sourceFilteredTxs]);
   const allCohorts = useMemo(
     () => computeCohorts(sourceFilteredTxs, subscriptions, { maxRenewalDepth: maxRenewalColumns, selectedCountries }),
     [sourceFilteredTxs, subscriptions, maxRenewalColumns, selectedCountries],
@@ -919,6 +919,26 @@ export default function CohortsPage() {
     [allCohorts, funnelFilter, campaignPathFilter, refundFilter, cohortDateFrom, cohortDateTo],
   );
   const filteredCohorts = filteredCohortResult.cohorts;
+  const cohortRowFilters = useMemo(
+    () => ({
+      funnelFilter,
+      campaignPathFilter,
+      refundFilter,
+      cohortDateFrom,
+      cohortDateTo,
+    }),
+    [funnelFilter, campaignPathFilter, refundFilter, cohortDateFrom, cohortDateTo],
+  );
+  const countryOptions = useMemo(
+    () =>
+      buildCohortGeoOptions({
+        txs: sourceFilteredTxs,
+        subscriptions,
+        filters: cohortRowFilters,
+        maxRenewalDepth: maxRenewalColumns,
+      }),
+    [sourceFilteredTxs, subscriptions, cohortRowFilters, maxRenewalColumns],
+  );
 
   useEffect(() => {
     if (!import.meta.env.DEV) return;

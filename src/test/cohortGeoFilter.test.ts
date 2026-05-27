@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { computeCohorts } from "@/services/analytics";
+import { buildCohortGeoOptions } from "@/services/cohortGeo";
 import { computeCohortReportTotals } from "@/services/cohortReporting";
 import type { Transaction, TransactionType } from "@/services/types";
 
@@ -132,5 +133,27 @@ describe("cohort GEO filter", () => {
   it("excludes missing-country users only when the GEO filter is active", () => {
     expect(computeCohorts(rows)[0].trial_users).toBe(4);
     expect(computeCohorts(rows, [], { selectedCountries: ["US", "CA", "GB"] })[0].trial_users).toBe(3);
+  });
+
+  it("shows GEO option counts as current filtered Trial Users, not all transaction users", () => {
+    const rowsWithNonCohortUser = [
+      ...rows,
+      tx("us_non_trial", "renewal_2", "2026-05-15T00:00:00Z", "US"),
+      ...userRows("us_other_campaign", "US", 1, 10).map((row) => ({
+        ...row,
+        campaign_path: "other-campaign",
+        cohort_id: `other-campaign_${row.cohort_date ?? row.event_time.slice(0, 10)}`,
+      })),
+    ];
+
+    const options = buildCohortGeoOptions({
+      txs: rowsWithNonCohortUser,
+      filters: { campaignPathFilter: "soulmate-reading" },
+    });
+
+    expect(options.find((option) => option.country_code === "US")?.user_count).toBe(1);
+    expect(computeCohorts(rowsWithNonCohortUser, [], { selectedCountries: ["US"] })
+      .filter((cohort) => cohort.campaign_path === "soulmate-reading")
+      .reduce((total, cohort) => total + cohort.trial_users, 0)).toBe(1);
   });
 });

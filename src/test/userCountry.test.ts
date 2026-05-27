@@ -27,7 +27,7 @@ function tx(overrides: Partial<Transaction> = {}): Transaction {
 }
 
 describe("user country helpers", () => {
-  it("counts unique users per country for GEO filter options", () => {
+  it("counts unique users per country from transaction history", () => {
     const rows = [
       tx({ transaction_id: "us_trial", user_id: "us_1", metadata: { ff_country_code: "us" } }),
       tx({ transaction_id: "us_renewal", user_id: "us_1", metadata: { ff_country_code: "us" }, transaction_type: "renewal_2" }),
