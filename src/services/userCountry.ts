@@ -79,3 +79,29 @@ export function countryCodeForUserTransactions(txs: Transaction[]): string | nul
 
   return null;
 }
+
+export interface CountryUserCount {
+  country_code: string;
+  user_count: number;
+}
+
+export function countryUserCountsForTransactions(txs: Transaction[]): CountryUserCount[] {
+  const txsByUser = new Map<string, Transaction[]>();
+  for (const tx of txs) {
+    const userKey = tx.user_id || tx.email || tx.transaction_id;
+    const list = txsByUser.get(userKey) ?? [];
+    list.push(tx);
+    txsByUser.set(userKey, list);
+  }
+
+  const counts = new Map<string, number>();
+  txsByUser.forEach((list) => {
+    const country = countryCodeForUserTransactions(list);
+    if (!country) return;
+    counts.set(country, (counts.get(country) ?? 0) + 1);
+  });
+
+  return Array.from(counts.entries())
+    .map(([country_code, user_count]) => ({ country_code, user_count }))
+    .sort((a, b) => a.country_code.localeCompare(b.country_code));
+}

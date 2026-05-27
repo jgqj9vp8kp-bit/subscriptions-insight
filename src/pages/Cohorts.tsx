@@ -29,7 +29,7 @@ import {
   formatPct,
 } from "@/services/analytics";
 import { normalizeCampaignPath, type TrafficMetric } from "@/services/trafficImport";
-import type { CohortRow, PlanBreakdownRow, Transaction } from "@/services/types";
+import type { CohortRow, PlanBreakdownRow } from "@/services/types";
 import { useDataStore } from "@/store/dataStore";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
 import {
@@ -66,7 +66,7 @@ import {
   renewalLevelFromColumnId,
 } from "@/services/dataSettings";
 import { filterCohortsWithDiagnostics, normalizeCohortDateKey } from "@/services/cohortFiltering";
-import { countryCodeForUserTransactions, normalizeCountryCode } from "@/services/userCountry";
+import { countryUserCountsForTransactions, normalizeCountryCode } from "@/services/userCountry";
 
 // Visual-only helpers — no data/logic impact.
 const HEAD_BASE =
@@ -485,21 +485,6 @@ function trafficForCohort(row: CohortRow, trafficByKey: Map<string, TrafficAggre
   };
 }
 
-function countryOptionsFromTransactions(txs: Transaction[]): string[] {
-  const txsByUser = new Map<string, Transaction[]>();
-  for (const tx of txs) {
-    const list = txsByUser.get(tx.user_id) ?? [];
-    list.push(tx);
-    txsByUser.set(tx.user_id, list);
-  }
-
-  return Array.from(txsByUser.values())
-    .map((list) => normalizeCountryCode(countryCodeForUserTransactions(list)))
-    .filter((country): country is string => Boolean(country))
-    .filter((country, index, countries) => countries.indexOf(country) === index)
-    .sort();
-}
-
 function isTrafficDerivedColumn(id: string): boolean {
   return id === "trial_cost" || TRAFFIC_DERIVED_COLUMN_PREFIXES.some((prefix) => id.startsWith(prefix));
 }
@@ -914,7 +899,7 @@ export default function CohortsPage() {
       }),
     [txs, trafficSourceFilter, campaignIdFilter]
   );
-  const countryOptions = useMemo(() => countryOptionsFromTransactions(sourceFilteredTxs), [sourceFilteredTxs]);
+  const countryOptions = useMemo(() => countryUserCountsForTransactions(sourceFilteredTxs), [sourceFilteredTxs]);
   const allCohorts = useMemo(
     () => computeCohorts(sourceFilteredTxs, subscriptions, { maxRenewalDepth: maxRenewalColumns, selectedCountries }),
     [sourceFilteredTxs, subscriptions, maxRenewalColumns, selectedCountries],
@@ -1616,12 +1601,13 @@ export default function CohortsPage() {
                   <div className="px-3 py-3 text-sm text-muted-foreground">No country data</div>
                 )}
                 {countryOptions.map((country) => (
-                  <label key={country} className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted/50">
+                  <label key={country.country_code} className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted/50">
                     <Checkbox
-                      checked={selectedCountries.includes(country)}
-                      onCheckedChange={() => toggleCountry(country)}
+                      checked={selectedCountries.includes(country.country_code)}
+                      onCheckedChange={() => toggleCountry(country.country_code)}
                     />
-                    <span className="font-medium tabular-nums">{country}</span>
+                    <span className="font-medium tabular-nums">{country.country_code}</span>
+                    <span className="ml-auto text-xs tabular-nums text-muted-foreground">{country.user_count}</span>
                   </label>
                 ))}
               </div>
