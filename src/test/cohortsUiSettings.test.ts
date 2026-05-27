@@ -47,6 +47,7 @@ const defaults: CohortsUiSettingsDefaults = {
   },
   defaultFilters: {
     campaignPathFilter: "all",
+    selectedCountries: [],
     cohortDateFrom: "",
   },
   validWidthKeys: ["__cohort__", "cohort_date", "campaign_path", "trial_users", "net_revenue"],
@@ -105,6 +106,26 @@ describe("cohorts UI settings", () => {
 
     expect(loaded?.sortColumn).toBe("net_revenue");
     expect(loaded?.sortDirection).toBe("desc");
+  });
+
+  it("persists selected GEO countries in local UI settings", () => {
+    const payload = buildCohortsUiSettingsPayload(
+      {
+        columnOrder: ["net_revenue", "campaign_path", "cohort_date", "trial_users"],
+        columnWidths: {},
+        columnVisibility: {},
+        selectedView: null,
+        savedViews: [],
+        filters: { selectedCountries: ["US", "CA"] },
+        updatedAt: "2026-05-09T10:00:00.000Z",
+      },
+      defaults,
+    );
+
+    saveCohortsUiSettingsLocal(payload);
+    const loaded = loadCohortsUiSettingsLocal(defaults);
+
+    expect(loaded?.filters.selectedCountries).toEqual(["US", "CA"]);
   });
 
   it("uses cloud settings when local storage is empty", () => {

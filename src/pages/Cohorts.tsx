@@ -29,7 +29,7 @@ import {
   formatPct,
 } from "@/services/analytics";
 import { normalizeCampaignPath, type TrafficMetric } from "@/services/trafficImport";
-import type { CohortRow, PlanBreakdownRow } from "@/services/types";
+import type { CohortRow, PlanBreakdownRow, Transaction } from "@/services/types";
 import { useDataStore } from "@/store/dataStore";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
 import {
@@ -66,6 +66,7 @@ import {
   renewalLevelFromColumnId,
 } from "@/services/dataSettings";
 import { filterCohortsWithDiagnostics, normalizeCohortDateKey } from "@/services/cohortFiltering";
+import { countryCodeForUserTransactions, normalizeCountryCode } from "@/services/userCountry";
 
 // Visual-only helpers — no data/logic impact.
 const HEAD_BASE =
@@ -85,6 +86,7 @@ const DEFAULT_COHORTS_UI_STATE = {
   trafficSourceFilter: "all",
   campaignIdFilter: "all",
   refundFilter: "all",
+  selectedCountries: [] as string[],
   cohortDateFrom: "",
   cohortDateTo: "",
   dateSort: "desc" as "desc" | "asc",
@@ -416,6 +418,9 @@ type CohortTraffic = {
   ctr: number | null;
 };
 
+const TRAFFIC_GEO_NOTE = "Traffic spend is not GEO-split";
+const TRAFFIC_DERIVED_COLUMN_PREFIXES = ["traffic_", "roas_", "profit"] as const;
+
 function normalizeCohortDate(date: string): string {
   const trimmed = String(date ?? "").trim();
   const isoMatch = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})/);
@@ -478,6 +483,25 @@ function trafficForCohort(row: CohortRow, trafficByKey: Map<string, TrafficAggre
     cpm: traffic.row_count === 1 ? traffic.cpm : null,
     ctr: traffic.row_count === 1 ? traffic.ctr : null,
   };
+}
+
+function countryOptionsFromTransactions(txs: Transaction[]): string[] {
+  const txsByUser = new Map<string, Transaction[]>();
+  for (const tx of txs) {
+    const list = txsByUser.get(tx.user_id) ?? [];
+    list.push(tx);
+    txsByUser.set(tx.user_id, list);
+  }
+
+  return Array.from(txsByUser.values())
+    .map((list) => normalizeCountryCode(countryCodeForUserTransactions(list)))
+    .filter((country): country is string => Boolean(country))
+    .filter((country, index, countries) => countries.indexOf(country) === index)
+    .sort();
+}
+
+function isTrafficDerivedColumn(id: string): boolean {
+  return id === "trial_cost" || TRAFFIC_DERIVED_COLUMN_PREFIXES.some((prefix) => id.startsWith(prefix));
 }
 
 function buildVisibility(visibleIds: CohortColumnId[], defaultColumnOrder = DEFAULT_COLUMN_ORDER): Record<CohortColumnId, boolean> {
@@ -587,12 +611,23 @@ export default function CohortsPage() {
     trafficSourceFilter,
     campaignIdFilter,
     refundFilter,
+    selectedCountries: rawSelectedCountries,
     cohortDateFrom,
     cohortDateTo,
     sortColumn,
     sortDirection,
     expandedCohortIds: expandedCohortIdList,
   } = uiState;
+  const selectedCountries = useMemo(
+    () => Array.isArray(rawSelectedCountries)
+      ? rawSelectedCountries.flatMap((country) => {
+        const normalized = normalizeCountryCode(country);
+        return normalized ? [normalized] : [];
+      })
+      : [],
+    [rawSelectedCountries],
+  );
+  const hasGeoFilter = selectedCountries.length > 0;
   const expandedCohortIds = useMemo(() => new Set(expandedCohortIdList), [expandedCohortIdList]);
   const updateUiState = (patch: Partial<typeof DEFAULT_COHORTS_UI_STATE>) => {
     markCohortsUiSettingsUpdated();
@@ -879,9 +914,10 @@ export default function CohortsPage() {
       }),
     [txs, trafficSourceFilter, campaignIdFilter]
   );
+  const countryOptions = useMemo(() => countryOptionsFromTransactions(sourceFilteredTxs), [sourceFilteredTxs]);
   const allCohorts = useMemo(
-    () => computeCohorts(sourceFilteredTxs, subscriptions, { maxRenewalDepth: maxRenewalColumns }),
-    [sourceFilteredTxs, subscriptions, maxRenewalColumns],
+    () => computeCohorts(sourceFilteredTxs, subscriptions, { maxRenewalDepth: maxRenewalColumns, selectedCountries }),
+    [sourceFilteredTxs, subscriptions, maxRenewalColumns, selectedCountries],
   );
   const trafficByKey = useMemo(() => aggregateTrafficMetrics(trafficMetrics), [trafficMetrics]);
   const funnelOptions = useMemo(() => Array.from(new Set(allCohorts.map((c) => c.funnel))).sort(), [allCohorts]);
@@ -1175,12 +1211,24 @@ export default function CohortsPage() {
     if (sortColumn !== id || !sortDirection) return <ArrowUpDown className="h-3 w-3 opacity-35" />;
     return sortDirection === "asc" ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />;
   };
+  const countrySummary = selectedCountries.length ? selectedCountries.join(", ") : "All countries";
+  const toggleCountry = (country: string) => {
+    const normalized = normalizeCountryCode(country);
+    if (!normalized) return;
+    const next = selectedCountries.includes(normalized)
+      ? selectedCountries.filter((value) => value !== normalized)
+      : [...selectedCountries, normalized].sort();
+    updateUiState({ selectedCountries: next });
+  };
+  const clearCountries = () => updateUiState({ selectedCountries: [] });
+  const trafficCellTitle = hasGeoFilter ? TRAFFIC_GEO_NOTE : undefined;
 
   const renderHeaderCell = (id: CohortColumnId) => (
     <TableHead
       key={id}
       className={headerClassFor(id)}
       style={{ width: columnWidths[id], minWidth: MIN_COLUMN_WIDTH }}
+      title={hasGeoFilter && isTrafficDerivedColumn(id) ? TRAFFIC_GEO_NOTE : undefined}
       draggable
       onDragStart={() => onHeaderDragStart(id)}
       onDragOver={onHeaderDragOver}
@@ -1276,37 +1324,37 @@ export default function CohortsPage() {
       case "revenue_d60":
         return <TableCell key={id} className={className}>{formatCurrency(c.revenue_d60)}</TableCell>;
       case "traffic_spend":
-        return <TableCell key={id} className={className}>{traffic ? formatCurrency(traffic.spend) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic ? formatCurrency(traffic.spend) : dash}</TableCell>;
       case "trial_cost": {
         const trialCost = trialCostForCohort(c, traffic);
-        return <TableCell key={id} className={className}>{trialCost != null ? formatCurrency(trialCost) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{trialCost != null ? formatCurrency(trialCost) : dash}</TableCell>;
       }
       case "profit":
-        return <TableCell key={id} className={className}>{traffic ? formatCurrency(c.net_revenue - traffic.spend) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic ? formatCurrency(c.net_revenue - traffic.spend) : dash}</TableCell>;
       case "profit_d7":
-        return <TableCell key={id} className={className}>{traffic ? formatCurrency(c.revenue_d7 - traffic.spend) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic ? formatCurrency(c.revenue_d7 - traffic.spend) : dash}</TableCell>;
       case "profit_1m":
-        return <TableCell key={id} className={className}>{traffic ? formatCurrency(c.revenue_d30 - traffic.spend) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic ? formatCurrency(c.revenue_d30 - traffic.spend) : dash}</TableCell>;
       case "profit_2m":
-        return <TableCell key={id} className={className}>{traffic ? formatCurrency(c.revenue_d60 - traffic.spend) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic ? formatCurrency(c.revenue_d60 - traffic.spend) : dash}</TableCell>;
       case "traffic_cac":
-        return <TableCell key={id} className={className}>{traffic ? formatCurrency(traffic.cac) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic ? formatCurrency(traffic.cac) : dash}</TableCell>;
       case "traffic_trial_count":
-        return <TableCell key={id} className={className}>{traffic ? traffic.trial_count : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic ? traffic.trial_count : dash}</TableCell>;
       case "traffic_clicks":
-        return <TableCell key={id} className={className}>{traffic ? traffic.clicks : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic ? traffic.clicks : dash}</TableCell>;
       case "traffic_cpc":
-        return <TableCell key={id} className={className}>{traffic ? formatCurrency(traffic.cpc) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic ? formatCurrency(traffic.cpc) : dash}</TableCell>;
       case "traffic_cpm":
-        return <TableCell key={id} className={className}>{traffic?.cpm != null ? formatCurrency(traffic.cpm) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic?.cpm != null ? formatCurrency(traffic.cpm) : dash}</TableCell>;
       case "traffic_ctr":
-        return <TableCell key={id} className={className}>{traffic?.ctr != null ? formatPct(traffic.ctr) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic?.ctr != null ? formatPct(traffic.ctr) : dash}</TableCell>;
       case "roas_d7":
-        return <TableCell key={id} className={className}>{traffic?.spend ? formatRoas(c.revenue_d7 / traffic.spend) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic?.spend ? formatRoas(c.revenue_d7 / traffic.spend) : dash}</TableCell>;
       case "roas_1m":
-        return <TableCell key={id} className={className}>{traffic?.spend ? formatRoas(c.revenue_d30 / traffic.spend) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic?.spend ? formatRoas(c.revenue_d30 / traffic.spend) : dash}</TableCell>;
       case "roas_2m":
-        return <TableCell key={id} className={className}>{traffic?.spend ? formatRoas(c.revenue_d60 / traffic.spend) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic?.spend ? formatRoas(c.revenue_d60 / traffic.spend) : dash}</TableCell>;
     }
   };
 
@@ -1378,7 +1426,7 @@ export default function CohortsPage() {
         return <TableCell key={id} className={className}>{formatCurrency(plan.revenue_d60)}</TableCell>;
       case "trial_cost": {
         const trialCost = trialCostFromSpend(traffic?.spend, plan.trial_users);
-        return <TableCell key={id} className={className}>{trialCost != null ? formatCurrency(trialCost) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{trialCost != null ? formatCurrency(trialCost) : dash}</TableCell>;
       }
       case "traffic_spend":
       case "profit":
@@ -1394,7 +1442,7 @@ export default function CohortsPage() {
       case "roas_d7":
       case "roas_1m":
       case "roas_2m":
-        return <TableCell key={id} className={className}>{dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{dash}</TableCell>;
     }
   };
 
@@ -1466,34 +1514,34 @@ export default function CohortsPage() {
       case "revenue_d60":
         return <TableCell key={id} className={className}>{formatCurrency(totals.revenueD60)}</TableCell>;
       case "traffic_spend":
-        return <TableCell key={id} className={className}>{totals.hasTrafficSpend ? formatCurrency(totals.trafficSpend) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{totals.hasTrafficSpend ? formatCurrency(totals.trafficSpend) : dash}</TableCell>;
       case "trial_cost":
-        return <TableCell key={id} className={className}>{totals.trialCost != null ? formatCurrency(totals.trialCost) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{totals.trialCost != null ? formatCurrency(totals.trialCost) : dash}</TableCell>;
       case "profit":
-        return <TableCell key={id} className={className}>{totals.hasCompleteTrafficSpend ? formatCurrency(totals.profit) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{totals.hasCompleteTrafficSpend ? formatCurrency(totals.profit) : dash}</TableCell>;
       case "profit_d7":
-        return <TableCell key={id} className={className}>{totals.hasCompleteTrafficSpend ? formatCurrency(totals.profitD7) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{totals.hasCompleteTrafficSpend ? formatCurrency(totals.profitD7) : dash}</TableCell>;
       case "profit_1m":
-        return <TableCell key={id} className={className}>{totals.hasCompleteTrafficSpend ? formatCurrency(totals.profit1m) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{totals.hasCompleteTrafficSpend ? formatCurrency(totals.profit1m) : dash}</TableCell>;
       case "profit_2m":
-        return <TableCell key={id} className={className}>{totals.hasCompleteTrafficSpend ? formatCurrency(totals.profit2m) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{totals.hasCompleteTrafficSpend ? formatCurrency(totals.profit2m) : dash}</TableCell>;
       case "traffic_cac":
-        return <TableCell key={id} className={className}>{totals.trafficTrials ? formatCurrency(totals.trafficCac) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{totals.trafficTrials ? formatCurrency(totals.trafficCac) : dash}</TableCell>;
       case "traffic_trial_count":
-        return <TableCell key={id} className={className}>{totals.trafficTrials || dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{totals.trafficTrials || dash}</TableCell>;
       case "traffic_clicks":
-        return <TableCell key={id} className={className}>{totals.trafficClicks || dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{totals.trafficClicks || dash}</TableCell>;
       case "traffic_cpc":
-        return <TableCell key={id} className={className}>{totals.trafficClicks ? formatCurrency(totals.trafficCpc) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{totals.trafficClicks ? formatCurrency(totals.trafficCpc) : dash}</TableCell>;
       case "traffic_cpm":
       case "traffic_ctr":
-        return <TableCell key={id} className={className}>{dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{dash}</TableCell>;
       case "roas_d7":
-        return <TableCell key={id} className={className}>{totals.hasCompleteTrafficSpend && totals.trafficSpend ? formatRoas(totals.roasD7) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{totals.hasCompleteTrafficSpend && totals.trafficSpend ? formatRoas(totals.roasD7) : dash}</TableCell>;
       case "roas_1m":
-        return <TableCell key={id} className={className}>{totals.hasCompleteTrafficSpend && totals.trafficSpend ? formatRoas(totals.roas1m) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{totals.hasCompleteTrafficSpend && totals.trafficSpend ? formatRoas(totals.roas1m) : dash}</TableCell>;
       case "roas_2m":
-        return <TableCell key={id} className={className}>{totals.hasCompleteTrafficSpend && totals.trafficSpend ? formatRoas(totals.roas2m) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{totals.hasCompleteTrafficSpend && totals.trafficSpend ? formatRoas(totals.roas2m) : dash}</TableCell>;
     }
   };
 
@@ -1545,6 +1593,45 @@ export default function CohortsPage() {
               <SelectItem value="none">No refunds</SelectItem>
             </SelectContent>
           </Select>
+          <Popover>
+            <PopoverTrigger asChild>
+              <Button type="button" variant="outline" size="sm" className="h-9 max-w-[220px] justify-between gap-2">
+                <span className="text-xs text-muted-foreground">GEO</span>
+                <span className="truncate">{countrySummary}</span>
+                <ChevronDown className="h-3.5 w-3.5 shrink-0 opacity-60" />
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent align="start" className="w-64 p-0">
+              <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
+                <div>
+                  <div className="text-xs font-medium text-muted-foreground">GEO</div>
+                  <div className="text-xs text-muted-foreground">All countries by default</div>
+                </div>
+                <Button type="button" variant="ghost" size="sm" className="h-7 text-xs" onClick={clearCountries} disabled={!selectedCountries.length}>
+                  Clear
+                </Button>
+              </div>
+              <div className="max-h-72 overflow-auto py-1">
+                {countryOptions.length === 0 && (
+                  <div className="px-3 py-3 text-sm text-muted-foreground">No country data</div>
+                )}
+                {countryOptions.map((country) => (
+                  <label key={country} className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted/50">
+                    <Checkbox
+                      checked={selectedCountries.includes(country)}
+                      onCheckedChange={() => toggleCountry(country)}
+                    />
+                    <span className="font-medium tabular-nums">{country}</span>
+                  </label>
+                ))}
+              </div>
+            </PopoverContent>
+          </Popover>
+          {hasGeoFilter && (
+            <span className="text-xs text-muted-foreground" title={TRAFFIC_GEO_NOTE}>
+              Spend is cohort-level
+            </span>
+          )}
           <div className="flex items-center gap-2">
             <Label htmlFor="cohort-date-from" className="text-xs text-muted-foreground">Cohort date from</Label>
             <Input

@@ -1,6 +1,6 @@
 import type { CohortRow, PlanBreakdownRow, Transaction, UserAggregate } from "./types";
 import type { SubscriptionClean } from "@/types/subscriptions";
-import { countryCodeForUserTransactions } from "@/services/userCountry";
+import { countryCodeForUserTransactions, normalizeCountryCode } from "@/services/userCountry";
 import {
   DEFAULT_MAX_RENEWAL_COLUMNS,
   MAX_SUPPORTED_RENEWAL_COLUMNS,
@@ -193,6 +193,15 @@ export interface Kpis {
 
 export interface ComputeCohortsOptions {
   maxRenewalDepth?: number;
+  selectedCountries?: string[];
+}
+
+function normalizeCountryFilter(countries: unknown): Set<string> {
+  if (!Array.isArray(countries)) return new Set();
+  return new Set(countries.flatMap((country) => {
+    const normalized = normalizeCountryCode(country);
+    return normalized ? [normalized] : [];
+  }));
 }
 
 export function computeKpis(txs: Transaction[]): Kpis {
@@ -545,9 +554,27 @@ export function computeCohorts(
   options: ComputeCohortsOptions = {},
 ): CohortRow[] {
   const analyticsTxs = dedupeTransactionsForAnalytics(txs);
+  const selectedCountries = normalizeCountryFilter(options.selectedCountries);
+  const countryFilteredUserIds = new Set<string>();
+  const txsByUserForCountry = new Map<string, Transaction[]>();
+  if (selectedCountries.size > 0) {
+    for (const tx of analyticsTxs) {
+      const list = txsByUserForCountry.get(tx.user_id) ?? [];
+      list.push(tx);
+      txsByUserForCountry.set(tx.user_id, list);
+    }
+    txsByUserForCountry.forEach((list, userId) => {
+      const country = countryCodeForUserTransactions(list);
+      if (country && selectedCountries.has(country)) countryFilteredUserIds.add(userId);
+    });
+  }
   // Cohort membership is anchored to the exact trial timestamp; the displayed
   // date is only a label. This keeps D0/D7/D30 windows aligned per user.
-  const trials = analyticsTxs.filter((t) => t.transaction_type === "trial" && t.status === "success");
+  const countryFilteredTxs =
+    selectedCountries.size > 0
+      ? analyticsTxs.filter((tx) => countryFilteredUserIds.has(tx.user_id))
+      : analyticsTxs;
+  const trials = countryFilteredTxs.filter((t) => t.transaction_type === "trial" && t.status === "success");
   const cohortByUser = new Map<string, { id: string; date: string; funnel: Transaction["funnel"]; campaignPath: string; ts: number }>();
   for (const t of [...trials].sort((a, b) => (a.event_time < b.event_time ? -1 : 1))) {
     if (cohortByUser.has(t.user_id)) continue;
@@ -571,12 +598,12 @@ export function computeCohorts(
   });
 
   const userTxs = new Map<string, Transaction[]>();
-  for (const t of analyticsTxs) {
+  for (const t of countryFilteredTxs) {
     const list = userTxs.get(t.user_id) ?? [];
     list.push(t);
     userTxs.set(t.user_id, list);
   }
-  const subscriptionFlags = subscriptionFlagsByEmail(analyticsTxs, subscriptions);
+  const subscriptionFlags = subscriptionFlagsByEmail(countryFilteredTxs, subscriptions);
   const maxRenewalDepth = sanitizeMaxRenewalColumns(options.maxRenewalDepth ?? DEFAULT_MAX_RENEWAL_DEPTH);
 
   const rows: CohortRow[] = [];
