@@ -258,6 +258,7 @@ export default function UsersPage() {
     const fromDateKey = toDateKey(cohortDateFrom);
     const toDateKeyValue = toDateKey(cohortDateTo);
     const list = cohorts.filter((cohort) => {
+      if (campaignPathFilter !== "all" && cohort.campaign_path !== campaignPathFilter) return false;
       if (q && !`${cohort.campaign_path} ${cohort.funnel}`.toLowerCase().includes(q)) return false;
       const cohortDateKey = toDateKey(cohort.cohort_date);
       if (fromDateKey && cohortDateKey < fromDateKey) return false;
@@ -271,7 +272,7 @@ export default function UsersPage() {
       return cohortSortDir === "asc" ? cmp : -cmp;
     });
     return list;
-  }, [cohorts, cohortSearch, cohortDateFrom, cohortDateTo, cohortSortKey, cohortSortDir]);
+  }, [cohorts, campaignPathFilter, cohortSearch, cohortDateFrom, cohortDateTo, cohortSortKey, cohortSortDir]);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -406,6 +407,15 @@ export default function UsersPage() {
                 className="h-9 pl-8"
               />
             </div>
+            <Select value={campaignPathFilter} onValueChange={(value) => updateUiState({ campaignPathFilter: value })}>
+              <SelectTrigger className="h-9 w-full"><SelectValue placeholder="Campaign path" /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All campaign paths</SelectItem>
+                {campaignPathOptions.map((path) => (
+                  <SelectItem key={path} value={path}>{path}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
             <div className="grid grid-cols-2 gap-2">
               <Input
                 type="date"
@@ -501,15 +511,6 @@ export default function UsersPage() {
               className="pl-8 h-9"
             />
           </div>
-          <Select value={campaignPathFilter} onValueChange={(value) => updateUiState({ campaignPathFilter: value })}>
-            <SelectTrigger className="h-9 w-[220px]"><SelectValue placeholder="Campaign path" /></SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">All campaign paths</SelectItem>
-              {campaignPathOptions.map((path) => (
-                <SelectItem key={path} value={path}>{path}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
           <Select value={countryFilter} onValueChange={(value) => updateUiState({ countryFilter: value })}>
             <SelectTrigger className="h-9 w-[170px]"><SelectValue placeholder="Country" /></SelectTrigger>
             <SelectContent>
