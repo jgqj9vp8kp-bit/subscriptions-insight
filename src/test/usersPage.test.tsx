@@ -435,6 +435,47 @@ describe("Users page", () => {
     expect(screen.queryByText("No users match your filters.")).not.toBeInTheDocument();
   });
 
+  it("shows active user filters and resets them without clearing selected cohorts", () => {
+    localStorage.setItem(
+      "ui_state_users",
+      JSON.stringify({
+        selectedCohortIds: ["campaign-a_2026-05-02"],
+        firstSubFilter: "has",
+        firstTrialTo: "2026-04-14",
+      }),
+    );
+    vi.mocked(useTransactions).mockReturnValue([
+      cohortTx({
+        user_id: "may_user",
+        email: "may@example.com",
+        campaign_path: "campaign-a",
+        event_time: "2026-05-02T10:00:00.000Z",
+        cohort_date: "2026-05-02",
+        cohort_id: "campaign-a_2026-05-02",
+      }),
+      cohortTx({
+        user_id: "other",
+        email: "other@example.com",
+        campaign_path: "campaign-b",
+        event_time: "2026-05-03T10:00:00.000Z",
+        cohort_date: "2026-05-03",
+        cohort_id: "campaign-b_2026-05-03",
+      }),
+    ]);
+
+    render(<UsersPage />);
+
+    expect(screen.getByText("No users match selected cohorts and filters.")).toBeInTheDocument();
+    expect(screen.getByText(/First sub: Has First Sub/)).toBeInTheDocument();
+    expect(screen.getByText(/First trial to: 14.04.2026/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Reset filters" }));
+
+    expect(screen.getByText("may@example.com")).toBeInTheDocument();
+    expect(screen.queryByText("other@example.com")).not.toBeInTheDocument();
+    expect(screen.getByText("1 cohort selected")).toBeInTheDocument();
+  });
+
   it("selects multiple cohorts with regular clicks", () => {
     vi.mocked(useTransactions).mockReturnValue([
       cohortTx({ user_id: "a", email: "a@example.com", campaign_path: "campaign-a" }),

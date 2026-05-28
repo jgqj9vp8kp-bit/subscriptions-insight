@@ -252,7 +252,7 @@ export default function UsersPage() {
   const txs = useTransactions();
   const rawPalmerRows = useDataStore((s) => s.rawPalmerRows);
   const subscriptions = useDataStore((s) => s.subscriptions);
-  const [uiState, setUiState, resetUiState] = usePersistedPageState("ui_state_users", DEFAULT_USERS_UI_STATE);
+  const [uiState, setUiState] = usePersistedPageState("ui_state_users", DEFAULT_USERS_UI_STATE);
   const {
     search,
     campaignPathFilter,
@@ -565,6 +565,31 @@ export default function UsersPage() {
     { label: "Avg Failed Attempts", value: declineAnalytics.avgAttempts.toFixed(2) },
   ];
   const maxDeclineTransactions = Math.max(1, ...declineAnalytics.rows.map((row) => row.failed_transactions));
+  const activeUserFilterLabels = [
+    search.trim() ? `Search: ${search.trim()}` : null,
+    selectedCohortIdSet.size === 0 && campaignPathFilter !== "all" ? `Campaign: ${campaignPathFilter}` : null,
+    countryFilter !== "all" ? `Country: ${countryFilter}` : null,
+    selectedCardTypes.length ? `Card Type: ${selectedCardTypes.map(cardTypeLabel).join(", ")}` : null,
+    paymentFailedFilter !== "all" ? `Payment Failed: ${paymentFailedFilter === "has" ? "Has failed payments" : "No failed payments"}` : null,
+    selectedDeclineReasons.length ? `Decline Reason: ${selectedDeclineReasons.join(", ")}` : null,
+    failedAttemptsFilter !== "all" ? `Failed Attempts: ${failedAttemptsFilter.replace("gte", ">= ")}` : null,
+    firstSubFilter !== "all" ? `First sub: ${firstSubFilter === "has" ? "Has First Sub" : "No First Sub"}` : null,
+    refundFilter !== "all" ? `Refund: ${refundFilter === "has" ? "Has refund" : "No refund"}` : null,
+    firstTrialFrom ? `First trial from: ${formatDateKey(firstTrialFrom)}` : null,
+    firstTrialTo ? `First trial to: ${formatDateKey(firstTrialTo)}` : null,
+  ].filter((label): label is string => Boolean(label));
+  const clearUserFilters = () => updateUiState({
+    search: "",
+    countryFilter: "all",
+    selectedCardTypes: [],
+    paymentFailedFilter: "all",
+    selectedDeclineReasons: [],
+    failedAttemptsFilter: "all",
+    firstSubFilter: "all",
+    refundFilter: "all",
+    firstTrialFrom: "",
+    firstTrialTo: "",
+  });
 
   return (
     <AppLayout title="Users" description={`${filtered.length} users`}>
@@ -839,7 +864,7 @@ export default function UsersPage() {
               Clear date filter
             </Button>
           )}
-          <Button type="button" variant="ghost" size="sm" onClick={resetUiState}>
+          <Button type="button" variant="ghost" size="sm" onClick={clearUserFilters}>
             Reset filters
           </Button>
         </div>
@@ -980,7 +1005,19 @@ export default function UsersPage() {
               {filtered.length === 0 && (
                 <TableRow>
                   <TableCell colSpan={18} className="text-center text-sm text-muted-foreground py-10">
-                    No users match your filters.
+                    <div className="space-y-3">
+                      <div>{selectedCohortIds.length ? "No users match selected cohorts and filters." : "No users match your filters."}</div>
+                      {activeUserFilterLabels.length > 0 && (
+                        <div className="mx-auto max-w-2xl text-xs">
+                          Active filters: {activeUserFilterLabels.join("; ")}
+                        </div>
+                      )}
+                      {activeUserFilterLabels.length > 0 && (
+                        <Button type="button" variant="outline" size="sm" onClick={clearUserFilters}>
+                          Reset user filters
+                        </Button>
+                      )}
+                    </div>
                   </TableCell>
                 </TableRow>
               )}
@@ -1023,9 +1060,23 @@ export default function UsersPage() {
 
             {declineAnalytics.selectedUsers === 0 ? (
               <div className="rounded-md border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">
-                {selectedCohortIds.length && cohortScopedUserCount > 0
-                  ? "No users match selected cohorts and filters."
-                  : "No users selected."}
+                <div className="space-y-3">
+                  <div>
+                    {selectedCohortIds.length && cohortScopedUserCount > 0
+                      ? "No users match selected cohorts and filters."
+                      : "No users selected."}
+                  </div>
+                  {activeUserFilterLabels.length > 0 && (
+                    <div className="mx-auto max-w-2xl text-xs">
+                      Active filters: {activeUserFilterLabels.join("; ")}
+                    </div>
+                  )}
+                  {activeUserFilterLabels.length > 0 && (
+                    <Button type="button" variant="outline" size="sm" onClick={clearUserFilters}>
+                      Reset user filters
+                    </Button>
+                  )}
+                </div>
               </div>
             ) : declineAnalytics.failedTransactions === 0 ? (
               <div className="rounded-md border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">
