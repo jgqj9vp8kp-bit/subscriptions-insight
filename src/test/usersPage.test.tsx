@@ -1,7 +1,8 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import UsersPage from "@/pages/Users";
+import { useDataStore } from "@/store/dataStore";
 import type { Transaction } from "@/services/types";
 
 vi.mock("@/components/AppLayout", () => ({
@@ -43,6 +44,7 @@ describe("Users page", () => {
   beforeEach(() => {
     localStorage.clear();
     vi.clearAllMocks();
+    useDataStore.setState({ rawPalmerRows: [], subscriptions: [] });
   });
 
   it("displays user country code when available", () => {
@@ -290,5 +292,141 @@ describe("Users page", () => {
     const rows = screen.getAllByRole("row");
     expect(rows[1]).toHaveTextContent("multi@example.com");
     expect(rows[2]).toHaveTextContent("single@example.com");
+  });
+
+  function cohortTx(overrides: Partial<Transaction> = {}): Transaction {
+    const campaignPath = overrides.campaign_path ?? "campaign-a";
+    const eventDate = overrides.event_time?.slice(0, 10) ?? "2026-01-01";
+    return tx({
+      transaction_id: `${overrides.user_id ?? "user_1"}_trial`,
+      user_id: overrides.user_id ?? "user_1",
+      email: overrides.email ?? "user@example.com",
+      event_time: overrides.event_time ?? "2026-01-01T10:00:00.000Z",
+      campaign_path: campaignPath,
+      funnel: overrides.funnel ?? "soulmate",
+      cohort_date: overrides.cohort_date ?? eventDate,
+      cohort_id: overrides.cohort_id ?? `${campaignPath}_${eventDate}`,
+      ...overrides,
+    });
+  }
+
+  function clickCohort(campaignPath: string, options: MouseEventInit = {}) {
+    const label = screen.getAllByText(campaignPath)[0];
+    const button = label.closest('[role="button"]');
+    if (!button) throw new Error(`Could not find cohort button for ${campaignPath}`);
+    fireEvent.click(button, options);
+  }
+
+  it("renders the cohort list", () => {
+    vi.mocked(useTransactions).mockReturnValue([
+      cohortTx({ user_id: "a", email: "a@example.com", campaign_path: "campaign-a" }),
+      cohortTx({ user_id: "b", email: "b@example.com", campaign_path: "campaign-b", event_time: "2026-01-02T10:00:00.000Z" }),
+    ]);
+
+    render(<UsersPage />);
+
+    expect(screen.getByText("Cohorts")).toBeInTheDocument();
+    expect(screen.getAllByText("campaign-a").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("campaign-b").length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/1 trials/).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("selects one cohort and filters users", () => {
+    vi.mocked(useTransactions).mockReturnValue([
+      cohortTx({ user_id: "a", email: "a@example.com", campaign_path: "campaign-a" }),
+      cohortTx({ user_id: "b", email: "b@example.com", campaign_path: "campaign-b", event_time: "2026-01-02T10:00:00.000Z" }),
+    ]);
+
+    render(<UsersPage />);
+    clickCohort("campaign-a");
+
+    expect(screen.getByText("a@example.com")).toBeInTheDocument();
+    expect(screen.queryByText("b@example.com")).not.toBeInTheDocument();
+  });
+
+  it("selects multiple cohorts with modifier click", () => {
+    vi.mocked(useTransactions).mockReturnValue([
+      cohortTx({ user_id: "a", email: "a@example.com", campaign_path: "campaign-a" }),
+      cohortTx({ user_id: "b", email: "b@example.com", campaign_path: "campaign-b", event_time: "2026-01-02T10:00:00.000Z" }),
+      cohortTx({ user_id: "c", email: "c@example.com", campaign_path: "campaign-c", event_time: "2026-01-03T10:00:00.000Z" }),
+    ]);
+
+    render(<UsersPage />);
+    clickCohort("campaign-a");
+    clickCohort("campaign-b", { ctrlKey: true });
+
+    expect(screen.getByText("a@example.com")).toBeInTheDocument();
+    expect(screen.getByText("b@example.com")).toBeInTheDocument();
+    expect(screen.queryByText("c@example.com")).not.toBeInTheDocument();
+  });
+
+  it("clears cohort selection and shows all users again", () => {
+    vi.mocked(useTransactions).mockReturnValue([
+      cohortTx({ user_id: "a", email: "a@example.com", campaign_path: "campaign-a" }),
+      cohortTx({ user_id: "b", email: "b@example.com", campaign_path: "campaign-b", event_time: "2026-01-02T10:00:00.000Z" }),
+    ]);
+
+    render(<UsersPage />);
+    clickCohort("campaign-a");
+    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+
+    expect(screen.getByText("a@example.com")).toBeInTheDocument();
+    expect(screen.getByText("b@example.com")).toBeInTheDocument();
+  });
+
+  it("updates summary stats after cohort selection", () => {
+    vi.mocked(useTransactions).mockReturnValue([
+      cohortTx({ user_id: "a", email: "a@example.com", campaign_path: "campaign-a" }),
+      tx({
+        transaction_id: "a_upsell",
+        user_id: "a",
+        email: "a@example.com",
+        event_time: "2026-01-01T11:00:00.000Z",
+        transaction_type: "upsell",
+        campaign_path: "campaign-a",
+        amount_usd: 9,
+        gross_amount_usd: 9,
+        net_amount_usd: 9,
+      }),
+      cohortTx({ user_id: "b", email: "b@example.com", campaign_path: "campaign-b", event_time: "2026-01-02T10:00:00.000Z" }),
+    ]);
+
+    render(<UsersPage />);
+    clickCohort("campaign-a");
+
+    expect(screen.getByText("Users").parentElement).toHaveTextContent("1");
+    expect(screen.getByText("Upsell Users").parentElement).toHaveTextContent("1");
+    expect(screen.getByText("Net Rev").parentElement).toHaveTextContent("$10");
+  });
+
+  it("keeps existing filters after cohort selection", () => {
+    localStorage.setItem("ui_state_users", JSON.stringify({ selectedCardTypes: ["credit"] }));
+    vi.mocked(useTransactions).mockReturnValue([
+      cohortTx({ user_id: "credit", email: "credit@example.com", campaign_path: "campaign-a", card_type: "credit" }),
+      cohortTx({ user_id: "debit", email: "debit@example.com", campaign_path: "campaign-a", card_type: "debit" }),
+    ]);
+
+    render(<UsersPage />);
+    clickCohort("campaign-a");
+
+    expect(screen.getByText("credit@example.com")).toBeInTheDocument();
+    expect(screen.queryByText("debit@example.com")).not.toBeInTheDocument();
+  });
+
+  it("sorts users inside selected cohorts", () => {
+    localStorage.setItem("ui_state_users", JSON.stringify({ sortKey: "total_revenue", sortDir: "desc" }));
+    vi.mocked(useTransactions).mockReturnValue([
+      cohortTx({ user_id: "low", email: "low@example.com", campaign_path: "campaign-a", amount_usd: 1, gross_amount_usd: 1, net_amount_usd: 1 }),
+      cohortTx({ user_id: "high", email: "high@example.com", campaign_path: "campaign-a", amount_usd: 5, gross_amount_usd: 5, net_amount_usd: 5 }),
+      cohortTx({ user_id: "other", email: "other@example.com", campaign_path: "campaign-b", event_time: "2026-01-02T10:00:00.000Z", amount_usd: 20, gross_amount_usd: 20, net_amount_usd: 20 }),
+    ]);
+
+    render(<UsersPage />);
+    clickCohort("campaign-a");
+
+    const rows = screen.getAllByRole("row");
+    expect(rows[1]).toHaveTextContent("high@example.com");
+    expect(rows[2]).toHaveTextContent("low@example.com");
+    expect(screen.queryByText("other@example.com")).not.toBeInTheDocument();
   });
 });
