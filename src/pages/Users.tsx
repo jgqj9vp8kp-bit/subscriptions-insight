@@ -74,6 +74,11 @@ interface UserSubscriptionFlags {
   cancelled: boolean;
 }
 
+interface CohortMembershipLookup {
+  byUserId: Map<string, Set<string>>;
+  byEmail: Map<string, Set<string>>;
+}
+
 interface DeclineBreakdownRow {
   reason: DeclineReason;
   failed_users: number;
@@ -161,6 +166,53 @@ function buildCohortByUser(txs: Transaction[]): Map<string, UserCohortInfo> {
     });
   }
   return result;
+}
+
+function addCohortMembership(
+  lookup: CohortMembershipLookup,
+  tx: Pick<Transaction, "user_id" | "email">,
+  cohortId: string | null | undefined,
+) {
+  if (!cohortId) return;
+  if (tx.user_id) {
+    const ids = lookup.byUserId.get(tx.user_id) ?? new Set<string>();
+    ids.add(cohortId);
+    lookup.byUserId.set(tx.user_id, ids);
+  }
+  const email = emailKey(tx.email);
+  if (email) {
+    const ids = lookup.byEmail.get(email) ?? new Set<string>();
+    ids.add(cohortId);
+    lookup.byEmail.set(email, ids);
+  }
+}
+
+function buildCohortMembershipLookup(txs: Transaction[]): CohortMembershipLookup {
+  const lookup: CohortMembershipLookup = { byUserId: new Map(), byEmail: new Map() };
+
+  for (const tx of txs) {
+    addCohortMembership(lookup, tx, tx.cohort_id);
+    if (tx.transaction_type === "trial" && tx.status === "success") {
+      const cohortDate = tx.cohort_date ?? tx.event_time.slice(0, 10);
+      const campaignPath = tx.campaign_path || "unknown";
+      addCohortMembership(lookup, tx, tx.cohort_id ?? `${campaignPath}_${cohortDate}`);
+    }
+  }
+
+  return lookup;
+}
+
+function userMatchesSelectedCohorts(
+  user: UserExplorerRow,
+  selectedCohortIdSet: Set<string>,
+  membership: CohortMembershipLookup,
+): boolean {
+  if (selectedCohortIdSet.size === 0) return true;
+  if (user.cohort_id && selectedCohortIdSet.has(user.cohort_id)) return true;
+  const userIds = membership.byUserId.get(user.user_id);
+  if (userIds && [...selectedCohortIdSet].some((cohortId) => userIds.has(cohortId))) return true;
+  const emailIds = membership.byEmail.get(emailKey(user.email));
+  return Boolean(emailIds && [...selectedCohortIdSet].some((cohortId) => emailIds.has(cohortId)));
 }
 
 function buildUserSubscriptionFlags(cohorts: CohortRow[]): Map<string, UserSubscriptionFlags> {
@@ -260,6 +312,7 @@ export default function UsersPage() {
   const cohorts = useMemo(() => computeCohorts(analyticsTxs, subscriptions), [analyticsTxs, subscriptions]);
   const users: UserAggregate[] = useMemo(() => computeUsers(analyticsTxs), [analyticsTxs]);
   const cohortByUser = useMemo(() => buildCohortByUser(analyticsTxs), [analyticsTxs]);
+  const cohortMembership = useMemo(() => buildCohortMembershipLookup(analyticsTxs), [analyticsTxs]);
   const campaignPathByUser = useMemo(() => buildCampaignPathByUser(analyticsTxs), [analyticsTxs]);
   const userSubscriptionFlags = useMemo(() => buildUserSubscriptionFlags(cohorts), [cohorts]);
   const usersWithCampaignPath: UserExplorerRow[] = useMemo(
@@ -309,6 +362,11 @@ export default function UsersPage() {
     return list;
   }, [cohorts, campaignPathFilter, cohortSearch, cohortDateFrom, cohortDateTo, cohortSortKey, cohortSortDir]);
 
+  const cohortScopedUserCount = useMemo(
+    () => usersWithCampaignPath.filter((user) => userMatchesSelectedCohorts(user, selectedCohortIdSet, cohortMembership)).length,
+    [usersWithCampaignPath, selectedCohortIdSet, cohortMembership],
+  );
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     const fromDateKey = toDateKey(firstTrialFrom);
@@ -316,7 +374,7 @@ export default function UsersPage() {
     const hasFirstTrialFilter = Boolean(fromDateKey || toDateKeyValue);
     const failedAttemptsThreshold = failedAttemptsFilter === "gte5" ? 5 : failedAttemptsFilter === "gte3" ? 3 : failedAttemptsFilter === "gte1" ? 1 : 0;
     const list = usersWithCampaignPath.filter((u) => {
-      if (selectedCohortIdSet.size > 0 && (!u.cohort_id || !selectedCohortIdSet.has(u.cohort_id))) return false;
+      if (!userMatchesSelectedCohorts(u, selectedCohortIdSet, cohortMembership)) return false;
       if (q && !u.email.toLowerCase().includes(q) && !u.user_id.toLowerCase().includes(q)) return false;
       if (campaignPathFilter !== "all" && u.campaign_path !== campaignPathFilter) return false;
       if (countryFilter !== "all" && u.country_code !== countryFilter) return false;
@@ -350,7 +408,7 @@ export default function UsersPage() {
       return sortDir === "asc" ? cmp : -cmp;
     });
     return list;
-  }, [usersWithCampaignPath, selectedCohortIdSet, search, campaignPathFilter, countryFilter, selectedCardTypes, paymentFailedFilter, selectedDeclineReasons, failedAttemptsFilter, firstSubFilter, refundFilter, firstTrialFrom, firstTrialTo, sortKey, sortDir]);
+  }, [usersWithCampaignPath, selectedCohortIdSet, cohortMembership, search, campaignPathFilter, countryFilter, selectedCardTypes, paymentFailedFilter, selectedDeclineReasons, failedAttemptsFilter, firstSubFilter, refundFilter, firstTrialFrom, firstTrialTo, sortKey, sortDir]);
 
   const summary = useMemo(() => {
     const userIds = new Set(filtered.map((user) => user.user_id));
@@ -965,7 +1023,9 @@ export default function UsersPage() {
 
             {declineAnalytics.selectedUsers === 0 ? (
               <div className="rounded-md border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">
-                No users selected.
+                {selectedCohortIds.length && cohortScopedUserCount > 0
+                  ? "No users match selected cohorts and filters."
+                  : "No users selected."}
               </div>
             ) : declineAnalytics.failedTransactions === 0 ? (
               <div className="rounded-md border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">

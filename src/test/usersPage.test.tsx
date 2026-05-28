@@ -376,6 +376,33 @@ describe("Users page", () => {
     expect(screen.queryByText("b@example.com")).not.toBeInTheDocument();
   });
 
+  it("matches selected cohorts from transaction cohort ids when user rows have no trial cohort", () => {
+    vi.mocked(useTransactions).mockReturnValue([
+      cohortTx({ user_id: "trial_user", email: "trial@example.com", campaign_path: "campaign-a" }),
+      tx({
+        transaction_id: "payment_tx",
+        user_id: "payment_user",
+        email: "payment@example.com",
+        transaction_type: "renewal_2",
+        status: "success",
+        amount_usd: 10,
+        gross_amount_usd: 10,
+        net_amount_usd: 10,
+        campaign_path: "campaign-a",
+        cohort_id: "campaign-a_2026-01-01",
+        cohort_date: "2026-01-01",
+      }),
+      cohortTx({ user_id: "other", email: "other@example.com", campaign_path: "campaign-b", event_time: "2026-01-02T10:00:00.000Z" }),
+    ]);
+
+    render(<UsersPage />);
+    clickCohort("campaign-a");
+
+    expect(screen.getByText("trial@example.com")).toBeInTheDocument();
+    expect(screen.getByText("payment@example.com")).toBeInTheDocument();
+    expect(screen.queryByText("other@example.com")).not.toBeInTheDocument();
+  });
+
   it("selects multiple cohorts with regular clicks", () => {
     vi.mocked(useTransactions).mockReturnValue([
       cohortTx({ user_id: "a", email: "a@example.com", campaign_path: "campaign-a" }),
