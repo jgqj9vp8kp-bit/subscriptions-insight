@@ -344,7 +344,7 @@ describe("Users page", () => {
     expect(screen.queryByText("b@example.com")).not.toBeInTheDocument();
   });
 
-  it("selects multiple cohorts with modifier click", () => {
+  it("selects multiple cohorts with regular clicks", () => {
     vi.mocked(useTransactions).mockReturnValue([
       cohortTx({ user_id: "a", email: "a@example.com", campaign_path: "campaign-a" }),
       cohortTx({ user_id: "b", email: "b@example.com", campaign_path: "campaign-b", event_time: "2026-01-02T10:00:00.000Z" }),
@@ -353,7 +353,7 @@ describe("Users page", () => {
 
     render(<UsersPage />);
     clickCohort("campaign-a");
-    clickCohort("campaign-b", { ctrlKey: true });
+    clickCohort("campaign-b");
 
     expect(screen.getByText("a@example.com")).toBeInTheDocument();
     expect(screen.getByText("b@example.com")).toBeInTheDocument();

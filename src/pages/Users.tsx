@@ -368,7 +368,6 @@ export default function UsersPage() {
       : [...selectedCohortIds, cohortId];
     updateUiState({ selectedCohortIds: next });
   };
-  const selectOnlyCohort = (cohortId: string) => updateUiState({ selectedCohortIds: [cohortId] });
   const clearCohortSelection = () => updateUiState({ selectedCohortIds: [] });
   const toggleCohortSortDirection = () => updateUiState({ cohortSortDir: cohortSortDir === "asc" ? "desc" : "asc" });
   const summaryCards = [
@@ -453,15 +452,11 @@ export default function UsersPage() {
                     key={cohort.cohort_id}
                     role="button"
                     tabIndex={0}
-                    onClick={(event) => {
-                      if (event.metaKey || event.ctrlKey) toggleCohortSelection(cohort.cohort_id);
-                      else selectOnlyCohort(cohort.cohort_id);
-                    }}
+                    onClick={() => toggleCohortSelection(cohort.cohort_id)}
                     onKeyDown={(event) => {
                       if (event.key === "Enter" || event.key === " ") {
                         event.preventDefault();
-                        if (event.metaKey || event.ctrlKey) toggleCohortSelection(cohort.cohort_id);
-                        else selectOnlyCohort(cohort.cohort_id);
+                        toggleCohortSelection(cohort.cohort_id);
                       }
                     }}
                     className={cn(
