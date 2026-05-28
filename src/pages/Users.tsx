@@ -376,7 +376,7 @@ export default function UsersPage() {
     const list = usersWithCampaignPath.filter((u) => {
       if (!userMatchesSelectedCohorts(u, selectedCohortIdSet, cohortMembership)) return false;
       if (q && !u.email.toLowerCase().includes(q) && !u.user_id.toLowerCase().includes(q)) return false;
-      if (campaignPathFilter !== "all" && u.campaign_path !== campaignPathFilter) return false;
+      if (selectedCohortIdSet.size === 0 && campaignPathFilter !== "all" && u.campaign_path !== campaignPathFilter) return false;
       if (countryFilter !== "all" && u.country_code !== countryFilter) return false;
       if (selectedCardTypes.length > 0 && !selectedCardTypes.includes(u.card_type)) return false;
       if (paymentFailedFilter === "has" && !u.has_failed_payment) return false;

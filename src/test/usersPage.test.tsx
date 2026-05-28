@@ -403,6 +403,38 @@ describe("Users page", () => {
     expect(screen.queryByText("other@example.com")).not.toBeInTheDocument();
   });
 
+  it("does not re-filter selected cohort users by campaign path", () => {
+    localStorage.setItem(
+      "ui_state_users",
+      JSON.stringify({
+        campaignPathFilter: "campaign-a",
+        selectedCohortIds: ["campaign-a_2026-01-01"],
+      }),
+    );
+    vi.mocked(useTransactions).mockReturnValue([
+      cohortTx({ user_id: "trial_user", email: "trial@example.com", campaign_path: "campaign-a" }),
+      tx({
+        transaction_id: "payment_tx",
+        user_id: "payment_user",
+        email: "payment@example.com",
+        transaction_type: "renewal_2",
+        status: "success",
+        amount_usd: 10,
+        gross_amount_usd: 10,
+        net_amount_usd: 10,
+        campaign_path: "unknown",
+        cohort_id: "campaign-a_2026-01-01",
+        cohort_date: "2026-01-01",
+      }),
+    ]);
+
+    render(<UsersPage />);
+
+    expect(screen.getByText("trial@example.com")).toBeInTheDocument();
+    expect(screen.getByText("payment@example.com")).toBeInTheDocument();
+    expect(screen.queryByText("No users match your filters.")).not.toBeInTheDocument();
+  });
+
   it("selects multiple cohorts with regular clicks", () => {
     vi.mocked(useTransactions).mockReturnValue([
       cohortTx({ user_id: "a", email: "a@example.com", campaign_path: "campaign-a" }),
