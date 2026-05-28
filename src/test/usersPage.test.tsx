@@ -317,6 +317,38 @@ describe("Users page", () => {
     fireEvent.click(button, options);
   }
 
+  function switchToDeclineAnalytics() {
+    const tab = screen.getByRole("tab", { name: "Decline Analytics" });
+    fireEvent.mouseDown(tab, { button: 0, ctrlKey: false });
+  }
+
+  function startInDeclineAnalytics(extraState: Record<string, unknown> = {}) {
+    localStorage.setItem("ui_state_users", JSON.stringify({ mode: "decline_analytics", ...extraState }));
+  }
+
+  function summaryCard(label: string): HTMLElement {
+    const card = screen
+      .getAllByText(label)
+      .map((element) => element.closest(".rounded-md"))
+      .find((element): element is HTMLElement => Boolean(element?.textContent?.includes(label)));
+    if (!card) throw new Error(`Could not find summary card: ${label}`);
+    return card;
+  }
+
+  function failedTx(overrides: Partial<Transaction> = {}): Transaction {
+    return tx({
+      transaction_id: overrides.transaction_id ?? "failed_tx",
+      status: "failed",
+      transaction_type: "failed_payment",
+      amount_usd: 0,
+      gross_amount_usd: 0,
+      net_amount_usd: 0,
+      classification_reason: "failed Palmer status",
+      event_time: overrides.event_time ?? "2026-01-02T10:00:00.000Z",
+      ...overrides,
+    });
+  }
+
   it("renders the cohort list", () => {
     vi.mocked(useTransactions).mockReturnValue([
       cohortTx({ user_id: "a", email: "a@example.com", campaign_path: "campaign-a" }),
@@ -428,5 +460,159 @@ describe("Users page", () => {
     expect(rows[1]).toHaveTextContent("high@example.com");
     expect(rows[2]).toHaveTextContent("low@example.com");
     expect(screen.queryByText("other@example.com")).not.toBeInTheDocument();
+  });
+
+  it("switches from the users table to decline analytics", () => {
+    vi.mocked(useTransactions).mockReturnValue([
+      cohortTx({ user_id: "a", email: "a@example.com", campaign_path: "campaign-a" }),
+    ]);
+
+    render(<UsersPage />);
+
+    expect(screen.getByText("a@example.com")).toBeInTheDocument();
+    switchToDeclineAnalytics();
+    expect(screen.getByText("No declined payments found for selected users.")).toBeInTheDocument();
+  });
+
+  it("switches to decline analytics and groups all failed transactions by reason", () => {
+    startInDeclineAnalytics();
+    vi.mocked(useTransactions).mockReturnValue([
+      cohortTx({ user_id: "a", email: "a@example.com", campaign_path: "campaign-a" }),
+      failedTx({
+        transaction_id: "a_fail_1",
+        user_id: "a",
+        email: "a@example.com",
+        raw: { declineReasons: "[{'decline_reason': 'INSUFFICIENT_FUNDS', 'message': 'insufficient_funds'}]" },
+      }),
+      failedTx({
+        transaction_id: "a_fail_2",
+        user_id: "a",
+        email: "a@example.com",
+        event_time: "2026-01-03T10:00:00.000Z",
+        raw: { declineReasons: "[{'payment_method_result_code': '51'}]" },
+      }),
+      cohortTx({ user_id: "b", email: "b@example.com", campaign_path: "campaign-b", event_time: "2026-01-04T10:00:00.000Z" }),
+      failedTx({
+        transaction_id: "b_fail_1",
+        user_id: "b",
+        email: "b@example.com",
+        event_time: "2026-01-05T10:00:00.000Z",
+        raw: { declineReasons: "[{'decline_reason': 'DO_NOT_HONOR'}]" },
+      }),
+    ]);
+
+    render(<UsersPage />);
+
+    expect(summaryCard("Failed Users")).toHaveTextContent("2");
+    expect(summaryCard("Failed Transactions")).toHaveTextContent("3");
+    expect(summaryCard("Decline Rate")).toHaveTextContent("100.0%");
+    expect(summaryCard("Top Decline Reason")).toHaveTextContent("insufficient_funds");
+    expect(summaryCard("Avg Failed Attempts")).toHaveTextContent("1.50");
+    expect(screen.getByText("66.7%")).toBeInTheDocument();
+    expect(screen.getByText("33.3%")).toBeInTheDocument();
+  });
+
+  it("uses all visible users in decline analytics when no cohort is selected", () => {
+    startInDeclineAnalytics({ selectedCardTypes: ["credit"] });
+    vi.mocked(useTransactions).mockReturnValue([
+      cohortTx({ user_id: "credit", email: "credit@example.com", campaign_path: "campaign-a", card_type: "credit" }),
+      failedTx({
+        transaction_id: "credit_fail",
+        user_id: "credit",
+        email: "credit@example.com",
+        card_type: "credit",
+        raw: { declineReasons: "[{'decline_reason': 'DO_NOT_HONOR'}]" },
+      }),
+      cohortTx({ user_id: "debit", email: "debit@example.com", campaign_path: "campaign-b", card_type: "debit" }),
+      failedTx({
+        transaction_id: "debit_fail",
+        user_id: "debit",
+        email: "debit@example.com",
+        card_type: "debit",
+        raw: { declineReasons: "[{'decline_reason': 'INSUFFICIENT_FUNDS'}]" },
+      }),
+    ]);
+
+    render(<UsersPage />);
+
+    expect(summaryCard("Failed Transactions")).toHaveTextContent("1");
+    expect(screen.getAllByText("do_not_honor").length).toBeGreaterThan(0);
+    expect(screen.queryByText("insufficient_funds")).not.toBeInTheDocument();
+  });
+
+  it("updates decline analytics when selected cohorts change", () => {
+    startInDeclineAnalytics();
+    vi.mocked(useTransactions).mockReturnValue([
+      cohortTx({ user_id: "a", email: "a@example.com", campaign_path: "campaign-a" }),
+      failedTx({
+        transaction_id: "a_fail",
+        user_id: "a",
+        email: "a@example.com",
+        raw: { declineReasons: "[{'decline_reason': 'INSUFFICIENT_FUNDS'}]" },
+      }),
+      cohortTx({ user_id: "b", email: "b@example.com", campaign_path: "campaign-b", event_time: "2026-01-04T10:00:00.000Z" }),
+      failedTx({
+        transaction_id: "b_fail",
+        user_id: "b",
+        email: "b@example.com",
+        raw: { declineReasons: "[{'decline_reason': 'DO_NOT_HONOR'}]" },
+      }),
+    ]);
+
+    render(<UsersPage />);
+    clickCohort("campaign-a");
+
+    expect(summaryCard("Failed Transactions")).toHaveTextContent("1");
+    expect(screen.getAllByText("insufficient_funds").length).toBeGreaterThan(0);
+    expect(screen.queryByText("do_not_honor")).not.toBeInTheDocument();
+  });
+
+  it("shows an empty decline analytics state when no failures exist", () => {
+    startInDeclineAnalytics();
+    vi.mocked(useTransactions).mockReturnValue([
+      cohortTx({ user_id: "a", email: "a@example.com", campaign_path: "campaign-a" }),
+    ]);
+
+    render(<UsersPage />);
+
+    expect(screen.getByText("No declined payments found for selected users.")).toBeInTheDocument();
+  });
+
+  it("sorts decline reason breakdown", () => {
+    startInDeclineAnalytics();
+    vi.mocked(useTransactions).mockReturnValue([
+      cohortTx({ user_id: "a", email: "a@example.com", campaign_path: "campaign-a" }),
+      failedTx({
+        transaction_id: "a_fail",
+        user_id: "a",
+        email: "a@example.com",
+        raw: { declineReasons: "[{'decline_reason': 'INSUFFICIENT_FUNDS'}]" },
+      }),
+      cohortTx({ user_id: "b", email: "b@example.com", campaign_path: "campaign-b", event_time: "2026-01-04T10:00:00.000Z" }),
+      failedTx({
+        transaction_id: "b_fail_1",
+        user_id: "b",
+        email: "b@example.com",
+        raw: { declineReasons: "[{'decline_reason': 'DO_NOT_HONOR'}]" },
+      }),
+      failedTx({
+        transaction_id: "b_fail_2",
+        user_id: "b",
+        email: "b@example.com",
+        event_time: "2026-01-05T10:00:00.000Z",
+        raw: { declineReasons: "[{'decline_reason': 'DO_NOT_HONOR'}]" },
+      }),
+    ]);
+
+    render(<UsersPage />);
+
+    let rows = screen.getAllByRole("row");
+    expect(rows[1]).toHaveTextContent("do_not_honor");
+    fireEvent.click(screen.getAllByRole("button", { name: /Decline Reason/ }).at(-1)!);
+    rows = screen.getAllByRole("row");
+    expect(rows[1]).toHaveTextContent("do_not_honor");
+    fireEvent.click(screen.getAllByRole("button", { name: /Decline Reason/ }).at(-1)!);
+    rows = screen.getAllByRole("row");
+    expect(rows[1]).toHaveTextContent("insufficient_funds");
   });
 });

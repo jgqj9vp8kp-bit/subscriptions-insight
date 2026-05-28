@@ -6,6 +6,7 @@ import { Card } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Select,
   SelectContent,
@@ -27,7 +28,7 @@ import { formatDateKey, toDateKey } from "@/services/dateKeys";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
 import { CARD_TYPE_VALUES, cardTypeLabel } from "@/services/userCardType";
 import { backfillTransactionCardTypesFromRawRows } from "@/services/palmerTransform";
-import { DECLINE_REASON_VALUES, enrichTransactionDeclinesFromRawRows } from "@/services/paymentFailures";
+import { DECLINE_REASON_VALUES, declineDetailsForTransaction, enrichTransactionDeclinesFromRawRows, isFailedPaymentTransaction } from "@/services/paymentFailures";
 import { useDataStore } from "@/store/dataStore";
 import { cn } from "@/lib/utils";
 import type { CardType, CohortRow, DeclineReason, Transaction, UserAggregate } from "@/services/types";
@@ -50,6 +51,8 @@ type RefundFilter = "all" | "has" | "none";
 type PaymentFailedFilter = "all" | "has" | "none";
 type FailedAttemptsFilter = "all" | "gte1" | "gte3" | "gte5";
 type CohortExplorerSortKey = "date" | "trial_users" | "net_revenue";
+type UsersPageMode = "users_table" | "decline_analytics";
+type DeclineSortKey = "reason" | "failed_users" | "failed_transactions" | "share" | "avg_attempts" | "latest_failed_date";
 type UserExplorerRow = UserAggregate & {
   campaign_path: string;
   cohort_id: string | null;
@@ -71,6 +74,15 @@ interface UserSubscriptionFlags {
   cancelled: boolean;
 }
 
+interface DeclineBreakdownRow {
+  reason: DeclineReason;
+  failed_users: number;
+  failed_transactions: number;
+  share: number;
+  avg_attempts: number;
+  latest_failed_date: string | null;
+}
+
 const DEFAULT_USERS_UI_STATE = {
   search: "",
   campaignPathFilter: "all",
@@ -85,6 +97,10 @@ const DEFAULT_USERS_UI_STATE = {
   cohortDateTo: "",
   cohortSortKey: "date" as CohortExplorerSortKey,
   cohortSortDir: "desc" as "asc" | "desc",
+  mode: "users_table" as UsersPageMode,
+  declineAnalyticsReasons: [] as DeclineReason[],
+  declineSortKey: "failed_transactions" as DeclineSortKey,
+  declineSortDir: "desc" as "asc" | "desc",
   firstSubFilter: "all" as FirstSubFilter,
   refundFilter: "all" as RefundFilter,
   firstTrialFrom: "",
@@ -172,6 +188,14 @@ function declineReasonBadgeClass(reason: DeclineReason): string {
   return "bg-secondary text-secondary-foreground";
 }
 
+function emailKey(value: string | null | undefined): string {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+function formatPct(value: number, digits = 1): string {
+  return `${value.toFixed(digits)}%`;
+}
+
 export default function UsersPage() {
   const txs = useTransactions();
   const rawPalmerRows = useDataStore((s) => s.rawPalmerRows);
@@ -191,6 +215,10 @@ export default function UsersPage() {
     cohortDateTo,
     cohortSortKey,
     cohortSortDir,
+    mode,
+    declineAnalyticsReasons: rawDeclineAnalyticsReasons,
+    declineSortKey,
+    declineSortDir,
     firstSubFilter,
     refundFilter,
     firstTrialFrom,
@@ -216,6 +244,13 @@ export default function UsersPage() {
   const selectedCohortIds = useMemo(
     () => Array.isArray(rawSelectedCohortIds) ? rawSelectedCohortIds.filter((value): value is string => typeof value === "string") : [],
     [rawSelectedCohortIds],
+  );
+  const declineAnalyticsReasons = useMemo(
+    () =>
+      Array.isArray(rawDeclineAnalyticsReasons)
+        ? rawDeclineAnalyticsReasons.filter((value): value is DeclineReason => DECLINE_REASON_VALUES.includes(value as DeclineReason))
+        : [],
+    [rawDeclineAnalyticsReasons],
   );
 
   const analyticsTxs = useMemo(
@@ -336,6 +371,73 @@ export default function UsersPage() {
     };
   }, [filtered, analyticsTxs]);
 
+  const declineAnalytics = useMemo(() => {
+    const selectedUserIds = new Set(filtered.map((user) => user.user_id));
+    const selectedEmails = new Set(filtered.map((user) => emailKey(user.email)).filter(Boolean));
+    const selectedReasonSet = new Set(declineAnalyticsReasons);
+    const byReason = new Map<DeclineReason, { users: Set<string>; transactions: number; latest: string | null }>();
+    const failedUsers = new Set<string>();
+    let failedTransactions = 0;
+
+    if (!filtered.length) {
+      return {
+        selectedUsers: 0,
+        failedUsers: 0,
+        failedTransactions: 0,
+        declineRate: 0,
+        topReason: null as DeclineReason | null,
+        avgAttempts: 0,
+        rows: [] as DeclineBreakdownRow[],
+      };
+    }
+
+    for (const tx of analyticsTxs) {
+      if (!isFailedPaymentTransaction(tx)) continue;
+      const userMatches = selectedUserIds.has(tx.user_id) || selectedEmails.has(emailKey(tx.email));
+      if (!userMatches) continue;
+      const details = declineDetailsForTransaction(tx);
+      const reason = details?.reason ?? "unknown";
+      if (selectedReasonSet.size > 0 && !selectedReasonSet.has(reason)) continue;
+      const userKey = tx.user_id || emailKey(tx.email);
+      failedUsers.add(userKey);
+      failedTransactions += 1;
+      const row = byReason.get(reason) ?? { users: new Set<string>(), transactions: 0, latest: null };
+      row.users.add(userKey);
+      row.transactions += 1;
+      const eventTime = details?.date ?? tx.event_time;
+      if (!row.latest || eventTime > row.latest) row.latest = eventTime;
+      byReason.set(reason, row);
+    }
+
+    const rows = Array.from(byReason.entries()).map(([reason, row]) => ({
+      reason,
+      failed_users: row.users.size,
+      failed_transactions: row.transactions,
+      share: failedTransactions ? (row.transactions / failedTransactions) * 100 : 0,
+      avg_attempts: row.users.size ? row.transactions / row.users.size : 0,
+      latest_failed_date: row.latest,
+    }));
+
+    rows.sort((a, b) => {
+      const av = a[declineSortKey];
+      const bv = b[declineSortKey];
+      const cmp = av == null && bv == null ? 0 : av == null ? 1 : bv == null ? -1 : av < bv ? -1 : av > bv ? 1 : 0;
+      return declineSortDir === "asc" ? cmp : -cmp;
+    });
+
+    const topReason = [...rows].sort((a, b) => b.failed_transactions - a.failed_transactions || a.reason.localeCompare(b.reason))[0]?.reason ?? null;
+
+    return {
+      selectedUsers: filtered.length,
+      failedUsers: failedUsers.size,
+      failedTransactions,
+      declineRate: filtered.length ? (failedUsers.size / filtered.length) * 100 : 0,
+      topReason,
+      avgAttempts: failedUsers.size ? failedTransactions / failedUsers.size : 0,
+      rows,
+    };
+  }, [filtered, analyticsTxs, declineAnalyticsReasons, declineSortKey, declineSortDir]);
+
   const hasFirstTrialFilter = Boolean(firstTrialFrom || firstTrialTo);
 
   const toggleSort = (key: SortKey) => {
@@ -348,6 +450,7 @@ export default function UsersPage() {
     sortDir === "asc" ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />;
   const cardTypeSummary = selectedCardTypes.length ? selectedCardTypes.map(cardTypeLabel).join(", ") : "All card types";
   const declineReasonSummary = selectedDeclineReasons.length ? selectedDeclineReasons.join(", ") : "All reasons";
+  const declineAnalyticsReasonSummary = declineAnalyticsReasons.length ? declineAnalyticsReasons.join(", ") : "All reasons";
   const toggleCardType = (cardType: CardType) => {
     const next = selectedCardTypes.includes(cardType)
       ? selectedCardTypes.filter((value) => value !== cardType)
@@ -362,6 +465,20 @@ export default function UsersPage() {
     updateUiState({ selectedDeclineReasons: next });
   };
   const clearDeclineReasons = () => updateUiState({ selectedDeclineReasons: [] });
+  const toggleDeclineAnalyticsReason = (reason: DeclineReason) => {
+    const next = declineAnalyticsReasons.includes(reason)
+      ? declineAnalyticsReasons.filter((value) => value !== reason)
+      : [...declineAnalyticsReasons, reason];
+    updateUiState({ declineAnalyticsReasons: next });
+  };
+  const clearDeclineAnalyticsReasons = () => updateUiState({ declineAnalyticsReasons: [] });
+  const toggleDeclineSort = (key: DeclineSortKey) => {
+    if (declineSortKey === key) updateUiState({ declineSortDir: declineSortDir === "asc" ? "desc" : "asc" });
+    else updateUiState({ declineSortKey: key, declineSortDir: key === "reason" ? "asc" : "desc" });
+  };
+  const declineIcon = (key: DeclineSortKey) =>
+    declineSortKey !== key ? <ArrowUpDown className="h-3 w-3 opacity-40" /> :
+    declineSortDir === "asc" ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />;
   const toggleCohortSelection = (cohortId: string) => {
     const next = selectedCohortIds.includes(cohortId)
       ? selectedCohortIds.filter((value) => value !== cohortId)
@@ -382,6 +499,14 @@ export default function UsersPage() {
     { label: "Net Rev", value: formatCurrency(summary.net_revenue) },
     { label: "Failed Payment Users", value: String(summary.failed_payment_users) },
   ];
+  const declineSummaryCards = [
+    { label: "Failed Users", value: String(declineAnalytics.failedUsers) },
+    { label: "Failed Transactions", value: String(declineAnalytics.failedTransactions) },
+    { label: "Decline Rate", value: formatPct(declineAnalytics.declineRate) },
+    { label: "Top Decline Reason", value: declineAnalytics.topReason ?? "—" },
+    { label: "Avg Failed Attempts", value: declineAnalytics.avgAttempts.toFixed(2) },
+  ];
+  const maxDeclineTransactions = Math.max(1, ...declineAnalytics.rows.map((row) => row.failed_transactions));
 
   return (
     <AppLayout title="Users" description={`${filtered.length} users`}>
@@ -496,6 +621,18 @@ export default function UsersPage() {
         </Card>
 
         <Card className="min-w-0 p-4 shadow-card">
+        <Tabs value={mode} onValueChange={(value) => updateUiState({ mode: value as UsersPageMode })}>
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+            <TabsList>
+              <TabsTrigger value="users_table">Users Table</TabsTrigger>
+              <TabsTrigger value="decline_analytics">Decline Analytics</TabsTrigger>
+            </TabsList>
+            <div className="text-xs text-muted-foreground">
+              {selectedCohortIds.length ? `${selectedCohortIds.length} cohort${selectedCohortIds.length === 1 ? "" : "s"} selected` : "All visible users"}
+            </div>
+          </div>
+
+          <TabsContent value="users_table" className="mt-0">
         <div className="flex flex-wrap items-center gap-2">
           <div className="relative min-w-[220px] flex-1">
             <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
@@ -792,6 +929,137 @@ export default function UsersPage() {
             </TableBody>
           </Table>
         </div>
+          </TabsContent>
+
+          <TabsContent value="decline_analytics" className="mt-0 space-y-4">
+            <div className="flex flex-wrap items-center gap-2">
+              <Popover>
+                <PopoverTrigger asChild>
+                  <Button type="button" variant="outline" size="sm" className="h-9 max-w-[300px] justify-between gap-2">
+                    <span className="text-xs text-muted-foreground">Decline Reason</span>
+                    <span className="truncate">{declineAnalyticsReasonSummary}</span>
+                    <ChevronDown className="h-3.5 w-3.5 shrink-0 opacity-60" />
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent align="start" className="w-72 p-0">
+                  <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
+                    <div className="text-xs font-medium text-muted-foreground">Decline Reason</div>
+                    <Button type="button" variant="ghost" size="sm" className="h-7 text-xs" onClick={clearDeclineAnalyticsReasons} disabled={!declineAnalyticsReasons.length}>
+                      All reasons
+                    </Button>
+                  </div>
+                  <div className="max-h-72 overflow-y-auto py-1">
+                    {DECLINE_REASON_VALUES.map((reason) => (
+                      <label key={reason} className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted/50">
+                        <Checkbox
+                          checked={declineAnalyticsReasons.includes(reason)}
+                          onCheckedChange={() => toggleDeclineAnalyticsReason(reason)}
+                        />
+                        <span>{reason}</span>
+                      </label>
+                    ))}
+                  </div>
+                </PopoverContent>
+              </Popover>
+            </div>
+
+            {declineAnalytics.selectedUsers === 0 ? (
+              <div className="rounded-md border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">
+                No users selected.
+              </div>
+            ) : declineAnalytics.failedTransactions === 0 ? (
+              <div className="rounded-md border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">
+                No declined payments found for selected users.
+              </div>
+            ) : (
+              <>
+                <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-5">
+                  {declineSummaryCards.map((card) => (
+                    <div key={card.label} className="rounded-md border border-border bg-muted/20 px-3 py-2">
+                      <div className="text-xs text-muted-foreground">{card.label}</div>
+                      <div className="mt-1 truncate text-sm font-semibold tabular-nums">{card.value}</div>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="rounded-lg border border-border p-4">
+                  <div className="mb-3 text-sm font-medium">Top decline reasons</div>
+                  <div className="space-y-3">
+                    {declineAnalytics.rows.slice(0, 8).map((row) => (
+                      <div key={row.reason} className="grid grid-cols-[minmax(150px,240px)_1fr_auto] items-center gap-3 text-sm">
+                        <span className="truncate text-xs text-muted-foreground">{row.reason}</span>
+                        <div className="h-2 overflow-hidden rounded-full bg-muted">
+                          <div
+                            className="h-full rounded-full bg-primary"
+                            style={{ width: `${Math.max(4, (row.failed_transactions / maxDeclineTransactions) * 100)}%` }}
+                          />
+                        </div>
+                        <span className="text-xs font-medium tabular-nums">{row.failed_transactions}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="overflow-x-auto rounded-lg border border-border">
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>
+                          <button onClick={() => toggleDeclineSort("reason")} className="inline-flex items-center gap-1 hover:text-foreground">
+                            Decline Reason {declineIcon("reason")}
+                          </button>
+                        </TableHead>
+                        <TableHead className="text-right">
+                          <button onClick={() => toggleDeclineSort("failed_users")} className="inline-flex items-center gap-1 hover:text-foreground">
+                            Failed Users {declineIcon("failed_users")}
+                          </button>
+                        </TableHead>
+                        <TableHead className="text-right">
+                          <button onClick={() => toggleDeclineSort("failed_transactions")} className="inline-flex items-center gap-1 hover:text-foreground">
+                            Failed Transactions {declineIcon("failed_transactions")}
+                          </button>
+                        </TableHead>
+                        <TableHead className="text-right">
+                          <button onClick={() => toggleDeclineSort("share")} className="inline-flex items-center gap-1 hover:text-foreground">
+                            Share {declineIcon("share")}
+                          </button>
+                        </TableHead>
+                        <TableHead className="text-right">
+                          <button onClick={() => toggleDeclineSort("avg_attempts")} className="inline-flex items-center gap-1 hover:text-foreground">
+                            Avg Attempts {declineIcon("avg_attempts")}
+                          </button>
+                        </TableHead>
+                        <TableHead>
+                          <button onClick={() => toggleDeclineSort("latest_failed_date")} className="inline-flex items-center gap-1 hover:text-foreground">
+                            Latest Failed Date {declineIcon("latest_failed_date")}
+                          </button>
+                        </TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {declineAnalytics.rows.map((row) => (
+                        <TableRow key={row.reason}>
+                          <TableCell>
+                            <span className={cn("inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium", declineReasonBadgeClass(row.reason))}>
+                              {row.reason}
+                            </span>
+                          </TableCell>
+                          <TableCell className="text-right tabular-nums">{row.failed_users}</TableCell>
+                          <TableCell className="text-right tabular-nums">{row.failed_transactions}</TableCell>
+                          <TableCell className="text-right tabular-nums">{formatPct(row.share)}</TableCell>
+                          <TableCell className="text-right tabular-nums">{row.avg_attempts.toFixed(2)}</TableCell>
+                          <TableCell className="text-xs text-muted-foreground tabular-nums">
+                            {row.latest_failed_date ? formatDateKey(row.latest_failed_date) : "—"}
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </div>
+              </>
+            )}
+          </TabsContent>
+        </Tabs>
         </Card>
       </div>
     </AppLayout>
