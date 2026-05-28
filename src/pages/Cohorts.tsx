@@ -29,7 +29,7 @@ import {
   formatPct,
 } from "@/services/analytics";
 import { normalizeCampaignPath, type TrafficMetric } from "@/services/trafficImport";
-import type { CohortRow, PlanBreakdownRow } from "@/services/types";
+import type { CardType, CohortRow, PlanBreakdownRow } from "@/services/types";
 import { useDataStore } from "@/store/dataStore";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
 import {
@@ -68,6 +68,8 @@ import {
 import { filterCohortsWithDiagnostics, normalizeCohortDateKey } from "@/services/cohortFiltering";
 import { buildCohortGeoOptions } from "@/services/cohortGeo";
 import { normalizeCountryCode } from "@/services/userCountry";
+import { CARD_TYPE_VALUES, cardTypeLabel } from "@/services/userCardType";
+import { backfillTransactionCardTypesFromRawRows } from "@/services/palmerTransform";
 
 // Visual-only helpers — no data/logic impact.
 const HEAD_BASE =
@@ -88,6 +90,7 @@ const DEFAULT_COHORTS_UI_STATE = {
   campaignIdFilter: "all",
   refundFilter: "all",
   selectedCountries: [] as string[],
+  selectedCardTypes: [] as CardType[],
   cohortDateFrom: "",
   cohortDateTo: "",
   dateSort: "desc" as "desc" | "asc",
@@ -420,6 +423,7 @@ type CohortTraffic = {
 };
 
 const TRAFFIC_GEO_NOTE = "Traffic spend is not GEO-split";
+const TRAFFIC_CARD_TYPE_NOTE = "Traffic spend is not split by card type.";
 const TRAFFIC_DERIVED_COLUMN_PREFIXES = ["traffic_", "roas_", "profit"] as const;
 
 function normalizeCohortDate(date: string): string {
@@ -590,6 +594,7 @@ export default function CohortsPage() {
   const txs = useTransactions();
   const subscriptions = useDataStore((s) => s.subscriptions);
   const trafficMetrics = useDataStore((s) => s.trafficMetrics);
+  const rawPalmerRows = useDataStore((s) => s.rawPalmerRows);
   const [uiState, setUiState, resetUiState] = usePersistedPageState("ui_state_cohorts", DEFAULT_COHORTS_UI_STATE);
   const {
     funnelFilter,
@@ -598,6 +603,7 @@ export default function CohortsPage() {
     campaignIdFilter,
     refundFilter,
     selectedCountries: rawSelectedCountries,
+    selectedCardTypes: rawSelectedCardTypes,
     cohortDateFrom,
     cohortDateTo,
     sortColumn,
@@ -613,7 +619,15 @@ export default function CohortsPage() {
       : [],
     [rawSelectedCountries],
   );
+  const selectedCardTypes = useMemo(
+    () =>
+      Array.isArray(rawSelectedCardTypes)
+        ? rawSelectedCardTypes.filter((value): value is CardType => CARD_TYPE_VALUES.includes(value as CardType))
+        : [],
+    [rawSelectedCardTypes],
+  );
   const hasGeoFilter = selectedCountries.length > 0;
+  const hasCardTypeFilter = selectedCardTypes.length > 0;
   const expandedCohortIds = useMemo(() => new Set(expandedCohortIdList), [expandedCohortIdList]);
   const updateUiState = (patch: Partial<typeof DEFAULT_COHORTS_UI_STATE>) => {
     markCohortsUiSettingsUpdated();
@@ -889,20 +903,24 @@ export default function CohortsPage() {
     }
   }, [defaultColumnOrder, defaultColumnWidths, defaultVisibility, setUiState, sortColumn]);
 
-  const trafficSourceOptions = useMemo(() => Array.from(new Set(txs.map((t) => t.traffic_source))).sort(), [txs]);
-  const campaignIdOptions = useMemo(() => Array.from(new Set(txs.map((t) => t.campaign_id || "unknown"))).sort(), [txs]);
+  const analyticsTxs = useMemo(
+    () => backfillTransactionCardTypesFromRawRows(txs, rawPalmerRows),
+    [txs, rawPalmerRows],
+  );
+  const trafficSourceOptions = useMemo(() => Array.from(new Set(analyticsTxs.map((t) => t.traffic_source))).sort(), [analyticsTxs]);
+  const campaignIdOptions = useMemo(() => Array.from(new Set(analyticsTxs.map((t) => t.campaign_id || "unknown"))).sort(), [analyticsTxs]);
   const sourceFilteredTxs = useMemo(
     () =>
-      txs.filter((t) => {
+      analyticsTxs.filter((t) => {
         if (trafficSourceFilter !== "all" && t.traffic_source !== trafficSourceFilter) return false;
         if (campaignIdFilter !== "all" && (t.campaign_id || "unknown") !== campaignIdFilter) return false;
         return true;
       }),
-    [txs, trafficSourceFilter, campaignIdFilter]
+    [analyticsTxs, trafficSourceFilter, campaignIdFilter]
   );
   const allCohorts = useMemo(
-    () => computeCohorts(sourceFilteredTxs, subscriptions, { maxRenewalDepth: maxRenewalColumns, selectedCountries }),
-    [sourceFilteredTxs, subscriptions, maxRenewalColumns, selectedCountries],
+    () => computeCohorts(sourceFilteredTxs, subscriptions, { maxRenewalDepth: maxRenewalColumns, selectedCountries, selectedCardTypes }),
+    [sourceFilteredTxs, subscriptions, maxRenewalColumns, selectedCountries, selectedCardTypes],
   );
   const trafficByKey = useMemo(() => aggregateTrafficMetrics(trafficMetrics), [trafficMetrics]);
   const funnelOptions = useMemo(() => Array.from(new Set(allCohorts.map((c) => c.funnel))).sort(), [allCohorts]);
@@ -1217,6 +1235,7 @@ export default function CohortsPage() {
     return sortDirection === "asc" ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />;
   };
   const countrySummary = selectedCountries.length ? selectedCountries.join(", ") : "All countries";
+  const cardTypeSummary = selectedCardTypes.length ? selectedCardTypes.map(cardTypeLabel).join(", ") : "All card types";
   const toggleCountry = (country: string) => {
     const normalized = normalizeCountryCode(country);
     if (!normalized) return;
@@ -1226,14 +1245,27 @@ export default function CohortsPage() {
     updateUiState({ selectedCountries: next });
   };
   const clearCountries = () => updateUiState({ selectedCountries: [] });
-  const trafficCellTitle = hasGeoFilter ? TRAFFIC_GEO_NOTE : undefined;
+  const toggleCardType = (cardType: CardType) => {
+    const next = selectedCardTypes.includes(cardType)
+      ? selectedCardTypes.filter((value) => value !== cardType)
+      : [...selectedCardTypes, cardType];
+    updateUiState({ selectedCardTypes: next });
+  };
+  const clearCardTypes = () => updateUiState({ selectedCardTypes: [] });
+  const trafficCellTitle = hasGeoFilter && hasCardTypeFilter
+    ? `${TRAFFIC_GEO_NOTE}. ${TRAFFIC_CARD_TYPE_NOTE}`
+    : hasCardTypeFilter
+      ? TRAFFIC_CARD_TYPE_NOTE
+      : hasGeoFilter
+        ? TRAFFIC_GEO_NOTE
+        : undefined;
 
   const renderHeaderCell = (id: CohortColumnId) => (
     <TableHead
       key={id}
       className={headerClassFor(id)}
       style={{ width: columnWidths[id], minWidth: MIN_COLUMN_WIDTH }}
-      title={hasGeoFilter && isTrafficDerivedColumn(id) ? TRAFFIC_GEO_NOTE : undefined}
+      title={trafficCellTitle && isTrafficDerivedColumn(id) ? trafficCellTitle : undefined}
       draggable
       onDragStart={() => onHeaderDragStart(id)}
       onDragOver={onHeaderDragOver}
@@ -1633,8 +1665,39 @@ export default function CohortsPage() {
               </div>
             </PopoverContent>
           </Popover>
-          {hasGeoFilter && (
-            <span className="text-xs text-muted-foreground" title={TRAFFIC_GEO_NOTE}>
+          <Popover>
+            <PopoverTrigger asChild>
+              <Button type="button" variant="outline" size="sm" className="h-9 max-w-[230px] justify-between gap-2">
+                <span className="text-xs text-muted-foreground">Card Type</span>
+                <span className="truncate">{cardTypeSummary}</span>
+                <ChevronDown className="h-3.5 w-3.5 shrink-0 opacity-60" />
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent align="start" className="w-60 p-0">
+              <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
+                <div>
+                  <div className="text-xs font-medium text-muted-foreground">Card Type</div>
+                  <div className="text-xs text-muted-foreground">All card types by default</div>
+                </div>
+                <Button type="button" variant="ghost" size="sm" className="h-7 text-xs" onClick={clearCardTypes} disabled={!selectedCardTypes.length}>
+                  Clear
+                </Button>
+              </div>
+              <div className="py-1">
+                {CARD_TYPE_VALUES.map((cardType) => (
+                  <label key={cardType} className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted/50">
+                    <Checkbox
+                      checked={selectedCardTypes.includes(cardType)}
+                      onCheckedChange={() => toggleCardType(cardType)}
+                    />
+                    <span>{cardTypeLabel(cardType)}</span>
+                  </label>
+                ))}
+              </div>
+            </PopoverContent>
+          </Popover>
+          {(hasGeoFilter || hasCardTypeFilter) && (
+            <span className="text-xs text-muted-foreground" title={trafficCellTitle}>
               Spend is cohort-level
             </span>
           )}
