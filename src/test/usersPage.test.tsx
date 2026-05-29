@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import UsersPage from "@/pages/Users";
@@ -667,6 +667,108 @@ describe("Users page", () => {
     expect(screen.queryByText("do_not_honor")).not.toBeInTheDocument();
   });
 
+  it("shows decline stage breakdown for selected cohorts", () => {
+    startInDeclineAnalytics({ selectedCohortIds: ["campaign-a_2026-01-01"] });
+    vi.mocked(useTransactions).mockReturnValue([
+      cohortTx({ user_id: "trial_user", email: "trial@example.com", campaign_path: "campaign-a" }),
+      failedTx({
+        transaction_id: "trial_fail",
+        user_id: "trial_user",
+        email: "trial@example.com",
+        event_time: "2026-01-01T11:00:00.000Z",
+        raw: { declineReasons: "[{'decline_reason': 'INSUFFICIENT_FUNDS'}]" },
+      }),
+      cohortTx({ user_id: "renewal_user", email: "renewal@example.com", campaign_path: "campaign-a" }),
+      tx({
+        transaction_id: "renewal_first_sub",
+        user_id: "renewal_user",
+        email: "renewal@example.com",
+        event_time: "2026-01-02T10:00:00.000Z",
+        transaction_type: "first_subscription",
+        campaign_path: "campaign-a",
+      }),
+      tx({
+        transaction_id: "renewal_payment",
+        user_id: "renewal_user",
+        email: "renewal@example.com",
+        event_time: "2026-01-03T10:00:00.000Z",
+        transaction_type: "renewal_2",
+        campaign_path: "campaign-a",
+      }),
+      failedTx({
+        transaction_id: "renewal_fail",
+        user_id: "renewal_user",
+        email: "renewal@example.com",
+        event_time: "2026-01-04T10:00:00.000Z",
+        raw: { declineReasons: "[{'decline_reason': 'DO_NOT_HONOR'}]" },
+      }),
+      cohortTx({ user_id: "other", email: "other@example.com", campaign_path: "campaign-b", event_time: "2026-01-05T10:00:00.000Z" }),
+      failedTx({
+        transaction_id: "other_fail",
+        user_id: "other",
+        email: "other@example.com",
+        event_time: "2026-01-05T11:00:00.000Z",
+        raw: { declineReasons: "[{'decline_reason': 'EXPIRED_CARD'}]" },
+      }),
+    ]);
+
+    render(<UsersPage />);
+
+    expect(summaryCard("Failed Transactions")).toHaveTextContent("2");
+    expect(summaryCard("Declines After Trial")).toHaveTextContent("1");
+    expect(summaryCard("Declines After First Sub")).toHaveTextContent("0");
+    expect(summaryCard("Declines After Renewal")).toHaveTextContent("1");
+    expect(screen.getAllByText("After Trial").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("After Renewal").length).toBeGreaterThan(0);
+    expect(screen.queryByText("expired_card")).not.toBeInTheDocument();
+  });
+
+  it("filters decline analytics by decline stage", () => {
+    startInDeclineAnalytics({ declineAnalyticsStages: ["after_renewal"] });
+    vi.mocked(useTransactions).mockReturnValue([
+      cohortTx({ user_id: "trial_user", email: "trial@example.com", campaign_path: "campaign-a" }),
+      failedTx({
+        transaction_id: "trial_fail",
+        user_id: "trial_user",
+        email: "trial@example.com",
+        event_time: "2026-01-01T11:00:00.000Z",
+        raw: { declineReasons: "[{'decline_reason': 'INSUFFICIENT_FUNDS'}]" },
+      }),
+      cohortTx({ user_id: "renewal_user", email: "renewal@example.com", campaign_path: "campaign-b", event_time: "2026-01-02T10:00:00.000Z" }),
+      tx({
+        transaction_id: "renewal_first_sub",
+        user_id: "renewal_user",
+        email: "renewal@example.com",
+        event_time: "2026-01-03T10:00:00.000Z",
+        transaction_type: "first_subscription",
+        campaign_path: "campaign-b",
+      }),
+      tx({
+        transaction_id: "renewal_payment",
+        user_id: "renewal_user",
+        email: "renewal@example.com",
+        event_time: "2026-01-04T10:00:00.000Z",
+        transaction_type: "renewal_2",
+        campaign_path: "campaign-b",
+      }),
+      failedTx({
+        transaction_id: "renewal_fail",
+        user_id: "renewal_user",
+        email: "renewal@example.com",
+        event_time: "2026-01-05T10:00:00.000Z",
+        raw: { declineReasons: "[{'decline_reason': 'DO_NOT_HONOR'}]" },
+      }),
+    ]);
+
+    render(<UsersPage />);
+
+    expect(summaryCard("Failed Transactions")).toHaveTextContent("1");
+    expect(summaryCard("Declines After Trial")).toHaveTextContent("0");
+    expect(summaryCard("Declines After Renewal")).toHaveTextContent("1");
+    expect(screen.getAllByText("do_not_honor").length).toBeGreaterThan(0);
+    expect(screen.queryByText("insufficient_funds")).not.toBeInTheDocument();
+  });
+
   it("shows an empty decline analytics state when no failures exist", () => {
     startInDeclineAnalytics();
     vi.mocked(useTransactions).mockReturnValue([
@@ -706,13 +808,14 @@ describe("Users page", () => {
 
     render(<UsersPage />);
 
-    let rows = screen.getAllByRole("row");
+    const reasonTable = screen.getByRole("table", { name: "Decline reason breakdown" });
+    let rows = within(reasonTable).getAllByRole("row");
     expect(rows[1]).toHaveTextContent("do_not_honor");
     fireEvent.click(screen.getAllByRole("button", { name: /Decline Reason/ }).at(-1)!);
-    rows = screen.getAllByRole("row");
+    rows = within(reasonTable).getAllByRole("row");
     expect(rows[1]).toHaveTextContent("do_not_honor");
     fireEvent.click(screen.getAllByRole("button", { name: /Decline Reason/ }).at(-1)!);
-    rows = screen.getAllByRole("row");
+    rows = within(reasonTable).getAllByRole("row");
     expect(rows[1]).toHaveTextContent("insufficient_funds");
   });
 });

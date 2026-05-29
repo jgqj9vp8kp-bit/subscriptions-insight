@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { computeUsers } from "@/services/analytics";
 import {
+  classifyDeclineStagesForTransactions,
   declineRateByCardType,
   declineRateByGeo,
   normalizeDeclineReason,
@@ -147,5 +148,59 @@ describe("payment failure analytics", () => {
     expect(topDeclineReasons(users)).toEqual([{ reason: "insufficient_funds", users: 1 }]);
     expect(declineRateByGeo(users).find((row) => row.key === "US")).toMatchObject({ users: 1, failed_users: 1, decline_rate: 100 });
     expect(declineRateByCardType(users).find((row) => row.key === "debit")).toMatchObject({ users: 1, failed_users: 0, decline_rate: 0 });
+  });
+
+  it("classifies failed payments after trial", () => {
+    const stages = classifyDeclineStagesForTransactions([
+      tx({ transaction_id: "trial", event_time: "2026-01-01T10:00:00.000Z" }),
+      failed({ transaction_id: "fail", event_time: "2026-01-01T11:00:00.000Z" }),
+    ]);
+
+    expect(stages.get("fail")).toBe("after_trial");
+  });
+
+  it("classifies failed payments after first subscription", () => {
+    const stages = classifyDeclineStagesForTransactions([
+      tx({ transaction_id: "trial", event_time: "2026-01-01T10:00:00.000Z" }),
+      tx({ transaction_id: "first_sub", transaction_type: "first_subscription", event_time: "2026-01-02T10:00:00.000Z" }),
+      failed({ transaction_id: "fail", event_time: "2026-01-03T10:00:00.000Z" }),
+    ]);
+
+    expect(stages.get("fail")).toBe("after_first_subscription");
+  });
+
+  it("classifies failed payments after renewal", () => {
+    const stages = classifyDeclineStagesForTransactions([
+      tx({ transaction_id: "trial", event_time: "2026-01-01T10:00:00.000Z" }),
+      tx({ transaction_id: "first_sub", transaction_type: "first_subscription", event_time: "2026-01-02T10:00:00.000Z" }),
+      tx({ transaction_id: "renewal", transaction_type: "renewal_2", event_time: "2026-01-03T10:00:00.000Z" }),
+      failed({ transaction_id: "fail", event_time: "2026-01-04T10:00:00.000Z" }),
+    ]);
+
+    expect(stages.get("fail")).toBe("after_renewal");
+  });
+
+  it("classifies failed payments before trial as unknown", () => {
+    const stages = classifyDeclineStagesForTransactions([
+      failed({ transaction_id: "fail", event_time: "2026-01-01T09:00:00.000Z" }),
+      tx({ transaction_id: "trial", event_time: "2026-01-01T10:00:00.000Z" }),
+    ]);
+
+    expect(stages.get("fail")).toBe("unknown");
+  });
+
+  it("classifies multiple failed payments independently", () => {
+    const stages = classifyDeclineStagesForTransactions([
+      tx({ transaction_id: "trial", event_time: "2026-01-01T10:00:00.000Z" }),
+      failed({ transaction_id: "fail_after_trial", event_time: "2026-01-01T11:00:00.000Z" }),
+      tx({ transaction_id: "first_sub", transaction_type: "first_subscription", event_time: "2026-01-02T10:00:00.000Z" }),
+      failed({ transaction_id: "fail_after_first_sub", event_time: "2026-01-02T11:00:00.000Z" }),
+      tx({ transaction_id: "renewal", transaction_type: "renewal_2", event_time: "2026-01-03T10:00:00.000Z" }),
+      failed({ transaction_id: "fail_after_renewal", event_time: "2026-01-03T11:00:00.000Z" }),
+    ]);
+
+    expect(stages.get("fail_after_trial")).toBe("after_trial");
+    expect(stages.get("fail_after_first_sub")).toBe("after_first_subscription");
+    expect(stages.get("fail_after_renewal")).toBe("after_renewal");
   });
 });

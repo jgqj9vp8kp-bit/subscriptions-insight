@@ -33,6 +33,12 @@ export type DeclineReason =
   | "generic_decline"
   | "unknown";
 
+export type DeclineStage =
+  | "after_trial"
+  | "after_first_subscription"
+  | "after_renewal"
+  | "unknown";
+
 export interface Transaction {
   transaction_id: string;
   user_id: string;
@@ -58,6 +64,7 @@ export interface Transaction {
   transaction_day?: number | null;
   card_type?: CardType;
   normalized_decline_reason?: DeclineReason;
+  normalized_decline_stage?: DeclineStage;
   decline_message?: string | null;
   metadata?: Record<string, unknown>;
   raw?: Record<string, unknown>;

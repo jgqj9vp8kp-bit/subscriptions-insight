@@ -1,4 +1,4 @@
-import type { DeclineReason, Transaction, UserAggregate } from "@/services/types";
+import type { DeclineReason, DeclineStage, Transaction, UserAggregate } from "@/services/types";
 
 export const DECLINE_REASON_VALUES: DeclineReason[] = [
   "insufficient_funds",
@@ -13,6 +13,13 @@ export const DECLINE_REASON_VALUES: DeclineReason[] = [
   "card_velocity_exceeded",
   "processing_error",
   "generic_decline",
+  "unknown",
+];
+
+export const DECLINE_STAGE_VALUES: DeclineStage[] = [
+  "after_trial",
+  "after_first_subscription",
+  "after_renewal",
   "unknown",
 ];
 
@@ -56,6 +63,55 @@ export interface DeclineRateRow {
 
 function compact(value: unknown): string {
   return String(value ?? "").trim();
+}
+
+function grossAmount(tx: Transaction): number {
+  return tx.gross_amount_usd ?? (tx.amount_usd > 0 ? tx.amount_usd : 0);
+}
+
+function transactionDedupeKey(tx: Transaction): string {
+  const id = compact(tx.transaction_id);
+  if (id) return `id:${id}`;
+  const email = compact(tx.email).toLowerCase();
+  return `fallback:${email}|${grossAmount(tx).toFixed(2)}|${tx.event_time}`;
+}
+
+function lifecyclePriority(tx: Transaction): number {
+  if (tx.status === "success" && isEntryPayment(tx)) return 0;
+  if (tx.status === "success" && tx.transaction_type === "first_subscription") return 1;
+  if (tx.status === "success" && isRenewalPayment(tx)) return 2;
+  if (isFailedPaymentTransaction(tx)) return 3;
+  return 4;
+}
+
+function dedupeAndSortTimeline(txs: Transaction[]): Transaction[] {
+  const byKey = new Map<string, Transaction>();
+  for (const tx of txs) byKey.set(transactionDedupeKey(tx), tx);
+  return Array.from(byKey.values()).sort((a, b) => {
+    if (a.event_time !== b.event_time) return a.event_time < b.event_time ? -1 : 1;
+    const priority = lifecyclePriority(a) - lifecyclePriority(b);
+    if (priority !== 0) return priority;
+    return a.transaction_id.localeCompare(b.transaction_id);
+  });
+}
+
+function userTimelineKey(tx: Transaction): string {
+  return compact(tx.user_id) || compact(tx.email).toLowerCase() || compact(tx.transaction_id);
+}
+
+function isRenewalPayment(tx: Transaction): boolean {
+  return tx.transaction_type === "renewal_2" || tx.transaction_type === "renewal_3" || tx.transaction_type === "renewal";
+}
+
+function isEntryPayment(tx: Transaction): boolean {
+  if (tx.transaction_type === "trial") return true;
+  return tx.status === "success"
+    && tx.transaction_type !== "upsell"
+    && tx.transaction_type !== "first_subscription"
+    && !isRenewalPayment(tx)
+    && tx.transaction_type !== "refund"
+    && tx.transaction_type !== "chargeback"
+    && tx.transaction_type !== "failed_payment";
 }
 
 function normalizeToken(value: unknown): string {
@@ -251,6 +307,51 @@ export function declineDetailsForTransaction(tx: Transaction): { reason: Decline
     message: tx.decline_message ?? declineMessageFromRecord(record),
     date: tx.event_time,
   };
+}
+
+export function declineStageLabel(stage: DeclineStage): string {
+  if (stage === "after_trial") return "After Trial";
+  if (stage === "after_first_subscription") return "After First Subscription";
+  if (stage === "after_renewal") return "After Renewal";
+  return "Unknown";
+}
+
+export function classifyDeclineStagesForTransactions(txs: Transaction[]): Map<string, DeclineStage> {
+  const byUser = new Map<string, Transaction[]>();
+  for (const tx of dedupeAndSortTimeline(txs)) {
+    const key = userTimelineKey(tx);
+    const list = byUser.get(key) ?? [];
+    list.push(tx);
+    byUser.set(key, list);
+  }
+
+  const result = new Map<string, DeclineStage>();
+  byUser.forEach((timeline) => {
+    let hasEntryPayment = false;
+    let hasFirstSubscription = false;
+    let hasRenewal = false;
+
+    for (const tx of timeline) {
+      if (tx.status === "success") {
+        if (isEntryPayment(tx)) hasEntryPayment = true;
+        if (tx.transaction_type === "first_subscription") hasFirstSubscription = true;
+        if (isRenewalPayment(tx)) hasRenewal = true;
+      }
+
+      if (!isFailedPaymentTransaction(tx)) continue;
+      const stage: DeclineStage = tx.normalized_decline_stage
+        ?? (hasRenewal
+          ? "after_renewal"
+          : hasFirstSubscription
+            ? "after_first_subscription"
+            : hasEntryPayment
+              ? "after_trial"
+              : "unknown");
+      result.set(tx.transaction_id, stage);
+    }
+  });
+
+  return result;
 }
 
 export function failedPaymentStateForUserTransactions(txs: Transaction[]): FailedPaymentState {

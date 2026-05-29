@@ -28,10 +28,18 @@ import { formatDateKey, toDateKey } from "@/services/dateKeys";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
 import { CARD_TYPE_VALUES, cardTypeLabel } from "@/services/userCardType";
 import { backfillTransactionCardTypesFromRawRows } from "@/services/palmerTransform";
-import { DECLINE_REASON_VALUES, declineDetailsForTransaction, enrichTransactionDeclinesFromRawRows, isFailedPaymentTransaction } from "@/services/paymentFailures";
+import {
+  DECLINE_REASON_VALUES,
+  DECLINE_STAGE_VALUES,
+  classifyDeclineStagesForTransactions,
+  declineDetailsForTransaction,
+  declineStageLabel,
+  enrichTransactionDeclinesFromRawRows,
+  isFailedPaymentTransaction,
+} from "@/services/paymentFailures";
 import { useDataStore } from "@/store/dataStore";
 import { cn } from "@/lib/utils";
-import type { CardType, CohortRow, DeclineReason, Transaction, UserAggregate } from "@/services/types";
+import type { CardType, CohortRow, DeclineReason, DeclineStage, Transaction, UserAggregate } from "@/services/types";
 
 type SortKey =
   | "card_type"
@@ -86,6 +94,16 @@ interface DeclineBreakdownRow {
   share: number;
   avg_attempts: number;
   latest_failed_date: string | null;
+  stage_counts: Record<DeclineStage, number>;
+  top_stage: DeclineStage;
+}
+
+interface DeclineStageBreakdownRow {
+  stage: DeclineStage;
+  failed_users: number;
+  failed_transactions: number;
+  share: number;
+  top_reason: DeclineReason | null;
 }
 
 const DEFAULT_USERS_UI_STATE = {
@@ -104,6 +122,7 @@ const DEFAULT_USERS_UI_STATE = {
   cohortSortDir: "desc" as "asc" | "desc",
   mode: "users_table" as UsersPageMode,
   declineAnalyticsReasons: [] as DeclineReason[],
+  declineAnalyticsStages: [] as DeclineStage[],
   declineSortKey: "failed_transactions" as DeclineSortKey,
   declineSortDir: "desc" as "asc" | "desc",
   firstSubFilter: "all" as FirstSubFilter,
@@ -248,6 +267,33 @@ function formatPct(value: number, digits = 1): string {
   return `${value.toFixed(digits)}%`;
 }
 
+function createDeclineStageCounts(): Record<DeclineStage, number> {
+  return {
+    after_trial: 0,
+    after_first_subscription: 0,
+    after_renewal: 0,
+    unknown: 0,
+  };
+}
+
+function topStageFromCounts(counts: Record<DeclineStage, number>): DeclineStage {
+  return [...DECLINE_STAGE_VALUES].sort((a, b) => counts[b] - counts[a] || DECLINE_STAGE_VALUES.indexOf(a) - DECLINE_STAGE_VALUES.indexOf(b))[0] ?? "unknown";
+}
+
+function declineStageBadgeClass(stage: DeclineStage): string {
+  if (stage === "after_trial") return "bg-primary/10 text-primary";
+  if (stage === "after_first_subscription") return "bg-warning/15 text-warning";
+  if (stage === "after_renewal") return "bg-success/10 text-success";
+  return "bg-muted text-muted-foreground";
+}
+
+function declineStageBarClass(stage: DeclineStage): string {
+  if (stage === "after_trial") return "bg-primary";
+  if (stage === "after_first_subscription") return "bg-warning";
+  if (stage === "after_renewal") return "bg-success";
+  return "bg-muted-foreground/50";
+}
+
 export default function UsersPage() {
   const txs = useTransactions();
   const rawPalmerRows = useDataStore((s) => s.rawPalmerRows);
@@ -269,6 +315,7 @@ export default function UsersPage() {
     cohortSortDir,
     mode,
     declineAnalyticsReasons: rawDeclineAnalyticsReasons,
+    declineAnalyticsStages: rawDeclineAnalyticsStages,
     declineSortKey,
     declineSortDir,
     firstSubFilter,
@@ -304,11 +351,19 @@ export default function UsersPage() {
         : [],
     [rawDeclineAnalyticsReasons],
   );
+  const declineAnalyticsStages = useMemo(
+    () =>
+      Array.isArray(rawDeclineAnalyticsStages)
+        ? rawDeclineAnalyticsStages.filter((value): value is DeclineStage => DECLINE_STAGE_VALUES.includes(value as DeclineStage))
+        : [],
+    [rawDeclineAnalyticsStages],
+  );
 
   const analyticsTxs = useMemo(
     () => enrichTransactionDeclinesFromRawRows(backfillTransactionCardTypesFromRawRows(txs, rawPalmerRows), rawPalmerRows),
     [txs, rawPalmerRows],
   );
+  const declineStagesByTransaction = useMemo(() => classifyDeclineStagesForTransactions(analyticsTxs), [analyticsTxs]);
   const cohorts = useMemo(() => computeCohorts(analyticsTxs, subscriptions), [analyticsTxs, subscriptions]);
   const users: UserAggregate[] = useMemo(() => computeUsers(analyticsTxs), [analyticsTxs]);
   const cohortByUser = useMemo(() => buildCohortByUser(analyticsTxs), [analyticsTxs]);
@@ -433,8 +488,11 @@ export default function UsersPage() {
     const selectedUserIds = new Set(filtered.map((user) => user.user_id));
     const selectedEmails = new Set(filtered.map((user) => emailKey(user.email)).filter(Boolean));
     const selectedReasonSet = new Set(declineAnalyticsReasons);
-    const byReason = new Map<DeclineReason, { users: Set<string>; transactions: number; latest: string | null }>();
+    const selectedStageSet = new Set(declineAnalyticsStages);
+    const byReason = new Map<DeclineReason, { users: Set<string>; transactions: number; latest: string | null; stageCounts: Record<DeclineStage, number> }>();
+    const byStage = new Map<DeclineStage, { users: Set<string>; transactions: number; reasons: Map<DeclineReason, number> }>();
     const failedUsers = new Set<string>();
+    const stageTotals = createDeclineStageCounts();
     let failedTransactions = 0;
 
     if (!filtered.length) {
@@ -446,6 +504,8 @@ export default function UsersPage() {
         topReason: null as DeclineReason | null,
         avgAttempts: 0,
         rows: [] as DeclineBreakdownRow[],
+        stageRows: [] as DeclineStageBreakdownRow[],
+        stageTotals,
       };
     }
 
@@ -455,16 +515,27 @@ export default function UsersPage() {
       if (!userMatches) continue;
       const details = declineDetailsForTransaction(tx);
       const reason = details?.reason ?? "unknown";
+      const stage = declineStagesByTransaction.get(tx.transaction_id) ?? tx.normalized_decline_stage ?? "unknown";
       if (selectedReasonSet.size > 0 && !selectedReasonSet.has(reason)) continue;
+      if (selectedStageSet.size > 0 && !selectedStageSet.has(stage)) continue;
       const userKey = tx.user_id || emailKey(tx.email);
       failedUsers.add(userKey);
       failedTransactions += 1;
-      const row = byReason.get(reason) ?? { users: new Set<string>(), transactions: 0, latest: null };
+      stageTotals[stage] += 1;
+
+      const row = byReason.get(reason) ?? { users: new Set<string>(), transactions: 0, latest: null, stageCounts: createDeclineStageCounts() };
       row.users.add(userKey);
       row.transactions += 1;
+      row.stageCounts[stage] += 1;
       const eventTime = details?.date ?? tx.event_time;
       if (!row.latest || eventTime > row.latest) row.latest = eventTime;
       byReason.set(reason, row);
+
+      const stageRow = byStage.get(stage) ?? { users: new Set<string>(), transactions: 0, reasons: new Map<DeclineReason, number>() };
+      stageRow.users.add(userKey);
+      stageRow.transactions += 1;
+      stageRow.reasons.set(reason, (stageRow.reasons.get(reason) ?? 0) + 1);
+      byStage.set(stage, stageRow);
     }
 
     const rows = Array.from(byReason.entries()).map(([reason, row]) => ({
@@ -474,7 +545,25 @@ export default function UsersPage() {
       share: failedTransactions ? (row.transactions / failedTransactions) * 100 : 0,
       avg_attempts: row.users.size ? row.transactions / row.users.size : 0,
       latest_failed_date: row.latest,
+      stage_counts: row.stageCounts,
+      top_stage: topStageFromCounts(row.stageCounts),
     }));
+
+    const stageRows = DECLINE_STAGE_VALUES
+      .map((stage) => {
+        const row = byStage.get(stage);
+        const topReason = row
+          ? Array.from(row.reasons.entries()).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0]?.[0] ?? null
+          : null;
+        return {
+          stage,
+          failed_users: row?.users.size ?? 0,
+          failed_transactions: row?.transactions ?? 0,
+          share: failedTransactions && row ? (row.transactions / failedTransactions) * 100 : 0,
+          top_reason: topReason,
+        };
+      })
+      .filter((row) => row.failed_transactions > 0);
 
     rows.sort((a, b) => {
       const av = a[declineSortKey];
@@ -493,8 +582,10 @@ export default function UsersPage() {
       topReason,
       avgAttempts: failedUsers.size ? failedTransactions / failedUsers.size : 0,
       rows,
+      stageRows,
+      stageTotals,
     };
-  }, [filtered, analyticsTxs, declineAnalyticsReasons, declineSortKey, declineSortDir]);
+  }, [filtered, analyticsTxs, declineAnalyticsReasons, declineAnalyticsStages, declineStagesByTransaction, declineSortKey, declineSortDir]);
 
   const hasFirstTrialFilter = Boolean(firstTrialFrom || firstTrialTo);
 
@@ -509,6 +600,7 @@ export default function UsersPage() {
   const cardTypeSummary = selectedCardTypes.length ? selectedCardTypes.map(cardTypeLabel).join(", ") : "All card types";
   const declineReasonSummary = selectedDeclineReasons.length ? selectedDeclineReasons.join(", ") : "All reasons";
   const declineAnalyticsReasonSummary = declineAnalyticsReasons.length ? declineAnalyticsReasons.join(", ") : "All reasons";
+  const declineAnalyticsStageSummary = declineAnalyticsStages.length ? declineAnalyticsStages.map(declineStageLabel).join(", ") : "All stages";
   const toggleCardType = (cardType: CardType) => {
     const next = selectedCardTypes.includes(cardType)
       ? selectedCardTypes.filter((value) => value !== cardType)
@@ -530,6 +622,13 @@ export default function UsersPage() {
     updateUiState({ declineAnalyticsReasons: next });
   };
   const clearDeclineAnalyticsReasons = () => updateUiState({ declineAnalyticsReasons: [] });
+  const toggleDeclineAnalyticsStage = (stage: DeclineStage) => {
+    const next = declineAnalyticsStages.includes(stage)
+      ? declineAnalyticsStages.filter((value) => value !== stage)
+      : [...declineAnalyticsStages, stage];
+    updateUiState({ declineAnalyticsStages: next });
+  };
+  const clearDeclineAnalyticsStages = () => updateUiState({ declineAnalyticsStages: [] });
   const toggleDeclineSort = (key: DeclineSortKey) => {
     if (declineSortKey === key) updateUiState({ declineSortDir: declineSortDir === "asc" ? "desc" : "asc" });
     else updateUiState({ declineSortKey: key, declineSortDir: key === "reason" ? "asc" : "desc" });
@@ -563,8 +662,10 @@ export default function UsersPage() {
     { label: "Decline Rate", value: formatPct(declineAnalytics.declineRate) },
     { label: "Top Decline Reason", value: declineAnalytics.topReason ?? "—" },
     { label: "Avg Failed Attempts", value: declineAnalytics.avgAttempts.toFixed(2) },
+    { label: "Declines After Trial", value: String(declineAnalytics.stageTotals.after_trial) },
+    { label: "Declines After First Sub", value: String(declineAnalytics.stageTotals.after_first_subscription) },
+    { label: "Declines After Renewal", value: String(declineAnalytics.stageTotals.after_renewal) },
   ];
-  const maxDeclineTransactions = Math.max(1, ...declineAnalytics.rows.map((row) => row.failed_transactions));
   const activeUserFilterLabels = [
     search.trim() ? `Search: ${search.trim()}` : null,
     selectedCohortIdSet.size === 0 && campaignPathFilter !== "all" ? `Campaign: ${campaignPathFilter}` : null,
@@ -577,6 +678,8 @@ export default function UsersPage() {
     refundFilter !== "all" ? `Refund: ${refundFilter === "has" ? "Has refund" : "No refund"}` : null,
     firstTrialFrom ? `First trial from: ${formatDateKey(firstTrialFrom)}` : null,
     firstTrialTo ? `First trial to: ${formatDateKey(firstTrialTo)}` : null,
+    declineAnalyticsReasons.length ? `Analytics Decline Reason: ${declineAnalyticsReasons.join(", ")}` : null,
+    declineAnalyticsStages.length ? `Analytics Decline Stage: ${declineAnalyticsStages.map(declineStageLabel).join(", ")}` : null,
   ].filter((label): label is string => Boolean(label));
   const clearUserFilters = () => updateUiState({
     search: "",
@@ -589,6 +692,8 @@ export default function UsersPage() {
     refundFilter: "all",
     firstTrialFrom: "",
     firstTrialTo: "",
+    declineAnalyticsReasons: [],
+    declineAnalyticsStages: [],
   });
 
   return (
@@ -1056,6 +1161,34 @@ export default function UsersPage() {
                   </div>
                 </PopoverContent>
               </Popover>
+              <Popover>
+                <PopoverTrigger asChild>
+                  <Button type="button" variant="outline" size="sm" className="h-9 max-w-[320px] justify-between gap-2">
+                    <span className="text-xs text-muted-foreground">Decline Stage</span>
+                    <span className="truncate">{declineAnalyticsStageSummary}</span>
+                    <ChevronDown className="h-3.5 w-3.5 shrink-0 opacity-60" />
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent align="start" className="w-72 p-0">
+                  <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
+                    <div className="text-xs font-medium text-muted-foreground">Decline Stage</div>
+                    <Button type="button" variant="ghost" size="sm" className="h-7 text-xs" onClick={clearDeclineAnalyticsStages} disabled={!declineAnalyticsStages.length}>
+                      All stages
+                    </Button>
+                  </div>
+                  <div className="py-1">
+                    {DECLINE_STAGE_VALUES.map((stage) => (
+                      <label key={stage} className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted/50">
+                        <Checkbox
+                          checked={declineAnalyticsStages.includes(stage)}
+                          onCheckedChange={() => toggleDeclineAnalyticsStage(stage)}
+                        />
+                        <span>{declineStageLabel(stage)}</span>
+                      </label>
+                    ))}
+                  </div>
+                </PopoverContent>
+              </Popover>
             </div>
 
             {declineAnalytics.selectedUsers === 0 ? (
@@ -1084,7 +1217,7 @@ export default function UsersPage() {
               </div>
             ) : (
               <>
-                <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-5">
+                <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
                   {declineSummaryCards.map((card) => (
                     <div key={card.label} className="rounded-md border border-border bg-muted/20 px-3 py-2">
                       <div className="text-xs text-muted-foreground">{card.label}</div>
@@ -1094,25 +1227,70 @@ export default function UsersPage() {
                 </div>
 
                 <div className="rounded-lg border border-border p-4">
-                  <div className="mb-3 text-sm font-medium">Top decline reasons</div>
+                  <div className="mb-3 text-sm font-medium">Decline reasons by stage</div>
                   <div className="space-y-3">
                     {declineAnalytics.rows.slice(0, 8).map((row) => (
                       <div key={row.reason} className="grid grid-cols-[minmax(150px,240px)_1fr_auto] items-center gap-3 text-sm">
                         <span className="truncate text-xs text-muted-foreground">{row.reason}</span>
-                        <div className="h-2 overflow-hidden rounded-full bg-muted">
-                          <div
-                            className="h-full rounded-full bg-primary"
-                            style={{ width: `${Math.max(4, (row.failed_transactions / maxDeclineTransactions) * 100)}%` }}
-                          />
+                        <div className="flex h-2 overflow-hidden rounded-full bg-muted" aria-label={`${row.reason} decline stages`}>
+                          {DECLINE_STAGE_VALUES.map((stage) => {
+                            const count = row.stage_counts[stage];
+                            if (!count) return null;
+                            return (
+                              <div
+                                key={stage}
+                                className={declineStageBarClass(stage)}
+                                title={`${declineStageLabel(stage)}: ${count}`}
+                                style={{ width: `${(count / row.failed_transactions) * 100}%` }}
+                              />
+                            );
+                          })}
                         </div>
                         <span className="text-xs font-medium tabular-nums">{row.failed_transactions}</span>
                       </div>
                     ))}
                   </div>
+                  <div className="mt-3 flex flex-wrap gap-3 text-xs text-muted-foreground">
+                    {DECLINE_STAGE_VALUES.map((stage) => (
+                      <span key={stage} className="inline-flex items-center gap-1">
+                        <span className={cn("h-2 w-2 rounded-full", declineStageBarClass(stage))} />
+                        {declineStageLabel(stage)}
+                      </span>
+                    ))}
+                  </div>
                 </div>
 
                 <div className="overflow-x-auto rounded-lg border border-border">
-                  <Table>
+                  <Table aria-label="Decline stage breakdown">
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>Decline Stage</TableHead>
+                        <TableHead className="text-right">Failed Users</TableHead>
+                        <TableHead className="text-right">Failed Transactions</TableHead>
+                        <TableHead className="text-right">Share</TableHead>
+                        <TableHead>Top Decline Reason</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {declineAnalytics.stageRows.map((row) => (
+                        <TableRow key={row.stage}>
+                          <TableCell>
+                            <span className={cn("inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium", declineStageBadgeClass(row.stage))}>
+                              {declineStageLabel(row.stage)}
+                            </span>
+                          </TableCell>
+                          <TableCell className="text-right tabular-nums">{row.failed_users}</TableCell>
+                          <TableCell className="text-right tabular-nums">{row.failed_transactions}</TableCell>
+                          <TableCell className="text-right tabular-nums">{formatPct(row.share)}</TableCell>
+                          <TableCell className="text-xs text-muted-foreground">{row.top_reason ?? "—"}</TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </div>
+
+                <div className="overflow-x-auto rounded-lg border border-border">
+                  <Table aria-label="Decline reason breakdown">
                     <TableHeader>
                       <TableRow>
                         <TableHead>
@@ -1140,6 +1318,7 @@ export default function UsersPage() {
                             Avg Attempts {declineIcon("avg_attempts")}
                           </button>
                         </TableHead>
+                        <TableHead>Decline Stage</TableHead>
                         <TableHead>
                           <button onClick={() => toggleDeclineSort("latest_failed_date")} className="inline-flex items-center gap-1 hover:text-foreground">
                             Latest Failed Date {declineIcon("latest_failed_date")}
@@ -1159,6 +1338,15 @@ export default function UsersPage() {
                           <TableCell className="text-right tabular-nums">{row.failed_transactions}</TableCell>
                           <TableCell className="text-right tabular-nums">{formatPct(row.share)}</TableCell>
                           <TableCell className="text-right tabular-nums">{row.avg_attempts.toFixed(2)}</TableCell>
+                          <TableCell>
+                            <div className="flex flex-wrap gap-1">
+                              {DECLINE_STAGE_VALUES.filter((stage) => row.stage_counts[stage] > 0).map((stage) => (
+                                <span key={stage} className={cn("inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium", declineStageBadgeClass(stage))}>
+                                  {declineStageLabel(stage)} · {row.stage_counts[stage]}
+                                </span>
+                              ))}
+                            </div>
+                          </TableCell>
                           <TableCell className="text-xs text-muted-foreground tabular-nums">
                             {row.latest_failed_date ? formatDateKey(row.latest_failed_date) : "—"}
                           </TableCell>
