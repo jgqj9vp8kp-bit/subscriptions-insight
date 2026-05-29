@@ -1,6 +1,8 @@
-import type { CohortRow, PlanBreakdownRow, Transaction, UserAggregate } from "./types";
+import type { CardType, CohortRow, PlanBreakdownRow, Transaction, UserAggregate } from "./types";
 import type { SubscriptionClean } from "@/types/subscriptions";
 import { countryCodeForUserTransactions, normalizeCountryCode } from "@/services/userCountry";
+import { CARD_TYPE_VALUES, cardTypeForUserTransactions } from "@/services/userCardType";
+import { failedPaymentStateForUserTransactions } from "@/services/paymentFailures";
 import {
   DEFAULT_MAX_RENEWAL_COLUMNS,
   MAX_SUPPORTED_RENEWAL_COLUMNS,
@@ -194,6 +196,7 @@ export interface Kpis {
 export interface ComputeCohortsOptions {
   maxRenewalDepth?: number;
   selectedCountries?: string[];
+  selectedCardTypes?: CardType[];
 }
 
 function normalizeCountryFilter(countries: unknown): Set<string> {
@@ -202,6 +205,11 @@ function normalizeCountryFilter(countries: unknown): Set<string> {
     const normalized = normalizeCountryCode(country);
     return normalized ? [normalized] : [];
   }));
+}
+
+function normalizeCardTypeFilter(cardTypes: unknown): Set<CardType> {
+  if (!Array.isArray(cardTypes)) return new Set();
+  return new Set(cardTypes.filter((value): value is CardType => CARD_TYPE_VALUES.includes(value as CardType)));
 }
 
 export function computeKpis(txs: Transaction[]): Kpis {
@@ -357,10 +365,12 @@ export function computeUsers(txs: Transaction[]): UserAggregate[] {
       const money = sorted.filter(isMoneyMoving);
       const total_revenue = money.reduce((s, t) => s + netAmount(t), 0);
       const total_refund_usd = sorted.reduce((s, t) => s + refundAmount(t), 0);
+      const failedPaymentState = failedPaymentStateForUserTransactions(sorted);
       return {
         user_id,
         email: sorted.find((t) => t.email)?.email || "",
         country_code: countryCodeForUserTransactions(sorted),
+        card_type: cardTypeForUserTransactions(sorted),
         funnel: sorted[0].funnel,
         first_trial_date: trial ? trial.event_time : null,
         plan_price: planPrice,
@@ -373,6 +383,7 @@ export function computeUsers(txs: Transaction[]): UserAggregate[] {
         total_refund_usd: Math.round(total_refund_usd * 100) / 100,
         renewal_count: sorted.filter((t) => isRenewalType(t) && t.status === "success").length,
         user_ltv: Math.round(total_revenue * 100) / 100,
+        ...failedPaymentState,
       } satisfies UserAggregate;
     })
     .sort((a, b) => b.total_revenue - a.total_revenue);
@@ -555,26 +566,29 @@ export function computeCohorts(
 ): CohortRow[] {
   const analyticsTxs = dedupeTransactionsForAnalytics(txs);
   const selectedCountries = normalizeCountryFilter(options.selectedCountries);
-  const countryFilteredUserIds = new Set<string>();
-  const txsByUserForCountry = new Map<string, Transaction[]>();
-  if (selectedCountries.size > 0) {
+  const selectedCardTypes = normalizeCardTypeFilter(options.selectedCardTypes);
+  const userFilteredIds = new Set<string>();
+  const txsByUserForFilters = new Map<string, Transaction[]>();
+  if (selectedCountries.size > 0 || selectedCardTypes.size > 0) {
     for (const tx of analyticsTxs) {
-      const list = txsByUserForCountry.get(tx.user_id) ?? [];
+      const list = txsByUserForFilters.get(tx.user_id) ?? [];
       list.push(tx);
-      txsByUserForCountry.set(tx.user_id, list);
+      txsByUserForFilters.set(tx.user_id, list);
     }
-    txsByUserForCountry.forEach((list, userId) => {
+    txsByUserForFilters.forEach((list, userId) => {
       const country = countryCodeForUserTransactions(list);
-      if (country && selectedCountries.has(country)) countryFilteredUserIds.add(userId);
+      if (selectedCountries.size > 0 && (!country || !selectedCountries.has(country))) return;
+      if (selectedCardTypes.size > 0 && !selectedCardTypes.has(cardTypeForUserTransactions(list))) return;
+      userFilteredIds.add(userId);
     });
   }
   // Cohort membership is anchored to the exact trial timestamp; the displayed
   // date is only a label. This keeps D0/D7/D30 windows aligned per user.
-  const countryFilteredTxs =
-    selectedCountries.size > 0
-      ? analyticsTxs.filter((tx) => countryFilteredUserIds.has(tx.user_id))
+  const userFilteredTxs =
+    selectedCountries.size > 0 || selectedCardTypes.size > 0
+      ? analyticsTxs.filter((tx) => userFilteredIds.has(tx.user_id))
       : analyticsTxs;
-  const trials = countryFilteredTxs.filter((t) => t.transaction_type === "trial" && t.status === "success");
+  const trials = userFilteredTxs.filter((t) => t.transaction_type === "trial" && t.status === "success");
   const cohortByUser = new Map<string, { id: string; date: string; funnel: Transaction["funnel"]; campaignPath: string; ts: number }>();
   for (const t of [...trials].sort((a, b) => (a.event_time < b.event_time ? -1 : 1))) {
     if (cohortByUser.has(t.user_id)) continue;
@@ -598,12 +612,12 @@ export function computeCohorts(
   });
 
   const userTxs = new Map<string, Transaction[]>();
-  for (const t of countryFilteredTxs) {
+  for (const t of userFilteredTxs) {
     const list = userTxs.get(t.user_id) ?? [];
     list.push(t);
     userTxs.set(t.user_id, list);
   }
-  const subscriptionFlags = subscriptionFlagsByEmail(countryFilteredTxs, subscriptions);
+  const subscriptionFlags = subscriptionFlagsByEmail(userFilteredTxs, subscriptions);
   const maxRenewalDepth = sanitizeMaxRenewalColumns(options.maxRenewalDepth ?? DEFAULT_MAX_RENEWAL_DEPTH);
 
   const rows: CohortRow[] = [];

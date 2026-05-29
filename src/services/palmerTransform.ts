@@ -5,6 +5,8 @@ import type {
   TransactionStatus,
   TransactionType,
 } from "./types";
+import { cardTypeFromSource } from "@/services/userCardType";
+import { declineDetailsForTransaction } from "@/services/paymentFailures";
 
 export type RawPalmerRow = Record<string, unknown>;
 
@@ -17,6 +19,7 @@ export interface PalmerMetadata {
   utm_campaign?: string;
   utm_content?: string;
   utm_source?: string;
+  paymentInstrumentBinDataAccountFundingType?: string;
   [key: string]: unknown;
 }
 
@@ -182,6 +185,11 @@ export function parseMetadata(rowOrMetadata: RawPalmerRow | unknown): PalmerMeta
     "utm_campaign",
     "utm_content",
     "utm_source",
+    "paymentInstrumentBinDataAccountFundingType",
+    "card_type",
+    "funding",
+    "card_funding",
+    "issuer_card_type",
   ]) {
     const direct = valueFrom(source, [key]);
     if (direct) merged[key] = direct;
@@ -260,6 +268,27 @@ function detectTrafficSource(row: RawPalmerRow, metadata: PalmerMetadata): Traff
   return "unknown";
 }
 
+function transactionIdFrom(row: RawPalmerRow, index: number): string {
+  return valueFrom(row, FIELD_ALIASES.transaction_id) || `palmer-row-${index + 1}`;
+}
+
+function rawTransactionMatchKey(row: RawPalmerRow, index: number): string {
+  const metadata = parseMetadata(row);
+  return [
+    userIdFrom(row, metadata, index),
+    parseEventTime(valueFrom(row, FIELD_ALIASES.event_time)),
+    Math.abs(normalizeAmount(valueFrom(row, FIELD_ALIASES.amount))).toFixed(2),
+  ].join("|");
+}
+
+function transactionMatchKey(tx: Transaction): string {
+  return [
+    tx.user_id,
+    tx.event_time,
+    Math.abs(tx.gross_amount_usd ?? tx.amount_usd).toFixed(2),
+  ].join("|");
+}
+
 function hasUpsellBillingReason(tx: Transaction): boolean {
   return String(tx.billing_reason ?? "").toLowerCase().includes("upsell");
 }
@@ -283,9 +312,10 @@ export function normalizePalmerRows(rows: RawPalmerRow[]): Transaction[] {
     const refundAmount = normalizeRefundAmount(valueFrom(row, FIELD_ALIASES.amount_refunded));
     const netAmount = grossAmount - refundAmount;
     const fallbackType = failedType(status);
+    const cardType = cardTypeFromSource(row) ?? cardTypeFromSource(metadata);
 
-    return {
-      transaction_id: valueFrom(row, FIELD_ALIASES.transaction_id) || `palmer-row-${index + 1}`,
+    const transaction: Transaction = {
+      transaction_id: transactionIdFrom(row, index),
       user_id: userIdFrom(row, metadata, index),
       email: emailFrom(row, metadata),
       event_time: parseEventTime(valueFrom(row, FIELD_ALIASES.event_time)),
@@ -304,12 +334,36 @@ export function normalizePalmerRows(rows: RawPalmerRow[]): Transaction[] {
       campaign_id: valueFrom(row, FIELD_ALIASES.campaign_id) || String(metadata.utm_campaign ?? ""),
       billing_reason: String(metadata.ff_billing_reason ?? ""),
       classification_reason: fallbackType ? `${status} Palmer status` : "awaiting user-level classification",
+      card_type: cardType ?? undefined,
       metadata,
       raw: {
         metadata,
         ff_country_code: valueFrom(row, ["ff_country_code"]),
+        paymentInstrumentBinDataAccountFundingType: valueFrom(row, ["paymentInstrumentBinDataAccountFundingType"]),
+        status: valueFrom(row, ["status"]),
+        processor: valueFrom(row, ["processor"]),
+        declineReasons: valueFrom(row, ["declineReasons", "decline_reasons", "declineReason"]),
+        payment_method_result_code: valueFrom(row, ["payment_method_result_code"]),
+        payment_method_result_message: valueFrom(row, ["payment_method_result_message"]),
+        payment_method_advice_code: valueFrom(row, ["payment_method_advice_code"]),
+        payment_method_advice_message: valueFrom(row, ["payment_method_advice_message"]),
+        advised_action: valueFrom(row, ["advised_action"]),
+        transaction_lifecycle_event: valueFrom(row, ["transaction_lifecycle_event"]),
+        message: valueFrom(row, ["message", "error_message", "failure_reason"]),
+        paymentInstrumentThreeDSecureAuthenticationResponseCode: valueFrom(row, ["paymentInstrumentThreeDSecureAuthenticationResponseCode"]),
+        paymentInstrumentThreeDSecureAuthenticationReasonCode: valueFrom(row, ["paymentInstrumentThreeDSecureAuthenticationReasonCode"]),
+        paymentInstrumentThreeDSecureAuthenticationReasonText: valueFrom(row, ["paymentInstrumentThreeDSecureAuthenticationReasonText"]),
       },
     };
+
+    const decline = declineDetailsForTransaction(transaction);
+    return decline
+      ? {
+          ...transaction,
+          normalized_decline_reason: decline.reason,
+          decline_message: decline.message,
+        }
+      : transaction;
   });
 }
 
@@ -422,6 +476,31 @@ export function addCohortFields(rows: Transaction[]): Transaction[] {
 
 export function transformPalmerRows(rows: RawPalmerRow[]): Transaction[] {
   return classifyUserTransactions(normalizePalmerRows(rows));
+}
+
+export function backfillTransactionCardTypesFromRawRows(
+  transactions: Transaction[],
+  rawRows: RawPalmerRow[] = [],
+): Transaction[] {
+  if (!rawRows.length) return transactions;
+
+  const byTransactionId = new Map<string, NonNullable<Transaction["card_type"]>>();
+  const byMatchKey = new Map<string, NonNullable<Transaction["card_type"]>>();
+
+  rawRows.forEach((row, index) => {
+    const cardType = cardTypeFromSource(row) ?? cardTypeFromSource(parseMetadata(row));
+    if (!cardType) return;
+    byTransactionId.set(transactionIdFrom(row, index), cardType);
+    byMatchKey.set(rawTransactionMatchKey(row, index), cardType);
+  });
+
+  if (!byTransactionId.size && !byMatchKey.size) return transactions;
+
+  return transactions.map((tx) => {
+    if (tx.card_type && tx.card_type !== "unknown") return tx;
+    const cardType = byTransactionId.get(tx.transaction_id) ?? byMatchKey.get(transactionMatchKey(tx));
+    return cardType ? { ...tx, card_type: cardType } : tx;
+  });
 }
 
 export function getPalmerImportDiagnostics(

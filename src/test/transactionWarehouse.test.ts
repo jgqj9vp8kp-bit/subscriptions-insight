@@ -249,6 +249,7 @@ describe("transaction warehouse import logic", () => {
     const hydrated = hydrateWarehouseTransactionsForAnalytics(
       records.map((record) => ({
         source: record.source,
+        raw_payload: record.raw_payload,
         normalized_payload: record.normalized_payload,
       })),
     );
@@ -261,5 +262,35 @@ describe("transaction warehouse import logic", () => {
     expect(cohort.renewal_2_users).toBe(1);
     expect(cohort.renewal_3_users).toBe(1);
     expect(cohort.renewal_4_users).toBe(0);
+  });
+
+  it("backfills card type from warehouse raw payload when normalized payload is old", async () => {
+    const record = await normalizeForWarehouse(
+      tx({
+        transaction_id: "warehouse_card_type",
+        user_id: "card_user",
+        email: "card@example.com",
+        card_type: undefined,
+      }),
+      {
+        id: "warehouse_card_type",
+        customerId: "card_user",
+        created_at: "2026-05-01T00:00:00.000Z",
+        amount: "100",
+        paymentInstrumentBinDataAccountFundingType: "prepaid",
+      },
+      "batch_card",
+      "palmer_csv",
+    );
+
+    const hydrated = hydrateWarehouseTransactionsForAnalytics([
+      {
+        source: record.source,
+        raw_payload: record.raw_payload,
+        normalized_payload: record.normalized_payload,
+      },
+    ]);
+
+    expect(hydrated[0].card_type).toBe("prepaid");
   });
 });

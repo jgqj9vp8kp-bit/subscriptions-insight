@@ -17,6 +17,27 @@ export type TransactionStatus = "success" | "failed" | "refunded" | "chargeback"
 
 export type Funnel = "past_life" | "soulmate" | "starseed" | "unknown";
 export type TrafficSource = "facebook" | "tiktok" | "google" | "unknown";
+export type CardType = "prepaid" | "debit" | "credit" | "other" | "unknown";
+export type DeclineReason =
+  | "insufficient_funds"
+  | "do_not_honor"
+  | "authentication_failed"
+  | "issuer_unavailable"
+  | "expired_card"
+  | "card_not_supported"
+  | "lost_card"
+  | "stolen_card"
+  | "fraud_suspected"
+  | "card_velocity_exceeded"
+  | "processing_error"
+  | "generic_decline"
+  | "unknown";
+
+export type DeclineStage =
+  | "after_trial"
+  | "after_first_subscription"
+  | "after_renewal"
+  | "unknown";
 
 export interface Transaction {
   transaction_id: string;
@@ -41,6 +62,10 @@ export interface Transaction {
   cohort_date?: string;
   cohort_id?: string;
   transaction_day?: number | null;
+  card_type?: CardType;
+  normalized_decline_reason?: DeclineReason;
+  normalized_decline_stage?: DeclineStage;
+  decline_message?: string | null;
   metadata?: Record<string, unknown>;
   raw?: Record<string, unknown>;
 }
@@ -49,6 +74,7 @@ export interface UserAggregate {
   user_id: string;
   email: string;
   country_code: string | null;
+  card_type: CardType;
   funnel: Funnel;
   first_trial_date: string | null;
   plan_price: number | null;
@@ -61,6 +87,11 @@ export interface UserAggregate {
   total_refund_usd: number;
   renewal_count: number;
   user_ltv: number;
+  has_failed_payment: boolean;
+  latest_decline_reason: DeclineReason | null;
+  latest_decline_message: string | null;
+  latest_decline_date: string | null;
+  failed_payment_count: number;
 }
 
 export interface PlanBreakdownRow {

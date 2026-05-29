@@ -15,6 +15,7 @@ import type {
   TransactionType,
 } from "./types";
 import { addCohortFields } from "./palmerTransform";
+import { normalizeCardType } from "@/services/userCardType";
 
 export const TARGET_FIELDS: { key: keyof Transaction; label: string; required: boolean }[] = [
   { key: "transaction_id", label: "Transaction ID", required: true },
@@ -35,6 +36,7 @@ export const TARGET_FIELDS: { key: keyof Transaction; label: string; required: b
   { key: "traffic_source", label: "Traffic source", required: false },
   { key: "campaign_id", label: "Campaign ID", required: false },
   { key: "classification_reason", label: "Classification reason", required: false },
+  { key: "card_type", label: "Card Type", required: false },
 ];
 
 export type ColumnMapping = Partial<Record<keyof Transaction, string>>;
@@ -75,6 +77,14 @@ const SYNONYMS: Partial<Record<keyof Transaction, string[]>> = {
   campaign_id: ["campaignid", "campaign", "utmcampaign"],
   classification_reason: ["classificationreason", "reason", "note", "comment"],
   billing_reason: ["billingreason", "ffbillingreason"],
+  card_type: [
+    "cardtype",
+    "cardfunding",
+    "funding",
+    "issuercardtype",
+    "paymentinstrumentbindataaccountfundingtype",
+    "paymentmethoddetailscardfunding",
+  ],
 };
 
 export function autoMap(headers: string[]): ColumnMapping {
@@ -192,6 +202,7 @@ export function applyMapping(parsed: ParsedSheet, mapping: ColumnMapping): MapRe
       traffic_source: coerceSource(get("traffic_source")),
       campaign_id: get("campaign_id") || "",
       classification_reason: get("classification_reason") || "",
+      card_type: normalizeCardType(get("card_type")),
     };
 
     for (const f of TARGET_FIELDS) {

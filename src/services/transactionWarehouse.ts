@@ -1,6 +1,7 @@
 import { publicRuntimeConfig } from "@/config/publicRuntimeConfig";
 import { supabase } from "@/services/supabaseClient";
-import { addCohortFields, classifyUserTransactions } from "@/services/palmerTransform";
+import { addCohortFields, backfillTransactionCardTypesFromRawRows, classifyUserTransactions } from "@/services/palmerTransform";
+import { declineDetailsForTransaction } from "@/services/paymentFailures";
 import type { TrafficSource, Transaction } from "@/services/types";
 
 export const USE_TRANSACTION_WAREHOUSE = publicRuntimeConfig.useTransactionWarehouse;
@@ -86,6 +87,7 @@ type ExistingWarehouseRecord = {
 
 type WarehouseLoadedRecord = {
   source: string | null;
+  raw_payload?: Record<string, unknown> | null;
   normalized_payload: Record<string, unknown> | null;
 };
 
@@ -525,7 +527,7 @@ export async function loadWarehouseTransactions(options: { limit?: number; offse
 
     const { data, error } = await client
       .from("transactions")
-      .select("source,normalized_payload")
+      .select("source,raw_payload,normalized_payload")
       .is("deleted_at", null)
       .order("event_time", { ascending: false })
       .range(pageOffset, pageOffset + remaining - 1);
@@ -549,7 +551,26 @@ export function hydrateWarehouseTransactionsForAnalytics(records: WarehouseLoade
   for (const record of records) {
     const payload = record.normalized_payload;
     if (!payload || typeof payload !== "object") continue;
-    const tx = payload as unknown as Transaction;
+    const payloadTx = payload as unknown as Transaction;
+    const txWithRaw = {
+      ...payloadTx,
+      raw: {
+        ...(payloadTx.raw ?? {}),
+        ...(record.raw_payload ?? {}),
+      },
+    };
+    const enrichedCardTx = backfillTransactionCardTypesFromRawRows(
+      [txWithRaw],
+      record.raw_payload ? [record.raw_payload] : [],
+    )[0];
+    const decline = declineDetailsForTransaction(enrichedCardTx);
+    const tx = decline
+      ? {
+          ...enrichedCardTx,
+          normalized_decline_reason: decline.reason,
+          decline_message: decline.message,
+        }
+      : enrichedCardTx;
     if (record.source === "palmer_csv") {
       palmerRows.push(tx);
     } else {

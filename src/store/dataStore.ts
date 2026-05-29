@@ -2,7 +2,7 @@ import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 import { MOCK_TRANSACTIONS } from "@/services/mockTransactions";
 import type { Transaction } from "@/services/types";
-import type { PalmerImportDiagnostics, RawPalmerRow } from "@/services/palmerTransform";
+import { backfillTransactionCardTypesFromRawRows, type PalmerImportDiagnostics, type RawPalmerRow } from "@/services/palmerTransform";
 import type { SubscriptionClean } from "@/types/subscriptions";
 import type { TrafficMetric } from "@/services/trafficImport";
 
@@ -70,17 +70,19 @@ export const useDataStore = create<DataState>()(
       subscriptions: [],
       lastSubscriptionSyncAt: null,
       meta: initialMeta,
-      setImported: (rows, info, rawPalmerRows = []) =>
+      setImported: (rows, info, rawPalmerRows = []) => {
+        const transactions = backfillTransactionCardTypesFromRawRows(rows, rawPalmerRows);
         set({
-          transactions: rows,
+          transactions,
           rawPalmerRows,
           meta: {
             ...info,
-            rowCount: rows.length,
+            rowCount: transactions.length,
             rawRowCount: rawPalmerRows.length || undefined,
             importedAt: new Date().toISOString(),
           },
-        }),
+        });
+      },
       setTrafficMetrics: (rows) =>
         set({
           trafficMetrics: rows,

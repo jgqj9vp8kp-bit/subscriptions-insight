@@ -48,6 +48,7 @@ const defaults: CohortsUiSettingsDefaults = {
   defaultFilters: {
     campaignPathFilter: "all",
     selectedCountries: [],
+    selectedCardTypes: [],
     cohortDateFrom: "",
   },
   validWidthKeys: ["__cohort__", "cohort_date", "campaign_path", "trial_users", "net_revenue"],
@@ -126,6 +127,26 @@ describe("cohorts UI settings", () => {
     const loaded = loadCohortsUiSettingsLocal(defaults);
 
     expect(loaded?.filters.selectedCountries).toEqual(["US", "CA"]);
+  });
+
+  it("persists selected Card Types in local UI settings", () => {
+    const payload = buildCohortsUiSettingsPayload(
+      {
+        columnOrder: ["net_revenue", "campaign_path", "cohort_date", "trial_users"],
+        columnWidths: {},
+        columnVisibility: {},
+        selectedView: null,
+        savedViews: [],
+        filters: { selectedCardTypes: ["credit", "debit"] },
+        updatedAt: "2026-05-09T10:00:00.000Z",
+      },
+      defaults,
+    );
+
+    saveCohortsUiSettingsLocal(payload);
+    const loaded = loadCohortsUiSettingsLocal(defaults);
+
+    expect(loaded?.filters.selectedCardTypes).toEqual(["credit", "debit"]);
   });
 
   it("uses cloud settings when local storage is empty", () => {
