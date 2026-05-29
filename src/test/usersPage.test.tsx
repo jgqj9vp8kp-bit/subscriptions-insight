@@ -610,6 +610,8 @@ describe("Users page", () => {
     expect(summaryCard("Avg Failed Attempts")).toHaveTextContent("1.50");
     expect(screen.getByText("66.7%")).toBeInTheDocument();
     expect(screen.getByText("33.3%")).toBeInTheDocument();
+    expect(screen.getByLabelText("insufficient_funds total decline volume")).toHaveStyle({ width: "100%" });
+    expect(screen.getByLabelText("do_not_honor total decline volume")).toHaveStyle({ width: "50%" });
   });
 
   it("uses all visible users in decline analytics when no cohort is selected", () => {

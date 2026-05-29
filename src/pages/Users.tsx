@@ -666,6 +666,7 @@ export default function UsersPage() {
     { label: "Declines After First Sub", value: String(declineAnalytics.stageTotals.after_first_subscription) },
     { label: "Declines After Renewal", value: String(declineAnalytics.stageTotals.after_renewal) },
   ];
+  const maxDeclineReasonTransactions = Math.max(1, ...declineAnalytics.rows.map((row) => row.failed_transactions));
   const activeUserFilterLabels = [
     search.trim() ? `Search: ${search.trim()}` : null,
     selectedCohortIdSet.size === 0 && campaignPathFilter !== "all" ? `Campaign: ${campaignPathFilter}` : null,
@@ -1232,19 +1233,29 @@ export default function UsersPage() {
                     {declineAnalytics.rows.slice(0, 8).map((row) => (
                       <div key={row.reason} className="grid grid-cols-[minmax(150px,240px)_1fr_auto] items-center gap-3 text-sm">
                         <span className="truncate text-xs text-muted-foreground">{row.reason}</span>
-                        <div className="flex h-2 overflow-hidden rounded-full bg-muted" aria-label={`${row.reason} decline stages`}>
-                          {DECLINE_STAGE_VALUES.map((stage) => {
-                            const count = row.stage_counts[stage];
-                            if (!count) return null;
-                            return (
-                              <div
-                                key={stage}
-                                className={declineStageBarClass(stage)}
-                                title={`${declineStageLabel(stage)}: ${count}`}
-                                style={{ width: `${(count / row.failed_transactions) * 100}%` }}
-                              />
-                            );
-                          })}
+                        <div
+                          className="h-2 overflow-hidden rounded-full bg-muted"
+                          aria-label={`${row.reason} decline stages`}
+                          title={`${row.reason}: ${row.failed_transactions} failed transactions`}
+                        >
+                          <div
+                            aria-label={`${row.reason} total decline volume`}
+                            className="flex h-full overflow-hidden rounded-full"
+                            style={{ width: `${(row.failed_transactions / maxDeclineReasonTransactions) * 100}%` }}
+                          >
+                            {DECLINE_STAGE_VALUES.map((stage) => {
+                              const count = row.stage_counts[stage];
+                              if (!count) return null;
+                              return (
+                                <div
+                                  key={stage}
+                                  className={declineStageBarClass(stage)}
+                                  title={`${declineStageLabel(stage)}: ${count}`}
+                                  style={{ width: `${(count / row.failed_transactions) * 100}%` }}
+                                />
+                              );
+                            })}
+                          </div>
                         </div>
                         <span className="text-xs font-medium tabular-nums">{row.failed_transactions}</span>
                       </div>
