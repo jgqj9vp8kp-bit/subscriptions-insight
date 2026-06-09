@@ -40,6 +40,7 @@ import {
 import { useDataStore } from "@/store/dataStore";
 import { cn } from "@/lib/utils";
 import type { CardType, CohortRow, DeclineReason, DeclineStage, Transaction, UserAggregate } from "@/services/types";
+import { buildCohortId } from "@/services/cohortIdentity";
 
 type SortKey =
   | "card_type"
@@ -162,7 +163,56 @@ function buildCampaignPathByUser(txs: Transaction[]): Map<string, string> {
 
 function campaignPathFromCohortId(cohortId: string | undefined): string {
   const match = String(cohortId ?? "").match(/^(.*)_\d{4}-\d{2}-\d{2}$/);
-  return normalizeCampaignPathLabel(match?.[1]);
+  let stem = match?.[1] ?? "";
+  for (const prefix of ["past_life_", "soulmate_", "starseed_", "unknown_"]) {
+    if (stem.startsWith(prefix)) {
+      stem = stem.slice(prefix.length);
+      break;
+    }
+  }
+  return normalizeCampaignPathLabel(stem);
+}
+
+function dateFromCohortId(cohortId: string | undefined): string | null {
+  return String(cohortId ?? "").match(/_(\d{4}-\d{2}-\d{2})$/)?.[1] ?? null;
+}
+
+function legacyCohortId(campaignPath: string, cohortDate: string): string {
+  return `${campaignPath}_${cohortDate}`;
+}
+
+function legacyCohortIdFromAny(cohortId: string): string | null {
+  const cohortDate = dateFromCohortId(cohortId);
+  if (!cohortDate) return null;
+  const campaignPath = campaignPathFromCohortId(cohortId);
+  if (campaignPath === "unknown") return null;
+  return legacyCohortId(campaignPath, cohortDate);
+}
+
+function cohortSelectionMatchIds(cohortIds: string[]): Set<string> {
+  const ids = new Set<string>();
+  for (const cohortId of cohortIds) {
+    ids.add(cohortId);
+    const legacyId = legacyCohortIdFromAny(cohortId);
+    if (legacyId) ids.add(legacyId);
+  }
+  return ids;
+}
+
+function cohortIdsForTransaction(tx: Transaction): string[] {
+  const ids = new Set<string>();
+  if (tx.cohort_id) ids.add(tx.cohort_id);
+
+  const cohortDate =
+    tx.cohort_date ??
+    dateFromCohortId(tx.cohort_id) ??
+    (tx.transaction_type === "trial" ? tx.event_time.slice(0, 10) : null);
+  if (!cohortDate) return Array.from(ids);
+
+  const campaignPath = tx.campaign_path || campaignPathFromCohortId(tx.cohort_id) || "unknown";
+  ids.add(buildCohortId(tx.funnel, campaignPath, cohortDate));
+  ids.add(legacyCohortId(campaignPath, cohortDate));
+  return Array.from(ids);
 }
 
 function normalizeCampaignPathLabel(path: string | undefined): string {
@@ -178,7 +228,7 @@ function buildCohortByUser(txs: Transaction[]): Map<string, UserCohortInfo> {
     const cohortDate = tx.cohort_date ?? tx.event_time.slice(0, 10);
     const campaignPath = tx.campaign_path || "unknown";
     result.set(tx.user_id, {
-      cohort_id: tx.cohort_id ?? `${campaignPath}_${cohortDate}`,
+      cohort_id: buildCohortId(tx.funnel, campaignPath, cohortDate),
       cohort_date: cohortDate,
       campaign_path: campaignPath,
       funnel: tx.funnel,
@@ -210,12 +260,7 @@ function buildCohortMembershipLookup(txs: Transaction[]): CohortMembershipLookup
   const lookup: CohortMembershipLookup = { byUserId: new Map(), byEmail: new Map() };
 
   for (const tx of txs) {
-    addCohortMembership(lookup, tx, tx.cohort_id);
-    if (tx.transaction_type === "trial" && tx.status === "success") {
-      const cohortDate = tx.cohort_date ?? tx.event_time.slice(0, 10);
-      const campaignPath = tx.campaign_path || "unknown";
-      addCohortMembership(lookup, tx, tx.cohort_id ?? `${campaignPath}_${cohortDate}`);
-    }
+    for (const cohortId of cohortIdsForTransaction(tx)) addCohortMembership(lookup, tx, cohortId);
   }
 
   return lookup;
@@ -396,6 +441,8 @@ export default function UsersPage() {
     [usersWithCampaignPath]
   );
   const selectedCohortIdSet = useMemo(() => new Set(selectedCohortIds), [selectedCohortIds]);
+  const selectedCohortMatchIdSet = useMemo(() => cohortSelectionMatchIds(selectedCohortIds), [selectedCohortIds]);
+  const hasSelectedCohorts = selectedCohortIds.length > 0;
   const visibleCohorts = useMemo(() => {
     const q = cohortSearch.trim().toLowerCase();
     const fromDateKey = toDateKey(cohortDateFrom);
@@ -418,8 +465,8 @@ export default function UsersPage() {
   }, [cohorts, campaignPathFilter, cohortSearch, cohortDateFrom, cohortDateTo, cohortSortKey, cohortSortDir]);
 
   const cohortScopedUserCount = useMemo(
-    () => usersWithCampaignPath.filter((user) => userMatchesSelectedCohorts(user, selectedCohortIdSet, cohortMembership)).length,
-    [usersWithCampaignPath, selectedCohortIdSet, cohortMembership],
+    () => usersWithCampaignPath.filter((user) => userMatchesSelectedCohorts(user, selectedCohortMatchIdSet, cohortMembership)).length,
+    [usersWithCampaignPath, selectedCohortMatchIdSet, cohortMembership],
   );
 
   const filtered = useMemo(() => {
@@ -429,9 +476,9 @@ export default function UsersPage() {
     const hasFirstTrialFilter = Boolean(fromDateKey || toDateKeyValue);
     const failedAttemptsThreshold = failedAttemptsFilter === "gte5" ? 5 : failedAttemptsFilter === "gte3" ? 3 : failedAttemptsFilter === "gte1" ? 1 : 0;
     const list = usersWithCampaignPath.filter((u) => {
-      if (!userMatchesSelectedCohorts(u, selectedCohortIdSet, cohortMembership)) return false;
+      if (!userMatchesSelectedCohorts(u, selectedCohortMatchIdSet, cohortMembership)) return false;
       if (q && !u.email.toLowerCase().includes(q) && !u.user_id.toLowerCase().includes(q)) return false;
-      if (selectedCohortIdSet.size === 0 && campaignPathFilter !== "all" && u.campaign_path !== campaignPathFilter) return false;
+      if (!hasSelectedCohorts && campaignPathFilter !== "all" && u.campaign_path !== campaignPathFilter) return false;
       if (countryFilter !== "all" && u.country_code !== countryFilter) return false;
       if (selectedCardTypes.length > 0 && !selectedCardTypes.includes(u.card_type)) return false;
       if (paymentFailedFilter === "has" && !u.has_failed_payment) return false;
@@ -463,7 +510,7 @@ export default function UsersPage() {
       return sortDir === "asc" ? cmp : -cmp;
     });
     return list;
-  }, [usersWithCampaignPath, selectedCohortIdSet, cohortMembership, search, campaignPathFilter, countryFilter, selectedCardTypes, paymentFailedFilter, selectedDeclineReasons, failedAttemptsFilter, firstSubFilter, refundFilter, firstTrialFrom, firstTrialTo, sortKey, sortDir]);
+  }, [usersWithCampaignPath, hasSelectedCohorts, selectedCohortMatchIdSet, cohortMembership, search, campaignPathFilter, countryFilter, selectedCardTypes, paymentFailedFilter, selectedDeclineReasons, failedAttemptsFilter, firstSubFilter, refundFilter, firstTrialFrom, firstTrialTo, sortKey, sortDir]);
 
   const summary = useMemo(() => {
     const userIds = new Set(filtered.map((user) => user.user_id));

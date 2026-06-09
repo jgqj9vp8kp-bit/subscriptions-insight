@@ -35,13 +35,13 @@ function tx(partial: Partial<Transaction>): Transaction {
     campaign_id: partial.campaign_id ?? "",
     classification_reason: partial.classification_reason ?? "",
     cohort_date: partial.cohort_date ?? "2026-03-01",
-    cohort_id: partial.cohort_id ?? "soulmate-reading_2026-03-01",
+    cohort_id: partial.cohort_id ?? "unknown_soulmate-reading_2026-03-01",
     transaction_day: partial.transaction_day ?? 0,
   };
 }
 
 describe("Forecasting price options", () => {
-  const selected = new Set(["soulmate-reading_2026-03-01"]);
+  const selected = new Set(["unknown_soulmate-reading_2026-03-01"]);
 
   it("auto-selects a single trial price", () => {
     const options = buildForecastPriceOptions([

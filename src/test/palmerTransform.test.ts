@@ -132,7 +132,7 @@ describe("Palmer transformation", () => {
     expect(rows.find((row) => row.transaction_id === "renewal_2")?.transaction_type).toBe("renewal_2");
     expect(rows.find((row) => row.transaction_id === "renewal_3")?.transaction_type).toBe("renewal_3");
     expect(rows.find((row) => row.transaction_id === "renewal")?.transaction_type).toBe("renewal");
-    expect(rows.every((row) => row.cohort_id === "unknown_2026-01-01")).toBe(true);
+    expect(rows.every((row) => row.cohort_id === "past_life_unknown_2026-01-01")).toBe(true);
     expect(rows.find((row) => row.transaction_id === "trial")?.classification_reason).toBe("First successful non-upsell payment → trial");
     expect(rows.find((row) => row.transaction_id === "upsell")?.classification_reason).toBe("Metadata ff_billing_reason contains upsell");
     expect(rows.find((row) => row.transaction_id === "sub")?.classification_reason).toBe("Next successful non-upsell payment after trial → first_subscription");
@@ -515,7 +515,7 @@ describe("Palmer transformation", () => {
 
     expect(rows.find((row) => row.transaction_id === "first_upsell")?.transaction_type).toBe("upsell");
     expect(rows.find((row) => row.transaction_id === "intro_trial")?.transaction_type).toBe("trial");
-    expect(rows.find((row) => row.transaction_id === "intro_trial")?.cohort_id).toBe("soulmate-reading_2026-01-01");
+    expect(rows.find((row) => row.transaction_id === "intro_trial")?.cohort_id).toBe("soulmate_soulmate-reading_2026-01-01");
   });
 
   it("groups cohorts by exact campaign_path instead of broad funnel", () => {
@@ -545,8 +545,8 @@ describe("Palmer transformation", () => {
     expect(rows.find((row) => row.user_id === "u_marriage")?.campaign_path).toBe("soulmate-marriage");
     expect(rows.find((row) => row.user_id === "u_reading")?.campaign_path).toBe("soulmate-reading");
     expect(cohorts.map((cohort) => cohort.cohort_id).sort()).toEqual([
-      "soulmate-marriage_2026-04-26",
-      "soulmate-reading_2026-04-26",
+      "soulmate_soulmate-marriage_2026-04-26",
+      "soulmate_soulmate-reading_2026-04-26",
     ]);
   });
 
@@ -564,7 +564,7 @@ describe("Palmer transformation", () => {
     ]);
 
     expect(rows[0].campaign_path).toBe("soulmate-reading");
-    expect(rows[0].cohort_id).toBe("soulmate-reading_2026-04-26");
+    expect(rows[0].cohort_id).toBe("unknown_soulmate-reading_2026-04-26");
   });
 
   it("aggregates refunded amount from amountRefunded cents regardless of status", () => {
@@ -772,7 +772,7 @@ describe("Palmer transformation", () => {
     ]);
     const cohort = computeCohorts(rows)[0];
 
-    expect(cohort.cohort_id).toBe("unknown_2026-01-01");
+    expect(cohort.cohort_id).toBe("soulmate_unknown_2026-01-01");
     expect(cohort.revenue_d0).toBe(15.98);
     expect(cohort.revenue_d7).toBe(45.97);
     expect(cohort.revenue_d30).toBe(45.97);

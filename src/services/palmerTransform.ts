@@ -7,6 +7,7 @@ import type {
 } from "./types";
 import { cardTypeFromSource } from "@/services/userCardType";
 import { declineDetailsForTransaction } from "@/services/paymentFailures";
+import { buildCohortId } from "@/services/cohortIdentity";
 
 export type RawPalmerRow = Record<string, unknown>;
 
@@ -468,7 +469,7 @@ export function addCohortFields(rows: Transaction[]): Transaction[] {
     return {
       ...tx,
       cohort_date: cohortDate,
-      cohort_id: `${campaignPath}_${cohortDate}`,
+      cohort_id: buildCohortId(trial.funnel, campaignPath, cohortDate),
       transaction_day: transactionDay,
     };
   });

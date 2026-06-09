@@ -1,4 +1,5 @@
 import type { CohortRow } from "@/services/types";
+import type { Transaction } from "@/services/types";
 
 export interface CohortFilters {
   funnelFilter?: string;
@@ -14,6 +15,11 @@ export interface CohortFilterDiagnostics {
   afterFunnelFilter: number;
   afterCampaignFilter: number;
   afterRefundFilter: number;
+}
+
+export interface TrialAttributionFilters {
+  trafficSourceFilter?: string;
+  campaignIdFilter?: string;
 }
 
 interface NormalizedDateRange {
@@ -115,4 +121,26 @@ export function filterCohortsWithDiagnostics<T extends CohortRow>(
 
 export function filterCohorts<T extends CohortRow>(cohorts: T[], filters: CohortFilters): T[] {
   return filterCohortsWithDiagnostics(cohorts, filters).cohorts;
+}
+
+export function filterTransactionsByTrialAttribution<T extends Pick<Transaction, "user_id" | "status" | "transaction_type" | "traffic_source" | "campaign_id">>(
+  transactions: T[],
+  filters: TrialAttributionFilters,
+): T[] {
+  const hasTrafficSourceFilter = Boolean(filters.trafficSourceFilter && filters.trafficSourceFilter !== "all");
+  const hasCampaignIdFilter = Boolean(filters.campaignIdFilter && filters.campaignIdFilter !== "all");
+  if (!hasTrafficSourceFilter && !hasCampaignIdFilter) return transactions;
+
+  const matchingTrialUsers = new Set(
+    transactions
+      .filter((tx) => {
+        if (tx.status !== "success" || tx.transaction_type !== "trial") return false;
+        if (hasTrafficSourceFilter && tx.traffic_source !== filters.trafficSourceFilter) return false;
+        if (hasCampaignIdFilter && (tx.campaign_id || "unknown") !== filters.campaignIdFilter) return false;
+        return true;
+      })
+      .map((tx) => tx.user_id),
+  );
+
+  return transactions.filter((tx) => matchingTrialUsers.has(tx.user_id));
 }

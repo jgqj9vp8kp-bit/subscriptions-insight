@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { computeCohortReportTotals } from "@/services/cohortReporting";
-import { filterCohorts, filterCohortsWithDiagnostics, normalizeCohortDateKey } from "@/services/cohortFiltering";
-import type { CohortRow, PlanBreakdownRow } from "@/services/types";
+import { filterCohorts, filterCohortsWithDiagnostics, filterTransactionsByTrialAttribution, normalizeCohortDateKey } from "@/services/cohortFiltering";
+import type { CohortRow, PlanBreakdownRow, Transaction } from "@/services/types";
 
 function cohort(overrides: Partial<CohortRow>): CohortRow {
   return {
@@ -189,5 +189,51 @@ describe("cohort filtering", () => {
     expect(visible).toHaveLength(1);
     expect(visible[0].cohort_id).toBe("included");
     expect(visible.flatMap((row) => row.plan_breakdown)).toEqual([includedPlan]);
+  });
+
+  it("keeps all lifecycle transactions for users whose trial matches attribution filters", () => {
+    const tx = (overrides: Partial<Transaction>): Transaction => ({
+      transaction_id: overrides.transaction_id ?? `${overrides.user_id}-${overrides.transaction_type}`,
+      user_id: overrides.user_id ?? "user",
+      email: `${overrides.user_id ?? "user"}@example.com`,
+      event_time: overrides.event_time ?? "2026-04-01T00:00:00Z",
+      amount_usd: overrides.amount_usd ?? 1,
+      gross_amount_usd: overrides.gross_amount_usd ?? overrides.amount_usd ?? 1,
+      refund_amount_usd: 0,
+      net_amount_usd: overrides.net_amount_usd ?? overrides.gross_amount_usd ?? overrides.amount_usd ?? 1,
+      is_refunded: false,
+      currency: "USD",
+      status: overrides.status ?? "success",
+      transaction_type: overrides.transaction_type ?? "trial",
+      funnel: overrides.funnel ?? "soulmate",
+      campaign_path: overrides.campaign_path ?? "soulmate-reading",
+      product: "",
+      traffic_source: overrides.traffic_source ?? "facebook",
+      campaign_id: overrides.campaign_id ?? "",
+      classification_reason: "",
+    });
+
+    const rows = [
+      tx({ user_id: "matched", transaction_type: "trial", traffic_source: "facebook", campaign_id: "trial-campaign" }),
+      tx({
+        user_id: "matched",
+        transaction_type: "first_subscription",
+        event_time: "2026-04-08T00:00:00Z",
+        amount_usd: 29.99,
+        traffic_source: "unknown",
+        campaign_id: "",
+      }),
+      tx({ user_id: "other", transaction_type: "trial", traffic_source: "google", campaign_id: "other-campaign" }),
+    ];
+
+    const filtered = filterTransactionsByTrialAttribution(rows, {
+      trafficSourceFilter: "facebook",
+      campaignIdFilter: "trial-campaign",
+    });
+
+    expect(filtered.map((row) => row.transaction_id)).toEqual([
+      "matched-trial",
+      "matched-first_subscription",
+    ]);
   });
 });

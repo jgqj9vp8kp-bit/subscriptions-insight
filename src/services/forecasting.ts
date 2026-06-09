@@ -1,4 +1,5 @@
 import type { Transaction } from "@/services/types";
+import { buildCohortId } from "@/services/cohortIdentity";
 
 export type PriceSelection = "weighted_average" | "custom" | "default" | `price:${number}`;
 export type PriceSourceLabel = "Auto selected" | "Selected price" | "Weighted average" | "Manual custom" | "Default";
@@ -65,7 +66,7 @@ function grossAmount(tx: Transaction): number {
 function cohortIdForTrial(trial: Transaction): string {
   const date = trial.cohort_date ?? trial.event_time.slice(0, 10);
   const path = trial.campaign_path || "unknown";
-  return trial.cohort_id ?? `${path}_${date}`;
+  return buildCohortId(trial.funnel, path, date);
 }
 
 function firstTrialByUser(txs: Transaction[]): Map<string, Transaction> {

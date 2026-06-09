@@ -3,6 +3,7 @@ import type { SubscriptionClean } from "@/types/subscriptions";
 import { countryCodeForUserTransactions, normalizeCountryCode } from "@/services/userCountry";
 import { CARD_TYPE_VALUES, cardTypeForUserTransactions } from "@/services/userCardType";
 import { failedPaymentStateForUserTransactions } from "@/services/paymentFailures";
+import { buildCohortId } from "@/services/cohortIdentity";
 import {
   DEFAULT_MAX_RENEWAL_COLUMNS,
   MAX_SUPPORTED_RENEWAL_COLUMNS,
@@ -596,7 +597,7 @@ export function computeCohorts(
     const funnel = t.funnel;
     const campaignPath = t.campaign_path || "unknown";
     cohortByUser.set(t.user_id, {
-      id: t.cohort_id ?? `${campaignPath}_${date}`,
+      id: buildCohortId(funnel, campaignPath, date),
       date,
       funnel,
       campaignPath,

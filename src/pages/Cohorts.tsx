@@ -65,7 +65,7 @@ import {
   renewalColumnIds,
   renewalLevelFromColumnId,
 } from "@/services/dataSettings";
-import { filterCohortsWithDiagnostics, normalizeCohortDateKey } from "@/services/cohortFiltering";
+import { filterCohortsWithDiagnostics, filterTransactionsByTrialAttribution, normalizeCohortDateKey } from "@/services/cohortFiltering";
 import { buildCohortGeoOptions } from "@/services/cohortGeo";
 import { normalizeCountryCode } from "@/services/userCountry";
 import { CARD_TYPE_VALUES, cardTypeLabel } from "@/services/userCardType";
@@ -494,7 +494,10 @@ function isTrafficDerivedColumn(id: string): boolean {
   return id === "trial_cost" || TRAFFIC_DERIVED_COLUMN_PREFIXES.some((prefix) => id.startsWith(prefix));
 }
 
-function buildVisibility(visibleIds: CohortColumnId[], defaultColumnOrder = DEFAULT_COLUMN_ORDER): Record<CohortColumnId, boolean> {
+function buildVisibility(
+  visibleIds: readonly CohortColumnId[],
+  defaultColumnOrder: readonly CohortColumnId[] = DEFAULT_COLUMN_ORDER,
+): Record<CohortColumnId, boolean> {
   const v = {} as Record<CohortColumnId, boolean>;
   for (const id of defaultColumnOrder) v[id] = visibleIds.includes(id);
   return v;
@@ -907,15 +910,14 @@ export default function CohortsPage() {
     () => backfillTransactionCardTypesFromRawRows(txs, rawPalmerRows),
     [txs, rawPalmerRows],
   );
-  const trafficSourceOptions = useMemo(() => Array.from(new Set(analyticsTxs.map((t) => t.traffic_source))).sort(), [analyticsTxs]);
-  const campaignIdOptions = useMemo(() => Array.from(new Set(analyticsTxs.map((t) => t.campaign_id || "unknown"))).sort(), [analyticsTxs]);
+  const trialAttributionTxs = useMemo(
+    () => analyticsTxs.filter((t) => t.status === "success" && t.transaction_type === "trial"),
+    [analyticsTxs],
+  );
+  const trafficSourceOptions = useMemo(() => Array.from(new Set(trialAttributionTxs.map((t) => t.traffic_source))).sort(), [trialAttributionTxs]);
+  const campaignIdOptions = useMemo(() => Array.from(new Set(trialAttributionTxs.map((t) => t.campaign_id || "unknown"))).sort(), [trialAttributionTxs]);
   const sourceFilteredTxs = useMemo(
-    () =>
-      analyticsTxs.filter((t) => {
-        if (trafficSourceFilter !== "all" && t.traffic_source !== trafficSourceFilter) return false;
-        if (campaignIdFilter !== "all" && (t.campaign_id || "unknown") !== campaignIdFilter) return false;
-        return true;
-      }),
+    () => filterTransactionsByTrialAttribution(analyticsTxs, { trafficSourceFilter, campaignIdFilter }),
     [analyticsTxs, trafficSourceFilter, campaignIdFilter]
   );
   const allCohorts = useMemo(
@@ -924,7 +926,15 @@ export default function CohortsPage() {
   );
   const trafficByKey = useMemo(() => aggregateTrafficMetrics(trafficMetrics), [trafficMetrics]);
   const funnelOptions = useMemo(() => Array.from(new Set(allCohorts.map((c) => c.funnel))).sort(), [allCohorts]);
-  const campaignPathOptions = useMemo(() => Array.from(new Set(allCohorts.map((c) => c.campaign_path))).sort(), [allCohorts]);
+  const campaignPathOptions = useMemo(() => {
+    const optionCohorts = funnelFilter !== "all" ? allCohorts.filter((c) => c.funnel === funnelFilter) : allCohorts;
+    return Array.from(new Set(optionCohorts.map((c) => c.campaign_path))).sort();
+  }, [allCohorts, funnelFilter]);
+  useEffect(() => {
+    if (campaignPathFilter === "all" || campaignPathOptions.includes(campaignPathFilter)) return;
+    markCohortsUiSettingsUpdated();
+    setUiState((current) => ({ ...current, campaignPathFilter: "all" }));
+  }, [campaignPathFilter, campaignPathOptions, setUiState]);
   const filteredCohortResult = useMemo(
     () =>
       filterCohortsWithDiagnostics(allCohorts, {
