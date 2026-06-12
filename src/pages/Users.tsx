@@ -53,6 +53,7 @@ type SortKey =
   | "total_refund_usd"
   | "has_failed_payment"
   | "latest_decline_reason"
+  | "latest_decline_stage"
   | "failed_payment_count"
   | "latest_decline_date";
 type FirstSubFilter = "all" | "has" | "none";
@@ -1057,6 +1058,11 @@ export default function UsersPage() {
                     Decline Reason {icon("latest_decline_reason")}
                   </button>
                 </TableHead>
+                <TableHead>
+                  <button onClick={() => toggleSort("latest_decline_stage")} className="inline-flex items-center gap-1 hover:text-foreground">
+                    Decline Stage {icon("latest_decline_stage")}
+                  </button>
+                </TableHead>
                 <TableHead className="text-right">
                   <button onClick={() => toggleSort("failed_payment_count")} className="inline-flex items-center gap-1 hover:text-foreground">
                     Failed Attempts {icon("failed_payment_count")}
@@ -1117,6 +1123,13 @@ export default function UsersPage() {
                       </span>
                     ) : "—"}
                   </TableCell>
+                  <TableCell className="text-xs">
+                    {u.latest_decline_stage ? (
+                      <span className={cn("inline-flex items-center rounded-md px-2 py-0.5 font-medium", declineStageBadgeClass(u.latest_decline_stage))}>
+                        {declineStageLabel(u.latest_decline_stage)}
+                      </span>
+                    ) : "—"}
+                  </TableCell>
                   <TableCell className="text-right tabular-nums text-sm">{u.failed_payment_count}</TableCell>
                   <TableCell className="text-xs text-muted-foreground tabular-nums">
                     {u.latest_decline_date ? formatDateKey(u.latest_decline_date) : "—"}
@@ -1157,7 +1170,7 @@ export default function UsersPage() {
               ))}
               {filtered.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={18} className="text-center text-sm text-muted-foreground py-10">
+                  <TableCell colSpan={19} className="text-center text-sm text-muted-foreground py-10">
                     <div className="space-y-3">
                       <div>{selectedCohortIds.length ? "No users match selected cohorts and filters." : "No users match your filters."}</div>
                       {activeUserFilterLabels.length > 0 && (

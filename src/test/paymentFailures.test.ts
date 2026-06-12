@@ -88,6 +88,7 @@ describe("payment failure analytics", () => {
     expect(users[0].has_failed_payment).toBe(true);
     expect(users[0].failed_payment_count).toBe(2);
     expect(users[0].latest_decline_reason).toBe("card_not_supported");
+    expect(users[0].latest_decline_stage).toBe("unknown");
     expect(users[0].latest_decline_date).toBe("2026-01-03T10:00:00.000Z");
   });
 
@@ -112,6 +113,7 @@ describe("payment failure analytics", () => {
 
     expect(users[0].has_failed_payment).toBe(true);
     expect(users[0].latest_decline_reason).toBe("expired_card");
+    expect(users[0].latest_decline_stage).toBe("after_trial");
     expect(users[0].total_revenue).toBe(5);
     expect(users[0].failed_payment_count).toBe(1);
   });

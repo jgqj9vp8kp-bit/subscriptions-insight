@@ -1,5 +1,30 @@
 # Subengine
 
+## Requirements
+
+This project requires **Node.js >= 18** (CI and local development are validated on **Node 20**).
+The toolchain (`vite`, `vitest`, `eslint`) uses syntax that older Node versions (e.g. Node 12/14)
+cannot parse, so `npm test`, `npm run build`, and `npm run lint` will fail on them with confusing
+parser errors rather than real failures.
+
+The required version is pinned in `package.json` (`engines.node`), `.nvmrc`, and `.node-version`.
+
+Switch Node version before running any scripts:
+
+```text
+# nvm
+nvm install      # installs the version from .nvmrc (20)
+nvm use          # switches to it
+
+# fnm
+fnm use          # reads .nvmrc / .node-version
+
+# Homebrew (no version manager)
+export PATH="$(brew --prefix node@20)/bin:$PATH"
+```
+
+Verify with `node -v` (should print `v20.x` or any `v18+`).
+
 ## Local Environment
 
 Create `.env.local` for local development:
@@ -28,6 +53,8 @@ Production defaults must stay locked down:
 
 - Do not set `VITE_ENABLE_LOCAL_AUTH=true`.
 - Do not set `VITE_ENABLE_FUNNELFOX_DEBUG=true`.
+- Do not set the `FUNNELFOX_DEBUG` Edge Function secret. When unset, the `funnelfox-profile` endpoint
+  returns only `{ profile_id, email }` and never the raw FunnelFox profile payload.
 - Do not expose `FUNNELFOX_SECRET` or any other server secret through `VITE_` variables.
 - The temporary FunnelFox key input is hidden in production by default.
 - Raw FunnelFox debug output is hidden in production by default.

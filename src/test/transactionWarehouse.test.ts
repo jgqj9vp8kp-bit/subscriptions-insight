@@ -294,3 +294,79 @@ describe("transaction warehouse import logic", () => {
     expect(hydrated[0].card_type).toBe("prepaid");
   });
 });
+
+describe("tenant-scoped warehouse dedup (P0-3)", () => {
+  // Simulates the DB composite unique index (auth_user_id, transaction_id): rows are stored per user,
+  // and each user's fetchExisting can only see that user's rows (mirroring per-user RLS + the
+  // .eq("auth_user_id", ...) scoping in createSupabaseUpsertClient).
+  function makeWarehouse() {
+    const store = new Map<string, WarehouseTransactionRecord>();
+    const key = (userId: string, txId: string) => `${userId}::${txId}`;
+    const clientForUser = (userId: string) => ({
+      async fetchExisting(ids: string[]) {
+        return ids
+          .map((id) => store.get(key(userId, id)))
+          .filter((record): record is WarehouseTransactionRecord => Boolean(record))
+          .map((record) => ({
+            transaction_id: record.transaction_id,
+            normalized_payload: record.normalized_payload,
+          }));
+      },
+      async upsertTransactions(records: WarehouseTransactionRecord[]) {
+        for (const record of records) store.set(key(userId, record.transaction_id), record);
+      },
+    });
+    return { store, key, clientForUser };
+  }
+
+  const runImport = async (
+    client: ReturnType<ReturnType<typeof makeWarehouse>["clientForUser"]>,
+    rows: Transaction[],
+    batchId: string,
+  ) => {
+    const records = await Promise.all(rows.map((row) => normalizeForWarehouse(row, undefined, batchId, "palmer_csv")));
+    return summarizeWarehouseUpsert(records, client);
+  };
+
+  it("allows the same transaction_id to exist for different auth users", async () => {
+    const { store, key, clientForUser } = makeWarehouse();
+    const shared = tx({ transaction_id: "shared_tx", email: "a@example.com" });
+
+    const a = await runImport(clientForUser("user-A"), [shared], "batch_a");
+    const b = await runImport(clientForUser("user-B"), [shared], "batch_b");
+
+    // User B's import must NOT see user A's row, so it is a fresh insert (no cross-tenant collision).
+    expect(a).toMatchObject({ inserted: 1, updated: 0, skipped: 0 });
+    expect(b).toMatchObject({ inserted: 1, updated: 0, skipped: 0, potentialDuplicates: 0 });
+    expect(store.has(key("user-A", "shared_tx"))).toBe(true);
+    expect(store.has(key("user-B", "shared_tx"))).toBe(true);
+    expect(store.size).toBe(2);
+  });
+
+  it("dedupes the same transaction_id within one auth user", async () => {
+    const { store, clientForUser } = makeWarehouse();
+    const client = clientForUser("user-A");
+    const row = tx({ transaction_id: "dup_tx" });
+
+    const first = await runImport(client, [row], "batch_1");
+    const second = await runImport(client, [row], "batch_2");
+
+    expect(first).toMatchObject({ inserted: 1, skipped: 0 });
+    expect(second).toMatchObject({ inserted: 0, updated: 0, skipped: 1, potentialDuplicates: 1 });
+    expect(store.size).toBe(1);
+  });
+
+  it("does not duplicate rows across overlapping imports for one user", async () => {
+    const { store, key, clientForUser } = makeWarehouse();
+    const client = clientForUser("user-A");
+
+    await runImport(client, [tx({ transaction_id: "t1" }), tx({ transaction_id: "t2" })], "batch_1");
+    const second = await runImport(client, [tx({ transaction_id: "t2" }), tx({ transaction_id: "t3" })], "batch_2");
+
+    expect(second).toMatchObject({ inserted: 1, updated: 0, skipped: 1, potentialDuplicates: 1 });
+    expect(Array.from(store.keys()).sort()).toEqual(
+      [key("user-A", "t1"), key("user-A", "t2"), key("user-A", "t3")].sort(),
+    );
+    expect(store.size).toBe(3);
+  });
+});

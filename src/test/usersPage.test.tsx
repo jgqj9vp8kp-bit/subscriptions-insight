@@ -163,7 +163,43 @@ describe("Users page", () => {
 
     expect(screen.getByText("Yes")).toBeInTheDocument();
     expect(screen.getByText("insufficient_funds")).toBeInTheDocument();
+    expect(screen.getAllByText("Unknown").length).toBeGreaterThan(0);
     expect(screen.getAllByText("01.01.2026").length).toBeGreaterThan(0);
+  });
+
+  it("displays latest decline stage in the users table", () => {
+    vi.mocked(useTransactions).mockReturnValue([
+      tx({
+        transaction_id: "trial",
+        user_id: "stage_user",
+        email: "stage@example.com",
+        event_time: "2026-01-01T10:00:00.000Z",
+      }),
+      tx({
+        transaction_id: "first_sub",
+        user_id: "stage_user",
+        email: "stage@example.com",
+        event_time: "2026-01-02T10:00:00.000Z",
+        transaction_type: "first_subscription",
+        amount_usd: 10,
+        gross_amount_usd: 10,
+        net_amount_usd: 10,
+      }),
+      tx({
+        transaction_id: "stage_fail",
+        user_id: "stage_user",
+        email: "stage@example.com",
+        status: "failed",
+        transaction_type: "failed_payment",
+        event_time: "2026-01-03T10:00:00.000Z",
+        raw: { declineReasons: "[{'decline_reason': 'DO_NOT_HONOR'}]" },
+      }),
+    ]);
+
+    render(<UsersPage />);
+
+    expect(screen.getByText("stage@example.com")).toBeInTheDocument();
+    expect(screen.getByText("After First Subscription")).toBeInTheDocument();
   });
 
   it("filters users by failed payment status from persisted UI state", () => {

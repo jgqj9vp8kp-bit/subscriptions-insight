@@ -25,19 +25,21 @@ import {
 import { computeCohorts, formatCurrency, formatPct } from "@/services/analytics";
 import { useTransactions } from "@/services/sheets";
 import { normalizeCampaignPath, type TrafficMetric } from "@/services/trafficImport";
-import type { CohortRow, Transaction } from "@/services/types";
+import type { CohortRow } from "@/services/types";
 import { useDataStore } from "@/store/dataStore";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
 import { loadDefaultRetentionCurve } from "@/services/forecastingSettings";
 import {
   buildForecastPriceOptions,
   defaultPriceSelection,
+  fallbackRetentionForMonth,
   forecastProfit,
   forecastRoas,
   projectedSpendFromCac,
   priceSourceLabel,
   resolveSelectedPrice,
   resolveForecastCac,
+  retentionPercentagesForCohorts,
   type ForecastPriceOption,
   type PriceSelection,
 } from "@/services/forecasting";
@@ -78,7 +80,6 @@ type MonthlyForecastRow = {
 
 const MONTHS = Array.from({ length: 12 }, (_, index) => index + 1);
 const SCENARIOS_STORAGE_KEY = "forecasting_scenarios_v1";
-const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_TRIAL_PRICE = 1;
 const DEFAULT_SUBSCRIPTION_PRICE = 29.99;
 const DEFAULT_UPSELL_VALUE = 14.98;
@@ -177,88 +178,9 @@ function aggregateTrafficMetrics(rows: TrafficMetric[]): Map<string, TrafficAggr
   return map;
 }
 
-function isSubscriptionRetentionType(tx: Transaction): boolean {
-  return ["first_subscription", "renewal_2", "renewal_3", "renewal"].includes(tx.transaction_type);
-}
-
-function buildFirstTrialByUser(txs: Transaction[]): Map<string, Transaction> {
-  const map = new Map<string, Transaction>();
-  const trials = txs
-    .filter((tx) => tx.status === "success" && tx.transaction_type === "trial")
-    .sort((a, b) => (a.event_time < b.event_time ? -1 : 1));
-  for (const trial of trials) {
-    if (!map.has(trial.user_id)) map.set(trial.user_id, trial);
-  }
-  return map;
-}
-
-function cohortIdForTrial(trial: Transaction): string {
-  const date = trial.cohort_date ?? trial.event_time.slice(0, 10);
-  const path = trial.campaign_path || "unknown";
-  return trial.cohort_id ?? `${path}_${date}`;
-}
-
-function retentionCountsForCohortIds(txs: Transaction[], selectedCohortIds: Set<string>): {
-  trialUsers: Set<string>;
-  monthUsers: Map<number, Set<string>>;
-} {
-  const firstTrialByUser = buildFirstTrialByUser(txs);
-  const trialUsers = new Set<string>();
-  const monthUsers = new Map<number, Set<string>>();
-
-  firstTrialByUser.forEach((trial, userId) => {
-    if (selectedCohortIds.has(cohortIdForTrial(trial))) trialUsers.add(userId);
-  });
-
-  for (const tx of txs) {
-    if (tx.status !== "success" || !isSubscriptionRetentionType(tx)) continue;
-    if (!trialUsers.has(tx.user_id)) continue;
-    const trial = firstTrialByUser.get(tx.user_id);
-    if (!trial) continue;
-    const diff = new Date(tx.event_time).getTime() - new Date(trial.event_time).getTime();
-    if (diff < 0) continue;
-    const month = Math.floor(diff / (30 * DAY_MS)) + 1;
-    if (month < 1 || month > 12) continue;
-    const set = monthUsers.get(month) ?? new Set<string>();
-    set.add(tx.user_id);
-    monthUsers.set(month, set);
-  }
-
-  return { trialUsers, monthUsers };
-}
-
-function retentionPercentagesForCohorts(txs: Transaction[], cohortIds: string[]): Array<number | null> {
-  const selected = new Set(cohortIds);
-  const { trialUsers, monthUsers } = retentionCountsForCohortIds(txs, selected);
-  if (trialUsers.size === 0) return MONTHS.map(() => null);
-  return MONTHS.map((month) => {
-    const users = monthUsers.get(month)?.size ?? 0;
-    return users > 0 ? (users / trialUsers.size) * 100 : null;
-  });
-}
-
-function fallbackRetentionForMonth(
-  monthIndex: number,
-  txs: Transaction[],
-  allCohorts: CohortRow[],
-  selectedIds: Set<string>,
-  selectedCampaignPaths: Set<string>,
-  defaultRetentionCurve: number[],
-): number {
-  const samePathIds = allCohorts
-    .filter((cohort) => !selectedIds.has(cohort.cohort_id) && selectedCampaignPaths.has(cohort.campaign_path))
-    .map((cohort) => cohort.cohort_id);
-  const samePathRetention = retentionPercentagesForCohorts(txs, samePathIds)[monthIndex];
-  if (samePathRetention != null) return samePathRetention;
-
-  const globalIds = allCohorts
-    .filter((cohort) => !selectedIds.has(cohort.cohort_id))
-    .map((cohort) => cohort.cohort_id);
-  const globalRetention = retentionPercentagesForCohorts(txs, globalIds)[monthIndex];
-  if (globalRetention != null) return globalRetention;
-
-  return defaultRetentionCurve[monthIndex];
-}
+// Retention helpers (cohortIdForTrial / retentionPercentagesForCohorts / fallbackRetentionForMonth)
+// now live in @/services/forecasting so they share the SAME cohort-id derivation as the price
+// options and are unit-tested. See P0-1.
 
 function sourceLabel(source: RetentionSource): string {
   if (source === "auto_actual") return "Actual";

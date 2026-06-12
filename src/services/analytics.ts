@@ -1,7 +1,8 @@
-import type { CardType, CohortRow, PlanBreakdownRow, Transaction, UserAggregate } from "./types";
+import type { CardType, CohortRow, MediaBuyer, PlanBreakdownRow, Transaction, UserAggregate } from "./types";
 import type { SubscriptionClean } from "@/types/subscriptions";
 import { countryCodeForUserTransactions, normalizeCountryCode } from "@/services/userCountry";
 import { CARD_TYPE_VALUES, cardTypeForUserTransactions } from "@/services/userCardType";
+import { MEDIA_BUYER_VALUES, mediaBuyerForUserTransactions } from "@/services/userMediaBuyer";
 import { failedPaymentStateForUserTransactions } from "@/services/paymentFailures";
 import { buildCohortId } from "@/services/cohortIdentity";
 import {
@@ -198,6 +199,7 @@ export interface ComputeCohortsOptions {
   maxRenewalDepth?: number;
   selectedCountries?: string[];
   selectedCardTypes?: CardType[];
+  selectedMediaBuyers?: MediaBuyer[];
 }
 
 function normalizeCountryFilter(countries: unknown): Set<string> {
@@ -211,6 +213,11 @@ function normalizeCountryFilter(countries: unknown): Set<string> {
 function normalizeCardTypeFilter(cardTypes: unknown): Set<CardType> {
   if (!Array.isArray(cardTypes)) return new Set();
   return new Set(cardTypes.filter((value): value is CardType => CARD_TYPE_VALUES.includes(value as CardType)));
+}
+
+function normalizeMediaBuyerFilter(mediaBuyers: unknown): Set<MediaBuyer> {
+  if (!Array.isArray(mediaBuyers)) return new Set();
+  return new Set(mediaBuyers.filter((value): value is MediaBuyer => MEDIA_BUYER_VALUES.includes(value as MediaBuyer)));
 }
 
 export function computeKpis(txs: Transaction[]): Kpis {
@@ -367,11 +374,14 @@ export function computeUsers(txs: Transaction[]): UserAggregate[] {
       const total_revenue = money.reduce((s, t) => s + netAmount(t), 0);
       const total_refund_usd = sorted.reduce((s, t) => s + refundAmount(t), 0);
       const failedPaymentState = failedPaymentStateForUserTransactions(sorted);
+      const mediaBuyer = mediaBuyerForUserTransactions(sorted);
       return {
         user_id,
         email: sorted.find((t) => t.email)?.email || "",
         country_code: countryCodeForUserTransactions(sorted),
         card_type: cardTypeForUserTransactions(sorted),
+        utm_source: mediaBuyer.utm_source,
+        media_buyer: mediaBuyer.media_buyer,
         funnel: sorted[0].funnel,
         first_trial_date: trial ? trial.event_time : null,
         plan_price: planPrice,
@@ -439,26 +449,46 @@ function failedTransactionsByEmail(txs: Transaction[]): Map<string, Transaction[
   return result;
 }
 
-function subscriptionSequenceLevelsForUser(
-  list: Transaction[],
-  cohortTs: number,
-  maxRenewalDepth = DEFAULT_MAX_RENEWAL_DEPTH,
-): Set<number> {
-  const payments = list
+/**
+ * Canonical subscription-payment sequence for a user — the single source of truth for renewal depth.
+ *
+ * Returns the user's SUCCESSFUL subscription payments (first_subscription + any renewal type) that
+ * occur at/after `fromTs` (the cohort trial timestamp), ordered by transaction TIMESTAMP with a
+ * deterministic type/id tie-break. Position in this array is the canonical level:
+ *   index 0 => First Sub, index 1 => Renewal 2, ..., index N-1 => Renewal N.
+ *
+ * Ordering is by event_time only — never CSV/import/row order. De-duplicate upstream with
+ * dedupeTransactionsForAnalytics so duplicate rows do not inflate depth.
+ */
+export function subscriptionPaymentSequenceForUser(txs: Transaction[], fromTs = -Infinity): Transaction[] {
+  return txs
     .filter((tx) => {
       if (!isSubscriptionSequencePayment(tx)) return false;
       const txMs = new Date(tx.event_time).getTime();
-      return Number.isFinite(txMs) && txMs >= cohortTs;
+      return Number.isFinite(txMs) && txMs >= fromTs;
     })
     .sort((a, b) => {
       const aKey = transactionSortKey(a);
       const bKey = transactionSortKey(b);
       return aKey < bKey ? -1 : aKey > bKey ? 1 : 0;
     });
+}
 
+/** Canonical 1-based subscription level (1 = First Sub, 2 = Renewal 2, ...) keyed by payment. */
+export function subscriptionLevelByPaymentForUser(txs: Transaction[], fromTs = -Infinity): Map<Transaction, number> {
+  const levels = new Map<Transaction, number>();
+  subscriptionPaymentSequenceForUser(txs, fromTs).forEach((tx, index) => levels.set(tx, index + 1));
+  return levels;
+}
+
+/** Set of canonical levels present for a user, capped at maxRenewalDepth (used for the *_users counts). */
+function subscriptionSequenceLevelsForUser(
+  list: Transaction[],
+  cohortTs: number,
+  maxRenewalDepth = DEFAULT_MAX_RENEWAL_DEPTH,
+): Set<number> {
   const levels = new Set<number>();
-  payments.forEach((_, index) => {
-    const level = index + 1;
+  subscriptionLevelByPaymentForUser(list, cohortTs).forEach((level) => {
     if (level <= maxRenewalDepth) levels.add(level);
   });
   return levels;
@@ -568,9 +598,10 @@ export function computeCohorts(
   const analyticsTxs = dedupeTransactionsForAnalytics(txs);
   const selectedCountries = normalizeCountryFilter(options.selectedCountries);
   const selectedCardTypes = normalizeCardTypeFilter(options.selectedCardTypes);
+  const selectedMediaBuyers = normalizeMediaBuyerFilter(options.selectedMediaBuyers);
   const userFilteredIds = new Set<string>();
   const txsByUserForFilters = new Map<string, Transaction[]>();
-  if (selectedCountries.size > 0 || selectedCardTypes.size > 0) {
+  if (selectedCountries.size > 0 || selectedCardTypes.size > 0 || selectedMediaBuyers.size > 0) {
     for (const tx of analyticsTxs) {
       const list = txsByUserForFilters.get(tx.user_id) ?? [];
       list.push(tx);
@@ -580,13 +611,14 @@ export function computeCohorts(
       const country = countryCodeForUserTransactions(list);
       if (selectedCountries.size > 0 && (!country || !selectedCountries.has(country))) return;
       if (selectedCardTypes.size > 0 && !selectedCardTypes.has(cardTypeForUserTransactions(list))) return;
+      if (selectedMediaBuyers.size > 0 && !selectedMediaBuyers.has(mediaBuyerForUserTransactions(list).media_buyer)) return;
       userFilteredIds.add(userId);
     });
   }
   // Cohort membership is anchored to the exact trial timestamp; the displayed
   // date is only a label. This keeps D0/D7/D30 windows aligned per user.
   const userFilteredTxs =
-    selectedCountries.size > 0 || selectedCardTypes.size > 0
+    selectedCountries.size > 0 || selectedCardTypes.size > 0 || selectedMediaBuyers.size > 0
       ? analyticsTxs.filter((tx) => userFilteredIds.has(tx.user_id))
       : analyticsTxs;
   const trials = userFilteredTxs.filter((t) => t.transaction_type === "trial" && t.status === "success");
@@ -657,7 +689,14 @@ export function computeCohorts(
       let userRefundAmount = 0;
       const userCohort = cohortByUser.get(uid);
       if (!userCohort) continue;
-      const subscriptionLevels = subscriptionSequenceLevelsForUser(list, userCohort.ts, maxRenewalDepth);
+      // Canonical renewal model: level = position of each successful subscription payment in the
+      // user's timestamp-ordered sequence. The same map drives BOTH the *_users counts and the
+      // first_subscription/renewal revenue split, so counts and revenue can never disagree.
+      const subscriptionLevelByPayment = subscriptionLevelByPaymentForUser(list, userCohort.ts);
+      const subscriptionLevels = new Set<number>();
+      subscriptionLevelByPayment.forEach((level) => {
+        if (level <= maxRenewalDepth) subscriptionLevels.add(level);
+      });
       for (const t of list) {
         const dt = (new Date(t.event_time).getTime() - userCohort.ts) / DAY;
         if (dt < 0) continue;
@@ -688,11 +727,16 @@ export function computeCohorts(
         }
         if (t.transaction_type === "trial") trial_revenue += net;
         if (t.transaction_type === "upsell") upsell_revenue += net;
-        if (t.transaction_type === "first_subscription") {
+        // First-sub / renewal revenue follow the canonical sequence position (NOT transaction_type),
+        // so the revenue split matches the renewal_*_users counts exactly. Level 1 = First Sub;
+        // levels >= 2 = renewals (uncapped, so the renewal_revenue total stays complete).
+        const subscriptionLevel = subscriptionLevelByPayment.get(t);
+        if (subscriptionLevel === 1) {
           first_subscription_revenue += net;
           if (plan) plan.first_subscription_revenue += net;
+        } else if (subscriptionLevel !== undefined && subscriptionLevel >= 2) {
+          renewal_revenue += net;
         }
-        if (isRenewalType(t)) renewal_revenue += net;
         if (t.transaction_type === "upsell" && t.status === "success") hasUpsell = true;
       }
       const hasRenewal = renewalLevelsThrough(maxRenewalDepth).some((level) => subscriptionLevels.has(level));

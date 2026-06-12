@@ -18,6 +18,7 @@ export type TransactionStatus = "success" | "failed" | "refunded" | "chargeback"
 export type Funnel = "past_life" | "soulmate" | "starseed" | "unknown";
 export type TrafficSource = "facebook" | "tiktok" | "google" | "unknown";
 export type CardType = "prepaid" | "debit" | "credit" | "other" | "unknown";
+export type MediaBuyer = "Ivan" | "Artem A" | "Artem D" | "Unknown";
 export type DeclineReason =
   | "insufficient_funds"
   | "do_not_honor"
@@ -57,6 +58,7 @@ export interface Transaction {
   product: string;
   traffic_source: TrafficSource;
   campaign_id: string;
+  utm_source?: string | null;
   classification_reason: string;
   billing_reason?: string;
   cohort_date?: string;
@@ -75,6 +77,8 @@ export interface UserAggregate {
   email: string;
   country_code: string | null;
   card_type: CardType;
+  utm_source: string | null;
+  media_buyer: MediaBuyer;
   funnel: Funnel;
   first_trial_date: string | null;
   plan_price: number | null;
@@ -89,6 +93,7 @@ export interface UserAggregate {
   user_ltv: number;
   has_failed_payment: boolean;
   latest_decline_reason: DeclineReason | null;
+  latest_decline_stage: DeclineStage | null;
   latest_decline_message: string | null;
   latest_decline_date: string | null;
   failed_payment_count: number;

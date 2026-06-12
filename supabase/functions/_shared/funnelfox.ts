@@ -33,6 +33,15 @@ export function getFunnelFoxSecret(): string | null {
   return Deno.env.get("FUNNELFOX_SECRET")?.trim() || null;
 }
 
+// P0-5: the rich profile/debug response (raw profile keys + full profile + detected email) must NOT
+// be exposed by default in production. It is gated behind a server-side FUNNELFOX_DEBUG env flag,
+// which a caller cannot set. The per-request `debug` query param only refines an already-enabled
+// debug environment.
+export function isFunnelFoxDebugEnabled(): boolean {
+  const flag = Deno.env.get("FUNNELFOX_DEBUG")?.trim().toLowerCase();
+  return flag === "1" || flag === "true";
+}
+
 export async function readRequestParams(req: Request): Promise<URLSearchParams> {
   const url = new URL(req.url);
   const params = new URLSearchParams(url.search);
@@ -176,18 +185,40 @@ function sanitizeDebugValue(value: unknown): unknown {
   );
 }
 
+const PROFILE_EMAIL_PATHS = [
+  "data.email",
+  "email",
+  "metadata.email",
+  "replies.email",
+  "fields.email",
+  "attributes.email",
+  "contact.email",
+];
+
+// Resolves the single profile email the app needs for enrichment, without exposing anything else.
+export function detectProfileEmail(payload: unknown): string | null {
+  const profile = readRecord(readRecord(payload).data ?? payload);
+  for (const path of PROFILE_EMAIL_PATHS) {
+    const value = normalizeEmail(readPath(payload, path) ?? readPath(profile, path));
+    if (value) return value;
+  }
+  return null;
+}
+
+// Minimal, production-safe profile response: only the id and the resolved email. No raw profile,
+// no key listing, no email-field enumeration (P0-5).
+export function profileMinimalBody(profileId: string, payload: unknown) {
+  return {
+    profile_id: profileId,
+    email: detectProfileEmail(payload),
+  };
+}
+
+// Rich diagnostic body. Only return this when isFunnelFoxDebugEnabled() is true — it exposes the
+// full (sanitized) profile and detected email, which is PII.
 export function profileDebugBody(profileId: string, payload: unknown) {
   const profile = readRecord(readRecord(payload).data ?? payload);
-  const checkedPaths = [
-    "data.email",
-    "email",
-    "metadata.email",
-    "replies.email",
-    "fields.email",
-    "attributes.email",
-    "contact.email",
-  ];
-  const emailLikeFieldsFound = checkedPaths
+  const emailLikeFieldsFound = PROFILE_EMAIL_PATHS
     .map((path) => ({ path, value: normalizeEmail(readPath(payload, path) ?? readPath(profile, path)) }))
     .filter((item) => item.value);
 
@@ -195,7 +226,7 @@ export function profileDebugBody(profileId: string, payload: unknown) {
     profile_id: profileId,
     raw_profile_keys: Object.keys(profile),
     detected_email: emailLikeFieldsFound[0]?.value ?? null,
-    checked_paths: checkedPaths,
+    checked_paths: PROFILE_EMAIL_PATHS,
     email_like_fields_found: emailLikeFieldsFound,
     profile: sanitizeDebugValue(profile),
   };

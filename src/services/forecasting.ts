@@ -1,4 +1,4 @@
-import type { Transaction } from "@/services/types";
+import type { CohortRow, Transaction } from "@/services/types";
 import { buildCohortId } from "@/services/cohortIdentity";
 
 export type PriceSelection = "weighted_average" | "custom" | "default" | `price:${number}`;
@@ -63,7 +63,12 @@ function grossAmount(tx: Transaction): number {
   return Number.isFinite(tx.gross_amount_usd) ? tx.gross_amount_usd : tx.amount_usd;
 }
 
-function cohortIdForTrial(trial: Transaction): string {
+// Shared cohort-id derivation for a trial transaction. MUST stay identical to the key
+// computeCohorts (analytics.ts) and palmerTransform build, otherwise selected cohorts will
+// never match the underlying transactions. Always re-derives via buildCohortId(funnel, path,
+// date) — including the funnel segment — rather than trusting a possibly-absent trial.cohort_id
+// (P0-1: the page previously used `${path}_${date}` with no funnel and silently never matched).
+export function cohortIdForTrial(trial: Transaction): string {
   const date = trial.cohort_date ?? trial.event_time.slice(0, 10);
   const path = trial.campaign_path || "unknown";
   return buildCohortId(trial.funnel, path, date);
@@ -210,4 +215,91 @@ export function reconcilePriceSelection(
 ): PriceSelection {
   if (previousCohortKey === nextCohortKey) return currentSelection;
   return defaultPriceSelection(options);
+}
+
+// ---------------------------------------------------------------------------
+// Retention (actual vs fallback) — P0-1
+// Centralized here so the Forecasting page reuses the SAME cohortIdForTrial as
+// the price-option path, and so the actual-vs-fallback logic is unit-testable.
+// ---------------------------------------------------------------------------
+
+const RETENTION_MONTHS = Array.from({ length: 12 }, (_, index) => index + 1);
+const RETENTION_DAY_MS = 24 * 60 * 60 * 1000;
+
+function isSubscriptionRetentionType(tx: Transaction): boolean {
+  return ["first_subscription", "renewal_2", "renewal_3", "renewal"].includes(tx.transaction_type);
+}
+
+function retentionCountsForCohortIds(
+  txs: Transaction[],
+  selectedCohortIds: Set<string>,
+): { trialUsers: Set<string>; monthUsers: Map<number, Set<string>> } {
+  const firstTrials = firstTrialByUser(txs);
+  const trialUsers = new Set<string>();
+  const monthUsers = new Map<number, Set<string>>();
+
+  firstTrials.forEach((trial, userId) => {
+    if (selectedCohortIds.has(cohortIdForTrial(trial))) trialUsers.add(userId);
+  });
+
+  for (const tx of txs) {
+    if (tx.status !== "success" || !isSubscriptionRetentionType(tx)) continue;
+    if (!trialUsers.has(tx.user_id)) continue;
+    const trial = firstTrials.get(tx.user_id);
+    if (!trial) continue;
+    const diff = new Date(tx.event_time).getTime() - new Date(trial.event_time).getTime();
+    if (diff < 0) continue;
+    const month = Math.floor(diff / (30 * RETENTION_DAY_MS)) + 1;
+    if (month < 1 || month > 12) continue;
+    const set = monthUsers.get(month) ?? new Set<string>();
+    set.add(tx.user_id);
+    monthUsers.set(month, set);
+  }
+
+  return { trialUsers, monthUsers };
+}
+
+// One entry per forecast month (1..12):
+//   null    => the cohort set has NO trial users => no actual data => caller should fall back.
+//   0..100  => the cohort set HAS trial users. A genuine 0% month stays 0 and MUST NOT be
+//              replaced by the fallback curve (P0-1 / audit CALC-7).
+export function retentionPercentagesForCohorts(
+  txs: Transaction[],
+  cohortIds: string[],
+): Array<number | null> {
+  const selected = new Set(cohortIds);
+  const { trialUsers, monthUsers } = retentionCountsForCohortIds(txs, selected);
+  if (trialUsers.size === 0) return RETENTION_MONTHS.map(() => null);
+  return RETENTION_MONTHS.map((month) => {
+    const users = monthUsers.get(month)?.size ?? 0;
+    return (users / trialUsers.size) * 100;
+  });
+}
+
+// Fallback cascade for a month with no actual data on the selected cohorts:
+// same-campaign-path cohorts -> all other cohorts -> static default curve.
+// Because retentionPercentagesForCohorts now returns 0 (not null) when a cohort set has trial
+// users, the default curve is only reached when NO cohort with trial data exists for that path
+// or globally — i.e. "fallback only when no cohort trial data exists".
+export function fallbackRetentionForMonth(
+  monthIndex: number,
+  txs: Transaction[],
+  allCohorts: CohortRow[],
+  selectedIds: Set<string>,
+  selectedCampaignPaths: Set<string>,
+  defaultRetentionCurve: number[],
+): number {
+  const samePathIds = allCohorts
+    .filter((cohort) => !selectedIds.has(cohort.cohort_id) && selectedCampaignPaths.has(cohort.campaign_path))
+    .map((cohort) => cohort.cohort_id);
+  const samePathRetention = retentionPercentagesForCohorts(txs, samePathIds)[monthIndex];
+  if (samePathRetention != null) return samePathRetention;
+
+  const globalIds = allCohorts
+    .filter((cohort) => !selectedIds.has(cohort.cohort_id))
+    .map((cohort) => cohort.cohort_id);
+  const globalRetention = retentionPercentagesForCohorts(txs, globalIds)[monthIndex];
+  if (globalRetention != null) return globalRetention;
+
+  return defaultRetentionCurve[monthIndex];
 }

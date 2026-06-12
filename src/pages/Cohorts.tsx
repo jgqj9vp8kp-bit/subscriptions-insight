@@ -29,7 +29,7 @@ import {
   formatPct,
 } from "@/services/analytics";
 import { normalizeCampaignPath, type TrafficMetric } from "@/services/trafficImport";
-import type { CardType, CohortRow, PlanBreakdownRow } from "@/services/types";
+import type { CardType, CohortRow, MediaBuyer, PlanBreakdownRow } from "@/services/types";
 import { useDataStore } from "@/store/dataStore";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
 import {
@@ -67,8 +67,12 @@ import {
 } from "@/services/dataSettings";
 import { filterCohortsWithDiagnostics, filterTransactionsByTrialAttribution, normalizeCohortDateKey } from "@/services/cohortFiltering";
 import { buildCohortGeoOptions } from "@/services/cohortGeo";
+import { buildCampaignIdOptions, formatCampaignIdOptionLabel } from "@/services/cohortCampaignIds";
+import { buildCohortCardTypeOptions } from "@/services/cohortCardTypes";
+import { buildMediaBuyerOptions, formatMediaBuyerOptionLabel } from "@/services/cohortMediaBuyer";
 import { normalizeCountryCode } from "@/services/userCountry";
 import { CARD_TYPE_VALUES, cardTypeLabel } from "@/services/userCardType";
+import { MEDIA_BUYER_VALUES, mediaBuyerLabel } from "@/services/userMediaBuyer";
 import { backfillTransactionCardTypesFromRawRows } from "@/services/palmerTransform";
 
 // Visual-only helpers — no data/logic impact.
@@ -87,10 +91,13 @@ const DEFAULT_COHORTS_UI_STATE = {
   funnelFilter: "all",
   campaignPathFilter: "all",
   trafficSourceFilter: "all",
+  selectedCampaignIds: [] as string[],
+  // Backward compatibility for locally/cloud-persisted single-select settings.
   campaignIdFilter: "all",
   refundFilter: "all",
   selectedCountries: [] as string[],
   selectedCardTypes: [] as CardType[],
+  selectedMediaBuyers: [] as MediaBuyer[],
   cohortDateFrom: "",
   cohortDateTo: "",
   dateSort: "desc" as "desc" | "asc",
@@ -424,6 +431,8 @@ type CohortTraffic = {
 
 const TRAFFIC_GEO_NOTE = "Traffic spend is not GEO-split";
 const TRAFFIC_CARD_TYPE_NOTE = "Traffic spend is not split by card type.";
+const TRAFFIC_CAMPAIGN_ID_NOTE = "Traffic spend is cohort-level and is not split by Campaign ID.";
+const TRAFFIC_MEDIA_BUYER_NOTE = "Spend is not split by Media Buyer";
 const TRAFFIC_DERIVED_COLUMN_PREFIXES = ["traffic_", "roas_", "profit"] as const;
 
 function normalizeCohortDate(date: string): string {
@@ -603,10 +612,12 @@ export default function CohortsPage() {
     funnelFilter,
     campaignPathFilter,
     trafficSourceFilter,
-    campaignIdFilter,
+    selectedCampaignIds: rawSelectedCampaignIds,
+    campaignIdFilter: legacyCampaignIdFilter,
     refundFilter,
     selectedCountries: rawSelectedCountries,
     selectedCardTypes: rawSelectedCardTypes,
+    selectedMediaBuyers: rawSelectedMediaBuyers,
     cohortDateFrom,
     cohortDateTo,
     sortColumn,
@@ -629,8 +640,28 @@ export default function CohortsPage() {
         : [],
     [rawSelectedCardTypes],
   );
+  const selectedMediaBuyers = useMemo(
+    () =>
+      Array.isArray(rawSelectedMediaBuyers)
+        ? rawSelectedMediaBuyers.filter((value): value is MediaBuyer => MEDIA_BUYER_VALUES.includes(value as MediaBuyer))
+        : [],
+    [rawSelectedMediaBuyers],
+  );
+  const selectedCampaignIds = useMemo(() => {
+    const ids = new Set<string>();
+    if (Array.isArray(rawSelectedCampaignIds)) {
+      rawSelectedCampaignIds.forEach((value) => {
+        const id = String(value ?? "").trim();
+        if (id && id !== "all") ids.add(id);
+      });
+    }
+    if (legacyCampaignIdFilter && legacyCampaignIdFilter !== "all") ids.add(legacyCampaignIdFilter);
+    return Array.from(ids).sort();
+  }, [rawSelectedCampaignIds, legacyCampaignIdFilter]);
   const hasGeoFilter = selectedCountries.length > 0;
   const hasCardTypeFilter = selectedCardTypes.length > 0;
+  const hasMediaBuyerFilter = selectedMediaBuyers.length > 0;
+  const hasCampaignIdFilter = selectedCampaignIds.length > 0;
   const expandedCohortIds = useMemo(() => new Set(expandedCohortIdList), [expandedCohortIdList]);
   const updateUiState = (patch: Partial<typeof DEFAULT_COHORTS_UI_STATE>) => {
     markCohortsUiSettingsUpdated();
@@ -642,6 +673,7 @@ export default function CohortsPage() {
   };
   const [columnsPopoverOpen, setColumnsPopoverOpen] = useState(false);
   const [viewsPopoverOpen, setViewsPopoverOpen] = useState(false);
+  const [campaignIdSearch, setCampaignIdSearch] = useState("");
   const [maxRenewalColumns, setMaxRenewalColumns] = useState(loadMaxRenewalColumns);
   const defaultColumnOrder = useMemo(() => buildDefaultColumnOrder(maxRenewalColumns), [maxRenewalColumns]);
   const defaultColumnWidths = useMemo(() => buildDefaultColumnWidths(defaultColumnOrder), [defaultColumnOrder]);
@@ -915,21 +947,28 @@ export default function CohortsPage() {
     [analyticsTxs],
   );
   const trafficSourceOptions = useMemo(() => Array.from(new Set(trialAttributionTxs.map((t) => t.traffic_source))).sort(), [trialAttributionTxs]);
-  const campaignIdOptions = useMemo(() => Array.from(new Set(trialAttributionTxs.map((t) => t.campaign_id || "unknown"))).sort(), [trialAttributionTxs]);
+  const parentAttributionTxs = useMemo(
+    () => filterTransactionsByTrialAttribution(analyticsTxs, { trafficSourceFilter }),
+    [analyticsTxs, trafficSourceFilter],
+  );
   const sourceFilteredTxs = useMemo(
-    () => filterTransactionsByTrialAttribution(analyticsTxs, { trafficSourceFilter, campaignIdFilter }),
-    [analyticsTxs, trafficSourceFilter, campaignIdFilter]
+    () => filterTransactionsByTrialAttribution(analyticsTxs, { trafficSourceFilter, selectedCampaignIds }),
+    [analyticsTxs, trafficSourceFilter, selectedCampaignIds]
+  );
+  const parentCohorts = useMemo(
+    () => computeCohorts(parentAttributionTxs, subscriptions, { maxRenewalDepth: maxRenewalColumns, selectedCountries, selectedCardTypes, selectedMediaBuyers }),
+    [parentAttributionTxs, subscriptions, maxRenewalColumns, selectedCountries, selectedCardTypes, selectedMediaBuyers],
   );
   const allCohorts = useMemo(
-    () => computeCohorts(sourceFilteredTxs, subscriptions, { maxRenewalDepth: maxRenewalColumns, selectedCountries, selectedCardTypes }),
-    [sourceFilteredTxs, subscriptions, maxRenewalColumns, selectedCountries, selectedCardTypes],
+    () => computeCohorts(sourceFilteredTxs, subscriptions, { maxRenewalDepth: maxRenewalColumns, selectedCountries, selectedCardTypes, selectedMediaBuyers }),
+    [sourceFilteredTxs, subscriptions, maxRenewalColumns, selectedCountries, selectedCardTypes, selectedMediaBuyers],
   );
   const trafficByKey = useMemo(() => aggregateTrafficMetrics(trafficMetrics), [trafficMetrics]);
-  const funnelOptions = useMemo(() => Array.from(new Set(allCohorts.map((c) => c.funnel))).sort(), [allCohorts]);
+  const funnelOptions = useMemo(() => Array.from(new Set(parentCohorts.map((c) => c.funnel))).sort(), [parentCohorts]);
   const campaignPathOptions = useMemo(() => {
-    const optionCohorts = funnelFilter !== "all" ? allCohorts.filter((c) => c.funnel === funnelFilter) : allCohorts;
+    const optionCohorts = funnelFilter !== "all" ? parentCohorts.filter((c) => c.funnel === funnelFilter) : parentCohorts;
     return Array.from(new Set(optionCohorts.map((c) => c.campaign_path))).sort();
-  }, [allCohorts, funnelFilter]);
+  }, [parentCohorts, funnelFilter]);
   useEffect(() => {
     if (campaignPathFilter === "all" || campaignPathOptions.includes(campaignPathFilter)) return;
     markCohortsUiSettingsUpdated();
@@ -957,16 +996,75 @@ export default function CohortsPage() {
     }),
     [funnelFilter, campaignPathFilter, refundFilter, cohortDateFrom, cohortDateTo],
   );
+  const campaignIdOptions = useMemo(
+    () =>
+      buildCampaignIdOptions({
+        txs: analyticsTxs,
+        subscriptions,
+        filters: cohortRowFilters,
+        trafficSourceFilter,
+        selectedCountries,
+        selectedCardTypes,
+        selectedMediaBuyers,
+        maxRenewalDepth: maxRenewalColumns,
+      }),
+    [analyticsTxs, subscriptions, cohortRowFilters, trafficSourceFilter, selectedCountries, selectedCardTypes, selectedMediaBuyers, maxRenewalColumns],
+  );
+  const campaignIdOptionIds = useMemo(() => new Set(campaignIdOptions.map((option) => option.campaign_id)), [campaignIdOptions]);
+  useEffect(() => {
+    if (!analyticsTxs.length) return;
+    if (!selectedCampaignIds.length && (!legacyCampaignIdFilter || legacyCampaignIdFilter === "all")) return;
+    const next = selectedCampaignIds.filter((id) => campaignIdOptionIds.has(id));
+    if (next.length === selectedCampaignIds.length && (!legacyCampaignIdFilter || legacyCampaignIdFilter === "all")) return;
+    markCohortsUiSettingsUpdated();
+    setUiState((current) => ({ ...current, selectedCampaignIds: next, campaignIdFilter: "all" }));
+  }, [analyticsTxs.length, campaignIdOptionIds, legacyCampaignIdFilter, selectedCampaignIds, setUiState]);
   const countryOptions = useMemo(
     () =>
       buildCohortGeoOptions({
         txs: sourceFilteredTxs,
         subscriptions,
         filters: cohortRowFilters,
+        selectedCardTypes,
+        selectedMediaBuyers,
         maxRenewalDepth: maxRenewalColumns,
       }),
-    [sourceFilteredTxs, subscriptions, cohortRowFilters, maxRenewalColumns],
+    [sourceFilteredTxs, subscriptions, cohortRowFilters, selectedCardTypes, selectedMediaBuyers, maxRenewalColumns],
   );
+  const cardTypeOptions = useMemo(
+    () =>
+      buildCohortCardTypeOptions({
+        txs: sourceFilteredTxs,
+        subscriptions,
+        filters: cohortRowFilters,
+        selectedCountries,
+        selectedMediaBuyers,
+        maxRenewalDepth: maxRenewalColumns,
+      }),
+    [sourceFilteredTxs, subscriptions, cohortRowFilters, selectedCountries, selectedMediaBuyers, maxRenewalColumns],
+  );
+  const mediaBuyerOptions = useMemo(
+    () =>
+      buildMediaBuyerOptions({
+        txs: analyticsTxs,
+        subscriptions,
+        filters: cohortRowFilters,
+        trafficSourceFilter,
+        selectedCampaignIds,
+        selectedCountries,
+        selectedCardTypes,
+        maxRenewalDepth: maxRenewalColumns,
+      }),
+    [analyticsTxs, subscriptions, cohortRowFilters, trafficSourceFilter, selectedCampaignIds, selectedCountries, selectedCardTypes, maxRenewalColumns],
+  );
+  const mediaBuyerOptionIds = useMemo(() => new Set(mediaBuyerOptions.map((option) => option.media_buyer)), [mediaBuyerOptions]);
+  useEffect(() => {
+    if (!analyticsTxs.length || !selectedMediaBuyers.length) return;
+    const next = selectedMediaBuyers.filter((mediaBuyer) => mediaBuyerOptionIds.has(mediaBuyer));
+    if (next.length === selectedMediaBuyers.length) return;
+    markCohortsUiSettingsUpdated();
+    setUiState((current) => ({ ...current, selectedMediaBuyers: next }));
+  }, [analyticsTxs.length, mediaBuyerOptionIds, selectedMediaBuyers, setUiState]);
 
   useEffect(() => {
     if (!import.meta.env.DEV) return;
@@ -1246,6 +1344,7 @@ export default function CohortsPage() {
   };
   const countrySummary = selectedCountries.length ? selectedCountries.join(", ") : "All countries";
   const cardTypeSummary = selectedCardTypes.length ? selectedCardTypes.map(cardTypeLabel).join(", ") : "All card types";
+  const mediaBuyerSummary = selectedMediaBuyers.length ? selectedMediaBuyers.map(mediaBuyerLabel).join(", ") : "All media buyers";
   const toggleCountry = (country: string) => {
     const normalized = normalizeCountryCode(country);
     if (!normalized) return;
@@ -1262,13 +1361,45 @@ export default function CohortsPage() {
     updateUiState({ selectedCardTypes: next });
   };
   const clearCardTypes = () => updateUiState({ selectedCardTypes: [] });
-  const trafficCellTitle = hasGeoFilter && hasCardTypeFilter
-    ? `${TRAFFIC_GEO_NOTE}. ${TRAFFIC_CARD_TYPE_NOTE}`
-    : hasCardTypeFilter
-      ? TRAFFIC_CARD_TYPE_NOTE
-      : hasGeoFilter
-        ? TRAFFIC_GEO_NOTE
-        : undefined;
+  const toggleMediaBuyer = (mediaBuyer: MediaBuyer) => {
+    const next = selectedMediaBuyers.includes(mediaBuyer)
+      ? selectedMediaBuyers.filter((value) => value !== mediaBuyer)
+      : [...selectedMediaBuyers, mediaBuyer];
+    updateUiState({ selectedMediaBuyers: next });
+  };
+  const clearMediaBuyers = () => updateUiState({ selectedMediaBuyers: [] });
+  const toggleCampaignId = (campaignId: string) => {
+    const next = selectedCampaignIds.includes(campaignId)
+      ? selectedCampaignIds.filter((value) => value !== campaignId)
+      : [...selectedCampaignIds, campaignId].sort();
+    updateUiState({ selectedCampaignIds: next, campaignIdFilter: "all" });
+  };
+  const clearCampaignIds = () => updateUiState({ selectedCampaignIds: [], campaignIdFilter: "all" });
+  const campaignIdOptionById = useMemo(
+    () => new Map(campaignIdOptions.map((option) => [option.campaign_id, option])),
+    [campaignIdOptions],
+  );
+  const campaignIdSummary = selectedCampaignIds.length === 0
+    ? "All campaign IDs"
+    : selectedCampaignIds.length === 1
+      ? (campaignIdOptionById.get(selectedCampaignIds[0])?.campaign_name
+          ? `${campaignIdOptionById.get(selectedCampaignIds[0])?.campaign_name} (${selectedCampaignIds[0]})`
+          : selectedCampaignIds[0])
+      : `${selectedCampaignIds.length} campaign IDs`;
+  const visibleCampaignIdOptions = useMemo(() => {
+    const query = campaignIdSearch.trim().toLowerCase();
+    if (!query) return campaignIdOptions;
+    return campaignIdOptions.filter((option) =>
+      `${option.campaign_id} ${option.campaign_name ?? ""}`.toLowerCase().includes(query),
+    );
+  }, [campaignIdOptions, campaignIdSearch]);
+  const trafficNotes = [
+    hasGeoFilter ? TRAFFIC_GEO_NOTE : null,
+    hasCardTypeFilter ? TRAFFIC_CARD_TYPE_NOTE : null,
+    hasCampaignIdFilter ? TRAFFIC_CAMPAIGN_ID_NOTE : null,
+    hasMediaBuyerFilter ? TRAFFIC_MEDIA_BUYER_NOTE : null,
+  ].filter(Boolean);
+  const trafficCellTitle = trafficNotes.length ? trafficNotes.join(" ") : undefined;
 
   const renderHeaderCell = (id: CohortColumnId) => (
     <TableHead
@@ -1623,15 +1754,49 @@ export default function CohortsPage() {
               ))}
             </SelectContent>
           </Select>
-          <Select value={campaignIdFilter} onValueChange={(value) => updateUiState({ campaignIdFilter: value })}>
-            <SelectTrigger className="h-9 w-[190px]"><SelectValue placeholder="Campaign ID" /></SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">All campaign IDs</SelectItem>
-              {campaignIdOptions.map((id) => (
-                <SelectItem key={id} value={id}>{id}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+          <Popover>
+            <PopoverTrigger asChild>
+              <Button type="button" variant="outline" size="sm" className="h-9 max-w-[280px] justify-between gap-2">
+                <span className="text-xs text-muted-foreground">Campaign ID</span>
+                <span className="truncate">{campaignIdSummary}</span>
+                <ChevronDown className="h-3.5 w-3.5 shrink-0 opacity-60" />
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent align="start" className="w-80 p-0">
+              <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
+                <div>
+                  <div className="text-xs font-medium text-muted-foreground">Campaign ID</div>
+                  <div className="text-xs text-muted-foreground">Filtered by current cohorts</div>
+                </div>
+                <Button type="button" variant="ghost" size="sm" className="h-7 text-xs" onClick={clearCampaignIds} disabled={!selectedCampaignIds.length}>
+                  Clear
+                </Button>
+              </div>
+              <div className="border-b border-border p-2">
+                <Input
+                  value={campaignIdSearch}
+                  onChange={(event) => setCampaignIdSearch(event.target.value)}
+                  placeholder="Search campaign ID"
+                  className="h-8"
+                />
+              </div>
+              <div className="max-h-72 overflow-auto py-1">
+                {visibleCampaignIdOptions.length === 0 && (
+                  <div className="px-3 py-3 text-sm text-muted-foreground">No Campaign IDs for current filters</div>
+                )}
+                {visibleCampaignIdOptions.map((option) => (
+                  <label key={option.campaign_id} className="flex cursor-pointer items-start gap-2 px-3 py-1.5 text-sm hover:bg-muted/50">
+                    <Checkbox
+                      checked={selectedCampaignIds.includes(option.campaign_id)}
+                      onCheckedChange={() => toggleCampaignId(option.campaign_id)}
+                      className="mt-0.5"
+                    />
+                    <span className="min-w-0 flex-1 truncate">{formatCampaignIdOptionLabel(option)}</span>
+                  </label>
+                ))}
+              </div>
+            </PopoverContent>
+          </Popover>
           <Select value={refundFilter} onValueChange={(value) => updateUiState({ refundFilter: value })}>
             <SelectTrigger className="h-9 w-[150px]"><SelectValue placeholder="Refund" /></SelectTrigger>
             <SelectContent>
@@ -1694,19 +1859,57 @@ export default function CohortsPage() {
                 </Button>
               </div>
               <div className="py-1">
-                {CARD_TYPE_VALUES.map((cardType) => (
-                  <label key={cardType} className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted/50">
+                {cardTypeOptions.length === 0 && (
+                  <div className="px-3 py-3 text-sm text-muted-foreground">No card type data</div>
+                )}
+                {cardTypeOptions.map((option) => (
+                  <label key={option.card_type} className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted/50">
                     <Checkbox
-                      checked={selectedCardTypes.includes(cardType)}
-                      onCheckedChange={() => toggleCardType(cardType)}
+                      checked={selectedCardTypes.includes(option.card_type)}
+                      onCheckedChange={() => toggleCardType(option.card_type)}
                     />
-                    <span>{cardTypeLabel(cardType)}</span>
+                    <span>{cardTypeLabel(option.card_type)}</span>
+                    <span className="ml-auto text-xs tabular-nums text-muted-foreground">{option.trial_count}</span>
                   </label>
                 ))}
               </div>
             </PopoverContent>
           </Popover>
-          {(hasGeoFilter || hasCardTypeFilter) && (
+          <Popover>
+            <PopoverTrigger asChild>
+              <Button type="button" variant="outline" size="sm" className="h-9 max-w-[250px] justify-between gap-2">
+                <span className="text-xs text-muted-foreground">Media Buyer</span>
+                <span className="truncate">{mediaBuyerSummary}</span>
+                <ChevronDown className="h-3.5 w-3.5 shrink-0 opacity-60" />
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent align="start" className="w-64 p-0">
+              <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
+                <div>
+                  <div className="text-xs font-medium text-muted-foreground">Media Buyer</div>
+                  <div className="text-xs text-muted-foreground">All media buyers by default</div>
+                </div>
+                <Button type="button" variant="ghost" size="sm" className="h-7 text-xs" onClick={clearMediaBuyers} disabled={!selectedMediaBuyers.length}>
+                  Clear
+                </Button>
+              </div>
+              <div className="max-h-72 overflow-auto py-1">
+                {mediaBuyerOptions.length === 0 && (
+                  <div className="px-3 py-3 text-sm text-muted-foreground">No media buyer data</div>
+                )}
+                {mediaBuyerOptions.map((option) => (
+                  <label key={option.media_buyer} className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted/50">
+                    <Checkbox
+                      checked={selectedMediaBuyers.includes(option.media_buyer)}
+                      onCheckedChange={() => toggleMediaBuyer(option.media_buyer)}
+                    />
+                    <span>{formatMediaBuyerOptionLabel(option)}</span>
+                  </label>
+                ))}
+              </div>
+            </PopoverContent>
+          </Popover>
+          {(hasGeoFilter || hasCardTypeFilter || hasMediaBuyerFilter) && (
             <span className="text-xs text-muted-foreground" title={trafficCellTitle}>
               Spend is cohort-level
             </span>

@@ -49,6 +49,7 @@ const defaults: CohortsUiSettingsDefaults = {
     campaignPathFilter: "all",
     selectedCountries: [],
     selectedCardTypes: [],
+    selectedMediaBuyers: [],
     cohortDateFrom: "",
   },
   validWidthKeys: ["__cohort__", "cohort_date", "campaign_path", "trial_users", "net_revenue"],
@@ -147,6 +148,46 @@ describe("cohorts UI settings", () => {
     const loaded = loadCohortsUiSettingsLocal(defaults);
 
     expect(loaded?.filters.selectedCardTypes).toEqual(["credit", "debit"]);
+  });
+
+  it("persists selected Media Buyers in local UI settings", () => {
+    const payload = buildCohortsUiSettingsPayload(
+      {
+        columnOrder: ["net_revenue", "campaign_path", "cohort_date", "trial_users"],
+        columnWidths: {},
+        columnVisibility: {},
+        selectedView: null,
+        savedViews: [],
+        filters: { selectedMediaBuyers: ["Ivan", "Artem D"] },
+        updatedAt: "2026-05-09T10:00:00.000Z",
+      },
+      defaults,
+    );
+
+    saveCohortsUiSettingsLocal(payload);
+    const loaded = loadCohortsUiSettingsLocal(defaults);
+
+    expect(loaded?.filters.selectedMediaBuyers).toEqual(["Ivan", "Artem D"]);
+  });
+
+  it("persists selected Campaign IDs in local UI settings", () => {
+    const payload = buildCohortsUiSettingsPayload(
+      {
+        columnOrder: ["net_revenue", "campaign_path", "cohort_date", "trial_users"],
+        columnWidths: {},
+        columnVisibility: {},
+        selectedView: null,
+        savedViews: [],
+        filters: { selectedCampaignIds: ["120394857", "unknown"] },
+        updatedAt: "2026-05-09T10:00:00.000Z",
+      },
+      defaults,
+    );
+
+    saveCohortsUiSettingsLocal(payload);
+    const loaded = loadCohortsUiSettingsLocal(defaults);
+
+    expect(loaded?.filters.selectedCampaignIds).toEqual(["120394857", "unknown"]);
   });
 
   it("uses cloud settings when local storage is empty", () => {

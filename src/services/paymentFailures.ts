@@ -49,6 +49,7 @@ export type DeclineReasonRecord = Partial<Record<(typeof DECLINE_FIELDS)[number]
 export interface FailedPaymentState {
   has_failed_payment: boolean;
   latest_decline_reason: DeclineReason | null;
+  latest_decline_stage: DeclineStage | null;
   latest_decline_message: string | null;
   latest_decline_date: string | null;
   failed_payment_count: number;
@@ -359,9 +360,11 @@ export function failedPaymentStateForUserTransactions(txs: Transaction[]): Faile
     .filter(isFailedPaymentTransaction)
     .sort((a, b) => (a.event_time < b.event_time ? 1 : a.event_time > b.event_time ? -1 : 0));
   const latest = failed[0] ? declineDetailsForTransaction(failed[0]) : null;
+  const stages = failed[0] ? classifyDeclineStagesForTransactions(txs) : new Map<string, DeclineStage>();
   return {
     has_failed_payment: failed.length > 0,
     latest_decline_reason: latest?.reason ?? null,
+    latest_decline_stage: failed[0] ? stages.get(failed[0].transaction_id) ?? failed[0].normalized_decline_stage ?? "unknown" : null,
     latest_decline_message: latest?.message ?? null,
     latest_decline_date: latest?.date ?? null,
     failed_payment_count: failed.length,

@@ -9,7 +9,9 @@ import Dashboard from "./pages/Dashboard.tsx";
 import Transactions from "./pages/Transactions.tsx";
 import UsersPage from "./pages/Users.tsx";
 import Cohorts from "./pages/Cohorts.tsx";
+import FBAnalyticsPage from "./pages/FBAnalytics.tsx";
 import ForecastingPage from "./pages/Forecasting.tsx";
+import IntegrationsPage from "./pages/Integrations.tsx";
 import ImportPage from "./pages/Import.tsx";
 import LoginPage from "./pages/Login.tsx";
 import SubscriptionsPage from "./pages/Subscriptions.tsx";
@@ -31,6 +33,8 @@ const App = () => (
               <Route path="/transactions" element={<Transactions />} />
               <Route path="/users" element={<UsersPage />} />
               <Route path="/cohorts" element={<Cohorts />} />
+              <Route path="/fb-analytics" element={<FBAnalyticsPage />} />
+              <Route path="/integrations" element={<IntegrationsPage />} />
               <Route path="/forecasting" element={<ForecastingPage />} />
               <Route path="/subscriptions" element={<SubscriptionsPage />} />
               <Route path="/import" element={<ImportPage />} />

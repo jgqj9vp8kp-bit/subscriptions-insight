@@ -1,0 +1,4 @@
+project_id = "wsjbpkderyhdefukppvb"
+
+[functions.export-campaign-performance]
+verify_jwt = false

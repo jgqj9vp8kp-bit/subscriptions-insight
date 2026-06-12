@@ -2,6 +2,7 @@ import { publicRuntimeConfig } from "@/config/publicRuntimeConfig";
 import { supabase } from "@/services/supabaseClient";
 import { addCohortFields, backfillTransactionCardTypesFromRawRows, classifyUserTransactions } from "@/services/palmerTransform";
 import { declineDetailsForTransaction } from "@/services/paymentFailures";
+import { sha256Hex } from "@/services/sha256";
 import type { TrafficSource, Transaction } from "@/services/types";
 
 export const USE_TRANSACTION_WAREHOUSE = publicRuntimeConfig.useTransactionWarehouse;
@@ -185,18 +186,14 @@ function canonicalStringify(value: unknown): string {
   return JSON.stringify(canonicalize(value));
 }
 
-async function sha256Hex(value: string): Promise<string> {
-  const bytes = new TextEncoder().encode(value);
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
-  return Array.from(new Uint8Array(digest))
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
-}
-
 export async function checksumRows(rows: Record<string, unknown>[]): Promise<string> {
   return sha256Hex(canonicalStringify(rows));
 }
 
+// Deterministic id used when a provider transaction_id is missing. It is intentionally NOT scoped
+// by auth_user_id: cross-tenant safety comes from the composite (auth_user_id, transaction_id)
+// unique index (P0-3), so the same logical row imported by two accounts lands on each account's own
+// row instead of colliding. Within one account, an identical fallback id still dedupes as intended.
 export async function fallbackTransactionId(row: Transaction): Promise<string> {
   const basis = [
     normalizeText(row.email)?.toLowerCase() ?? "",
@@ -329,12 +326,21 @@ export async function summarizeWarehouseUpsert(
 
 function createSupabaseUpsertClient(): UpsertClient {
   const client = ensureSupabase();
+  // P0-3: dedup is scoped per tenant. fetchExisting must only see THIS user's rows so a
+  // transaction_id that exists for another account is correctly treated as a new insert, and the
+  // upsert conflict target must be the composite (auth_user_id, transaction_id) unique index.
+  let cachedAuthUserId: string | null = null;
+  const authUserId = async () => {
+    if (!cachedAuthUserId) cachedAuthUserId = await currentUserId();
+    return cachedAuthUserId;
+  };
   return {
     async fetchExisting(transactionIds) {
       if (!transactionIds.length) return [];
       const { data, error } = await client
         .from("transactions")
         .select("transaction_id,event_time,normalized_payload")
+        .eq("auth_user_id", await authUserId())
         .in("transaction_id", transactionIds)
         .is("deleted_at", null);
       if (error) throw new Error(`Could not inspect existing transactions: ${error.message}`);
@@ -342,14 +348,14 @@ function createSupabaseUpsertClient(): UpsertClient {
     },
     async upsertTransactions(records) {
       if (!records.length) return;
-      const authUserId = await currentUserId();
+      const userId = await authUserId();
       const payload = records.map((record) => ({
         ...record,
-        auth_user_id: authUserId,
+        auth_user_id: userId,
       }));
       const { error } = await client
         .from("transactions")
-        .upsert(payload, { onConflict: "transaction_id" });
+        .upsert(payload, { onConflict: "auth_user_id,transaction_id" });
       if (error) throw new Error(`Could not upsert transaction batch: ${error.message}`);
     },
   };

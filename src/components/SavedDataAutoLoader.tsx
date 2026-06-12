@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Loader2 } from "lucide-react";
+import { autoLoadWarehouseIntoStore } from "@/services/analyticsAdapters";
 import { loadLatestCloudSnapshot } from "@/services/dataSnapshots";
 import { FORECASTING_DEFAULT_RETENTION_KEY, saveDefaultRetentionCurve } from "@/services/forecastingSettings";
 import {
@@ -131,6 +132,23 @@ export function SavedDataAutoLoader() {
         } else {
           console.warn("Could not restore Palmer dataset.", error);
           warnings.push("Palmer dataset");
+        }
+      }
+
+      // Clean-template / Primer imports live ONLY in the Supabase transaction warehouse (not the
+      // Palmer cache/cloud snapshots restored above). Auto-load them so analytics survive a refresh /
+      // new-device login instead of silently reverting to mock data (P0-2). No-op when a Palmer
+      // dataset was already restored (autoLoadWarehouseIntoStore skips when source !== "mock").
+      if (mounted) {
+        const warehouse = await autoLoadWarehouseIntoStore();
+        if (warehouse.status === "loaded") {
+          loadedCount += 1;
+          details.push("Loaded transactions from warehouse");
+        } else if (warehouse.status === "empty") {
+          details.push("No warehouse data found");
+        } else if (warehouse.status === "error") {
+          if (warehouse.error) console.warn("Could not load warehouse transactions.", warehouse.error);
+          warnings.push("Transaction warehouse");
         }
       }
 

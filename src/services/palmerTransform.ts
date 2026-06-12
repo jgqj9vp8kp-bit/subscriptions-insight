@@ -333,6 +333,7 @@ export function normalizePalmerRows(rows: RawPalmerRow[]): Transaction[] {
       product: valueFrom(row, FIELD_ALIASES.product) || productFromAmount(grossAmount),
       traffic_source: detectTrafficSource(row, metadata),
       campaign_id: valueFrom(row, FIELD_ALIASES.campaign_id) || String(metadata.utm_campaign ?? ""),
+      utm_source: String(metadata.utm_source ?? valueFrom(row, ["utm_source"]) ?? "").trim() || null,
       billing_reason: String(metadata.ff_billing_reason ?? ""),
       classification_reason: fallbackType ? `${status} Palmer status` : "awaiting user-level classification",
       card_type: cardType ?? undefined,
