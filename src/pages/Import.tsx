@@ -1609,9 +1609,13 @@ export default function ImportPage() {
               disabled={warehouseLoading || !warehouseEnabled}
             >
               <Database className="h-3.5 w-3.5" />
-              Recalculate analytics from DB
+              Refresh local analytics cache from DB
             </Button>
           </div>
+          <p className="mt-2 text-xs text-muted-foreground">
+            This only updates the analytics shown in this browser. The Export API reads directly from Supabase and
+            does not require this button — imported data is available to integrations immediately.
+          </p>
         </div>
 
         {!warehouseEnabled && (

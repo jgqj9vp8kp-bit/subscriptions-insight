@@ -21,6 +21,8 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useToast } from "@/hooks/use-toast";
+import { CampaignIdSplitDiagnostics } from "@/components/CampaignIdSplitDiagnostics";
+import { ExportApiHealth } from "@/components/ExportApiHealth";
 import {
   createApiKey,
   exportCampaignPerformanceEndpoint,
@@ -70,12 +72,17 @@ const exampleResponse = JSON.stringify(
         first_sub_users: 35,
         trial_to_first_sub_cr: 0.35,
         refund_users: 3,
+        net_revenue: 1180.5,
+        spend: 400,
+        cac: 4,
+        roas: 2.95,
       },
     ],
     meta: {
       date_from: "2026-05-01",
       date_to: "2026-05-08",
       rows: 1,
+      traffic_rows: 12,
       generated_at: "2026-06-11T00:00:00.000Z",
     },
   },
@@ -221,6 +228,10 @@ export default function IntegrationsPage() {
 
   return (
     <AppLayout title="Integrations" description="Secure export access for external platforms">
+      <section className="mb-4">
+        <ExportApiHealth />
+      </section>
+
       <section className="grid gap-4 xl:grid-cols-[minmax(0,1.1fr)_minmax(360px,0.9fr)]">
         <div className="space-y-4">
           <Card className="p-4 shadow-card">
@@ -407,6 +418,10 @@ export default function IntegrationsPage() {
             </div>
           </Card>
         </div>
+      </section>
+
+      <section className="mt-4">
+        <CampaignIdSplitDiagnostics />
       </section>
     </AppLayout>
   );

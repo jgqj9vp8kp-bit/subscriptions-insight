@@ -1,35 +1,11 @@
 /* global Deno */
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { decompressFromEncodedURIComponent } from "https://esm.sh/lz-string@1.5.0";
+import { buildCampaignPerformanceRows, collectPages, summarizeBatchLoad, type ComputeTxn } from "./compute.ts";
+import { extractTrafficMetrics, type TrafficMetricLike } from "./aggregate.ts";
 
 type TransactionStatus = "success" | "failed" | "refunded" | "chargeback";
-type TransactionType = "trial" | "upsell" | "first_subscription" | "failed_payment" | "refund" | "chargeback" | string;
-type MediaBuyer = "Ivan" | "Artem A" | "Artem D" | "Unknown";
-
-type Transaction = {
-  transaction_id: string;
-  user_id: string;
-  email: string;
-  event_time: string;
-  amount_usd: number;
-  gross_amount_usd: number;
-  refund_amount_usd: number;
-  net_amount_usd: number;
-  is_refunded: boolean;
-  currency: string;
-  status: TransactionStatus;
-  transaction_type: TransactionType;
-  funnel: string;
-  campaign_path: string;
-  product: string;
-  traffic_source: string;
-  campaign_id: string;
-  utm_source?: string | null;
-  classification_reason: string;
-  billing_reason?: string;
-  metadata?: Record<string, unknown>;
-  raw?: Record<string, unknown>;
-};
 
 type ApiKeyRecord = {
   id: string;
@@ -67,10 +43,6 @@ function normalize(value: unknown): string {
   return String(value ?? "").trim();
 }
 
-function normalizePath(value: unknown): string {
-  return normalize(value).replace(/^\/+/, "").toLowerCase();
-}
-
 async function sha256Hex(value: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
   return Array.from(new Uint8Array(digest))
@@ -89,75 +61,14 @@ function objectFrom(value: unknown): Record<string, unknown> | null {
   return null;
 }
 
-function valueAtPath(source: unknown, path: string[]): unknown {
-  let current: unknown = source;
-  for (const segment of path) {
-    const object = objectFrom(current);
-    if (!object) return undefined;
-    current = object[segment];
-  }
-  return current;
-}
-
-function firstString(source: unknown, paths: string[][]): string | null {
-  for (const path of paths) {
-    const value = valueAtPath(source, path);
-    const normalized = normalize(value);
-    if (normalized) return normalized;
-  }
-  return null;
-}
-
-function campaignIdFor(tx: Transaction): string {
-  return normalize(
-    tx.campaign_id ||
-      firstString(tx, [["campaign_id"], ["campaign", "id"], ["raw_payload", "campaign_id"], ["normalized_payload", "campaign_id"]]) ||
-      firstString(tx.metadata, [["campaign_id"], ["campaign", "id"]]) ||
-      firstString(tx.raw, [["campaign_id"], ["campaign", "id"], ["raw_payload", "campaign_id"], ["normalized_payload", "campaign_id"]]) ||
-      "Unknown",
-  );
-}
-
-function utmSourceFrom(source: unknown): string | null {
-  return firstString(source, [
-    ["utm_source"],
-    ["user", "utm_source"],
-    ["transaction", "utm_source"],
-    ["metadata", "utm_source"],
-    ["raw_payload", "utm_source"],
-    ["normalized_payload", "utm_source"],
-    ["raw_payload", "metadata", "utm_source"],
-    ["normalized_payload", "metadata", "utm_source"],
-  ]);
-}
-
-function utmSourceFor(tx: Transaction): string | null {
-  return utmSourceFrom(tx) ?? utmSourceFrom(tx.metadata) ?? utmSourceFrom(tx.raw) ?? utmSourceFrom(tx.raw?.metadata) ?? null;
-}
-
-function mediaBuyerFromUtmSource(value: unknown): MediaBuyer {
-  const normalized = normalize(value);
-  if (normalized === "4") return "Ivan";
-  if (normalized === "22") return "Artem A";
-  if (normalized === "19") return "Artem D";
-  return "Unknown";
-}
-
-function attributionForUser(txs: Transaction[]): { utm_source: string | null; media_buyer: MediaBuyer } {
-  const sorted = [...txs].sort((a, b) => a.event_time.localeCompare(b.event_time));
-  const trial = sorted.find((tx) => tx.status === "success" && tx.transaction_type === "trial");
-  const trialUtm = trial ? utmSourceFor(trial) : null;
-  if (trialUtm) return { utm_source: trialUtm, media_buyer: mediaBuyerFromUtmSource(trialUtm) };
-  const fallback = sorted.map(utmSourceFor).find(Boolean) ?? null;
-  return { utm_source: fallback, media_buyer: mediaBuyerFromUtmSource(fallback) };
-}
-
 function num(value: unknown): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function hydrateTransaction(record: Record<string, unknown>): Transaction | null {
+// Maps a stored warehouse row to the shape compute.ts expects. transaction_type is intentionally
+// passed through unchanged — compute.ts re-derives it over the user's full history.
+function hydrateTransaction(record: Record<string, unknown>): ComputeTxn | null {
   const payload = objectFrom(record.normalized_payload) ?? {};
   const raw = objectFrom(record.raw_payload) ?? {};
   const transactionId = normalize(payload.transaction_id ?? record.transaction_id);
@@ -173,113 +84,67 @@ function hydrateTransaction(record: Record<string, unknown>): Transaction | null
     refund_amount_usd: num(payload.refund_amount_usd ?? record.amount_refunded),
     net_amount_usd: num(payload.net_amount_usd ?? record.amount_net ?? payload.amount_usd),
     is_refunded: Boolean(payload.is_refunded) || num(record.amount_refunded) > 0,
-    currency: normalize(payload.currency ?? record.currency ?? "USD"),
     status: normalize(payload.status ?? record.status) as TransactionStatus,
-    transaction_type: normalize(payload.transaction_type ?? record.transaction_type) as TransactionType,
+    transaction_type: normalize(payload.transaction_type ?? record.transaction_type),
     funnel: normalize(payload.funnel ?? record.funnel ?? "unknown"),
     campaign_path: normalize(payload.campaign_path ?? record.campaign_path ?? "unknown"),
-    product: normalize(payload.product),
-    traffic_source: normalize(payload.traffic_source ?? record.source_name ?? "unknown"),
     campaign_id: normalize(payload.campaign_id),
     utm_source: normalize(payload.utm_source) || null,
     classification_reason: normalize(payload.classification_reason),
     billing_reason: normalize(payload.billing_reason) || undefined,
+    source: normalize(record.source) || null,
+    import_batch_id: normalize(record.import_batch_id) || null,
     metadata: objectFrom(payload.metadata) ?? undefined,
     raw: { ...raw, ...(objectFrom(payload.raw) ?? {}) },
   };
 }
 
-function groupTransactionsByUser(txs: Transaction[]): Map<string, Transaction[]> {
-  const result = new Map<string, Transaction[]>();
-  for (const tx of txs) {
-    const userKey = tx.user_id || tx.email || tx.transaction_id;
-    result.set(userKey, [...(result.get(userKey) ?? []), tx]);
-  }
-  return result;
-}
-
-function firstTrial(txs: Transaction[]): Transaction | null {
-  return [...txs]
-    .filter((tx) => tx.status === "success" && tx.transaction_type === "trial")
-    .sort((a, b) => a.event_time.localeCompare(b.event_time))[0] ?? null;
-}
-
-function roundRatio(value: number): number {
-  return Math.round(value * 10000) / 10000;
-}
-
-// Rows aggregate per (campaign_id, campaign_path, funnel). media_buyer still works as a request
-// filter (it selects which users are included), but it is no longer a grouping dimension or a
-// payload field — external consumers receive one row per campaign.
-function buildRows(txs: Transaction[], params: URLSearchParams) {
-  const from = dateKey(params.get("date_from"));
-  const to = dateKey(params.get("date_to"));
-  const pathFilter = normalizePath(params.get("campaign_path"));
-  const buyerFilter = normalize(params.get("media_buyer"));
-  const campaignIdFilter = normalize(params.get("campaign_id"));
-  const grouped = new Map<string, Array<{ userId: string; txs: Transaction[]; campaignId: string; campaignPath: string; funnel: string }>>();
-
-  groupTransactionsByUser(txs).forEach((list, userId) => {
-    const trial = firstTrial(list);
-    if (!trial) return;
-    const trialDate = dateKey(trial.event_time);
-    if (!trialDate) return;
-    if (from && trialDate < from) return;
-    if (to && trialDate > to) return;
-
-    const campaignId = campaignIdFor(trial);
-    if (campaignIdFilter && campaignId !== campaignIdFilter) return;
-    const campaignPath = trial.campaign_path || "unknown";
-    if (pathFilter && normalizePath(campaignPath) !== pathFilter) return;
-    if (buyerFilter && attributionForUser(list).media_buyer !== buyerFilter) return;
-
-    const entry = { userId, txs: list, campaignId, campaignPath, funnel: trial.funnel || "unknown" };
-    const key = [campaignId, campaignPath, entry.funnel].join("||");
-    grouped.set(key, [...(grouped.get(key) ?? []), entry]);
-  });
-
-  return Array.from(grouped.values())
-    .map((users) => {
-      const first = users[0];
-      const allTxs = users.flatMap((user) => user.txs);
-      const trialUsers = users.length;
-      const upsellUsers = new Set(allTxs.filter((tx) => tx.status === "success" && tx.transaction_type === "upsell").map((tx) => tx.user_id)).size;
-      const firstSubUsers = new Set(allTxs.filter((tx) => tx.status === "success" && tx.transaction_type === "first_subscription").map((tx) => tx.user_id)).size;
-      const refundUsers = new Set(allTxs.filter((tx) => tx.is_refunded || tx.transaction_type === "refund" || tx.refund_amount_usd > 0).map((tx) => tx.user_id)).size;
-      return {
-        campaign_id: first.campaignId,
-        campaign_path: first.campaignPath,
-        funnel: first.funnel,
-        date_from: from,
-        date_to: to,
-        trial_users: trialUsers,
-        upsell_users: upsellUsers,
-        upsell_cr: trialUsers ? roundRatio(upsellUsers / trialUsers) : 0,
-        first_sub_users: firstSubUsers,
-        trial_to_first_sub_cr: trialUsers ? roundRatio(firstSubUsers / trialUsers) : 0,
-        refund_users: refundUsers,
-      };
-    })
-    .sort((a, b) => b.trial_users - a.trial_users || a.campaign_id.localeCompare(b.campaign_id));
-}
-
-async function loadTransactions(client: ReturnType<typeof createClient>, userId: string): Promise<Transaction[]> {
-  const rows: Record<string, unknown>[] = [];
-  const pageSize = 1000;
-  for (let offset = 0; ; offset += pageSize) {
+// Loads EVERY non-deleted warehouse row for the API key owner across all import batches — paged so
+// it is never capped at Supabase's default single-response row limit. Ordered by (event_time,
+// transaction_id) so range pagination is stable when event_time ties. No import_batch_id filter.
+async function loadTransactions(client: ReturnType<typeof createClient>, userId: string): Promise<ComputeTxn[]> {
+  const rows = await collectPages<Record<string, unknown>>(async (offset, limit) => {
     const { data, error } = await client
       .from("transactions")
-      .select("transaction_id,user_id,event_time,status,transaction_type,amount_gross,amount_net,amount_refunded,currency,email,campaign_path,funnel,source_name,raw_payload,normalized_payload")
+      .select("transaction_id,user_id,event_time,status,transaction_type,amount_gross,amount_net,amount_refunded,currency,email,campaign_path,funnel,source,source_name,import_batch_id,raw_payload,normalized_payload")
       .eq("auth_user_id", userId)
       .is("deleted_at", null)
       .order("event_time", { ascending: true })
-      .range(offset, offset + pageSize - 1);
+      .order("transaction_id", { ascending: true })
+      .range(offset, offset + limit - 1);
     if (error) throw error;
-    const page = (data ?? []) as Record<string, unknown>[];
-    rows.push(...page);
-    if (page.length < pageSize) break;
-  }
-  return rows.map(hydrateTransaction).filter((tx): tx is Transaction => Boolean(tx));
+    return (data ?? []) as Record<string, unknown>[];
+  });
+  return rows.map(hydrateTransaction).filter((tx): tx is ComputeTxn => Boolean(tx));
+}
+
+// Most recent import batch for the account — used only to report how many loaded rows fall outside
+// it (diagnostics), never to filter the data the API computes on.
+async function loadLatestBatchId(client: ReturnType<typeof createClient>, userId: string): Promise<string | null> {
+  const { data, error } = await client
+    .from("import_batches")
+    .select("id")
+    .eq("user_id", userId)
+    .order("imported_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error || !data) return null;
+  return (data as { id?: string }).id ?? null;
+}
+
+// Latest saved Facebook traffic snapshot for the account. Returns [] when none exists, so the API
+// still returns conversion metrics (spend/cac/roas become null) instead of failing.
+async function loadTrafficSnapshot(client: ReturnType<typeof createClient>, userId: string): Promise<TrafficMetricLike[]> {
+  const { data, error } = await client
+    .from("data_snapshots")
+    .select("payload")
+    .eq("user_id", userId)
+    .eq("dataset_type", "facebook_traffic")
+    .order("updated_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error || !data) return [];
+  return extractTrafficMetrics((data as { payload: unknown }).payload, decompressFromEncodedURIComponent);
 }
 
 Deno.serve(async (req: Request) => {
@@ -317,8 +182,23 @@ Deno.serve(async (req: Request) => {
 
   try {
     await client.from("api_keys").update({ last_used_at: new Date().toISOString() }).eq("id", key.id);
-    const txs = await loadTransactions(client, key.user_id);
-    const rows = buildRows(txs, params);
+    const [txs, traffic, latestBatchId] = await Promise.all([
+      loadTransactions(client, key.user_id),
+      loadTrafficSnapshot(client, key.user_id),
+      loadLatestBatchId(client, key.user_id),
+    ]);
+    const rows = buildCampaignPerformanceRows({
+      txs,
+      traffic,
+      params: {
+        date_from: params.get("date_from"),
+        date_to: params.get("date_to"),
+        campaign_path: params.get("campaign_path"),
+        media_buyer: params.get("media_buyer"),
+        campaign_id: params.get("campaign_id"),
+      },
+    });
+    const batchLoad = summarizeBatchLoad(txs, latestBatchId);
     await client.from("api_export_logs").insert({ ...logBase, status_code: 200, rows_returned: rows.length });
     return jsonResponse({
       data: rows,
@@ -326,6 +206,11 @@ Deno.serve(async (req: Request) => {
         date_from: dateKey(params.get("date_from")),
         date_to: dateKey(params.get("date_to")),
         rows: rows.length,
+        traffic_rows: traffic.length,
+        transactions_loaded: batchLoad.transactions_loaded,
+        import_batches_loaded: batchLoad.import_batches_loaded,
+        latest_batch_rows: batchLoad.latest_batch_rows,
+        rows_outside_latest_batch: batchLoad.rows_outside_latest_batch,
         generated_at: new Date().toISOString(),
       },
     });

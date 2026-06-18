@@ -64,6 +64,25 @@ export function SavedDataAutoLoader() {
       const details: string[] = [];
       let loadedCount = 0;
 
+      // The full merged Supabase warehouse is the source of truth and is loaded FIRST. The Palmer
+      // IndexedDB / cloud snapshot only holds the most recently imported CSV part, so restoring it
+      // first would shadow earlier CSV parts until the user clicked "Refresh local analytics cache
+      // from DB". Loading the warehouse up front makes in-app analytics match the Export API (full
+      // history across every import batch) with no manual refresh. The Palmer cache below is only a
+      // fallback for when the warehouse is disabled, empty, or errors.
+      if (mounted) {
+        const warehouse = await autoLoadWarehouseIntoStore();
+        if (warehouse.status === "loaded") {
+          loadedCount += 1;
+          details.push("Loaded transactions from warehouse");
+        } else if (warehouse.status === "empty") {
+          details.push("No warehouse data found");
+        } else if (warehouse.status === "error") {
+          if (warehouse.error) console.warn("Could not load warehouse transactions.", warehouse.error);
+          warnings.push("Transaction warehouse");
+        }
+      }
+
       try {
         if (useDataStore.getState().meta.source !== "mock") {
           details.push("Palmer dataset already loaded");
@@ -132,23 +151,6 @@ export function SavedDataAutoLoader() {
         } else {
           console.warn("Could not restore Palmer dataset.", error);
           warnings.push("Palmer dataset");
-        }
-      }
-
-      // Clean-template / Primer imports live ONLY in the Supabase transaction warehouse (not the
-      // Palmer cache/cloud snapshots restored above). Auto-load them so analytics survive a refresh /
-      // new-device login instead of silently reverting to mock data (P0-2). No-op when a Palmer
-      // dataset was already restored (autoLoadWarehouseIntoStore skips when source !== "mock").
-      if (mounted) {
-        const warehouse = await autoLoadWarehouseIntoStore();
-        if (warehouse.status === "loaded") {
-          loadedCount += 1;
-          details.push("Loaded transactions from warehouse");
-        } else if (warehouse.status === "empty") {
-          details.push("No warehouse data found");
-        } else if (warehouse.status === "error") {
-          if (warehouse.error) console.warn("Could not load warehouse transactions.", warehouse.error);
-          warnings.push("Transaction warehouse");
         }
       }
 
