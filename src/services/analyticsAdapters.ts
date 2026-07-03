@@ -1,8 +1,14 @@
 import { useDataStore } from "@/store/dataStore";
 import {
+  cleanupDuplicateImports,
+  deleteImportBatch,
   getWarehouseTransactionCount,
   isTransactionWarehouseEnabled,
   loadWarehouseTransactions,
+  rollbackImportBatch,
+  type DuplicateCleanupResult,
+  type ImportDeletionResult,
+  type WarehouseManagementClient,
 } from "@/services/transactionWarehouse";
 import type { Transaction } from "@/services/types";
 
@@ -38,6 +44,46 @@ export async function refreshLocalAnalyticsCacheFromWarehouse(): Promise<Transac
     fileName: "Supabase transaction warehouse",
   });
   return transactions;
+}
+
+/**
+ * Import-management orchestrators. Each performs the destructive warehouse operation and then
+ * rebuilds the in-memory analytics store from the warehouse, so every page subscribed to the store
+ * (Transactions / Users / Cohorts / Dashboard / FB / Payment) refreshes WITHOUT a page reload and
+ * WITHOUT touching analytics calculations. `client` / `refresh` are injectable for tests.
+ */
+export interface ImportManagementOptions {
+  client?: WarehouseManagementClient;
+  refresh?: () => Promise<Transaction[]>;
+}
+
+export async function deleteImportBatchAndRefresh(
+  batchId: string,
+  options: ImportManagementOptions = {},
+): Promise<{ result: ImportDeletionResult; transactions: number }> {
+  const refresh = options.refresh ?? refreshLocalAnalyticsCacheFromWarehouse;
+  const result = await deleteImportBatch(batchId, options.client);
+  const transactions = await refresh();
+  return { result, transactions: transactions.length };
+}
+
+export async function rollbackImportBatchAndRefresh(
+  batchId: string,
+  options: ImportManagementOptions = {},
+): Promise<{ result: ImportDeletionResult; transactions: number }> {
+  const refresh = options.refresh ?? refreshLocalAnalyticsCacheFromWarehouse;
+  const result = await rollbackImportBatch(batchId, options.client);
+  const transactions = await refresh();
+  return { result, transactions: transactions.length };
+}
+
+export async function cleanupDuplicateImportsAndRefresh(
+  options: ImportManagementOptions = {},
+): Promise<{ result: DuplicateCleanupResult; transactions: number }> {
+  const refresh = options.refresh ?? refreshLocalAnalyticsCacheFromWarehouse;
+  const result = await cleanupDuplicateImports(options.client);
+  const transactions = await refresh();
+  return { result, transactions: transactions.length };
 }
 
 export type WarehouseAutoLoadStatus = "loaded" | "empty" | "disabled" | "skipped" | "error";

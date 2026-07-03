@@ -9,7 +9,7 @@ export const USE_TRANSACTION_WAREHOUSE = publicRuntimeConfig.useTransactionWareh
 export const TRANSACTION_WAREHOUSE_CHUNK_SIZE = 1000;
 export const TRANSACTION_WAREHOUSE_SELECT_PAGE_SIZE = 1000;
 
-export type ImportBatchStatus = "processing" | "completed" | "failed";
+export type ImportBatchStatus = "processing" | "completed" | "failed" | "cancelled" | "rolled_back";
 
 export interface ImportBatchInfo {
   id: string;
@@ -508,6 +508,170 @@ export async function listImportBatches(limit = 20): Promise<ImportBatchInfo[]> 
     .limit(limit);
   if (error) throw new Error(`Could not load import history: ${error.message}`);
   return (data ?? []) as ImportBatchInfo[];
+}
+
+// ---------------------------------------------------------------------------
+// Import management: Delete / Rollback / Duplicate cleanup.
+// ---------------------------------------------------------------------------
+
+/** Statuses whose batches are always removed by Cleanup (never "completed"). */
+export const CLEANUP_REMOVABLE_STATUSES: ImportBatchStatus[] = ["failed", "cancelled", "rolled_back"];
+
+export interface DuplicateCleanupPlan {
+  /** Batch ids that survive cleanup (newest completed per checksum). */
+  keepIds: string[];
+  /** Batch ids to remove (older completed duplicates + failed/cancelled/rolled_back). */
+  deleteIds: string[];
+  /** Older completed batches sharing a checksum with a newer completed batch. */
+  duplicateImports: number;
+  /** Failed + cancelled + rolled_back batches. */
+  failedImports: number;
+}
+
+export interface ImportDeletionResult {
+  batchId: string;
+  deletedTransactions: number;
+}
+
+export interface DuplicateCleanupResult {
+  duplicateImports: number;
+  failedImports: number;
+  transactionsRemoved: number;
+}
+
+/**
+ * Pure planner mirroring the cleanup_duplicate_imports() SQL: for each checksum group of COMPLETED
+ * batches keep the newest (by imported_at, id tie-break) and mark the rest as duplicates; every
+ * failed / cancelled / rolled_back batch is removed regardless of checksum. Batches without a
+ * checksum are their own group (never deduped against others), matching coalesce(checksum, id).
+ */
+export function planDuplicateCleanup(batches: ImportBatchInfo[]): DuplicateCleanupPlan {
+  const removable = new Set<ImportBatchStatus>(CLEANUP_REMOVABLE_STATUSES);
+  const deleteIds: string[] = [];
+
+  const completedByChecksum = new Map<string, ImportBatchInfo[]>();
+  for (const batch of batches) {
+    if (batch.status !== "completed") continue;
+    const key = batch.checksum ? `checksum:${batch.checksum}` : `id:${batch.id}`;
+    const group = completedByChecksum.get(key) ?? [];
+    group.push(batch);
+    completedByChecksum.set(key, group);
+  }
+
+  let duplicateImports = 0;
+  completedByChecksum.forEach((group) => {
+    if (group.length < 2) return;
+    const sorted = [...group].sort((a, b) =>
+      a.imported_at < b.imported_at ? 1 : a.imported_at > b.imported_at ? -1 : a.id < b.id ? 1 : -1,
+    );
+    // Keep sorted[0] (newest); delete the rest.
+    for (const batch of sorted.slice(1)) {
+      deleteIds.push(batch.id);
+      duplicateImports += 1;
+    }
+  });
+
+  let failedImports = 0;
+  for (const batch of batches) {
+    if (!removable.has(batch.status)) continue;
+    deleteIds.push(batch.id);
+    failedImports += 1;
+  }
+
+  const deleteSet = new Set(deleteIds);
+  const keepIds = batches.filter((batch) => !deleteSet.has(batch.id)).map((batch) => batch.id);
+  return { keepIds, deleteIds, duplicateImports, failedImports };
+}
+
+/**
+ * Abstraction over the destructive warehouse operations so the UI can run them against Supabase RPC
+ * (atomic, hard delete, transactions removed before the batch) while tests inject an in-memory store.
+ */
+export interface WarehouseManagementClient {
+  deleteBatch: (batchId: string) => Promise<ImportDeletionResult>;
+  rollbackBatch: (batchId: string) => Promise<ImportDeletionResult>;
+  cleanupDuplicates: (dryRun: boolean) => Promise<DuplicateCleanupResult>;
+  batchTransactionCounts: () => Promise<Map<string, number>>;
+}
+
+function createSupabaseManagementClient(): WarehouseManagementClient {
+  const client = ensureSupabase();
+  return {
+    async deleteBatch(batchId) {
+      const { data, error } = await client.rpc("delete_import_batch", { p_batch_id: batchId });
+      if (error) throw new Error(`Could not delete import: ${error.message}`);
+      const result = (data ?? {}) as { deleted_transactions?: number };
+      return { batchId, deletedTransactions: Number(result.deleted_transactions ?? 0) };
+    },
+    async rollbackBatch(batchId) {
+      const { data, error } = await client.rpc("rollback_import_batch", { p_batch_id: batchId });
+      if (error) throw new Error(`Could not roll back import: ${error.message}`);
+      const result = (data ?? {}) as { deleted_transactions?: number };
+      return { batchId, deletedTransactions: Number(result.deleted_transactions ?? 0) };
+    },
+    async cleanupDuplicates(dryRun) {
+      const { data, error } = await client.rpc("cleanup_duplicate_imports", { p_dry_run: dryRun });
+      if (error) throw new Error(`Could not clean up imports: ${error.message}`);
+      const result = (data ?? {}) as {
+        duplicate_imports?: number;
+        failed_imports?: number;
+        transactions_removed?: number;
+      };
+      return {
+        duplicateImports: Number(result.duplicate_imports ?? 0),
+        failedImports: Number(result.failed_imports ?? 0),
+        transactionsRemoved: Number(result.transactions_removed ?? 0),
+      };
+    },
+    async batchTransactionCounts() {
+      const { data, error } = await client.rpc("import_batch_transaction_counts");
+      if (error) throw new Error(`Could not load transaction counts: ${error.message}`);
+      const counts = new Map<string, number>();
+      for (const row of (data ?? []) as { import_batch_id: string; transaction_count: number }[]) {
+        counts.set(row.import_batch_id, Number(row.transaction_count ?? 0));
+      }
+      return counts;
+    },
+  };
+}
+
+/** Delete an import and ALL transactions it owns (hard delete — no orphaned rows). */
+export async function deleteImportBatch(
+  batchId: string,
+  client: WarehouseManagementClient = createSupabaseManagementClient(),
+): Promise<ImportDeletionResult> {
+  if (!batchId) throw new Error("An import batch id is required to delete an import.");
+  return client.deleteBatch(batchId);
+}
+
+/** Roll back an import: remove only its transactions, keep the history row as an audit trail. */
+export async function rollbackImportBatch(
+  batchId: string,
+  client: WarehouseManagementClient = createSupabaseManagementClient(),
+): Promise<ImportDeletionResult> {
+  if (!batchId) throw new Error("An import batch id is required to roll back an import.");
+  return client.rollbackBatch(batchId);
+}
+
+/** Preview the duplicate-cleanup plan (no rows are removed). */
+export async function previewDuplicateCleanup(
+  client: WarehouseManagementClient = createSupabaseManagementClient(),
+): Promise<DuplicateCleanupResult> {
+  return client.cleanupDuplicates(true);
+}
+
+/** Remove duplicate / failed / cancelled imports and their transactions. */
+export async function cleanupDuplicateImports(
+  client: WarehouseManagementClient = createSupabaseManagementClient(),
+): Promise<DuplicateCleanupResult> {
+  return client.cleanupDuplicates(false);
+}
+
+/** Live transaction counts keyed by import_batch_id (for the details panel). */
+export async function getImportBatchTransactionCounts(
+  client: WarehouseManagementClient = createSupabaseManagementClient(),
+): Promise<Map<string, number>> {
+  return client.batchTransactionCounts();
 }
 
 export async function getWarehouseTransactionCount(): Promise<number> {

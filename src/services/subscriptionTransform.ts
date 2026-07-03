@@ -86,22 +86,69 @@ export function extractSubscriptionProfileId(raw: FunnelFoxSubscriptionRaw): str
   return normalizeProfileId(candidate);
 }
 
+// Keys that may carry an email anywhere in a profile-detail payload.
+const PROFILE_EMAIL_KEYS = ["email", "email_address", "emailAddress", "contact_email", "customer_email", "user_email", "profile_email"];
+// Container objects that may hold those keys (checked under both the response root and its `data`).
+const PROFILE_EMAIL_CONTAINERS = ["", "profile", "customer", "user", "contact", "metadata", "fields", "attributes", "replies", "preview"];
+
+function looksLikeEmail(value: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim());
+}
+
+function emailFromContainer(container: Record<string, unknown>): string | null {
+  for (const key of PROFILE_EMAIL_KEYS) {
+    const email = normalizeEmail(container[key]);
+    if (email) return email;
+  }
+  return null;
+}
+
+/** Last-resort: walk the payload for any "email"-named key whose value looks like an email. */
+function deepFindEmail(value: unknown, depth: number): string | null {
+  if (value == null || depth < 0) return null;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = deepFindEmail(item, depth - 1);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    for (const [key, entry] of Object.entries(record)) {
+      if (typeof entry === "string" && key.toLowerCase().includes("email") && looksLikeEmail(entry)) {
+        return normalizeEmail(entry);
+      }
+    }
+    for (const entry of Object.values(record)) {
+      const found = deepFindEmail(entry, depth - 1);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve the email from a /profiles/{id} detail payload. FunnelFox is inconsistent about where the
+ * email lives (root, `data`, `customer`, `user`, `metadata`, `preview`, …), so we check a broad set of
+ * explicit container.key paths first (deterministic priority), then fall back to a bounded deep walk
+ * for any email-shaped value under an "email"-named key. Returning null here means the payload truly
+ * has no email — not that we failed to look in the right place.
+ */
 export function extractProfileEmail(profileResponse: unknown): string | null {
   const root = readRecord(profileResponse);
   const data = readRecord(root.data);
-  const profile = Object.keys(data).length ? data : readRecord(root.profile);
-  const replies = readRecord(profile.replies);
-  const metadata = readRecord(profile.metadata);
-  const fields = readRecord(profile.fields);
+  const roots = [root, data];
 
-  return (
-    normalizeEmail(root.email) ??
-    normalizeEmail(profile.email) ??
-    normalizeEmail(data.email) ??
-    normalizeEmail(replies.email) ??
-    normalizeEmail(metadata.email) ??
-    normalizeEmail(fields.email)
-  );
+  for (const base of roots) {
+    for (const container of PROFILE_EMAIL_CONTAINERS) {
+      const target = container === "" ? base : readRecord(base[container]);
+      const email = emailFromContainer(target);
+      if (email) return email;
+    }
+  }
+
+  return deepFindEmail(profileResponse, 5);
 }
 
 function statusContains(status: string, needle: string): boolean {

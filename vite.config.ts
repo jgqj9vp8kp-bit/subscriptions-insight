@@ -78,5 +78,20 @@ export default defineConfig(({ mode }) => {
       },
       dedupe: ["react", "react-dom", "react/jsx-runtime", "react/jsx-dev-runtime", "@tanstack/react-query", "@tanstack/query-core"],
     },
+    build: {
+      rollupOptions: {
+        output: {
+          // Split large, rarely-changing vendor libraries into their own long-cached chunks so the
+          // main app chunk shrinks and the browser can download them in parallel. recharts (the
+          // single biggest dependency) is isolated so only chart-using pages pay for it.
+          manualChunks: {
+            "vendor-react": ["react", "react-dom", "react-router-dom"],
+            "vendor-charts": ["recharts"],
+            "vendor-supabase": ["@supabase/supabase-js"],
+            "vendor-query": ["@tanstack/react-query"],
+          },
+        },
+      },
+    },
   };
 });

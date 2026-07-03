@@ -12,6 +12,7 @@
 - Import Data is the single connection center. Keep Palmer import/cache, Facebook traffic import, FunnelFox sync/test, and local saved-data controls there; analytics pages should not own data loading controls.
 - Page filters and small UI settings are persisted through `usePersistedPageState`; never put imported datasets, raw API payloads, or secrets into page UI state.
 - Subengine requires Supabase Auth before analytics routes render. Keep Supabase credentials in environment variables and disable public signup in the Supabase project.
+- Support Inbox reads Mail.ru only from the `sync-support-mail` Supabase Edge Function. Do not put `MAILRU_IMAP_PASSWORD`, service role keys, raw IMAP credentials, or full email bodies in frontend logs or browser state.
 
 ## Assumptions
 
@@ -181,6 +182,51 @@ Fox-Secret: Deno.env.get("FUNNELFOX_SECRET")
 Duplicate subscriptions are removed before normalization using `id`, then `subscription_id`, then `psp_id`; the most recently updated record is kept. Detail fetches are cached per sync so repeated subscription ids only call FunnelFox once. Detail failures do not fail the whole subscription sync; missing fields stay empty and the UI reports partial enrichment warnings.
 
 Security warning: never put `Fox-Secret`, `FUNNELFOX_SECRET`, or the raw FunnelFox API URL in browser code. The browser must only call the server-side proxy.
+
+## Mail.ru Support Inbox
+
+The Support page is backed by `public.support_messages` and the `sync-support-mail` Edge Function:
+
+```text
+Mail.ru IMAP
+-> Supabase Edge Function sync-support-mail
+-> public.support_messages
+-> Support page filters / detail view
+```
+
+The function requires a logged-in Supabase JWT in `Authorization: Bearer ...`; it should not be deployed as a public unauthenticated mailbox sync. Mailbox credentials are read only from Edge Function secrets:
+
+```text
+MAILRU_IMAP_HOST=imap.mail.ru
+MAILRU_IMAP_PORT=993
+MAILRU_IMAP_USER=support@azora-astro.com
+MAILRU_IMAP_PASSWORD=...
+```
+
+Set and deploy:
+
+```text
+supabase secrets set MAILRU_IMAP_HOST=imap.mail.ru
+supabase secrets set MAILRU_IMAP_PORT=993
+supabase secrets set MAILRU_IMAP_USER=support@azora-astro.com
+supabase secrets set MAILRU_IMAP_PASSWORD=...
+supabase functions deploy sync-support-mail
+```
+
+If Mail.ru 2FA is enabled, use a Mail.ru app password. The frontend calls only `/functions/v1/sync-support-mail`; it never connects to IMAP directly.
+
+Support intent classification is keyword-based with priority:
+
+```text
+refund_request
+-> cancel_subscription
+-> payment_problem
+-> access_problem
+-> general_support
+-> unknown
+```
+
+Matching uses normalized sender email against transaction warehouse email fields and enriches with the existing user/cohort attribution helpers. Unmatched messages are still stored with null matched fields so the Support page can triage them.
 
 ### Local FunnelFox sync testing
 

@@ -1,1000 +1,657 @@
-import { useEffect, useMemo, useState } from "react";
-import { Calculator, RotateCcw, Save, TrendingUp } from "lucide-react";
+import { useDeferredValue, useMemo, type ReactNode } from "react";
+import { ArrowDown, ArrowUp, ArrowUpDown, Info, RotateCcw, TrendingUp } from "lucide-react";
+import { CartesianGrid, ComposedChart, Line, ReferenceLine, XAxis, YAxis } from "recharts";
 import { AppLayout } from "@/components/AppLayout";
 import { KpiCard } from "@/components/KpiCard";
-import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
-import { Checkbox } from "@/components/ui/checkbox";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
-import { computeCohorts, formatCurrency, formatPct } from "@/services/analytics";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { ChartContainer, ChartTooltip, ChartTooltipContent, type ChartConfig } from "@/components/ui/chart";
+import { cn } from "@/lib/utils";
 import { useTransactions } from "@/services/sheets";
-import { normalizeCampaignPath, type TrafficMetric } from "@/services/trafficImport";
-import type { CohortRow } from "@/services/types";
 import { useDataStore } from "@/store/dataStore";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
-import { loadDefaultRetentionCurve } from "@/services/forecastingSettings";
+import { computeCohorts, formatCurrency, DEFAULT_MAX_RENEWAL_DEPTH } from "@/services/analytics";
+import { aggregateTrafficMetrics } from "@/services/cohortReporting";
+import { filterCohortsWithDiagnostics, filterTransactionsByTrialAttribution, campaignIdForTransaction } from "@/services/cohortFiltering";
+import { countryUserCountsForTransactions } from "@/services/userCountry";
+import { CARD_TYPE_VALUES, cardTypeLabel } from "@/services/userCardType";
+import { MEDIA_BUYER_VALUES } from "@/services/userMediaBuyer";
 import {
-  buildForecastPriceOptions,
-  defaultPriceSelection,
-  fallbackRetentionForMonth,
-  forecastProfit,
-  forecastRoas,
-  projectedSpendFromCac,
-  priceSourceLabel,
-  resolveSelectedPrice,
-  resolveForecastCac,
-  retentionPercentagesForCohorts,
-  type ForecastPriceOption,
-  type PriceSelection,
-} from "@/services/forecasting";
+  buildCohortPaybackRows,
+  buildPaybackCurve,
+  buildSelectedCohortDataset,
+  calculateActualRevenueByDay,
+  calculatePaybackSummary,
+  calculateScenario,
+  deriveAssumptionsFromCohorts,
+  projectMonthlyNetRevenue,
+  resolveSpendAndCac,
+  type CohortPaybackRow,
+  type ForecastAssumptions,
+  type ForecastComputationInput,
+  type PaybackStatus,
+} from "@/services/paybackForecast";
+import type { CardType, MediaBuyer } from "@/services/types";
 
-type RetentionSource = "auto_actual" | "auto_fallback" | "manual";
+const PROCESSING_FEE_DEFAULT_PCT = 3; // %
+const FIXED_FEE_DEFAULT = 0.3; // $ per charge
+const COHORT_PAGE_SIZE = 25;
 
-type RetentionInput = {
-  month: number;
-  value: string;
-  actualValue: number | null;
-  fallbackValue: number;
-  source: RetentionSource;
-};
+type SortKey = "trialUsers" | "spend" | "cac" | "roas1M" | "paybackDay" | "profitPerUser";
+type SortDir = "asc" | "desc";
 
-type ForecastInputs = {
-  trialPrice: string;
-  subscriptionPrice: string;
-  upsellRate: string;
-  upsellValue: string;
-  refundRate: string;
-  stripeFee: string;
-  fbFee: string;
-  cac: string;
-};
-
-type MonthlyForecastRow = {
-  month: number;
-  retention: number;
-  payingUsers: number;
-  subscriptionRevenue: number;
-  cumulativeGrossRevenue: number;
-  cumulativeNetRevenue: number;
-  projectedSpend: number | null;
-  cumulativeLtv: number;
-  cumulativeProfit: number;
-  roas: number | null;
-};
-
-const MONTHS = Array.from({ length: 12 }, (_, index) => index + 1);
-const SCENARIOS_STORAGE_KEY = "forecasting_scenarios_v1";
-const DEFAULT_TRIAL_PRICE = 1;
-const DEFAULT_SUBSCRIPTION_PRICE = 29.99;
-const DEFAULT_UPSELL_VALUE = 14.98;
-
-const DEFAULT_FORECAST_INPUTS: ForecastInputs = {
-  trialPrice: "0",
-  subscriptionPrice: "0",
-  upsellRate: "0",
-  upsellValue: "0",
-  refundRate: "0",
-  stripeFee: "0",
-  fbFee: "0",
-  cac: "",
-};
-
-const DEFAULT_FORECASTING_UI_STATE = {
+const DEFAULT_FORECAST_UI_STATE = {
+  funnelFilter: "all",
+  campaignPathFilter: "all",
+  countryFilter: "all",
+  cardTypeFilter: "all",
+  mediaBuyerFilter: "all",
+  campaignIdFilter: "all",
   dateFrom: "",
   dateTo: "",
-  campaignPathFilter: "all",
-  funnelFilter: "all",
   selectedCohortIds: [] as string[],
-  retentionInputs: [] as RetentionInput[],
-  forecastInputs: DEFAULT_FORECAST_INPUTS,
-  trialPriceSelection: "default" as PriceSelection,
-  subscriptionPriceSelection: "default" as PriceSelection,
-  upsellValueSelection: "default" as PriceSelection,
-  cacSource: "actual" as "actual" | "manual",
-  lastAutoFillKey: "",
+  // Cost overrides ("" = use auto). Rate fields are entered as percentages.
+  trialPrice: "",
+  subscriptionPrice: "",
+  upsellValue: "",
+  upsellRate: "",
+  firstRenewalRate: "",
+  monthlyRetention: "",
+  refundRate: "",
+  processingFeePct: String(PROCESSING_FEE_DEFAULT_PCT),
+  fixedFee: String(FIXED_FEE_DEFAULT),
+  manualSpend: "",
+  manualCac: "",
+  marginTarget: "",
+  // Scenario overrides ("" = use base).
+  scCac: "",
+  scTrialPrice: "",
+  scSubscriptionPrice: "",
+  scFirstRenewalRate: "",
+  scMonthlyRetention: "",
+  scUpsellRate: "",
+  scUpsellValue: "",
+  scRefundRate: "",
+  sortKey: "trialUsers" as SortKey,
+  sortDir: "desc" as SortDir,
+  page: 1,
 };
 
-type TrafficAggregate = TrafficMetric & { row_count: number };
+type UiState = typeof DEFAULT_FORECAST_UI_STATE;
 
-function round2(value: number): number {
-  return Math.round(value * 100) / 100;
+// ---------------------------------------------------------------------------
+// Formatting helpers
+// ---------------------------------------------------------------------------
+
+const parseNum = (value: string): number | null => {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const n = Number(trimmed);
+  return Number.isFinite(n) ? n : null;
+};
+
+const fmtRoas = (roas: number | null | undefined) => (roas == null ? "—" : `${roas.toFixed(2)}x`);
+const fmtDay = (day: number | null | undefined) => (day == null ? "Never" : `Day ${day}`);
+const fmtMoney = (n: number | null | undefined) => (n == null ? "—" : formatCurrency(n));
+const fmtInt = (n: number) => Math.round(n).toLocaleString();
+
+const STATUS_META: Record<PaybackStatus, { label: string; cls: string }> = {
+  scale: { label: "Scale", cls: "bg-success/15 text-success" },
+  watch: { label: "Watch", cls: "bg-warning/15 text-warning" },
+  stop: { label: "Stop", cls: "bg-destructive/15 text-destructive" },
+  unknown: { label: "Unknown", cls: "bg-muted text-muted-foreground" },
+};
+
+function StatusBadge({ status }: { status: PaybackStatus }) {
+  const meta = STATUS_META[status];
+  return <span className={cn("inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium", meta.cls)}>{meta.label}</span>;
 }
 
-function inputString(value: unknown): string {
-  return value == null ? "" : String(value);
+function Hint({ text }: { text: string }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span className="ml-1 inline-flex cursor-help align-middle text-muted-foreground">
+          <Info className="h-3 w-3" />
+        </span>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-[240px] text-xs">{text}</TooltipContent>
+    </Tooltip>
+  );
 }
 
-function parseNumberInput(value: unknown): number {
-  const normalized = String(value ?? "").trim().replace(",", ".");
-  if (!normalized) return 0;
-  const parsed = Number(normalized);
-  return Number.isFinite(parsed) ? parsed : 0;
-}
-
-function stripExtraLeadingZero(value: string): string {
-  return value.replace(/^(-?)0+(?=\d)/, "$1");
-}
-
-function clampPercent(value: unknown): number {
-  return Math.min(100, Math.max(0, parseNumberInput(value)));
-}
-
-function numericInputProps() {
-  return {
-    type: "text" as const,
-    inputMode: "decimal" as const,
-  };
-}
-
-function normalizeDate(date: string): string {
-  const raw = String(date ?? "").trim();
-  const isoMatch = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
-  if (isoMatch) return `${isoMatch[1]}-${isoMatch[2]}-${isoMatch[3]}`;
-  const parsed = new Date(raw);
-  if (Number.isNaN(parsed.getTime())) return raw;
-  return `${parsed.getFullYear()}-${String(parsed.getMonth() + 1).padStart(2, "0")}-${String(parsed.getDate()).padStart(2, "0")}`;
-}
-
-function trafficKey(date: string, campaignPath: string): string {
-  return `${normalizeDate(date)}__${normalizeCampaignPath(campaignPath)}`;
-}
-
-function cohortTrafficKey(row: CohortRow): string {
-  return trafficKey(row.cohort_date, row.campaign_path);
-}
-
-function aggregateTrafficMetrics(rows: TrafficMetric[]): Map<string, TrafficAggregate> {
-  const map = new Map<string, TrafficAggregate>();
-  for (const row of rows) {
-    const key = trafficKey(row.date, row.campaign_path);
-    const current = map.get(key);
-    if (!current) {
-      map.set(key, { ...row, row_count: 1 });
-      continue;
-    }
-    current.trial_count += row.trial_count;
-    current.spend += row.spend;
-    current.clicks += row.clicks;
-    current.cac = current.trial_count ? current.spend / current.trial_count : 0;
-    current.cpc = current.clicks ? current.spend / current.clicks : 0;
-    current.row_count += 1;
-  }
-  return map;
-}
-
-// Retention helpers (cohortIdForTrial / retentionPercentagesForCohorts / fallbackRetentionForMonth)
-// now live in @/services/forecasting so they share the SAME cohort-id derivation as the price
-// options and are unit-tested. See P0-1.
-
-function sourceLabel(source: RetentionSource): string {
-  if (source === "auto_actual") return "Actual";
-  if (source === "manual") return "Manual";
-  return "Fallback";
-}
-
-function sourceClass(source: RetentionSource): string {
-  if (source === "auto_actual") return "text-success";
-  if (source === "manual") return "text-primary";
-  return "text-warning";
-}
-
-function buildForecastRows(
-  trialUsers: number,
-  cac: number | null,
-  retention: RetentionInput[],
-  inputs: ForecastInputs,
-): MonthlyForecastRow[] {
-  const trialPrice = parseNumberInput(inputs.trialPrice);
-  const subscriptionPrice = parseNumberInput(inputs.subscriptionPrice);
-  const upsellRate = parseNumberInput(inputs.upsellRate);
-  const upsellValue = parseNumberInput(inputs.upsellValue);
-  const refundRate = parseNumberInput(inputs.refundRate);
-  const stripeFee = parseNumberInput(inputs.stripeFee);
-  const fbFee = parseNumberInput(inputs.fbFee);
-  const trialRevenue = trialUsers * trialPrice;
-  const upsellRevenue = trialUsers * (upsellRate / 100) * upsellValue;
-  const feeMultiplier = Math.max(0, 1 - (refundRate + stripeFee + fbFee) / 100);
-  const projectedSpend = projectedSpendFromCac(trialUsers, cac);
-
-  let cumulativeSubscriptionRevenue = 0;
-  return retention.map((month) => {
-    const retentionValue = clampPercent(month.value);
-    const payingUsers = trialUsers * (retentionValue / 100);
-    const subscriptionRevenue = payingUsers * subscriptionPrice;
-    cumulativeSubscriptionRevenue += subscriptionRevenue;
-    const cumulativeGrossRevenue = trialRevenue + upsellRevenue + cumulativeSubscriptionRevenue;
-    const cumulativeNetRevenue = cumulativeGrossRevenue * feeMultiplier;
-    return {
-      month: month.month,
-      retention: retentionValue,
-      payingUsers,
-      subscriptionRevenue,
-      cumulativeGrossRevenue,
-      cumulativeNetRevenue,
-      projectedSpend,
-      cumulativeLtv: trialUsers ? cumulativeNetRevenue / trialUsers : 0,
-      cumulativeProfit: forecastProfit(cumulativeNetRevenue, projectedSpend),
-      roas: forecastRoas(cumulativeNetRevenue, projectedSpend),
-    };
-  });
-}
-
-function sum(numbers: number[]): number {
-  return numbers.reduce((total, value) => total + value, 0);
+/** Cost input with an auto value, manual override, and reset-to-auto. */
+function CostInput({
+  label,
+  autoValue,
+  value,
+  onChange,
+  suffix,
+  hint,
+}: {
+  label: string;
+  autoValue: string;
+  value: string;
+  onChange: (next: string) => void;
+  suffix?: string;
+  hint?: string;
+}) {
+  const overridden = value.trim() !== "";
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center justify-between">
+        <Label className="text-xs text-muted-foreground">
+          {label}
+          {suffix ? ` (${suffix})` : ""}
+          {hint && <Hint text={hint} />}
+        </Label>
+        {overridden && (
+          <button type="button" className="text-[10px] text-primary hover:underline" onClick={() => onChange("")}>
+            reset
+          </button>
+        )}
+      </div>
+      <Input className="h-8" value={value} placeholder={autoValue} onChange={(event) => onChange(event.target.value)} />
+      <p className="text-[10px] text-muted-foreground">
+        Auto: <span className="font-medium">{autoValue}</span> · {overridden ? "manual override" : "using auto"}
+      </p>
+    </div>
+  );
 }
 
 export default function ForecastingPage() {
   const txs = useTransactions();
   const subscriptions = useDataStore((state) => state.subscriptions);
   const trafficMetrics = useDataStore((state) => state.trafficMetrics);
-  const [uiState, setUiState, resetUiState] = usePersistedPageState("ui_state_forecasting", DEFAULT_FORECASTING_UI_STATE);
-  const {
-    dateFrom,
-    dateTo,
-    campaignPathFilter,
-    funnelFilter,
-    selectedCohortIds: selectedIdList,
-    retentionInputs,
-    forecastInputs,
-    trialPriceSelection: rawTrialPriceSelection,
-    subscriptionPriceSelection: rawSubscriptionPriceSelection,
-    upsellValueSelection: rawUpsellValueSelection,
-    cacSource: rawCacSource,
-    lastAutoFillKey,
-  } = uiState;
-  const normalizedForecastInputs = useMemo<ForecastInputs>(
-    () => ({ ...DEFAULT_FORECAST_INPUTS, ...forecastInputs }),
-    [forecastInputs],
-  );
-  const trialPriceSelection = (rawTrialPriceSelection ?? "default") as PriceSelection;
-  const subscriptionPriceSelection = (rawSubscriptionPriceSelection ?? "default") as PriceSelection;
-  const upsellValueSelection = (rawUpsellValueSelection ?? "default") as PriceSelection;
-  const cacSource = rawCacSource === "manual" ? "manual" : "actual";
-  const selectedIds = useMemo(() => new Set(selectedIdList), [selectedIdList]);
-  const updateUiState = (patch: Partial<typeof DEFAULT_FORECASTING_UI_STATE>) => setUiState((current) => ({ ...current, ...patch }));
-  const [scenarioName, setScenarioName] = useState("");
-  const [scenarioMessage, setScenarioMessage] = useState<string | null>(null);
-  const defaultRetentionCurve = useMemo(() => loadDefaultRetentionCurve(), []);
+  const [ui, setUi, resetUi] = usePersistedPageState<UiState>("ui_state_forecasting_v2", DEFAULT_FORECAST_UI_STATE);
+  const update = (patch: Partial<UiState>) => setUi((current) => ({ ...current, ...patch }));
 
-  const allCohorts = useMemo(() => computeCohorts(txs, subscriptions), [txs, subscriptions]);
-  const trafficByKey = useMemo(() => aggregateTrafficMetrics(trafficMetrics), [trafficMetrics]);
-  const campaignPathOptions = useMemo(() => Array.from(new Set(allCohorts.map((cohort) => cohort.campaign_path))).sort(), [allCohorts]);
-  const funnelOptions = useMemo(() => Array.from(new Set(allCohorts.map((cohort) => cohort.funnel))).sort(), [allCohorts]);
+  const deferredUi = useDeferredValue(ui);
+
+  const selectedCountries = useMemo(
+    () => (deferredUi.countryFilter === "all" ? [] : [deferredUi.countryFilter]),
+    [deferredUi.countryFilter],
+  );
+  const selectedCardTypes = useMemo(
+    () => (deferredUi.cardTypeFilter === "all" ? [] : [deferredUi.cardTypeFilter as CardType]),
+    [deferredUi.cardTypeFilter],
+  );
+  const selectedMediaBuyers = useMemo(
+    () => (deferredUi.mediaBuyerFilter === "all" ? [] : [deferredUi.mediaBuyerFilter as MediaBuyer]),
+    [deferredUi.mediaBuyerFilter],
+  );
+
+  // Filter option lists (cheap: derived directly from transactions).
+  const geoOptions = useMemo(() => countryUserCountsForTransactions(txs), [txs]);
+  const campaignIdOptions = useMemo(() => {
+    const set = new Set<string>();
+    for (const t of txs) if (t.transaction_type === "trial") set.add(campaignIdForTransaction(t));
+    return Array.from(set).filter(Boolean).sort();
+  }, [txs]);
+
+  // Campaign-id attribution then the single heavy cohort computation (memoized).
+  const sourceFilteredTxs = useMemo(
+    () =>
+      deferredUi.campaignIdFilter === "all"
+        ? txs
+        : filterTransactionsByTrialAttribution(txs, { selectedCampaignIds: [deferredUi.campaignIdFilter] }),
+    [txs, deferredUi.campaignIdFilter],
+  );
+
+  const allCohorts = useMemo(
+    () =>
+      computeCohorts(sourceFilteredTxs, subscriptions, {
+        maxRenewalDepth: DEFAULT_MAX_RENEWAL_DEPTH,
+        selectedCountries,
+        selectedCardTypes,
+        selectedMediaBuyers,
+      }),
+    [sourceFilteredTxs, subscriptions, selectedCountries, selectedCardTypes, selectedMediaBuyers],
+  );
+
+  const funnelOptions = useMemo(() => Array.from(new Set(allCohorts.map((c) => c.funnel))).sort(), [allCohorts]);
+  const campaignPathOptions = useMemo(() => Array.from(new Set(allCohorts.map((c) => c.campaign_path))).sort(), [allCohorts]);
 
   const filteredCohorts = useMemo(
     () =>
-      allCohorts.filter((cohort) => {
-        if (dateFrom && cohort.cohort_date < dateFrom) return false;
-        if (dateTo && cohort.cohort_date > dateTo) return false;
-        if (campaignPathFilter !== "all" && cohort.campaign_path !== campaignPathFilter) return false;
-        if (funnelFilter !== "all" && cohort.funnel !== funnelFilter) return false;
-        return true;
-      }),
-    [allCohorts, dateFrom, dateTo, campaignPathFilter, funnelFilter],
+      filterCohortsWithDiagnostics(allCohorts, {
+        funnelFilter: deferredUi.funnelFilter,
+        campaignPathFilter: deferredUi.campaignPathFilter,
+        cohortDateFrom: deferredUi.dateFrom || undefined,
+        cohortDateTo: deferredUi.dateTo || undefined,
+      }).cohorts,
+    [allCohorts, deferredUi.funnelFilter, deferredUi.campaignPathFilter, deferredUi.dateFrom, deferredUi.dateTo],
   );
 
-  const effectiveSelectedCohorts = useMemo(() => {
-    const explicit = filteredCohorts.filter((cohort) => selectedIds.has(cohort.cohort_id));
+  const selectedIds = useMemo(() => new Set(deferredUi.selectedCohortIds), [deferredUi.selectedCohortIds]);
+  const selectedCohorts = useMemo(() => {
+    const explicit = filteredCohorts.filter((c) => selectedIds.has(c.cohort_id));
     return explicit.length ? explicit : filteredCohorts;
   }, [filteredCohorts, selectedIds]);
 
-  const selectedCohortIds = useMemo(
-    () => new Set(effectiveSelectedCohorts.map((cohort) => cohort.cohort_id)),
-    [effectiveSelectedCohorts],
-  );
+  const trafficByKey = useMemo(() => aggregateTrafficMetrics(trafficMetrics), [trafficMetrics]);
+  const dataset = useMemo(() => buildSelectedCohortDataset(selectedCohorts, trafficByKey), [selectedCohorts, trafficByKey]);
+  const autoAssumptions = useMemo(() => deriveAssumptionsFromCohorts(selectedCohorts), [selectedCohorts]);
 
-  const actualSummary = useMemo(() => {
-    const trafficRows = effectiveSelectedCohorts.map((cohort) => trafficByKey.get(cohortTrafficKey(cohort))).filter(Boolean) as TrafficAggregate[];
-    const spend = sum(trafficRows.map((traffic) => traffic.spend));
-    const fbTrialCount = sum(trafficRows.map((traffic) => traffic.trial_count));
-    const trialUsers = sum(effectiveSelectedCohorts.map((cohort) => cohort.trial_users));
-    const grossRevenue = sum(effectiveSelectedCohorts.map((cohort) => cohort.gross_revenue));
-    const netRevenue = sum(effectiveSelectedCohorts.map((cohort) => cohort.net_revenue));
-    const amountRefunded = sum(effectiveSelectedCohorts.map((cohort) => cohort.amount_refunded));
-    const upsellUsers = sum(effectiveSelectedCohorts.map((cohort) => cohort.upsell_users));
+  // Merge auto values with manual overrides. Rate inputs are percentages -> fractions.
+  const effectiveAssumptions: ForecastAssumptions = useMemo(() => {
+    const pctOr = (raw: string, autoFraction: number) => {
+      const n = parseNum(raw);
+      return n == null ? autoFraction : n / 100;
+    };
+    const dollarsOr = (raw: string, auto: number) => parseNum(raw) ?? auto;
+    const margin = parseNum(deferredUi.marginTarget);
     return {
-      trialUsers,
-      spend,
-      hasActualSpend: trafficRows.length > 0,
-      fbTrialCount,
-      grossRevenue,
-      netRevenue,
-      revD0: sum(effectiveSelectedCohorts.map((cohort) => cohort.revenue_d0)),
-      revD7: sum(effectiveSelectedCohorts.map((cohort) => cohort.revenue_d7)),
-      rev1M: sum(effectiveSelectedCohorts.map((cohort) => cohort.revenue_d30)),
-      rev2M: sum(effectiveSelectedCohorts.map((cohort) => cohort.revenue_d60)),
-      cac: trafficRows.length > 0 && trialUsers ? spend / trialUsers : null,
-      campaignPaths: Array.from(new Set(effectiveSelectedCohorts.map((cohort) => cohort.campaign_path))).join(", "),
-      cohortDates: effectiveSelectedCohorts.map((cohort) => cohort.cohort_date).sort(),
-      upsellRate: trialUsers ? (upsellUsers / trialUsers) * 100 : 0,
-      refundRate: grossRevenue ? (amountRefunded / grossRevenue) * 100 : 0,
+      trialPrice: dollarsOr(deferredUi.trialPrice, autoAssumptions.trialPrice),
+      subscriptionPrice: dollarsOr(deferredUi.subscriptionPrice, autoAssumptions.subscriptionPrice),
+      upsellValue: dollarsOr(deferredUi.upsellValue, autoAssumptions.upsellValue),
+      upsellRate: pctOr(deferredUi.upsellRate, autoAssumptions.upsellRate),
+      firstRenewalRate: pctOr(deferredUi.firstRenewalRate, autoAssumptions.firstRenewalRate),
+      monthlyRetention: pctOr(deferredUi.monthlyRetention, autoAssumptions.monthlyRetention),
+      refundRate: pctOr(deferredUi.refundRate, autoAssumptions.refundRate),
+      processingFeePct: (parseNum(deferredUi.processingFeePct) ?? PROCESSING_FEE_DEFAULT_PCT) / 100,
+      fixedProcessingFee: parseNum(deferredUi.fixedFee) ?? FIXED_FEE_DEFAULT,
+      cac: null,
+      marginTarget: margin != null ? margin / 100 : undefined,
     };
-  }, [effectiveSelectedCohorts, trafficByKey]);
+  }, [autoAssumptions, deferredUi]);
 
-  const priceOptions = useMemo(
-    () => buildForecastPriceOptions(txs, selectedCohortIds),
-    [selectedCohortIds, txs],
-  );
-
-  const cacState = useMemo(
+  const spendResolution = useMemo(
     () =>
-      resolveForecastCac({
-        actualSpend: actualSummary.hasActualSpend ? actualSummary.spend : null,
-        trialUsers: actualSummary.trialUsers,
-        manualCac: normalizedForecastInputs.cac,
-        manualOverride: cacSource === "manual",
+      resolveSpendAndCac({
+        trialUsers: dataset.trialUsers,
+        facebookSpend: dataset.facebookSpend,
+        manualSpend: parseNum(deferredUi.manualSpend),
+        manualCac: parseNum(deferredUi.manualCac),
       }),
-    [actualSummary.hasActualSpend, actualSummary.spend, actualSummary.trialUsers, cacSource, normalizedForecastInputs.cac],
-  );
-  const cacInputValue = cacSource === "manual"
-    ? inputString(normalizedForecastInputs.cac)
-    : cacState.actualCac == null
-      ? ""
-      : String(round2(cacState.actualCac));
-  const forecastSpend = projectedSpendFromCac(actualSummary.trialUsers, cacState.cac);
-
-  const autoRetention = useMemo(() => {
-    const actual = retentionPercentagesForCohorts(txs, Array.from(selectedCohortIds));
-    const selectedCampaignPaths = new Set(effectiveSelectedCohorts.map((cohort) => cohort.campaign_path));
-    return MONTHS.map((month, index) => {
-      const fallbackValue = fallbackRetentionForMonth(index, txs, allCohorts, selectedCohortIds, selectedCampaignPaths, defaultRetentionCurve);
-      const actualValue = actual[index];
-      return {
-        month,
-        value: String(round2(actualValue ?? fallbackValue)),
-        actualValue: actualValue == null ? null : round2(actualValue),
-        fallbackValue: round2(fallbackValue),
-        source: actualValue == null ? "auto_fallback" as const : "auto_actual" as const,
-      };
-    });
-  }, [allCohorts, defaultRetentionCurve, effectiveSelectedCohorts, selectedCohortIds, txs]);
-
-  useEffect(() => {
-    setUiState((current) => ({
-      ...current,
-      retentionInputs: autoRetention.map((autoMonth) => {
-        const existing = current.retentionInputs.find((item) => item.month === autoMonth.month);
-        return existing?.source === "manual"
-          ? { ...autoMonth, value: inputString(existing.value), source: "manual" }
-          : autoMonth;
-      }),
-    }));
-  }, [autoRetention, setUiState]);
-
-  useEffect(() => {
-    const autoFillKey = Array.from(selectedCohortIds).sort().join("|");
-    if (autoFillKey === lastAutoFillKey && rawTrialPriceSelection && rawSubscriptionPriceSelection && rawUpsellValueSelection) return;
-    const nextTrialSelection = defaultPriceSelection(priceOptions.trialOptions);
-    const nextSubscriptionSelection = defaultPriceSelection(priceOptions.subscriptionOptions);
-    const nextUpsellSelection = defaultPriceSelection(priceOptions.upsellOptions);
-    setUiState((current) => {
-      const currentInputs = { ...DEFAULT_FORECAST_INPUTS, ...current.forecastInputs };
-      const nextTrialPrice = resolveSelectedPrice(
-        priceOptions.trialOptions,
-        nextTrialSelection,
-        parseNumberInput(currentInputs.trialPrice),
-        DEFAULT_TRIAL_PRICE,
-      );
-      const nextSubscriptionPrice = resolveSelectedPrice(
-        priceOptions.subscriptionOptions,
-        nextSubscriptionSelection,
-        parseNumberInput(currentInputs.subscriptionPrice),
-        DEFAULT_SUBSCRIPTION_PRICE,
-      );
-      const nextUpsellValue = resolveSelectedPrice(
-        priceOptions.upsellOptions,
-        nextUpsellSelection,
-        parseNumberInput(currentInputs.upsellValue),
-        DEFAULT_UPSELL_VALUE,
-        "transactions",
-      );
-      return {
-        ...current,
-        lastAutoFillKey: autoFillKey,
-        trialPriceSelection: nextTrialSelection,
-        subscriptionPriceSelection: nextSubscriptionSelection,
-        upsellValueSelection: nextUpsellSelection,
-        forecastInputs: {
-          ...currentInputs,
-          trialPrice: String(round2(nextTrialPrice)),
-          subscriptionPrice: String(round2(nextSubscriptionPrice)),
-          upsellRate: String(round2(actualSummary.upsellRate)),
-          upsellValue: String(round2(nextUpsellValue)),
-          refundRate: String(round2(actualSummary.refundRate)),
-        },
-      };
-    });
-  }, [
-    actualSummary.upsellRate,
-    actualSummary.refundRate,
-    lastAutoFillKey,
-    priceOptions.subscriptionOptions,
-    priceOptions.trialOptions,
-    priceOptions.upsellOptions,
-    rawSubscriptionPriceSelection,
-    rawTrialPriceSelection,
-    rawUpsellValueSelection,
-    selectedCohortIds,
-    setUiState,
-  ]);
-
-  const forecastRows = useMemo(
-    () => buildForecastRows(actualSummary.trialUsers, cacState.cac, retentionInputs, normalizedForecastInputs),
-    [actualSummary.trialUsers, cacState.cac, normalizedForecastInputs, retentionInputs],
+    [dataset.trialUsers, dataset.facebookSpend, deferredUi.manualSpend, deferredUi.manualCac],
   );
 
-  const forecastOutput = useMemo(() => {
-    const row3 = forecastRows[2] ?? null;
-    const row6 = forecastRows[5] ?? null;
-    const row12 = forecastRows[11] ?? null;
-    return { row3, row6, row12 };
-  }, [forecastRows]);
+  const actual = useMemo(
+    () => calculateActualRevenueByDay(sourceFilteredTxs, dataset.cohortIds),
+    [sourceFilteredTxs, dataset.cohortIds],
+  );
 
-  const setForecastInput = (key: keyof ForecastInputs, value: string) => {
-    setUiState((current) => ({
-      ...current,
-      forecastInputs: { ...DEFAULT_FORECAST_INPUTS, ...current.forecastInputs, [key]: stripExtraLeadingZero(value) },
-    }));
-  };
+  const baseInput: ForecastComputationInput = useMemo(
+    () => ({
+      actual,
+      trialUsers: dataset.trialUsers,
+      spend: spendResolution.spend,
+      spendAvailable: spendResolution.spendAvailable,
+      cac: spendResolution.cac,
+      grossRevenue: dataset.grossRevenue,
+      netRevenue: dataset.netRevenue,
+      assumptions: { ...effectiveAssumptions, cac: spendResolution.cac },
+    }),
+    [actual, dataset, spendResolution, effectiveAssumptions],
+  );
 
-  const commitForecastInput = (key: keyof ForecastInputs) => {
-    setUiState((current) => {
-      const currentInputs = { ...DEFAULT_FORECAST_INPUTS, ...current.forecastInputs };
-      return {
-        ...current,
-        forecastInputs: {
-          ...currentInputs,
-          [key]: String(parseNumberInput(currentInputs[key])),
-        },
-      };
-    });
-  };
+  const summary = useMemo(() => calculatePaybackSummary(baseInput), [baseInput]);
+  const projection = useMemo(
+    () => projectMonthlyNetRevenue(dataset.trialUsers, baseInput.assumptions, 12),
+    [dataset.trialUsers, baseInput.assumptions],
+  );
+  const curve = useMemo(() => buildPaybackCurve(actual, projection), [actual, projection]);
 
-  const setCacInput = (value: string) => {
-    setUiState((current) => ({
-      ...current,
-      cacSource: "manual",
-      forecastInputs: { ...DEFAULT_FORECAST_INPUTS, ...current.forecastInputs, cac: stripExtraLeadingZero(value) },
-    }));
-  };
-
-  const commitCacInput = () => {
-    setUiState((current) => {
-      const currentInputs = { ...DEFAULT_FORECAST_INPUTS, ...current.forecastInputs };
-      return {
-        ...current,
-        cacSource: "manual",
-        forecastInputs: {
-          ...currentInputs,
-          cac: currentInputs.cac.trim() ? String(parseNumberInput(currentInputs.cac)) : "",
-        },
-      };
-    });
-  };
-
-  const resetCacToActual = () => {
-    setUiState((current) => ({
-      ...current,
-      cacSource: "actual",
-      forecastInputs: {
-        ...DEFAULT_FORECAST_INPUTS,
-        ...current.forecastInputs,
-        cac: "",
-      },
-    }));
-  };
-
-  const setPriceSelection = (
-    field: "trialPrice" | "subscriptionPrice" | "upsellValue",
-    selectionKey: "trialPriceSelection" | "subscriptionPriceSelection" | "upsellValueSelection",
-    selection: PriceSelection,
-    options: ForecastPriceOption[],
-    fallbackPrice: number,
-    weightBy: "users" | "transactions" = "users",
-  ) => {
-    setUiState((current) => {
-      const currentInputs = { ...DEFAULT_FORECAST_INPUTS, ...current.forecastInputs };
-      const currentValue = inputString(currentInputs[field]);
-      const resolvedPrice = resolveSelectedPrice(options, selection, parseNumberInput(currentValue), fallbackPrice, weightBy);
-      return {
-        ...current,
-        [selectionKey]: selection,
-        forecastInputs: {
-          ...currentInputs,
-          [field]: selection === "custom" ? currentValue : String(round2(resolvedPrice)),
-        },
-      };
-    });
-  };
-
-  const resetForecastActuals = () => {
-    const nextTrialSelection = defaultPriceSelection(priceOptions.trialOptions);
-    const nextSubscriptionSelection = defaultPriceSelection(priceOptions.subscriptionOptions);
-    const nextUpsellSelection = defaultPriceSelection(priceOptions.upsellOptions);
-    updateUiState({
-      trialPriceSelection: nextTrialSelection,
-      subscriptionPriceSelection: nextSubscriptionSelection,
-      upsellValueSelection: nextUpsellSelection,
-      cacSource: "actual",
-      forecastInputs: {
-        ...normalizedForecastInputs,
-        cac: "",
-        trialPrice: String(round2(resolveSelectedPrice(priceOptions.trialOptions, nextTrialSelection, parseNumberInput(normalizedForecastInputs.trialPrice), DEFAULT_TRIAL_PRICE))),
-        subscriptionPrice: String(round2(resolveSelectedPrice(priceOptions.subscriptionOptions, nextSubscriptionSelection, parseNumberInput(normalizedForecastInputs.subscriptionPrice), DEFAULT_SUBSCRIPTION_PRICE))),
-        upsellValue: String(round2(resolveSelectedPrice(priceOptions.upsellOptions, nextUpsellSelection, parseNumberInput(normalizedForecastInputs.upsellValue), DEFAULT_UPSELL_VALUE, "transactions"))),
-        upsellRate: String(round2(actualSummary.upsellRate)),
-        refundRate: String(round2(actualSummary.refundRate)),
-      },
-    });
-  };
-
-  const updateRetention = (month: number, value: string) => {
-    setUiState((current) => ({
-      ...current,
-      retentionInputs: current.retentionInputs.map((item) =>
-        item.month === month ? { ...item, value: stripExtraLeadingZero(value), source: "manual" } : item,
-      ),
-    }));
-  };
-
-  const commitRetention = (month: number) => {
-    setUiState((current) => ({
-      ...current,
-      retentionInputs: current.retentionInputs.map((item) =>
-        item.month === month ? { ...item, value: String(clampPercent(item.value)), source: "manual" } : item,
-      ),
-    }));
-  };
-
-  const resetMonthToActual = (month: number) => {
-    setUiState((current) => ({
-      ...current,
-      retentionInputs: current.retentionInputs.map((item) => {
-        if (item.month !== month) return item;
-        const value = String(item.actualValue ?? item.fallbackValue);
-        return { ...item, value, source: item.actualValue == null ? "auto_fallback" : "auto_actual" };
-      }),
-    }));
-  };
-
-  const resetAllMonths = () => {
-    updateUiState({ retentionInputs: autoRetention });
-  };
-
-  const saveScenario = () => {
-    const name = scenarioName.trim() || `Scenario ${new Date().toLocaleString()}`;
-    const payload = {
-      id: `scenario_${Date.now()}`,
-      name,
-      saved_at: new Date().toISOString(),
-      cohort_ids: Array.from(selectedCohortIds),
-      inputs: normalizedForecastInputs,
-      cac_source: cacState.source,
-      actual_cac: cacState.actualCac,
-      forecast_spend: forecastSpend,
-      retention: retentionInputs,
-      outputs: forecastOutput,
+  // Scenario: base assumptions with scenario overrides layered on top.
+  const scenarioResult = useMemo(() => {
+    const pctOr = (raw: string, base: number) => {
+      const n = parseNum(raw);
+      return n == null ? base : n / 100;
     };
-    try {
-      const existing = JSON.parse(localStorage.getItem(SCENARIOS_STORAGE_KEY) ?? "[]");
-      const list = Array.isArray(existing) ? existing : [];
-      localStorage.setItem(SCENARIOS_STORAGE_KEY, JSON.stringify([payload, ...list].slice(0, 20)));
-      setScenarioName("");
-      setScenarioMessage(`Saved scenario: ${name}`);
-    } catch {
-      setScenarioMessage("Could not save scenario in localStorage.");
-    }
-  };
-
-  const toggleCohortSelection = (cohortId: string) => {
-    setUiState((current) => {
-      const next = new Set(current.selectedCohortIds);
-      if (next.has(cohortId)) next.delete(cohortId);
-      else next.add(cohortId);
-      return { ...current, selectedCohortIds: Array.from(next), lastAutoFillKey: "" };
+    const scenarioAssumptions: ForecastAssumptions = {
+      ...effectiveAssumptions,
+      trialPrice: parseNum(deferredUi.scTrialPrice) ?? effectiveAssumptions.trialPrice,
+      subscriptionPrice: parseNum(deferredUi.scSubscriptionPrice) ?? effectiveAssumptions.subscriptionPrice,
+      firstRenewalRate: pctOr(deferredUi.scFirstRenewalRate, effectiveAssumptions.firstRenewalRate),
+      monthlyRetention: pctOr(deferredUi.scMonthlyRetention, effectiveAssumptions.monthlyRetention),
+      upsellRate: pctOr(deferredUi.scUpsellRate, effectiveAssumptions.upsellRate),
+      upsellValue: parseNum(deferredUi.scUpsellValue) ?? effectiveAssumptions.upsellValue,
+      refundRate: pctOr(deferredUi.scRefundRate, effectiveAssumptions.refundRate),
+    };
+    const scCac = parseNum(deferredUi.scCac);
+    const scenarioSpend = resolveSpendAndCac({
+      trialUsers: dataset.trialUsers,
+      facebookSpend: dataset.facebookSpend,
+      manualSpend: parseNum(deferredUi.manualSpend),
+      manualCac: scCac ?? parseNum(deferredUi.manualCac),
     });
-  };
+    const scenarioInput: ForecastComputationInput = {
+      ...baseInput,
+      spend: scenarioSpend.spend,
+      spendAvailable: scenarioSpend.spendAvailable,
+      cac: scenarioSpend.cac,
+      assumptions: { ...scenarioAssumptions, cac: scenarioSpend.cac },
+    };
+    return calculateScenario(baseInput, scenarioInput);
+  }, [baseInput, dataset, effectiveAssumptions, deferredUi]);
 
-  const selectAllFiltered = () => {
-    updateUiState({ selectedCohortIds: filteredCohorts.map((cohort) => cohort.cohort_id), lastAutoFillKey: "" });
-  };
-
-  const renderPriceSelector = (
-    title: string,
-    field: "trialPrice" | "subscriptionPrice" | "upsellValue",
-    selectionKey: "trialPriceSelection" | "subscriptionPriceSelection" | "upsellValueSelection",
-    selection: PriceSelection,
-    options: ForecastPriceOption[],
-    fallbackPrice: number,
-    weightBy: "users" | "transactions" = "users",
-  ) => {
-    const hasMultiplePrices = options.length > 1;
-    return (
-      <div className="space-y-1.5 rounded-md border border-border p-3">
-        <Label className="text-xs text-muted-foreground">{title}</Label>
-        <Select
-          value={selection}
-          onValueChange={(value) => setPriceSelection(field, selectionKey, value as PriceSelection, options, fallbackPrice, weightBy)}
-        >
-          <SelectTrigger className="h-9">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {options.length === 0 && (
-              <SelectItem value="default">Default ({formatCurrency(fallbackPrice)})</SelectItem>
-            )}
-            {options.map((option) => (
-              <SelectItem key={`price:${option.price}`} value={`price:${option.price}`}>
-                {formatCurrency(option.price)} — {option.users} users
-              </SelectItem>
-            ))}
-            {hasMultiplePrices && <SelectItem value="weighted_average">Weighted average</SelectItem>}
-            <SelectItem value="custom">Custom</SelectItem>
-          </SelectContent>
-        </Select>
-        {selection === "custom" ? (
-          <Input
-            {...numericInputProps()}
-            value={inputString(normalizedForecastInputs[field])}
-            onChange={(event) => setForecastInput(field, event.target.value)}
-            onBlur={() => commitForecastInput(field)}
-            onFocus={(event) => event.currentTarget.select()}
-            className="h-9"
-          />
-        ) : (
-          <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-sm tabular-nums text-foreground">
-            {formatCurrency(parseNumberInput(normalizedForecastInputs[field]))}
-          </div>
-        )}
-        <div className="text-[11px] text-muted-foreground">
-          Source: {priceSourceLabel(selection, options)}
-        </div>
-      </div>
-    );
-  };
-
-  const renderPriceDiagnostics = (title: string, options: ForecastPriceOption[]) => (
-    <div className="rounded-md border border-border p-3">
-      <div className="mb-2 text-xs font-medium text-foreground">{title}</div>
-      {options.length ? (
-        <div className="space-y-1">
-          {options.map((option) => (
-            <div key={`${title}-${option.price}`} className="flex justify-between gap-3 text-xs">
-              <span className="tabular-nums text-foreground">{formatCurrency(option.price)}</span>
-              <span className="text-muted-foreground">
-                {option.transactions == null ? "" : `${option.transactions} tx · `}
-                {option.users} users · {formatPct(option.percentage)}
-              </span>
-            </div>
-          ))}
-        </div>
-      ) : (
-        <div className="text-xs text-muted-foreground">No detected prices.</div>
-      )}
-    </div>
+  // Per-cohort rows (heavy; batched internally). Manual CAC applies per cohort when set.
+  const cohortRows = useMemo(
+    () => buildCohortPaybackRows(filteredCohorts, sourceFilteredTxs, trafficByKey, { ...effectiveAssumptions, cac: parseNum(deferredUi.manualCac) }),
+    [filteredCohorts, sourceFilteredTxs, trafficByKey, effectiveAssumptions, deferredUi.manualCac],
   );
 
-  const cacSourceLabel = cacState.source === "manual" ? "Manual" : cacState.source === "actual" ? "Actual" : "Missing";
-  const cacSourceClass = cacState.source === "manual" ? "text-primary" : cacState.source === "actual" ? "text-success" : "text-warning";
+  const sortedRows = useMemo(() => {
+    const rows = [...cohortRows];
+    const dir = deferredUi.sortDir === "asc" ? 1 : -1;
+    rows.sort((a, b) => {
+      const av = (a[deferredUi.sortKey] ?? -Infinity) as number;
+      const bv = (b[deferredUi.sortKey] ?? -Infinity) as number;
+      return av < bv ? -dir : av > bv ? dir : 0;
+    });
+    return rows;
+  }, [cohortRows, deferredUi.sortKey, deferredUi.sortDir]);
+
+  const totalPages = Math.max(1, Math.ceil(sortedRows.length / COHORT_PAGE_SIZE));
+  const safePage = Math.min(ui.page, totalPages);
+  const pagedRows = sortedRows.slice((safePage - 1) * COHORT_PAGE_SIZE, safePage * COHORT_PAGE_SIZE);
+
+  const isStale = deferredUi !== ui;
+  const noData = allCohorts.length === 0;
+  const noSelection = selectedCohorts.length === 0;
+
+  const toggleSort = (key: SortKey) => {
+    if (ui.sortKey === key) update({ sortDir: ui.sortDir === "asc" ? "desc" : "asc" });
+    else update({ sortKey: key, sortDir: "desc", page: 1 });
+  };
+  const sortIcon = (key: SortKey): ReactNode =>
+    ui.sortKey !== key ? <ArrowUpDown className="inline h-3 w-3 opacity-40" /> : ui.sortDir === "asc" ? <ArrowUp className="inline h-3 w-3" /> : <ArrowDown className="inline h-3 w-3" />;
+
+  const toggleCohort = (id: string) => {
+    const next = new Set(ui.selectedCohortIds);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    update({ selectedCohortIds: Array.from(next), page: 1 });
+  };
+
+  const chartConfig = { cumulativeNet: { label: "Cumulative Net Revenue", color: "hsl(var(--chart-1))" } } satisfies ChartConfig;
+  const overallStatus = summary.paybackDay != null ? "Paid Back" : "Not Paid Back Yet";
 
   return (
-    <AppLayout title="Forecasting" description="Editable LTV forecast from cohort retention">
-      <div className="grid gap-4 xl:grid-cols-[360px_1fr]">
-        <div className="space-y-4">
+    <AppLayout
+      title="Traffic Payback Forecast"
+      description="Select cohorts and costs to see which traffic pays back, when, and how much CAC you can afford."
+    >
+      <TooltipProvider delayDuration={100}>
+        <div className={cn("space-y-4", isStale && "opacity-70 transition-opacity")}>
+          {/* -------- Section 1: Filters / cohort selection -------- */}
           <Card className="p-4 shadow-card">
-            <div className="mb-3 flex items-center gap-2">
-              <Calculator className="h-4 w-4 text-muted-foreground" />
-              <h3 className="text-sm font-semibold text-foreground">Cohort selection</h3>
-            </div>
-            <div className="grid gap-3">
-              <div className="grid grid-cols-2 gap-2">
-                <div className="space-y-1.5">
-                  <Label htmlFor="forecast-date-from" className="text-xs text-muted-foreground">Date from</Label>
-                  <Input id="forecast-date-from" type="date" value={dateFrom} onChange={(event) => updateUiState({ dateFrom: event.target.value, lastAutoFillKey: "" })} className="h-9" />
-                </div>
-                <div className="space-y-1.5">
-                  <Label htmlFor="forecast-date-to" className="text-xs text-muted-foreground">Date to</Label>
-                  <Input id="forecast-date-to" type="date" value={dateTo} onChange={(event) => updateUiState({ dateTo: event.target.value, lastAutoFillKey: "" })} className="h-9" />
-                </div>
-              </div>
-              <div className="space-y-1.5">
-                <Label className="text-xs text-muted-foreground">Campaign path</Label>
-                <Select value={campaignPathFilter} onValueChange={(value) => updateUiState({ campaignPathFilter: value, lastAutoFillKey: "" })}>
-                  <SelectTrigger className="h-9"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="all">All campaign paths</SelectItem>
-                    {campaignPathOptions.map((path) => <SelectItem key={path} value={path}>{path}</SelectItem>)}
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="space-y-1.5">
-                <Label className="text-xs text-muted-foreground">Funnel group</Label>
-                <Select value={funnelFilter} onValueChange={(value) => updateUiState({ funnelFilter: value, lastAutoFillKey: "" })}>
-                  <SelectTrigger className="h-9"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="all">All funnels</SelectItem>
-                    {funnelOptions.map((funnel) => <SelectItem key={funnel} value={funnel}>{funnel}</SelectItem>)}
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                <Button type="button" variant="outline" size="sm" onClick={selectAllFiltered}>Select visible</Button>
-                <Button type="button" variant="ghost" size="sm" onClick={() => updateUiState({ selectedCohortIds: [], lastAutoFillKey: "" })}>Use filtered</Button>
-                <Button type="button" variant="ghost" size="sm" onClick={resetUiState}>Reset filters</Button>
-              </div>
-              <div className="max-h-72 overflow-auto rounded-md border border-border">
-                {filteredCohorts.map((cohort) => (
-                  <label key={cohort.cohort_id} className="flex cursor-pointer items-start gap-2 border-b border-border/60 px-3 py-2 last:border-b-0 hover:bg-muted/30">
-                    <Checkbox checked={selectedIds.has(cohort.cohort_id)} onCheckedChange={() => toggleCohortSelection(cohort.cohort_id)} />
-                    <span className="min-w-0 text-xs">
-                      <span className="block truncate font-medium text-foreground">{cohort.campaign_path}</span>
-                      <span className="text-muted-foreground">{cohort.cohort_date} · {cohort.trial_users} trials</span>
-                    </span>
-                  </label>
-                ))}
-                {filteredCohorts.length === 0 && (
-                  <div className="p-4 text-center text-sm text-muted-foreground">No cohorts match filters.</div>
-                )}
-              </div>
-              <p className="text-xs text-muted-foreground">
-                If no boxes are checked, the forecast uses all filtered cohorts.
-              </p>
-            </div>
-          </Card>
-
-          <Card className="p-4 shadow-card">
-            <div className="mb-3 flex items-center justify-between gap-2">
-              <h3 className="text-sm font-semibold text-foreground">Forecast inputs</h3>
-              <Button type="button" variant="ghost" size="sm" onClick={resetForecastActuals}>
-                <RotateCcw className="h-3.5 w-3.5" />
-                Reset actuals
+            <div className="mb-3 flex items-center justify-between">
+              <h3 className="text-sm font-semibold">Cohort Selection</h3>
+              <Button variant="ghost" size="sm" onClick={resetUi}>
+                <RotateCcw className="mr-1 h-3.5 w-3.5" /> Reset all
               </Button>
             </div>
-            <div className="grid gap-3 sm:grid-cols-2">
-              {renderPriceSelector(
-                "Trial Price",
-                "trialPrice",
-                "trialPriceSelection",
-                trialPriceSelection as PriceSelection,
-                priceOptions.trialOptions,
-                DEFAULT_TRIAL_PRICE,
-              )}
-              {renderPriceSelector(
-                "Subscription Price",
-                "subscriptionPrice",
-                "subscriptionPriceSelection",
-                subscriptionPriceSelection as PriceSelection,
-                priceOptions.subscriptionOptions,
-                DEFAULT_SUBSCRIPTION_PRICE,
-              )}
-              {renderPriceSelector(
-                "Upsell Value",
-                "upsellValue",
-                "upsellValueSelection",
-                upsellValueSelection as PriceSelection,
-                priceOptions.upsellOptions,
-                DEFAULT_UPSELL_VALUE,
-                "transactions",
-              )}
-              <div className="rounded-md border border-border p-3 sm:col-span-2">
-                <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_auto] md:items-end">
-                  <div className="min-w-0 space-y-1.5">
-                    <div className="flex items-center justify-between gap-2">
-                      <Label htmlFor="forecast-cac" className="text-xs text-muted-foreground">CAC</Label>
-                      <span className={`rounded-full bg-muted/50 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide ${cacSourceClass}`}>
-                        {cacSourceLabel}
+            <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+              <FilterSelect label="Funnel" value={ui.funnelFilter} onChange={(v) => update({ funnelFilter: v, page: 1 })} options={funnelOptions} allLabel="All funnels" />
+              <FilterSelect label="Campaign Path" value={ui.campaignPathFilter} onChange={(v) => update({ campaignPathFilter: v, page: 1 })} options={campaignPathOptions} allLabel="All paths" />
+              <FilterSelect label="Campaign ID" value={ui.campaignIdFilter} onChange={(v) => update({ campaignIdFilter: v, page: 1 })} options={campaignIdOptions} allLabel="All campaign IDs" />
+              <FilterSelect label="Media Buyer" value={ui.mediaBuyerFilter} onChange={(v) => update({ mediaBuyerFilter: v, page: 1 })} options={MEDIA_BUYER_VALUES} allLabel="All buyers" />
+              <FilterSelect label="GEO / Country" value={ui.countryFilter} onChange={(v) => update({ countryFilter: v, page: 1 })} options={geoOptions.map((g) => g.country_code)} allLabel="All countries" />
+              <FilterSelect label="Card Type" value={ui.cardTypeFilter} onChange={(v) => update({ cardTypeFilter: v, page: 1 })} options={CARD_TYPE_VALUES} allLabel="All cards" format={(v) => cardTypeLabel(v as CardType)} />
+              <div className="space-y-1">
+                <Label className="text-xs text-muted-foreground">Cohort date from</Label>
+                <Input type="date" className="h-8" value={ui.dateFrom} onChange={(e) => update({ dateFrom: e.target.value, page: 1 })} />
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs text-muted-foreground">Cohort date to</Label>
+                <Input type="date" className="h-8" value={ui.dateTo} onChange={(e) => update({ dateTo: e.target.value, page: 1 })} />
+              </div>
+            </div>
+
+            <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+              <Button variant="outline" size="sm" onClick={() => update({ selectedCohortIds: filteredCohorts.map((c) => c.cohort_id) })}>Select all filtered</Button>
+              <Button variant="outline" size="sm" onClick={() => update({ selectedCohortIds: [] })}>Use all filtered</Button>
+              <span className="text-muted-foreground">
+                {fmtInt(selectedCohorts.length)} cohorts · {fmtInt(dataset.trialUsers)} trial users · Spend {spendResolution.spendAvailable ? fmtMoney(spendResolution.spend) : "unavailable"} · CAC {fmtMoney(spendResolution.cac)}
+              </span>
+            </div>
+
+            {filteredCohorts.length > 0 && (
+              <div className="mt-3 max-h-40 overflow-y-auto rounded-md border border-border p-2">
+                <div className="grid gap-1 sm:grid-cols-2 lg:grid-cols-3">
+                  {filteredCohorts.slice(0, 300).map((cohort) => (
+                    <label key={cohort.cohort_id} className="flex items-center gap-2 text-xs">
+                      <input type="checkbox" checked={selectedIds.has(cohort.cohort_id)} onChange={() => toggleCohort(cohort.cohort_id)} />
+                      <span className="truncate" title={cohort.cohort_id}>
+                        {cohort.cohort_date} · {cohort.funnel} · {cohort.campaign_path} ({fmtInt(cohort.trial_users)})
                       </span>
-                    </div>
-                    <div className="relative">
-                      <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">$</span>
-                      <Input
-                        id="forecast-cac"
-                        {...numericInputProps()}
-                        value={cacInputValue}
-                        onChange={(event) => setCacInput(event.target.value)}
-                        onBlur={commitCacInput}
-                        onFocus={(event) => event.currentTarget.select()}
-                        placeholder="No CAC data from traffic"
-                        className="h-9 pl-7 tabular-nums"
-                      />
-                    </div>
-                  </div>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    className="h-9 w-full whitespace-nowrap px-3 text-xs md:w-auto"
-                    onClick={resetCacToActual}
-                  >
-                    Reset to actual CAC
-                  </Button>
-                </div>
-                <div className="mt-1.5 truncate text-[11px] text-muted-foreground">
-                  {cacState.actualCac == null ? "No CAC data from traffic" : `Actual ${formatCurrency(cacState.actualCac)}`}
-                </div>
-              </div>
-              {[
-                ["upsellRate", "Upsell Rate %"],
-                ["refundRate", "Refund Rate %"],
-                ["stripeFee", "Stripe Fee %"],
-                ["fbFee", "FB Fee %"],
-              ].map(([key, label]) => (
-                <div key={key} className="space-y-1.5">
-                  <Label className="text-xs text-muted-foreground">{label}</Label>
-                  <Input
-                    {...numericInputProps()}
-                    value={inputString(normalizedForecastInputs[key as keyof ForecastInputs])}
-                    onChange={(event) => setForecastInput(key as keyof ForecastInputs, event.target.value)}
-                    onBlur={() => commitForecastInput(key as keyof ForecastInputs)}
-                    onFocus={(event) => event.currentTarget.select()}
-                    className="h-9"
-                  />
-                </div>
-              ))}
-            </div>
-            <div className="mt-3 grid gap-3 sm:grid-cols-2">
-              {renderPriceDiagnostics("Trial Price options", priceOptions.trialOptions)}
-              {renderPriceDiagnostics("Subscription Price options", priceOptions.subscriptionOptions)}
-              {renderPriceDiagnostics("Upsell Value options", priceOptions.upsellOptions)}
-            </div>
-          </Card>
-        </div>
-
-        <div className="space-y-4">
-          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-            <KpiCard label="Trial Users" value={String(actualSummary.trialUsers)} icon={<TrendingUp className="h-4 w-4" />} />
-            <KpiCard label="Actual Spend" value={actualSummary.hasActualSpend ? formatCurrency(actualSummary.spend) : "—"} icon={<TrendingUp className="h-4 w-4" />} />
-            <KpiCard label="Forecast Spend" value={forecastSpend == null ? "—" : formatCurrency(forecastSpend)} icon={<TrendingUp className="h-4 w-4" />} />
-            <KpiCard label="Net Rev" value={formatCurrency(actualSummary.netRevenue)} icon={<TrendingUp className="h-4 w-4" />} accent="success" />
-            <KpiCard label="CAC" value={cacState.cac == null ? "—" : formatCurrency(cacState.cac)} icon={<TrendingUp className="h-4 w-4" />} />
-            <KpiCard label="Gross Rev" value={formatCurrency(actualSummary.grossRevenue)} icon={<TrendingUp className="h-4 w-4" />} />
-            <KpiCard label="Rev D7" value={formatCurrency(actualSummary.revD7)} icon={<TrendingUp className="h-4 w-4" />} />
-            <KpiCard label="Rev 1M" value={formatCurrency(actualSummary.rev1M)} icon={<TrendingUp className="h-4 w-4" />} />
-            <KpiCard label="Rev 2M" value={formatCurrency(actualSummary.rev2M)} icon={<TrendingUp className="h-4 w-4" />} />
-          </div>
-
-          <Card className="p-4 shadow-card">
-            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-              <div>
-                <h3 className="text-sm font-semibold text-foreground">Retention curve editor</h3>
-                <p className="text-xs text-muted-foreground">
-                  Absolute retention from original trial users. Subscription and renewal payments only.
-                </p>
-              </div>
-              <div className="flex gap-2">
-                <Button type="button" variant="outline" size="sm" onClick={resetAllMonths}>
-                  <RotateCcw className="h-3.5 w-3.5" />
-                  Reset all months
-                </Button>
-              </div>
-            </div>
-            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-              {retentionInputs.map((month) => (
-                <div key={month.month} className="rounded-md border border-border p-2">
-                  <div className="mb-1 flex items-center justify-between gap-2">
-                    <Label className="text-xs font-medium text-foreground">M{month.month}</Label>
-                    <span className={`text-[11px] ${sourceClass(month.source)}`}>{sourceLabel(month.source)}</span>
-                  </div>
-                  <div className="flex gap-2">
-                    <Input
-                      {...numericInputProps()}
-                      value={inputString(month.value)}
-                      onChange={(event) => updateRetention(month.month, event.target.value)}
-                      onBlur={() => commitRetention(month.month)}
-                      onFocus={(event) => event.currentTarget.select()}
-                      className="h-8"
-                    />
-                    <Button type="button" variant="ghost" size="sm" className="h-8 px-2" onClick={() => resetMonthToActual(month.month)}>
-                      Reset
-                    </Button>
-                  </div>
-                  <div className="mt-1 text-[11px] text-muted-foreground">
-                    Actual {month.actualValue == null ? "—" : formatPct(month.actualValue)} · fallback {formatPct(month.fallbackValue)}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </Card>
-
-          <Card className="p-4 shadow-card">
-            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-              <h3 className="text-sm font-semibold text-foreground">Forecast results</h3>
-              <div className="flex flex-wrap items-center gap-2">
-                <Input
-                  value={scenarioName}
-                  onChange={(event) => setScenarioName(event.target.value)}
-                  placeholder="Scenario name"
-                  className="h-8 w-[180px]"
-                />
-                <Button type="button" size="sm" onClick={saveScenario}>
-                  <Save className="h-3.5 w-3.5" />
-                  Save scenario
-                </Button>
-              </div>
-            </div>
-            {scenarioMessage && <div className="mb-3 text-xs text-primary">{scenarioMessage}</div>}
-            <div className="grid gap-3 md:grid-cols-3">
-              {[
-                ["3M", forecastOutput.row3],
-                ["6M", forecastOutput.row6],
-                ["12M", forecastOutput.row12],
-              ].map(([label, row]) => {
-                const typedRow = row as MonthlyForecastRow | null;
-                return (
-                  <div key={label as string} className="rounded-md border border-border p-3">
-                    <div className="text-xs font-medium text-muted-foreground">{label as string}</div>
-                    <dl className="mt-2 space-y-1 text-sm">
-                      <div className="flex justify-between gap-3"><dt>LTV</dt><dd className="tabular-nums">{formatCurrency(typedRow?.cumulativeLtv ?? 0)}</dd></div>
-                      <div className="flex justify-between gap-3"><dt>Revenue</dt><dd className="tabular-nums">{formatCurrency(typedRow?.cumulativeNetRevenue ?? 0)}</dd></div>
-                      <div className="flex justify-between gap-3"><dt>Profit</dt><dd className="tabular-nums">{formatCurrency(typedRow?.cumulativeProfit ?? 0)}</dd></div>
-                      <div className="flex justify-between gap-3"><dt>ROAS</dt><dd className="tabular-nums">{typedRow?.roas == null ? "—" : `${typedRow.roas.toFixed(2)}x`}</dd></div>
-                    </dl>
-                  </div>
-                );
-              })}
-            </div>
-          </Card>
-
-          <Card className="p-4 shadow-card">
-            <div className="mb-3">
-              <h3 className="text-sm font-semibold text-foreground">Monthly forecast table</h3>
-              <p className="text-xs text-muted-foreground">
-                Campaign path: {actualSummary.campaignPaths || "—"} · Cohorts selected: {effectiveSelectedCohorts.length}
-              </p>
-            </div>
-            <div className="overflow-x-auto rounded-md border border-border">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Month</TableHead>
-                    <TableHead className="text-right">Retention %</TableHead>
-                    <TableHead className="text-right">Paying Users</TableHead>
-                    <TableHead className="text-right">Subscription Revenue</TableHead>
-                    <TableHead className="text-right">Cumulative Gross Revenue</TableHead>
-                    <TableHead className="text-right">Cumulative Net Revenue</TableHead>
-                    <TableHead className="text-right">Projected Spend</TableHead>
-                    <TableHead className="text-right">Cumulative LTV</TableHead>
-                    <TableHead className="text-right">Cumulative Profit</TableHead>
-                    <TableHead className="text-right">ROAS</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {forecastRows.map((row) => (
-                    <TableRow key={row.month}>
-                      <TableCell>M{row.month}</TableCell>
-                      <TableCell className="text-right tabular-nums">{formatPct(row.retention)}</TableCell>
-                      <TableCell className="text-right tabular-nums">{row.payingUsers.toFixed(1)}</TableCell>
-                      <TableCell className="text-right tabular-nums">{formatCurrency(row.subscriptionRevenue)}</TableCell>
-                      <TableCell className="text-right tabular-nums">{formatCurrency(row.cumulativeGrossRevenue)}</TableCell>
-                      <TableCell className="text-right tabular-nums">{formatCurrency(row.cumulativeNetRevenue)}</TableCell>
-                      <TableCell className="text-right tabular-nums">{row.projectedSpend == null ? "—" : formatCurrency(row.projectedSpend)}</TableCell>
-                      <TableCell className="text-right tabular-nums">{formatCurrency(row.cumulativeLtv)}</TableCell>
-                      <TableCell className="text-right tabular-nums">{formatCurrency(row.cumulativeProfit)}</TableCell>
-                      <TableCell className="text-right tabular-nums">{row.roas == null ? "—" : `${row.roas.toFixed(2)}x`}</TableCell>
-                    </TableRow>
+                    </label>
                   ))}
-                </TableBody>
-              </Table>
-            </div>
+                </div>
+              </div>
+            )}
           </Card>
+
+          {noData ? (
+            <Card className="p-10 text-center text-sm text-muted-foreground shadow-card">
+              No cohorts available. Import transactions on the Import page to build a forecast.
+            </Card>
+          ) : (
+            <>
+              {/* -------- Section 3: Payback summary -------- */}
+              <div className="flex flex-wrap items-center gap-2">
+                <span className={cn("inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium", summary.paybackDay != null ? "bg-success/15 text-success" : "bg-warning/15 text-warning")}>
+                  {overallStatus}
+                </span>
+                {!spendResolution.spendAvailable && (
+                  <span className="text-xs text-warning">Spend unavailable — enter a manual Spend or CAC below for ROAS / payback.</span>
+                )}
+              </div>
+              <div className="grid grid-cols-2 gap-3 md:grid-cols-4 xl:grid-cols-6">
+                <KpiCard label="Trial Users" value={fmtInt(summary.trialUsers)} icon={<TrendingUp className="h-4 w-4" />} />
+                <KpiCard label="Spend" value={summary.spendAvailable ? fmtMoney(summary.spend) : "—"} />
+                <KpiCard label="CAC" value={fmtMoney(summary.cac)} />
+                <KpiCard label="Gross Revenue" value={fmtMoney(summary.grossRevenue)} />
+                <KpiCard label="Net Revenue" value={fmtMoney(summary.netRevenue)} accent="success" hint="Realized (actual) net revenue to date." />
+                <KpiCard label="Profit / Loss" value={fmtMoney(summary.profit)} accent={summary.profit != null && summary.profit >= 0 ? "success" : "warning"} />
+                <KpiCard label="Current ROAS" value={fmtRoas(summary.currentRoas)} hint="Actual net revenue / spend." />
+                <KpiCard label="D7 ROAS" value={fmtRoas(summary.roasD7)} />
+                <KpiCard label="1M ROAS" value={fmtRoas(summary.roas1M)} hint="Projected net revenue by day 30 / spend." />
+                <KpiCard label="2M ROAS" value={fmtRoas(summary.roas2M)} />
+                <KpiCard label="3M ROAS" value={fmtRoas(summary.roas3M)} />
+                <KpiCard label="6M ROAS" value={fmtRoas(summary.roas6M)} />
+                <KpiCard label="Payback Day" value={fmtDay(summary.paybackDay)} hint="First day cumulative net revenue ≥ spend." />
+                <KpiCard label="Break-even CAC" value={fmtMoney(summary.breakEvenCac)} hint="Projected LTV at the 1M horizon." />
+                <KpiCard label="Max Profitable CAC" value={fmtMoney(summary.maxProfitableCac)} hint="Break-even CAC minus your margin target." />
+                <KpiCard label="Projected LTV" value={fmtMoney(summary.projectedLtv)} hint="Blended actual + projected net revenue per trial user at 1M." />
+                <KpiCard label="Profit / User" value={fmtMoney(summary.profitPerUser)} accent={summary.profitPerUser != null && summary.profitPerUser >= 0 ? "success" : "warning"} />
+              </div>
+
+              {/* -------- Section 5: Payback curve -------- */}
+              <Card className="p-4 shadow-card">
+                <h3 className="mb-3 text-sm font-semibold">
+                  Payback Curve — Cumulative Net Revenue vs Spend
+                  <Hint text="Realized actuals up to cohort maturity, then projected months continue. The dashed red line is spend; the crossing point is payback." />
+                </h3>
+                {noSelection ? (
+                  <p className="py-10 text-center text-sm text-muted-foreground">No cohorts selected.</p>
+                ) : (
+                  <ChartContainer config={chartConfig} className="h-[320px] w-full">
+                    <ComposedChart data={curve} margin={{ left: 8, right: 16, top: 8, bottom: 8 }}>
+                      <CartesianGrid vertical={false} />
+                      <XAxis dataKey="day" type="number" tickLine={false} axisLine={false} tickMargin={8} tickFormatter={(v) => `D${v}`} />
+                      <YAxis tickLine={false} axisLine={false} width={56} tickFormatter={(v) => `$${Math.round(Number(v) / 1000)}k`} />
+                      <ChartTooltip content={<ChartTooltipContent />} />
+                      <Line type="monotone" dataKey="cumulativeNet" stroke="var(--color-cumulativeNet)" strokeWidth={2} dot={false} />
+                      {summary.spendAvailable && summary.spend != null && (
+                        <ReferenceLine y={summary.spend} stroke="hsl(var(--destructive))" strokeDasharray="4 4" />
+                      )}
+                    </ComposedChart>
+                  </ChartContainer>
+                )}
+              </Card>
+
+              {/* -------- Section 2: Cost inputs -------- */}
+              <Card className="p-4 shadow-card">
+                <h3 className="mb-3 text-sm font-semibold">Cost & Assumption Inputs</h3>
+                <div className="grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-4">
+                  <CostInput label="Manual Spend" suffix="$" autoValue={dataset.facebookSpend != null ? fmtMoney(dataset.facebookSpend) : "unavailable"} value={ui.manualSpend} onChange={(v) => update({ manualSpend: v })} hint="Overrides Facebook spend. CAC = Spend / Trial Users." />
+                  <CostInput label="Manual CAC" suffix="$" autoValue={fmtMoney(spendResolution.source === "facebook" ? spendResolution.cac : null)} value={ui.manualCac} onChange={(v) => update({ manualCac: v })} hint="Overrides spend: Spend = CAC × Trial Users." />
+                  <CostInput label="Trial Price" suffix="$" autoValue={fmtMoney(autoAssumptions.trialPrice)} value={ui.trialPrice} onChange={(v) => update({ trialPrice: v })} />
+                  <CostInput label="Subscription Price" suffix="$" autoValue={fmtMoney(autoAssumptions.subscriptionPrice)} value={ui.subscriptionPrice} onChange={(v) => update({ subscriptionPrice: v })} />
+                  <CostInput label="Upsell Value" suffix="$" autoValue={fmtMoney(autoAssumptions.upsellValue)} value={ui.upsellValue} onChange={(v) => update({ upsellValue: v })} />
+                  <CostInput label="Upsell Rate" suffix="%" autoValue={`${(autoAssumptions.upsellRate * 100).toFixed(1)}%`} value={ui.upsellRate} onChange={(v) => update({ upsellRate: v })} />
+                  <CostInput label="First Renewal Rate" suffix="%" autoValue={`${(autoAssumptions.firstRenewalRate * 100).toFixed(1)}%`} value={ui.firstRenewalRate} onChange={(v) => update({ firstRenewalRate: v })} hint="Trial → first paid subscription month." />
+                  <CostInput label="Monthly Retention" suffix="%" autoValue={`${(autoAssumptions.monthlyRetention * 100).toFixed(1)}%`} value={ui.monthlyRetention} onChange={(v) => update({ monthlyRetention: v })} hint="Month-over-month retention after the first paid month." />
+                  <CostInput label="Refund Rate" suffix="%" autoValue={`${(autoAssumptions.refundRate * 100).toFixed(1)}%`} value={ui.refundRate} onChange={(v) => update({ refundRate: v })} />
+                  <CostInput label="Processing Fee" suffix="%" autoValue={`${PROCESSING_FEE_DEFAULT_PCT}%`} value={ui.processingFeePct} onChange={(v) => update({ processingFeePct: v })} />
+                  <CostInput label="Fixed Processing Fee" suffix="$/charge" autoValue={fmtMoney(FIXED_FEE_DEFAULT)} value={ui.fixedFee} onChange={(v) => update({ fixedFee: v })} />
+                  <CostInput label="Margin Target" suffix="%" autoValue="0%" value={ui.marginTarget} onChange={(v) => update({ marginTarget: v })} hint="Desired profit margin for Max Profitable CAC." />
+                </div>
+              </Card>
+
+              {/* -------- Section 4: Cohort payback table -------- */}
+              <Card className="p-4 shadow-card">
+                <h3 className="mb-3 text-sm font-semibold">Cohort Payback Table</h3>
+                <div className="overflow-x-auto rounded-lg border border-border">
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>Cohort</TableHead>
+                        <TableHead>Funnel</TableHead>
+                        <TableHead>Campaign Path</TableHead>
+                        <SortableHead label="Trial Users" k="trialUsers" onSort={toggleSort} icon={sortIcon} />
+                        <SortableHead label="Spend" k="spend" onSort={toggleSort} icon={sortIcon} />
+                        <SortableHead label="CAC" k="cac" onSort={toggleSort} icon={sortIcon} />
+                        <TableHead className="text-right">Gross</TableHead>
+                        <TableHead className="text-right">Net</TableHead>
+                        <TableHead className="text-right">Current</TableHead>
+                        <TableHead className="text-right">D7</TableHead>
+                        <SortableHead label="1M" k="roas1M" onSort={toggleSort} icon={sortIcon} />
+                        <TableHead className="text-right">2M</TableHead>
+                        <TableHead className="text-right">3M</TableHead>
+                        <SortableHead label="Payback" k="paybackDay" onSort={toggleSort} icon={sortIcon} />
+                        <TableHead className="text-right">LTV</TableHead>
+                        <SortableHead label="Profit/User" k="profitPerUser" onSort={toggleSort} icon={sortIcon} />
+                        <TableHead>Status</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {pagedRows.map((row: CohortPaybackRow) => (
+                        <TableRow key={row.cohortId}>
+                          <TableCell className="whitespace-nowrap text-xs tabular-nums">{row.cohortDate}</TableCell>
+                          <TableCell className="text-xs">{row.funnel}</TableCell>
+                          <TableCell className="max-w-[160px] truncate text-xs" title={row.campaignPath}>{row.campaignPath}</TableCell>
+                          <TableCell className="text-right tabular-nums">{fmtInt(row.trialUsers)}</TableCell>
+                          <TableCell className="text-right tabular-nums">{row.spendAvailable ? fmtMoney(row.spend) : "—"}</TableCell>
+                          <TableCell className="text-right tabular-nums">{fmtMoney(row.cac)}</TableCell>
+                          <TableCell className="text-right tabular-nums">{fmtMoney(row.grossRevenue)}</TableCell>
+                          <TableCell className="text-right tabular-nums">{fmtMoney(row.netRevenue)}</TableCell>
+                          <TableCell className="text-right tabular-nums">{fmtRoas(row.currentRoas)}</TableCell>
+                          <TableCell className="text-right tabular-nums">{fmtRoas(row.roasD7)}</TableCell>
+                          <TableCell className="text-right tabular-nums">{fmtRoas(row.roas1M)}</TableCell>
+                          <TableCell className="text-right tabular-nums">{fmtRoas(row.roas2M)}</TableCell>
+                          <TableCell className="text-right tabular-nums">{fmtRoas(row.roas3M)}</TableCell>
+                          <TableCell className="text-right tabular-nums">{fmtDay(row.paybackDay)}</TableCell>
+                          <TableCell className="text-right tabular-nums">{fmtMoney(row.projectedLtv)}</TableCell>
+                          <TableCell className="text-right tabular-nums">{fmtMoney(row.profitPerUser)}</TableCell>
+                          <TableCell><StatusBadge status={row.status} /></TableCell>
+                        </TableRow>
+                      ))}
+                      {pagedRows.length === 0 && (
+                        <TableRow>
+                          <TableCell colSpan={17} className="py-8 text-center text-sm text-muted-foreground">No cohorts match the current filters.</TableCell>
+                        </TableRow>
+                      )}
+                    </TableBody>
+                  </Table>
+                </div>
+                <div className="mt-3 flex items-center justify-between text-xs text-muted-foreground">
+                  <span>{fmtInt(sortedRows.length)} cohorts · page {safePage} of {totalPages}</span>
+                  <div className="flex gap-2">
+                    <Button variant="outline" size="sm" disabled={safePage <= 1} onClick={() => update({ page: Math.max(1, safePage - 1) })}>Previous</Button>
+                    <Button variant="outline" size="sm" disabled={safePage >= totalPages} onClick={() => update({ page: Math.min(totalPages, safePage + 1) })}>Next</Button>
+                  </div>
+                </div>
+              </Card>
+
+              {/* -------- Section 6: Scenario planner -------- */}
+              <Card className="p-4 shadow-card">
+                <h3 className="mb-3 text-sm font-semibold">Scenario Planner</h3>
+                <p className="mb-3 text-xs text-muted-foreground">Leave a field blank to use the base value. Answer "what if CAC goes to $32?" or "what if first renewal improves to 40%?"</p>
+                <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                  <ScenarioInput label="CAC ($)" value={ui.scCac} onChange={(v) => update({ scCac: v })} />
+                  <ScenarioInput label="Trial Price ($)" value={ui.scTrialPrice} onChange={(v) => update({ scTrialPrice: v })} />
+                  <ScenarioInput label="Subscription Price ($)" value={ui.scSubscriptionPrice} onChange={(v) => update({ scSubscriptionPrice: v })} />
+                  <ScenarioInput label="First Renewal (%)" value={ui.scFirstRenewalRate} onChange={(v) => update({ scFirstRenewalRate: v })} />
+                  <ScenarioInput label="Monthly Retention (%)" value={ui.scMonthlyRetention} onChange={(v) => update({ scMonthlyRetention: v })} />
+                  <ScenarioInput label="Upsell Rate (%)" value={ui.scUpsellRate} onChange={(v) => update({ scUpsellRate: v })} />
+                  <ScenarioInput label="Upsell Value ($)" value={ui.scUpsellValue} onChange={(v) => update({ scUpsellValue: v })} />
+                  <ScenarioInput label="Refund Rate (%)" value={ui.scRefundRate} onChange={(v) => update({ scRefundRate: v })} />
+                </div>
+                <div className="mt-4 grid grid-cols-2 gap-3 md:grid-cols-5">
+                  <KpiCard label="Base ROAS 1M" value={fmtRoas(scenarioResult.base.roas1M)} />
+                  <KpiCard label="Scenario ROAS 1M" value={fmtRoas(scenarioResult.scenario.roas1M)} accent="success" />
+                  <KpiCard label="Base Payback Day" value={fmtDay(scenarioResult.base.paybackDay)} />
+                  <KpiCard label="Scenario Payback Day" value={fmtDay(scenarioResult.scenario.paybackDay)} accent="success" />
+                  <KpiCard label="Δ Profit" value={fmtMoney(scenarioResult.deltaProfit)} accent={scenarioResult.deltaProfit != null && scenarioResult.deltaProfit >= 0 ? "success" : "warning"} />
+                </div>
+              </Card>
+            </>
+          )}
         </div>
-      </div>
+      </TooltipProvider>
     </AppLayout>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Presentational helpers
+// ---------------------------------------------------------------------------
+
+function FilterSelect({
+  label,
+  value,
+  onChange,
+  options,
+  allLabel,
+  format,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  options: readonly string[];
+  allLabel: string;
+  format?: (v: string) => string;
+}) {
+  return (
+    <div className="space-y-1">
+      <Label className="text-xs text-muted-foreground">{label}</Label>
+      <Select value={value} onValueChange={onChange}>
+        <SelectTrigger className="h-8"><SelectValue /></SelectTrigger>
+        <SelectContent>
+          <SelectItem value="all">{allLabel}</SelectItem>
+          {options.map((option) => (
+            <SelectItem key={option} value={option}>{format ? format(option) : option}</SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
+  );
+}
+
+function SortableHead({ label, k, onSort, icon }: { label: string; k: SortKey; onSort: (k: SortKey) => void; icon: (k: SortKey) => ReactNode }) {
+  return (
+    <TableHead className="text-right">
+      <button type="button" onClick={() => onSort(k)} className="inline-flex items-center gap-1 hover:text-foreground">
+        {label} {icon(k)}
+      </button>
+    </TableHead>
+  );
+}
+
+function ScenarioInput({ label, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) {
+  return (
+    <div className="space-y-1">
+      <Label className="text-xs text-muted-foreground">{label}</Label>
+      <Input className="h-8" value={value} onChange={(e) => onChange(e.target.value)} placeholder="base" />
+    </div>
   );
 }

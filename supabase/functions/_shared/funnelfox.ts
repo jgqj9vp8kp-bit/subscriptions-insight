@@ -185,24 +185,66 @@ function sanitizeDebugValue(value: unknown): unknown {
   );
 }
 
-const PROFILE_EMAIL_PATHS = [
-  "data.email",
-  "email",
-  "metadata.email",
-  "replies.email",
-  "fields.email",
-  "attributes.email",
-  "contact.email",
-];
+// Keys that may carry an email anywhere in a profile-detail payload (mirror of src extractProfileEmail).
+const PROFILE_EMAIL_KEYS = ["email", "email_address", "emailAddress", "contact_email", "customer_email", "user_email", "profile_email"];
+// Container objects that may hold those keys (checked under both the response root and its `data`).
+const PROFILE_EMAIL_CONTAINERS = ["", "profile", "customer", "user", "contact", "metadata", "fields", "attributes", "replies", "preview"];
+
+// Explicit container.key paths, kept for the debug body (which path matched).
+const PROFILE_EMAIL_PATHS = PROFILE_EMAIL_CONTAINERS.flatMap((container) =>
+  PROFILE_EMAIL_KEYS.map((key) => (container ? `${container}.${key}` : key)),
+);
+
+function looksLikeEmail(value: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim());
+}
+
+function emailFromContainer(container: JsonRecord): string {
+  for (const key of PROFILE_EMAIL_KEYS) {
+    const email = normalizeEmail(container[key]);
+    if (email) return email;
+  }
+  return "";
+}
+
+function deepFindEmail(value: unknown, depth: number): string {
+  if (value == null || depth < 0) return "";
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = deepFindEmail(item, depth - 1);
+      if (found) return found;
+    }
+    return "";
+  }
+  if (typeof value === "object") {
+    const record = value as JsonRecord;
+    for (const [key, entry] of Object.entries(record)) {
+      if (typeof entry === "string" && key.toLowerCase().includes("email") && looksLikeEmail(entry)) {
+        return normalizeEmail(entry);
+      }
+    }
+    for (const entry of Object.values(record)) {
+      const found = deepFindEmail(entry, depth - 1);
+      if (found) return found;
+    }
+  }
+  return "";
+}
 
 // Resolves the single profile email the app needs for enrichment, without exposing anything else.
+// FunnelFox puts the email in inconsistent places, so check a broad set of container.key paths first
+// (root + `data`), then fall back to a bounded deep walk over any "email"-named key.
 export function detectProfileEmail(payload: unknown): string | null {
-  const profile = readRecord(readRecord(payload).data ?? payload);
-  for (const path of PROFILE_EMAIL_PATHS) {
-    const value = normalizeEmail(readPath(payload, path) ?? readPath(profile, path));
-    if (value) return value;
+  const root = readRecord(payload);
+  const data = readRecord(root.data);
+  for (const base of [root, data]) {
+    for (const container of PROFILE_EMAIL_CONTAINERS) {
+      const target = container === "" ? base : readRecord(base[container]);
+      const email = emailFromContainer(target);
+      if (email) return email;
+    }
   }
-  return null;
+  return deepFindEmail(payload, 5) || null;
 }
 
 // Minimal, production-safe profile response: only the id and the resolved email. No raw profile,

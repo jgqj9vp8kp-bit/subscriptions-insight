@@ -2,3 +2,6 @@ project_id = "wsjbpkderyhdefukppvb"
 
 [functions.export-campaign-performance]
 verify_jwt = false
+
+[functions.sync-support-mail]
+verify_jwt = false

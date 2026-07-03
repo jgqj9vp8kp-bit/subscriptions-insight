@@ -83,6 +83,31 @@ Lovable frontend -> Supabase Edge Functions -> FunnelFox API
 
 The frontend sends the current Supabase Auth bearer token and anon `apikey` to Edge Functions. `FUNNELFOX_SECRET` stays only in Supabase Function secrets.
 
+### Mail.ru Support Inbox secrets
+
+Support Inbox reads `support@azora-astro.com` through IMAP from the `sync-support-mail` Supabase Edge Function. The browser never connects to IMAP and never receives the mailbox password.
+
+Required Edge Function secrets:
+
+```text
+MAILRU_IMAP_HOST=imap.mail.ru
+MAILRU_IMAP_PORT=993
+MAILRU_IMAP_USER=support@azora-astro.com
+MAILRU_IMAP_PASSWORD=...
+```
+
+Set secrets and deploy:
+
+```text
+supabase secrets set MAILRU_IMAP_HOST=imap.mail.ru
+supabase secrets set MAILRU_IMAP_PORT=993
+supabase secrets set MAILRU_IMAP_USER=support@azora-astro.com
+supabase secrets set MAILRU_IMAP_PASSWORD=...
+supabase functions deploy sync-support-mail
+```
+
+If Mail.ru 2FA is enabled, use an app password for `MAILRU_IMAP_PASSWORD`.
+
 ### Supabase settings
 
 - Disable public signup.

@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { ArrowDown, ArrowUp, ArrowUpDown, Check, ChevronDown, Search, X } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { Button } from "@/components/ui/button";
@@ -26,6 +26,7 @@ import { useTransactions } from "@/services/sheets";
 import { computeCohorts, computeUsers, formatCurrency } from "@/services/analytics";
 import { formatDateKey, toDateKey } from "@/services/dateKeys";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { CARD_TYPE_VALUES, cardTypeLabel } from "@/services/userCardType";
 import { backfillTransactionCardTypesFromRawRows } from "@/services/palmerTransform";
 import {
@@ -470,8 +471,13 @@ export default function UsersPage() {
     [usersWithCampaignPath, selectedCohortMatchIdSet, cohortMembership],
   );
 
+  // The search box is the only free-text (per-keystroke) filter here, so debounce just it: the input
+  // keeps showing `search` instantly while the O(users) filter pass keys off the debounced value.
+  // Every other Users filter stays synchronous because its heavy inputs (cohorts/users) are derived
+  // from the dataset, not the filters — those memos do not re-run on a filter click.
+  const [appliedSearch] = useDebouncedValue(search, 300);
   const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
+    const q = appliedSearch.trim().toLowerCase();
     const fromDateKey = toDateKey(firstTrialFrom);
     const toDateKeyValue = toDateKey(firstTrialTo);
     const hasFirstTrialFilter = Boolean(fromDateKey || toDateKeyValue);
@@ -511,7 +517,23 @@ export default function UsersPage() {
       return sortDir === "asc" ? cmp : -cmp;
     });
     return list;
-  }, [usersWithCampaignPath, hasSelectedCohorts, selectedCohortMatchIdSet, cohortMembership, search, campaignPathFilter, countryFilter, selectedCardTypes, paymentFailedFilter, selectedDeclineReasons, failedAttemptsFilter, firstSubFilter, refundFilter, firstTrialFrom, firstTrialTo, sortKey, sortDir]);
+  }, [usersWithCampaignPath, hasSelectedCohorts, selectedCohortMatchIdSet, cohortMembership, appliedSearch, campaignPathFilter, countryFilter, selectedCardTypes, paymentFailedFilter, selectedDeclineReasons, failedAttemptsFilter, firstSubFilter, refundFilter, firstTrialFrom, firstTrialTo, sortKey, sortDir]);
+
+  // Render the user table one page at a time so the DOM stays bounded for large accounts. Summary,
+  // decline analytics and every total below are still computed from the full `filtered` set, so
+  // pagination changes only what is rendered — never any metric.
+  const USERS_PAGE_SIZE = 50;
+  const [page, setPage] = useState(1);
+  useEffect(() => {
+    // `filtered` is memoized, so this fires only when the filter/sort set actually changes.
+    setPage(1);
+  }, [filtered]);
+  const totalPages = Math.max(1, Math.ceil(filtered.length / USERS_PAGE_SIZE));
+  const safePage = Math.min(page, totalPages);
+  const pagedUsers = useMemo(
+    () => filtered.slice((safePage - 1) * USERS_PAGE_SIZE, safePage * USERS_PAGE_SIZE),
+    [filtered, safePage],
+  );
 
   const summary = useMemo(() => {
     const userIds = new Set(filtered.map((user) => user.user_id));
@@ -1106,7 +1128,7 @@ export default function UsersPage() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {filtered.map((u) => (
+              {pagedUsers.map((u) => (
                 <TableRow key={u.user_id}>
                   <TableCell className="text-sm">{u.email || "—"}</TableCell>
                   <TableCell className="whitespace-nowrap">
@@ -1190,6 +1212,21 @@ export default function UsersPage() {
             </TableBody>
           </Table>
         </div>
+        {filtered.length > USERS_PAGE_SIZE && (
+          <div className="mt-3 flex items-center justify-between text-xs text-muted-foreground">
+            <span>
+              Showing {(safePage - 1) * USERS_PAGE_SIZE + 1}–{Math.min(safePage * USERS_PAGE_SIZE, filtered.length)} of {filtered.length}
+            </span>
+            <div className="flex gap-2">
+              <Button variant="outline" size="sm" disabled={safePage <= 1} onClick={() => setPage(safePage - 1)}>
+                Previous
+              </Button>
+              <Button variant="outline" size="sm" disabled={safePage >= totalPages} onClick={() => setPage(safePage + 1)}>
+                Next
+              </Button>
+            </div>
+          </div>
+        )}
           </TabsContent>
 
           <TabsContent value="decline_analytics" className="mt-0 space-y-4">

@@ -4,6 +4,7 @@ import {
   CreditCard,
   DollarSign,
   LineChart as LineChartIcon,
+  Loader2,
   Receipt,
   ShieldAlert,
   Target,
@@ -63,6 +64,9 @@ import {
 } from "@/services/dashboard";
 import { useDataStore } from "@/store/dataStore";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
+
+const FILTER_DEBOUNCE_MS = 300;
 
 const DEFAULT_DASHBOARD_UI_STATE = {
   funnelFilter: "all",
@@ -328,10 +332,26 @@ export default function Dashboard() {
   const { funnelFilter, campaignPathFilter, sourceFilter, cohortDateFrom, cohortDateTo } = uiState;
   const updateUiState = (patch: Partial<typeof DEFAULT_DASHBOARD_UI_STATE>) => setUiState((current) => ({ ...current, ...patch }));
 
+  // Filter controls read the live values above (instant). Everything that scans transactions/cohorts
+  // reads `applied*` below — the same filters debounced — so rapid changes recompute once and the
+  // UI thread stays responsive. Settled values are identical to the live ones, so no metric changes.
+  const liveFilters = useMemo(
+    () => ({ funnelFilter, campaignPathFilter, sourceFilter, cohortDateFrom, cohortDateTo }),
+    [funnelFilter, campaignPathFilter, sourceFilter, cohortDateFrom, cohortDateTo],
+  );
+  const [appliedFilters, isUpdating] = useDebouncedValue(liveFilters, FILTER_DEBOUNCE_MS);
+  const {
+    funnelFilter: appliedFunnelFilter,
+    campaignPathFilter: appliedCampaignPathFilter,
+    sourceFilter: appliedSourceFilter,
+    cohortDateFrom: appliedCohortDateFrom,
+    cohortDateTo: appliedCohortDateTo,
+  } = appliedFilters;
+
   const allCohorts = useMemo(() => computeCohorts(txs, subscriptions), [txs, subscriptions]);
   const filteredTrafficMetrics = useMemo(
-    () => trafficMetrics.filter((row) => sourceFilter === "all" || row.source === sourceFilter),
-    [sourceFilter, trafficMetrics],
+    () => trafficMetrics.filter((row) => appliedSourceFilter === "all" || row.source === appliedSourceFilter),
+    [appliedSourceFilter, trafficMetrics],
   );
   const trafficByKey = useMemo(() => aggregateTrafficMetrics(filteredTrafficMetrics), [filteredTrafficMetrics]);
   const sourceOptions = useMemo(() => Array.from(new Set(trafficMetrics.map((row) => row.source))).sort(), [trafficMetrics]);
@@ -340,13 +360,13 @@ export default function Dashboard() {
   const cohorts = useMemo(
     () =>
       allCohorts.filter((c) => {
-        if (funnelFilter !== "all" && c.funnel !== funnelFilter) return false;
-        if (campaignPathFilter !== "all" && c.campaign_path !== campaignPathFilter) return false;
-        if (cohortDateFrom && c.cohort_date < cohortDateFrom) return false;
-        if (cohortDateTo && c.cohort_date > cohortDateTo) return false;
+        if (appliedFunnelFilter !== "all" && c.funnel !== appliedFunnelFilter) return false;
+        if (appliedCampaignPathFilter !== "all" && c.campaign_path !== appliedCampaignPathFilter) return false;
+        if (appliedCohortDateFrom && c.cohort_date < appliedCohortDateFrom) return false;
+        if (appliedCohortDateTo && c.cohort_date > appliedCohortDateTo) return false;
         return true;
       }),
-    [allCohorts, funnelFilter, campaignPathFilter, cohortDateFrom, cohortDateTo],
+    [allCohorts, appliedFunnelFilter, appliedCampaignPathFilter, appliedCohortDateFrom, appliedCohortDateTo],
   );
 
   const dashboardCohorts = useMemo(
@@ -366,13 +386,13 @@ export default function Dashboard() {
   const cashRevenueSummary = useMemo(
     () =>
       getCashRevenueByDateRange(txs, {
-        dateFrom: cohortDateFrom,
-        dateTo: cohortDateTo,
-        funnelFilter,
-        campaignPathFilter,
-        sourceFilter,
+        dateFrom: appliedCohortDateFrom,
+        dateTo: appliedCohortDateTo,
+        funnelFilter: appliedFunnelFilter,
+        campaignPathFilter: appliedCampaignPathFilter,
+        sourceFilter: appliedSourceFilter,
       }),
-    [campaignPathFilter, cohortDateFrom, cohortDateTo, funnelFilter, sourceFilter, txs],
+    [appliedCampaignPathFilter, appliedCohortDateFrom, appliedCohortDateTo, appliedFunnelFilter, appliedSourceFilter, txs],
   );
 
   const kpiMap = useMemo(() => {
@@ -392,25 +412,25 @@ export default function Dashboard() {
       txs.filter((transaction) => {
         const eventDate = dateKey(transaction.event_time);
         if (!eventDate) return false;
-        if (cohortDateFrom && eventDate < cohortDateFrom) return false;
-        if (cohortDateTo && eventDate > cohortDateTo) return false;
-        if (funnelFilter !== "all" && transaction.funnel !== funnelFilter) return false;
-        if (campaignPathFilter !== "all" && transaction.campaign_path !== campaignPathFilter) return false;
-        if (sourceFilter !== "all" && transaction.traffic_source !== sourceFilter) return false;
+        if (appliedCohortDateFrom && eventDate < appliedCohortDateFrom) return false;
+        if (appliedCohortDateTo && eventDate > appliedCohortDateTo) return false;
+        if (appliedFunnelFilter !== "all" && transaction.funnel !== appliedFunnelFilter) return false;
+        if (appliedCampaignPathFilter !== "all" && transaction.campaign_path !== appliedCampaignPathFilter) return false;
+        if (appliedSourceFilter !== "all" && transaction.traffic_source !== appliedSourceFilter) return false;
         return true;
       }),
-    [txs, cohortDateFrom, cohortDateTo, funnelFilter, campaignPathFilter, sourceFilter],
+    [txs, appliedCohortDateFrom, appliedCohortDateTo, appliedFunnelFilter, appliedCampaignPathFilter, appliedSourceFilter],
   );
   const dailySubscriptions = useMemo(
     () =>
       subscriptions.filter((subscription) => {
         const cancelledDate = dateKey(subscription.cancelled_at);
         if (!cancelledDate) return false;
-        if (cohortDateFrom && cancelledDate < cohortDateFrom) return false;
-        if (cohortDateTo && cancelledDate > cohortDateTo) return false;
+        if (appliedCohortDateFrom && cancelledDate < appliedCohortDateFrom) return false;
+        if (appliedCohortDateTo && cancelledDate > appliedCohortDateTo) return false;
         return true;
       }),
-    [subscriptions, cohortDateFrom, cohortDateTo],
+    [subscriptions, appliedCohortDateFrom, appliedCohortDateTo],
   );
   const trialsUpsellsByDay = useMemo(() => buildTrialsUpsellsByDay(dailyTransactions), [dailyTransactions]);
   const refundsByDay = useMemo(() => buildRefundsByDay(dailyTransactions), [dailyTransactions]);
@@ -504,7 +524,15 @@ export default function Dashboard() {
   return (
     <AppLayout title="Dashboard" description="Cohort-based business overview">
       <Card className="mb-4 p-3 shadow-card">
-        <div className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">Global Filters</div>
+        <div className="mb-2 flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+          Global Filters
+          {isUpdating && (
+            <span className="flex items-center gap-1 normal-case text-primary">
+              <Loader2 className="h-3 w-3 animate-spin" />
+              Updating results…
+            </span>
+          )}
+        </div>
         <div className="flex flex-wrap items-center gap-2">
           <Select value={funnelFilter} onValueChange={(value) => updateUiState({ funnelFilter: value })}>
             <SelectTrigger className="h-9 w-[160px]"><SelectValue placeholder="Funnel" /></SelectTrigger>

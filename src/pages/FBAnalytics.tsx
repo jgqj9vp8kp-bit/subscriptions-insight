@@ -60,7 +60,11 @@ import { useTransactions } from "@/services/sheets";
 import { CARD_TYPE_VALUES, cardTypeForUserTransactions, cardTypeLabel } from "@/services/userCardType";
 import { countryCodeForUserTransactions, normalizeCountryCode } from "@/services/userCountry";
 import { useDataStore } from "@/store/dataStore";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import type { CardType, Transaction } from "@/services/types";
+
+// Wait this long after the last filter change before running the (heavy) analytics recompute.
+const FILTER_DEBOUNCE_MS = 300;
 
 const DEFAULT_FB_ANALYTICS_UI_STATE = {
   campaignPathFilter: "all",
@@ -356,9 +360,18 @@ export default function FBAnalyticsPage() {
     ],
   );
 
+  // buildFbAnalytics is the heaviest client computation on this page (it runs computeCohorts per
+  // campaign and per trial user). The filter controls read the live `uiState`, so clicks update
+  // instantly; the expensive recompute reads `appliedFbFilters`, which is the same object debounced
+  // by FILTER_DEBOUNCE_MS and committed inside a transition. Rapid multi-select clicks collapse into
+  // a single recompute and `isRecalculating` drives the loading affordance. The applied filters feed
+  // every downstream derive (result, rows, charts, totals, the dev baseline) so the numbers stay
+  // internally consistent — only the timing changes, never the formula.
+  const [appliedFbFilters, isRecalculating] = useDebouncedValue(fbFilters, FILTER_DEBOUNCE_MS);
+
   const result = useMemo(
-    () => buildFbAnalytics({ txs: enrichedTxs, subscriptions, trafficByKey, filters: fbFilters }),
-    [enrichedTxs, subscriptions, trafficByKey, fbFilters],
+    () => buildFbAnalytics({ txs: enrichedTxs, subscriptions, trafficByKey, filters: appliedFbFilters }),
+    [enrichedTxs, subscriptions, trafficByKey, appliedFbFilters],
   );
 
   // Dev-only guardrail (Phase 6): warn if FB Analytics totals drift from Cohorts for the same filters.
@@ -367,10 +380,10 @@ export default function FBAnalyticsPage() {
     logFbReconciliationInDev(
       reconcileFbAnalyticsTotals(
         result.summary,
-        fbAnalyticsCohortBaselineTotals({ txs: enrichedTxs, subscriptions, filters: fbFilters }),
+        fbAnalyticsCohortBaselineTotals({ txs: enrichedTxs, subscriptions, filters: appliedFbFilters }),
       ),
     );
-  }, [result.summary, enrichedTxs, subscriptions, fbFilters]);
+  }, [result.summary, enrichedTxs, subscriptions, appliedFbFilters]);
 
   const rows = useMemo(() => sortRows(result.rows, uiState.sortKey, uiState.sortDir), [result.rows, uiState.sortKey, uiState.sortDir]);
   const topTrials = useMemo(() => rows.slice(0, 10).map((row) => ({ ...row, label: shortCampaignLabel(row) })), [rows]);
@@ -571,11 +584,20 @@ export default function FBAnalyticsPage() {
               description={`${formatNumber(rows.length)} Campaign IDs from filtered Facebook trial users`}
             />
             <div className="flex items-center gap-2 text-xs text-muted-foreground">
-              <Check className="h-3.5 w-3.5" />
-              Cohort metrics use trial-user attribution
+              {isRecalculating ? (
+                <>
+                  <RotateCcw className="h-3.5 w-3.5 animate-spin" />
+                  Recalculating…
+                </>
+              ) : (
+                <>
+                  <Check className="h-3.5 w-3.5" />
+                  Cohort metrics use trial-user attribution
+                </>
+              )}
             </div>
           </div>
-          <div className="overflow-x-auto">
+          <div className={cn("overflow-x-auto transition-opacity", isRecalculating && "pointer-events-none opacity-60")}>
             <Table>
               <TableHeader>
                 <TableRow>

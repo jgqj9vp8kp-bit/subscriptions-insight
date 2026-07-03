@@ -19,7 +19,9 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { FunnelBadge, StatusBadge, TypeBadge } from "@/components/StatusBadges";
+import { PaymentPassAnalytics } from "@/components/PaymentPassAnalytics";
 import { useTransactions } from "@/services/sheets";
 import { formatCurrency } from "@/services/analytics";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
@@ -35,6 +37,7 @@ const FUNNELS = ["past_life", "soulmate", "starseed", "unknown"] as const;
 const PAGE_SIZE = 25;
 
 const DEFAULT_TRANSACTIONS_UI_STATE = {
+  mode: "list" as "list" | "pass",
   search: "",
   typeFilter: "all",
   funnelFilter: "all",
@@ -50,7 +53,7 @@ const DEFAULT_TRANSACTIONS_UI_STATE = {
 export default function TransactionsPage() {
   const txs = useTransactions();
   const [uiState, setUiState, resetUiState] = usePersistedPageState("ui_state_transactions", DEFAULT_TRANSACTIONS_UI_STATE);
-  const { search, typeFilter, funnelFilter, campaignPathFilter, statusFilter, dateFrom, dateTo, sortKey, sortDir, page } = uiState;
+  const { mode, search, typeFilter, funnelFilter, campaignPathFilter, statusFilter, dateFrom, dateTo, sortKey, sortDir, page } = uiState;
   const updateUiState = (patch: Partial<typeof DEFAULT_TRANSACTIONS_UI_STATE>) => setUiState((current) => ({ ...current, ...patch }));
 
   const campaignPathOptions = useMemo(() => Array.from(new Set(txs.map((t) => t.campaign_path || "unknown"))).sort(), [txs]);
@@ -99,6 +102,12 @@ export default function TransactionsPage() {
 
   return (
     <AppLayout title="Transactions" description={`${filtered.length} of ${txs.length} transactions`}>
+      <Tabs value={mode} onValueChange={(v) => updateUiState({ mode: v as "list" | "pass" })} className="space-y-4">
+        <TabsList>
+          <TabsTrigger value="list">Transaction List</TabsTrigger>
+          <TabsTrigger value="pass">Payment Pass Analytics</TabsTrigger>
+        </TabsList>
+        <TabsContent value="list">
       <Card className="p-4 shadow-card">
         <div className="flex flex-wrap items-center gap-2">
           <div className="relative min-w-[220px] flex-1">
@@ -234,6 +243,11 @@ export default function TransactionsPage() {
           </div>
         </div>
       </Card>
+        </TabsContent>
+        <TabsContent value="pass">
+          <PaymentPassAnalytics txs={txs} />
+        </TabsContent>
+      </Tabs>
     </AppLayout>
   );
 }

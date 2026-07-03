@@ -1,15 +1,20 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   AlertCircle,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   Database,
   FileSpreadsheet,
   KeyRound,
   Link as LinkIcon,
   Loader2,
+  MoreHorizontal,
   RefreshCw,
   RotateCcw,
+  Sparkles,
   Trash2,
+  Undo2,
   Upload,
 } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
@@ -33,6 +38,24 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { cn } from "@/lib/utils";
 import { useToast } from "@/hooks/use-toast";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
 import { useDataStore } from "@/store/dataStore";
@@ -110,14 +133,23 @@ import {
   type DatasetType,
 } from "@/services/dataSnapshots";
 import {
+  getImportBatchTransactionCounts,
   getWarehouseTransactionCount,
   importTransactionsToWarehouse,
   isTransactionWarehouseEnabled,
   listImportBatches,
+  previewDuplicateCleanup,
+  type DuplicateCleanupResult,
   type ImportBatchInfo,
+  type ImportBatchStatus,
   type WarehouseImportSummary,
 } from "@/services/transactionWarehouse";
-import { refreshLocalAnalyticsCacheFromWarehouse } from "@/services/analyticsAdapters";
+import {
+  cleanupDuplicateImportsAndRefresh,
+  deleteImportBatchAndRefresh,
+  refreshLocalAnalyticsCacheFromWarehouse,
+  rollbackImportBatchAndRefresh,
+} from "@/services/analyticsAdapters";
 import type { Transaction } from "@/services/types";
 import type { SubscriptionClean } from "@/types/subscriptions";
 import type { TrafficMetric } from "@/services/trafficImport";
@@ -166,6 +198,51 @@ function importBatchDateRange(batch: ImportBatchInfo): string {
   const to = typeof dateRange?.to === "string" ? dateRange.to : null;
   if (!from || !to) return "—";
   return from === to ? from : `${from} → ${to}`;
+}
+
+const STATUS_BADGE_CLASSES: Record<ImportBatchStatus, string> = {
+  completed: "bg-success/15 text-success",
+  failed: "bg-destructive/15 text-destructive",
+  cancelled: "bg-destructive/15 text-destructive",
+  rolled_back: "bg-muted text-muted-foreground",
+  processing: "bg-primary/15 text-primary",
+};
+
+function ImportStatusBadge({ status, isDuplicate }: { status: ImportBatchStatus; isDuplicate: boolean }) {
+  return (
+    <span className="inline-flex flex-wrap items-center gap-1">
+      <span
+        className={cn(
+          "inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium capitalize",
+          STATUS_BADGE_CLASSES[status] ?? "bg-muted text-muted-foreground",
+        )}
+      >
+        {status.replace("_", " ")}
+      </span>
+      {isDuplicate && (
+        <span className="inline-flex items-center rounded-full bg-warning/20 px-2 py-0.5 text-[11px] font-medium text-warning">
+          Duplicate
+        </span>
+      )}
+    </span>
+  );
+}
+
+/** Older completed batches sharing a checksum with a newer completed batch (yellow "Duplicate" badge). */
+function duplicateBatchIds(batches: ImportBatchInfo[]): Set<string> {
+  const newestByChecksum = new Map<string, ImportBatchInfo>();
+  for (const batch of batches) {
+    if (batch.status !== "completed" || !batch.checksum) continue;
+    const current = newestByChecksum.get(batch.checksum);
+    if (!current || batch.imported_at > current.imported_at) newestByChecksum.set(batch.checksum, batch);
+  }
+  const ids = new Set<string>();
+  for (const batch of batches) {
+    if (batch.status !== "completed" || !batch.checksum) continue;
+    const newest = newestByChecksum.get(batch.checksum);
+    if (newest && newest.id !== batch.id) ids.add(batch.id);
+  }
+  return ids;
 }
 
 export default function ImportPage() {
@@ -233,18 +310,24 @@ export default function ImportPage() {
   const [warehouseError, setWarehouseError] = useState<string | null>(null);
   const [warehouseSummary, setWarehouseSummary] = useState<WarehouseImportSummary | null>(null);
   const [warehouseTransactionCount, setWarehouseTransactionCount] = useState<number | null>(null);
+  const [batchTransactionCounts, setBatchTransactionCounts] = useState<Map<string, number>>(new Map());
+  const [expandedBatchId, setExpandedBatchId] = useState<string | null>(null);
+  const [managementBusy, setManagementBusy] = useState(false);
+  const [pendingImportAction, setPendingImportAction] = useState<{ type: "delete" | "rollback"; batch: ImportBatchInfo } | null>(null);
+  const [cleanupPreview, setCleanupPreview] = useState<DuplicateCleanupResult | null>(null);
 
   const temporaryKeyInputEnabled = isFunnelFoxTemporaryKeyInputEnabled();
   const warehouseEnabled = isTransactionWarehouseEnabled();
 
   const refreshLocalCacheInfo = useCallback(async () => {
-    const [palmerInfo, funnelFoxInfo, trafficInfo, cloudInfo, importBatches, warehouseCount] = await Promise.all([
+    const [palmerInfo, funnelFoxInfo, trafficInfo, cloudInfo, importBatches, warehouseCount, batchCounts] = await Promise.all([
       getPalmerCacheInfo().catch(() => null),
       getSubscriptionsCacheInfo().catch(() => null),
       getTrafficCacheInfo().catch(() => null),
       getCloudSnapshotInfos(CLOUD_DATASET_TYPES).catch(() => null),
       warehouseEnabled ? listImportBatches(10).catch(() => null) : Promise.resolve(null),
       warehouseEnabled ? getWarehouseTransactionCount().catch(() => null) : Promise.resolve(null),
+      warehouseEnabled ? getImportBatchTransactionCounts().catch(() => null) : Promise.resolve(null),
     ]);
     setPalmerCacheInfo(palmerInfo);
     setSubscriptionCacheInfo(funnelFoxInfo);
@@ -252,6 +335,7 @@ export default function ImportPage() {
     if (cloudInfo) setCloudSnapshots(cloudInfo);
     if (importBatches) setWarehouseHistory(importBatches);
     setWarehouseTransactionCount(warehouseCount);
+    if (batchCounts) setBatchTransactionCounts(batchCounts);
   }, [warehouseEnabled]);
 
   useEffect(() => {
@@ -601,6 +685,65 @@ export default function ImportPage() {
       setWarehouseError(error instanceof Error ? error.message : "Could not refresh import history.");
     } finally {
       setWarehouseLoading(false);
+    }
+  }
+
+  async function onConfirmImportAction() {
+    if (!pendingImportAction) return;
+    const { type, batch } = pendingImportAction;
+    try {
+      setManagementBusy(true);
+      setWarehouseError(null);
+      const { result, transactions } =
+        type === "delete"
+          ? await deleteImportBatchAndRefresh(batch.id)
+          : await rollbackImportBatchAndRefresh(batch.id);
+      await refreshLocalCacheInfo();
+      const label = type === "delete" ? "Import deleted" : "Import rolled back";
+      setWarehouseMessage(
+        `${label}: ${result.deletedTransactions} transactions removed. Analytics now use ${transactions} merged DB transactions.`,
+      );
+      toast({ title: label, description: `${result.deletedTransactions} transactions removed; analytics refreshed.` });
+    } catch (error) {
+      setWarehouseError(error instanceof Error ? error.message : "Could not complete the import action.");
+    } finally {
+      setManagementBusy(false);
+      setPendingImportAction(null);
+    }
+  }
+
+  async function onPreviewCleanup() {
+    if (!warehouseEnabled) return;
+    try {
+      setManagementBusy(true);
+      setWarehouseError(null);
+      const preview = await previewDuplicateCleanup();
+      setCleanupPreview(preview);
+    } catch (error) {
+      setWarehouseError(error instanceof Error ? error.message : "Could not analyze duplicate imports.");
+    } finally {
+      setManagementBusy(false);
+    }
+  }
+
+  async function onConfirmCleanup() {
+    try {
+      setManagementBusy(true);
+      setWarehouseError(null);
+      const { result, transactions } = await cleanupDuplicateImportsAndRefresh();
+      await refreshLocalCacheInfo();
+      setWarehouseMessage(
+        `Cleanup removed ${result.duplicateImports} duplicate and ${result.failedImports} failed/cancelled imports (${result.transactionsRemoved} transactions). Analytics now use ${transactions} merged DB transactions.`,
+      );
+      toast({
+        title: "Duplicate imports cleaned up",
+        description: `${result.duplicateImports + result.failedImports} imports and ${result.transactionsRemoved} transactions removed.`,
+      });
+    } catch (error) {
+      setWarehouseError(error instanceof Error ? error.message : "Could not clean up duplicate imports.");
+    } finally {
+      setManagementBusy(false);
+      setCleanupPreview(null);
     }
   }
 
@@ -1586,6 +1729,16 @@ export default function ImportPage() {
               type="button"
               variant="outline"
               size="sm"
+              onClick={onPreviewCleanup}
+              disabled={managementBusy || warehouseLoading || !warehouseEnabled}
+            >
+              {managementBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+              Cleanup Duplicate Imports
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
               onClick={onRefreshWarehouseHistory}
               disabled={warehouseLoading || !warehouseEnabled}
             >
@@ -1670,9 +1823,13 @@ export default function ImportPage() {
         )}
 
         <div className="overflow-x-auto rounded-md border border-border">
+          {(() => {
+            const dupIds = duplicateBatchIds(warehouseHistory);
+            return (
           <Table>
             <TableHeader>
               <TableRow>
+                <TableHead className="w-8" />
                 <TableHead>Imported at</TableHead>
                 <TableHead>Filename</TableHead>
                 <TableHead>Date range</TableHead>
@@ -1682,11 +1839,26 @@ export default function ImportPage() {
                 <TableHead className="text-right">Skipped</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead>Checksum</TableHead>
+                <TableHead className="w-10 text-right">Actions</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
-              {warehouseHistory.map((batch) => (
-                <TableRow key={batch.id}>
+              {warehouseHistory.map((batch) => {
+                const expanded = expandedBatchId === batch.id;
+                const txCount = batchTransactionCounts.get(batch.id) ?? 0;
+                return (
+                <Fragment key={batch.id}>
+                <TableRow>
+                  <TableCell className="px-2">
+                    <button
+                      type="button"
+                      aria-label={expanded ? "Collapse details" : "Expand details"}
+                      className="text-muted-foreground hover:text-foreground"
+                      onClick={() => setExpandedBatchId(expanded ? null : batch.id)}
+                    >
+                      {expanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+                    </button>
+                  </TableCell>
                   <TableCell className="whitespace-nowrap text-xs tabular-nums">
                     {new Date(batch.imported_at).toLocaleString()}
                   </TableCell>
@@ -1700,22 +1872,169 @@ export default function ImportPage() {
                   <TableCell className="text-right text-xs tabular-nums">{batch.rows_inserted}</TableCell>
                   <TableCell className="text-right text-xs tabular-nums">{batch.rows_updated}</TableCell>
                   <TableCell className="text-right text-xs tabular-nums">{batch.rows_skipped}</TableCell>
-                  <TableCell className="text-xs">{batch.status}</TableCell>
+                  <TableCell className="text-xs">
+                    <ImportStatusBadge status={batch.status} isDuplicate={dupIds.has(batch.id)} />
+                  </TableCell>
                   <TableCell className="max-w-[140px] truncate font-mono text-[11px]" title={batch.checksum ?? undefined}>
                     {batch.checksum ? batch.checksum.slice(0, 16) : "—"}
                   </TableCell>
+                  <TableCell className="text-right">
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          className="h-7 w-7"
+                          disabled={managementBusy || !warehouseEnabled}
+                          aria-label="Import actions"
+                        >
+                          <MoreHorizontal className="h-4 w-4" />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        <DropdownMenuItem onSelect={() => setExpandedBatchId(expanded ? null : batch.id)}>
+                          {expanded ? "Hide details" : "View details"}
+                        </DropdownMenuItem>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem onSelect={() => setPendingImportAction({ type: "rollback", batch })}>
+                          <Undo2 className="mr-2 h-4 w-4" /> Rollback
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          className="text-destructive focus:text-destructive"
+                          onSelect={() => setPendingImportAction({ type: "delete", batch })}
+                        >
+                          <Trash2 className="mr-2 h-4 w-4" /> Delete Import
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </TableCell>
                 </TableRow>
-              ))}
+                {expanded && (
+                  <TableRow className="bg-muted/20">
+                    <TableCell colSpan={11} className="p-4">
+                      <div className="grid gap-x-6 gap-y-2 text-xs sm:grid-cols-2 lg:grid-cols-3">
+                        {[
+                          ["Import Batch ID", <span className="font-mono">{batch.id}</span>],
+                          ["Checksum", <span className="font-mono break-all">{batch.checksum ?? "—"}</span>],
+                          ["Inserted", batch.rows_inserted],
+                          ["Updated", batch.rows_updated],
+                          ["Skipped", batch.rows_skipped],
+                          ["Total rows", batch.rows_total],
+                          ["Filename", batch.filename ?? "—"],
+                          ["Source", batch.source],
+                          ["Status", batch.status.replace("_", " ")],
+                          ["Created At", new Date(batch.imported_at).toLocaleString()],
+                          ["Transaction count", txCount],
+                        ].map(([label, value], index) => (
+                          <div key={index} className="flex justify-between gap-3 border-b border-border/60 py-1">
+                            <span className="text-muted-foreground">{label}</span>
+                            <span className="text-right font-medium text-foreground">{value}</span>
+                          </div>
+                        ))}
+                      </div>
+                      {batch.notes && (
+                        <div className="mt-2 rounded-md border border-border bg-background p-2 text-[11px] text-muted-foreground">
+                          {batch.notes}
+                        </div>
+                      )}
+                    </TableCell>
+                  </TableRow>
+                )}
+                </Fragment>
+                );
+              })}
               {!warehouseHistory.length && (
                 <TableRow>
-                  <TableCell colSpan={9} className="py-6 text-center text-xs text-muted-foreground">
+                  <TableCell colSpan={11} className="py-6 text-center text-xs text-muted-foreground">
                     No warehouse imports recorded yet.
                   </TableCell>
                 </TableRow>
               )}
             </TableBody>
           </Table>
+            );
+          })()}
         </div>
+
+        <AlertDialog open={pendingImportAction !== null} onOpenChange={(open) => !open && setPendingImportAction(null)}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>
+                {pendingImportAction?.type === "delete" ? "Delete import?" : "Rollback import?"}
+              </AlertDialogTitle>
+              <AlertDialogDescription asChild>
+                <div className="space-y-2">
+                  {pendingImportAction?.type === "delete" ? (
+                    <>
+                      <p>This will permanently remove:</p>
+                      <ul className="list-disc pl-5">
+                        <li>import history</li>
+                        <li>imported transactions ({batchTransactionCounts.get(pendingImportAction.batch.id) ?? 0})</li>
+                        <li>snapshots created by this import (if applicable)</li>
+                      </ul>
+                      <p className="font-medium text-destructive">This action cannot be undone.</p>
+                    </>
+                  ) : (
+                    <>
+                      <p>
+                        This removes only the {batchTransactionCounts.get(pendingImportAction?.batch.id ?? "") ?? 0}{" "}
+                        transactions inserted by this import. Older imports remain untouched and analytics rebuild
+                        immediately. The import is kept in history as <span className="font-medium">rolled back</span>.
+                      </p>
+                    </>
+                  )}
+                </div>
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel disabled={managementBusy}>Cancel</AlertDialogCancel>
+              <AlertDialogAction
+                onClick={(event) => {
+                  event.preventDefault();
+                  void onConfirmImportAction();
+                }}
+                disabled={managementBusy}
+                className={pendingImportAction?.type === "delete" ? "bg-destructive text-destructive-foreground hover:bg-destructive/90" : undefined}
+              >
+                {managementBusy ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                {pendingImportAction?.type === "delete" ? "Delete" : "Rollback"}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+
+        <AlertDialog open={cleanupPreview !== null} onOpenChange={(open) => !open && setCleanupPreview(null)}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Cleanup duplicate imports?</AlertDialogTitle>
+              <AlertDialogDescription asChild>
+                <div className="space-y-2">
+                  <p>Found:</p>
+                  <ul className="list-disc pl-5">
+                    <li>{cleanupPreview?.duplicateImports ?? 0} duplicate imports</li>
+                    <li>{cleanupPreview?.failedImports ?? 0} failed imports</li>
+                    <li>{cleanupPreview?.transactionsRemoved ?? 0} transactions will be removed</li>
+                  </ul>
+                  <p>The newest completed import for each checksum is kept. This cannot be undone.</p>
+                </div>
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel disabled={managementBusy}>Cancel</AlertDialogCancel>
+              <AlertDialogAction
+                onClick={(event) => {
+                  event.preventDefault();
+                  void onConfirmCleanup();
+                }}
+                disabled={managementBusy}
+              >
+                {managementBusy ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                Cleanup
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
       </Card>
 
       <Card className="mt-3 p-4 shadow-card">

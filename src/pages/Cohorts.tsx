@@ -32,6 +32,7 @@ import { normalizeCampaignPath, type TrafficMetric } from "@/services/trafficImp
 import type { CardType, CohortRow, MediaBuyer, PlanBreakdownRow } from "@/services/types";
 import { useDataStore } from "@/store/dataStore";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import {
   ACTIVE_VIEW_STORAGE_KEY,
   COLUMN_ORDER_STORAGE_KEY,
@@ -602,6 +603,9 @@ function fromCloudSavedView(view: CohortsUiSavedView): SavedView {
   };
 }
 
+// Wait this long after the last multi-select change before re-running the cohort computations.
+const COHORT_FILTER_DEBOUNCE_MS = 300;
+
 export default function CohortsPage() {
   const txs = useTransactions();
   const subscriptions = useDataStore((s) => s.subscriptions);
@@ -662,6 +666,27 @@ export default function CohortsPage() {
   const hasCardTypeFilter = selectedCardTypes.length > 0;
   const hasMediaBuyerFilter = selectedMediaBuyers.length > 0;
   const hasCampaignIdFilter = selectedCampaignIds.length > 0;
+
+  // The multi-select filters above (country / card type / media buyer / campaign IDs / traffic
+  // source) are the rapid-click controls: each click re-runs every computeCohorts pass on this page
+  // (the cohort table plus each "available options" builder). Debounce them as one bundle so a burst
+  // of clicks collapses into a single recompute. The checkbox UI keeps reading the live `selected*`
+  // values (instant feedback); only the heavy memos read the `applied*` values below. `maxRenewalColumns`
+  // is intentionally excluded — it is a rarely-changed setting that also drives the column layout, so
+  // it must stay in lockstep with the live value. Settled applied values equal the live ones, so no
+  // metric changes — only the timing of the recompute.
+  const heavyFilters = useMemo(
+    () => ({ trafficSourceFilter, selectedCampaignIds, selectedCountries, selectedCardTypes, selectedMediaBuyers }),
+    [trafficSourceFilter, selectedCampaignIds, selectedCountries, selectedCardTypes, selectedMediaBuyers],
+  );
+  const [appliedHeavyFilters, isRecomputing] = useDebouncedValue(heavyFilters, COHORT_FILTER_DEBOUNCE_MS);
+  const {
+    trafficSourceFilter: appliedTrafficSourceFilter,
+    selectedCampaignIds: appliedSelectedCampaignIds,
+    selectedCountries: appliedSelectedCountries,
+    selectedCardTypes: appliedSelectedCardTypes,
+    selectedMediaBuyers: appliedSelectedMediaBuyers,
+  } = appliedHeavyFilters;
   const expandedCohortIds = useMemo(() => new Set(expandedCohortIdList), [expandedCohortIdList]);
   const updateUiState = (patch: Partial<typeof DEFAULT_COHORTS_UI_STATE>) => {
     markCohortsUiSettingsUpdated();
@@ -948,20 +973,25 @@ export default function CohortsPage() {
   );
   const trafficSourceOptions = useMemo(() => Array.from(new Set(trialAttributionTxs.map((t) => t.traffic_source))).sort(), [trialAttributionTxs]);
   const parentAttributionTxs = useMemo(
-    () => filterTransactionsByTrialAttribution(analyticsTxs, { trafficSourceFilter }),
-    [analyticsTxs, trafficSourceFilter],
+    () => filterTransactionsByTrialAttribution(analyticsTxs, { trafficSourceFilter: appliedTrafficSourceFilter }),
+    [analyticsTxs, appliedTrafficSourceFilter],
   );
   const sourceFilteredTxs = useMemo(
-    () => filterTransactionsByTrialAttribution(analyticsTxs, { trafficSourceFilter, selectedCampaignIds }),
-    [analyticsTxs, trafficSourceFilter, selectedCampaignIds]
+    () => filterTransactionsByTrialAttribution(analyticsTxs, { trafficSourceFilter: appliedTrafficSourceFilter, selectedCampaignIds: appliedSelectedCampaignIds }),
+    [analyticsTxs, appliedTrafficSourceFilter, appliedSelectedCampaignIds]
   );
   const parentCohorts = useMemo(
-    () => computeCohorts(parentAttributionTxs, subscriptions, { maxRenewalDepth: maxRenewalColumns, selectedCountries, selectedCardTypes, selectedMediaBuyers }),
-    [parentAttributionTxs, subscriptions, maxRenewalColumns, selectedCountries, selectedCardTypes, selectedMediaBuyers],
+    () => computeCohorts(parentAttributionTxs, subscriptions, { maxRenewalDepth: maxRenewalColumns, selectedCountries: appliedSelectedCountries, selectedCardTypes: appliedSelectedCardTypes, selectedMediaBuyers: appliedSelectedMediaBuyers }),
+    [parentAttributionTxs, subscriptions, maxRenewalColumns, appliedSelectedCountries, appliedSelectedCardTypes, appliedSelectedMediaBuyers],
   );
+  // With no Campaign ID filter active, sourceFilteredTxs === parentAttributionTxs, so allCohorts is
+  // identical to parentCohorts. Reuse it instead of recomputing the full cohort set a second time.
   const allCohorts = useMemo(
-    () => computeCohorts(sourceFilteredTxs, subscriptions, { maxRenewalDepth: maxRenewalColumns, selectedCountries, selectedCardTypes, selectedMediaBuyers }),
-    [sourceFilteredTxs, subscriptions, maxRenewalColumns, selectedCountries, selectedCardTypes, selectedMediaBuyers],
+    () =>
+      (appliedSelectedCampaignIds?.length ?? 0) === 0
+        ? parentCohorts
+        : computeCohorts(sourceFilteredTxs, subscriptions, { maxRenewalDepth: maxRenewalColumns, selectedCountries: appliedSelectedCountries, selectedCardTypes: appliedSelectedCardTypes, selectedMediaBuyers: appliedSelectedMediaBuyers }),
+    [appliedSelectedCampaignIds, parentCohorts, sourceFilteredTxs, subscriptions, maxRenewalColumns, appliedSelectedCountries, appliedSelectedCardTypes, appliedSelectedMediaBuyers],
   );
   const trafficByKey = useMemo(() => aggregateTrafficMetrics(trafficMetrics), [trafficMetrics]);
   const funnelOptions = useMemo(() => Array.from(new Set(parentCohorts.map((c) => c.funnel))).sort(), [parentCohorts]);
@@ -1002,13 +1032,13 @@ export default function CohortsPage() {
         txs: analyticsTxs,
         subscriptions,
         filters: cohortRowFilters,
-        trafficSourceFilter,
-        selectedCountries,
-        selectedCardTypes,
-        selectedMediaBuyers,
+        trafficSourceFilter: appliedTrafficSourceFilter,
+        selectedCountries: appliedSelectedCountries,
+        selectedCardTypes: appliedSelectedCardTypes,
+        selectedMediaBuyers: appliedSelectedMediaBuyers,
         maxRenewalDepth: maxRenewalColumns,
       }),
-    [analyticsTxs, subscriptions, cohortRowFilters, trafficSourceFilter, selectedCountries, selectedCardTypes, selectedMediaBuyers, maxRenewalColumns],
+    [analyticsTxs, subscriptions, cohortRowFilters, appliedTrafficSourceFilter, appliedSelectedCountries, appliedSelectedCardTypes, appliedSelectedMediaBuyers, maxRenewalColumns],
   );
   const campaignIdOptionIds = useMemo(() => new Set(campaignIdOptions.map((option) => option.campaign_id)), [campaignIdOptions]);
   useEffect(() => {
@@ -1025,11 +1055,11 @@ export default function CohortsPage() {
         txs: sourceFilteredTxs,
         subscriptions,
         filters: cohortRowFilters,
-        selectedCardTypes,
-        selectedMediaBuyers,
+        selectedCardTypes: appliedSelectedCardTypes,
+        selectedMediaBuyers: appliedSelectedMediaBuyers,
         maxRenewalDepth: maxRenewalColumns,
       }),
-    [sourceFilteredTxs, subscriptions, cohortRowFilters, selectedCardTypes, selectedMediaBuyers, maxRenewalColumns],
+    [sourceFilteredTxs, subscriptions, cohortRowFilters, appliedSelectedCardTypes, appliedSelectedMediaBuyers, maxRenewalColumns],
   );
   const cardTypeOptions = useMemo(
     () =>
@@ -1037,11 +1067,11 @@ export default function CohortsPage() {
         txs: sourceFilteredTxs,
         subscriptions,
         filters: cohortRowFilters,
-        selectedCountries,
-        selectedMediaBuyers,
+        selectedCountries: appliedSelectedCountries,
+        selectedMediaBuyers: appliedSelectedMediaBuyers,
         maxRenewalDepth: maxRenewalColumns,
       }),
-    [sourceFilteredTxs, subscriptions, cohortRowFilters, selectedCountries, selectedMediaBuyers, maxRenewalColumns],
+    [sourceFilteredTxs, subscriptions, cohortRowFilters, appliedSelectedCountries, appliedSelectedMediaBuyers, maxRenewalColumns],
   );
   const mediaBuyerOptions = useMemo(
     () =>
@@ -1049,13 +1079,13 @@ export default function CohortsPage() {
         txs: analyticsTxs,
         subscriptions,
         filters: cohortRowFilters,
-        trafficSourceFilter,
-        selectedCampaignIds,
-        selectedCountries,
-        selectedCardTypes,
+        trafficSourceFilter: appliedTrafficSourceFilter,
+        selectedCampaignIds: appliedSelectedCampaignIds,
+        selectedCountries: appliedSelectedCountries,
+        selectedCardTypes: appliedSelectedCardTypes,
         maxRenewalDepth: maxRenewalColumns,
       }),
-    [analyticsTxs, subscriptions, cohortRowFilters, trafficSourceFilter, selectedCampaignIds, selectedCountries, selectedCardTypes, maxRenewalColumns],
+    [analyticsTxs, subscriptions, cohortRowFilters, appliedTrafficSourceFilter, appliedSelectedCampaignIds, appliedSelectedCountries, appliedSelectedCardTypes, maxRenewalColumns],
   );
   const mediaBuyerOptionIds = useMemo(() => new Set(mediaBuyerOptions.map((option) => option.media_buyer)), [mediaBuyerOptions]);
   useEffect(() => {
@@ -1727,6 +1757,12 @@ export default function CohortsPage() {
     <AppLayout title="Cohorts" description="Grouped by trial date">
       <Card className="rounded-lg border bg-card text-card-foreground shadow-sm p-4 shadow-card py-[20px]">
         <div className="mb-3 flex flex-wrap items-center gap-2 pb-3 border-b border-border">
+          {isRecomputing && (
+            <span className="order-last ml-auto flex items-center gap-1 text-xs text-primary">
+              <Loader2 className="h-3 w-3 animate-spin" />
+              Updating results…
+            </span>
+          )}
           <Select value={funnelFilter} onValueChange={(value) => updateUiState({ funnelFilter: value })}>
             <SelectTrigger className="h-9 w-[160px]"><SelectValue placeholder="Funnel" /></SelectTrigger>
             <SelectContent>

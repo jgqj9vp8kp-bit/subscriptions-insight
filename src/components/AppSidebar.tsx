@@ -1,4 +1,4 @@
-import { BarChart3, LayoutDashboard, Receipt, Users, Layers, Upload, Repeat, Calculator, Plug } from "lucide-react";
+import { BarChart3, Headphones, LayoutDashboard, Receipt, Users, UserPlus, Layers, Upload, Repeat, Calculator, Plug } from "lucide-react";
 import { NavLink } from "@/components/NavLink";
 import {
   Sidebar,
@@ -17,9 +17,11 @@ const items = [
   { title: "Dashboard", url: "/", icon: LayoutDashboard, end: true },
   { title: "Transactions", url: "/transactions", icon: Receipt, end: false },
   { title: "Users", url: "/users", icon: Users, end: false },
+  { title: "Leads", url: "/leads", icon: UserPlus, end: false },
   { title: "Cohorts", url: "/cohorts", icon: Layers, end: false },
   { title: "FB-Analytics", url: "/fb-analytics", icon: BarChart3, end: false },
   { title: "Integrations", url: "/integrations", icon: Plug, end: false },
+  { title: "Support", url: "/support", icon: Headphones, end: false },
   { title: "Forecasting", url: "/forecasting", icon: Calculator, end: false },
   { title: "Subscriptions", url: "/subscriptions", icon: Repeat, end: false },
   { title: "Import data", url: "/import", icon: Upload, end: false },
