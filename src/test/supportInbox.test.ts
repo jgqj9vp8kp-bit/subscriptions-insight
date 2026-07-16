@@ -10,6 +10,7 @@ import {
 import type { Transaction } from "@/services/types";
 import {
   extractEmailLiterals,
+  normalizeMessageId,
   parseRawEmail,
 } from "../../supabase/functions/sync-support-mail/support";
 
@@ -184,5 +185,52 @@ describe("support inbox helpers", () => {
   it("extracts IMAP literals for message deduplication parsing", () => {
     const response = "* 1 FETCH (UID 7 BODY[] {5}\r\nhello)\r\nA0001 OK FETCH completed\r\n";
     expect(extractEmailLiterals(response)).toEqual(["hello"]);
+  });
+
+  it("normalizes message ids and falls back from HTML-only bodies to plain text", () => {
+    const raw = [
+      "Message-ID: <M2@Example.COM>",
+      "From: Customer <customer@example.com>",
+      "To: support@azora-astro.com",
+      "Subject: HTML only",
+      "Date: Fri, 02 May 2026 10:00:00 +0000",
+      "Content-Type: text/html; charset=utf-8",
+      "",
+      "<html><body><p>Hello&nbsp;<strong>support</strong></p><script>nope()</script></body></html>",
+    ].join("\r\n");
+
+    const parsed = parseRawEmail(raw, "43");
+    expect(normalizeMessageId("<M2@Example.COM>")).toBe("m2@example.com");
+    expect(parsed.normalized_message_id).toBe("m2@example.com");
+    expect(parsed.body_text).toBe("Hello support");
+  });
+
+  it("captures attachment metadata without storing binary attachments separately", () => {
+    const raw = [
+      "Message-ID: <m3@example.com>",
+      "From: Customer <customer@example.com>",
+      "To: support@azora-astro.com",
+      "Subject: Attachment",
+      "Date: Fri, 02 May 2026 10:00:00 +0000",
+      "Content-Type: multipart/mixed; boundary=\"b1\"",
+      "",
+      "--b1",
+      "Content-Type: text/plain; charset=utf-8",
+      "",
+      "Please see attached.",
+      "--b1",
+      "Content-Type: application/pdf; name=\"invoice.pdf\"",
+      "Content-Disposition: attachment; filename=\"invoice.pdf\"",
+      "Content-Transfer-Encoding: base64",
+      "",
+      "SGVsbG8=",
+      "--b1--",
+    ].join("\r\n");
+
+    const parsed = parseRawEmail(raw, "44");
+    expect(parsed.has_attachments).toBe(true);
+    expect(parsed.attachment_count).toBe(1);
+    expect(parsed.attachment_metadata[0]).toMatchObject({ filename: "invoice.pdf", mime_type: "application/pdf" });
+    expect(parsed.body_text).toContain("Please see attached");
   });
 });

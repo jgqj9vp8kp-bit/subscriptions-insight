@@ -116,6 +116,7 @@ const VALID_TYPES: TransactionType[] = [
   "renewal_2",
   "renewal_3",
   "renewal",
+  "token_purchase",
   "failed_payment",
   "refund",
   "chargeback",

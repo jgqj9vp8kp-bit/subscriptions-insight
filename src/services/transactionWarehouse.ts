@@ -3,6 +3,7 @@ import { supabase } from "@/services/supabaseClient";
 import { addCohortFields, backfillTransactionCardTypesFromRawRows, classifyUserTransactions } from "@/services/palmerTransform";
 import { declineDetailsForTransaction } from "@/services/paymentFailures";
 import { sha256Hex } from "@/services/sha256";
+import { traceAsync, traceEvent, traceRequest } from "@/services/performanceTrace";
 import type { TrafficSource, Transaction } from "@/services/types";
 
 export const USE_TRANSACTION_WAREHOUSE = publicRuntimeConfig.useTransactionWarehouse;
@@ -676,42 +677,111 @@ export async function getImportBatchTransactionCounts(
 
 export async function getWarehouseTransactionCount(): Promise<number> {
   const client = ensureSupabase();
-  const { count, error } = await client
-    .from("transactions")
-    .select("id", { count: "exact", head: true })
-    .is("deleted_at", null);
+  const { count, error } = await traceRequest(
+    "supabase.transactions_count",
+    "supabase:transactions:count_head",
+    () => client
+      .from("transactions")
+      .select("id", { count: "exact", head: true })
+      .is("deleted_at", null),
+    { table: "transactions", operation: "count" },
+  );
   if (error) throw new Error(`Could not count warehouse transactions: ${error.message}`);
   return count ?? 0;
 }
 
-export async function loadWarehouseTransactions(options: { limit?: number; offset?: number; pageSize?: number } = {}): Promise<Transaction[]> {
-  const client = ensureSupabase();
-  const pageSize = options.pageSize ?? TRANSACTION_WAREHOUSE_SELECT_PAGE_SIZE;
-  const offset = options.offset ?? 0;
-  const records: WarehouseLoadedRecord[] = [];
-  let pageOffset = offset;
+export interface WarehouseTransactionsLoadProgress {
+  total_rows_expected: number | null;
+  rows_downloaded: number;
+  rows_stored: number;
+  pages_loaded: number;
+  pages_expected: number | null;
+  current_page: number;
+  has_more: boolean;
+  duration_ms: number;
+  source_complete: boolean;
+  stopped_reason: "loading" | "completed" | "limit_reached" | "empty_page";
+  progress_percent: number | null;
+}
 
-  while (options.limit == null || records.length < options.limit) {
-    const remaining = options.limit == null ? pageSize : Math.min(pageSize, options.limit - records.length);
-    if (remaining <= 0) break;
+function warehouseProgressPercent(rowsDownloaded: number, totalRowsExpected: number | null, sourceComplete: boolean): number | null {
+  if (!totalRowsExpected || totalRowsExpected <= 0) return null;
+  const percent = Math.floor((rowsDownloaded / totalRowsExpected) * 100);
+  return sourceComplete ? Math.min(100, percent) : Math.min(99, percent);
+}
 
-    const { data, error } = await client
-      .from("transactions")
-      .select("source,raw_payload,normalized_payload")
-      .is("deleted_at", null)
-      .order("event_time", { ascending: false })
-      .range(pageOffset, pageOffset + remaining - 1);
-    if (error) throw new Error(`Could not load warehouse transactions: ${error.message}`);
+export async function loadWarehouseTransactions(options: {
+  limit?: number;
+  offset?: number;
+  pageSize?: number;
+  totalRowsExpected?: number | null;
+  onProgress?: (progress: WarehouseTransactionsLoadProgress) => void;
+} = {}): Promise<Transaction[]> {
+  return traceAsync("supabase.transactions_full_load", async () => {
+    const client = ensureSupabase();
+    const pageSize = options.pageSize ?? TRANSACTION_WAREHOUSE_SELECT_PAGE_SIZE;
+    const offset = options.offset ?? 0;
+    const startedAt = Date.now();
+    const totalRowsExpected = options.totalRowsExpected ?? options.limit ?? null;
+    const pagesExpected = totalRowsExpected ? Math.ceil(totalRowsExpected / pageSize) : null;
+    const records: WarehouseLoadedRecord[] = [];
+    let pageOffset = offset;
+    let pages = 0;
+    let rowsDownloaded = 0;
+    let hasMore = true;
+    const emit = (sourceComplete: boolean, stoppedReason: WarehouseTransactionsLoadProgress["stopped_reason"]) => {
+      options.onProgress?.({
+        total_rows_expected: totalRowsExpected,
+        rows_downloaded: rowsDownloaded,
+        rows_stored: sourceComplete ? records.length : 0,
+        pages_loaded: pages,
+        pages_expected: pagesExpected,
+        current_page: pages,
+        has_more: hasMore,
+        duration_ms: Date.now() - startedAt,
+        source_complete: sourceComplete,
+        stopped_reason: stoppedReason,
+        progress_percent: warehouseProgressPercent(rowsDownloaded, totalRowsExpected, sourceComplete),
+      });
+    };
 
-    const pageRows = ((data ?? []) as WarehouseLoadedRecord[])
-      .filter((record) => Boolean(record.normalized_payload && typeof record.normalized_payload === "object"));
+    while (options.limit == null || records.length < options.limit) {
+      const remaining = options.limit == null ? pageSize : Math.min(pageSize, options.limit - records.length);
+      if (remaining <= 0) break;
 
-    records.push(...pageRows);
-    if (pageRows.length < remaining) break;
-    pageOffset += remaining;
-  }
+      const { data, error } = await traceRequest(
+        "supabase.transactions_page",
+        `supabase:transactions:page:${pageOffset}:${remaining}`,
+        () => client
+          .from("transactions")
+          .select("source,raw_payload,normalized_payload")
+          .is("deleted_at", null)
+          .order("event_time", { ascending: false })
+          .range(pageOffset, pageOffset + remaining - 1),
+        { table: "transactions", operation: "page", page_size: remaining },
+      );
+      if (error) throw new Error(`Could not load warehouse transactions: ${error.message}`);
 
-  return hydrateWarehouseTransactionsForAnalytics(records);
+      const sourceRows = (data ?? []) as WarehouseLoadedRecord[];
+      const pageRows = ((data ?? []) as WarehouseLoadedRecord[])
+        .filter((record) => Boolean(record.normalized_payload && typeof record.normalized_payload === "object"));
+
+      records.push(...pageRows);
+      pages += 1;
+      rowsDownloaded += sourceRows.length;
+      hasMore = sourceRows.length >= remaining;
+      traceEvent("supabase.transactions_page_completed", { page_rows: pageRows.length, source_rows: sourceRows.length, pages, total_rows: records.length });
+      emit(false, "loading");
+      if (sourceRows.length < remaining) break;
+      pageOffset += remaining;
+    }
+
+    hasMore = false;
+    const hydrated = hydrateWarehouseTransactionsForAnalytics(records);
+    traceEvent("warehouse.transactions_hydrated", { source_rows: records.length, hydrated_rows: hydrated.length });
+    emit(true, options.limit != null && rowsDownloaded >= options.limit ? "limit_reached" : rowsDownloaded === 0 ? "empty_page" : "completed");
+    return hydrated;
+  }, { table: "transactions", limit: options.limit ?? "all", page_size: options.pageSize ?? TRANSACTION_WAREHOUSE_SELECT_PAGE_SIZE });
 }
 
 export function hydrateWarehouseTransactionsForAnalytics(records: WarehouseLoadedRecord[]): Transaction[] {

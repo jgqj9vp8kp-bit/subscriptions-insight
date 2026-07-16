@@ -1,5 +1,48 @@
 import type { FunnelFoxSubscriptionRaw, SubscriptionClean } from "@/types/subscriptions";
 
+// Status tokens that mean a subscription is NOT active regardless of period.
+const INACTIVE_STATUS_TOKENS = ["expired", "unpaid", "failed", "cancel"] as const;
+
+export type SubscriptionActiveInput = Pick<SubscriptionClean, "status" | "renews" | "period_ends_at">;
+
+/**
+ * Single source of truth for "is this subscription active right now".
+ *
+ * A subscription is active iff ALL hold, evaluated against the SAME injected
+ * `nowMs` (never a frozen field, never Date.now() inside — so a computation is
+ * deterministic and reflects the current moment, not the last sync):
+ *   - renews === true          (a cancelled / non-renewing sub is NOT active,
+ *                                even if its paid period has not ended yet);
+ *   - status not expired / unpaid / failed / cancelled;
+ *   - period_ends_at is a valid date strictly in the future (> nowMs).
+ *
+ * Invalid / empty period_ends_at is treated as NOT active.
+ */
+export function isSubscriptionActiveNow(sub: SubscriptionActiveInput, nowMs: number): boolean {
+  if (sub.renews !== true) return false;
+  const status = (sub.status ?? "").toLowerCase();
+  if (INACTIVE_STATUS_TOKENS.some((token) => status.includes(token))) return false;
+  const periodMs = sub.period_ends_at ? new Date(sub.period_ends_at).getTime() : Number.NaN;
+  return Number.isFinite(periodMs) && periodMs > nowMs;
+}
+
+/**
+ * Canonical join key for attributing a subscription to a cohort user.
+ * Identity priority: normalized email → profile_id → customer/psp id. (Warehouse
+ * trials share only email with FunnelFox subscriptions, so email is primary.)
+ */
+export function canonicalSubscriptionIdentity(
+  sub: Pick<SubscriptionClean, "email" | "profile_id" | "psp_id">,
+): string | null {
+  const email = sub.email?.trim().toLowerCase();
+  if (email) return `email:${email}`;
+  const profileId = sub.profile_id?.trim();
+  if (profileId) return `profile:${profileId}`;
+  const pspId = sub.psp_id?.trim();
+  if (pspId) return `psp:${pspId}`;
+  return null;
+}
+
 function valueString(value: unknown): string {
   return value == null ? "" : String(value);
 }

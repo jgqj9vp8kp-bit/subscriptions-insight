@@ -38,7 +38,8 @@ const UPSERT_BATCH = 500;
 
 // ---- pure helpers (mirror funnelfoxLeadsTransform.ts) ----------------------------------------
 
-const MEDIA_BUYER_BY_UTM: Record<string, string> = { "4": "Ivan", "22": "Artem A", "19": "Artem D" };
+// Must match MEDIA_BUYER_BY_UTM_SOURCE in src/services/userMediaBuyer.ts.
+const MEDIA_BUYER_BY_UTM: Record<string, string> = { "4": "Ivan", "19": "Artem A", "22": "Artem D" };
 
 type SyncStage = "profiles" | "profile_details" | "sessions" | "reconcile";
 type SyncStoppedReason = "completed" | "soft_timeout" | "max_pages_reached" | "api_error" | "unknown";

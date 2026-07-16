@@ -290,7 +290,7 @@ describe("segment breakdowns", () => {
   it("computes media buyer pass rate", () => {
     const attempts = buildPaymentAttempts([
       tx("a", "trial", "2026-01-01T00:00:00Z", { raw: { utm_source: "4" } }), // Ivan
-      failed("b", "failed_payment", "2026-01-01T00:00:00Z", { raw: { utm_source: "22" } }), // Artem A
+      failed("b", "failed_payment", "2026-01-01T00:00:00Z", { raw: { utm_source: "19" } }), // Artem A
     ]);
     const rows = groupPaymentAttempts(attempts, "media_buyer");
     expect(rows.find((r) => r.key === "Ivan")!.pass_rate).toBe(1);

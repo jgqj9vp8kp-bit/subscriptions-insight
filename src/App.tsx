@@ -1,4 +1,4 @@
-import { lazy, Suspense } from "react";
+import { lazy, Suspense, useEffect } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, Route, Routes } from "react-router-dom";
 import { Loader2 } from "lucide-react";
@@ -7,6 +7,8 @@ import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ProtectedRoute } from "@/components/ProtectedRoute";
 import { AuthProvider } from "@/components/AuthProvider";
+import { AnalyticsCacheGate } from "@/components/AnalyticsCacheGate";
+import { traceMark } from "@/services/performanceTrace";
 import LoginPage from "./pages/Login.tsx";
 import NotFound from "./pages/NotFound.tsx";
 
@@ -24,9 +26,24 @@ const ImportPage = lazy(() => import("./pages/Import.tsx"));
 const SubscriptionsPage = lazy(() => import("./pages/Subscriptions.tsx"));
 const SupportPage = lazy(() => import("./pages/Support.tsx"));
 
-const queryClient = new QueryClient();
+// Cache defaults for the Cohorts read path (and any future warehouse query):
+// stale-while-revalidate with a 5-min freshness window, 60-min retention so the
+// cache survives route unmount/remount, no refetch on window focus, refetch on
+// reconnect, and bounded retries (per-query hooks refine transient-only retry).
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 5 * 60 * 1000,
+      gcTime: 60 * 60 * 1000,
+      refetchOnWindowFocus: false,
+      refetchOnReconnect: true,
+      retry: 2,
+    },
+  },
+});
 
 function RouteFallback() {
+  traceMark("router.route_chunk_fallback_rendered");
   return (
     <div className="flex min-h-screen items-center justify-center bg-background text-muted-foreground">
       <div className="flex items-center gap-2 text-sm">
@@ -37,33 +54,43 @@ function RouteFallback() {
   );
 }
 
+function AppPerfMarks() {
+  useEffect(() => {
+    traceMark("app.react_mounted");
+  }, []);
+  return null;
+}
+
 const App = () => (
   <QueryClientProvider client={queryClient}>
     <TooltipProvider>
+      <AppPerfMarks />
       <Toaster />
       <Sonner />
       <BrowserRouter>
         <AuthProvider>
-          <Suspense fallback={<RouteFallback />}>
-            <Routes>
-              <Route path="/login" element={<LoginPage />} />
-              <Route element={<ProtectedRoute />}>
-                <Route path="/" element={<Dashboard />} />
-                <Route path="/transactions" element={<Transactions />} />
-                <Route path="/users" element={<UsersPage />} />
-                <Route path="/leads" element={<LeadsPage />} />
-                <Route path="/cohorts" element={<Cohorts />} />
-                <Route path="/fb-analytics" element={<FBAnalyticsPage />} />
-                <Route path="/integrations" element={<IntegrationsPage />} />
-                <Route path="/support" element={<SupportPage />} />
-                <Route path="/forecasting" element={<ForecastingPage />} />
-                <Route path="/subscriptions" element={<SubscriptionsPage />} />
-                <Route path="/import" element={<ImportPage />} />
-              </Route>
-              {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
-              <Route path="*" element={<NotFound />} />
-            </Routes>
-          </Suspense>
+          <AnalyticsCacheGate>
+            <Suspense fallback={<RouteFallback />}>
+              <Routes>
+                <Route path="/login" element={<LoginPage />} />
+                <Route element={<ProtectedRoute />}>
+                  <Route path="/" element={<Dashboard />} />
+                  <Route path="/transactions" element={<Transactions />} />
+                  <Route path="/users" element={<UsersPage />} />
+                  <Route path="/leads" element={<LeadsPage />} />
+                  <Route path="/cohorts" element={<Cohorts />} />
+                  <Route path="/fb-analytics" element={<FBAnalyticsPage />} />
+                  <Route path="/integrations" element={<IntegrationsPage />} />
+                  <Route path="/support" element={<SupportPage />} />
+                  <Route path="/forecasting" element={<ForecastingPage />} />
+                  <Route path="/subscriptions" element={<SubscriptionsPage />} />
+                  <Route path="/import" element={<ImportPage />} />
+                </Route>
+                {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
+                <Route path="*" element={<NotFound />} />
+              </Routes>
+            </Suspense>
+          </AnalyticsCacheGate>
         </AuthProvider>
       </BrowserRouter>
     </TooltipProvider>

@@ -83,6 +83,18 @@ Lovable frontend -> Supabase Edge Functions -> FunnelFox API
 
 The frontend sends the current Supabase Auth bearer token and anon `apikey` to Edge Functions. `FUNNELFOX_SECRET` stays only in Supabase Function secrets.
 
+### Capsuled Facebook secrets
+
+Capsuled Facebook traffic sync runs only in the `capsuled-facebook-sync` Supabase Edge Function. The browser never receives the Capsuled bearer token.
+
+```text
+supabase secrets set CAPSULED_API_BASE_URL=https://your-capsuled-api-host
+supabase secrets set CAPSULED_API_TOKEN=your_capsuled_api_token
+supabase functions deploy capsuled-facebook-sync
+```
+
+The function calls `GET /api/external/v1/fb-stats`, stores the raw response, upserts normalized campaign rows by `level + campaign_id + date range`, and refreshes the latest `facebook_traffic` snapshot for the Export API.
+
 ### Mail.ru Support Inbox secrets
 
 Support Inbox reads `support@azora-astro.com` through IMAP from the `sync-support-mail` Supabase Edge Function. The browser never connects to IMAP and never receives the mailbox password.

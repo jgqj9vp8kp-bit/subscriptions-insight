@@ -1,4 +1,4 @@
-import { useDeferredValue, useMemo } from "react";
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { Bar, BarChart, CartesianGrid, ComposedChart, Line, LineChart, XAxis, YAxis } from "recharts";
 import { CheckCircle2, CreditCard, Percent, Users, X, XCircle } from "lucide-react";
 import type { Transaction } from "@/services/types";
@@ -47,6 +47,17 @@ import {
   type SegmentDimension,
   type PaymentStage,
 } from "@/services/paymentPassAnalytics";
+import {
+  paymentAnalyticsMode,
+  type PaymentAnalyticsQuery,
+} from "@/services/paymentAnalyticsDataSource";
+import { useAuth } from "@/hooks/useAuth";
+import { hashUserScope } from "@/services/analyticsCache";
+import { useWarehouseVersion } from "@/hooks/useAnalyticsCache";
+import { usePaymentAnalyticsBundle } from "@/hooks/usePaymentAnalyticsCache";
+import { formatUpdatedAgo } from "@/services/analyticsProgress";
+import { Progress } from "@/components/ui/progress";
+import { traceEvent, traceMark, traceMeasure } from "@/services/performanceTrace";
 
 const SEGMENT_PAGE_SIZE = 25;
 
@@ -122,6 +133,12 @@ const trialTrendConfig = {
 } satisfies ChartConfig;
 
 export function PaymentPassAnalytics({ txs }: { txs: Transaction[] }) {
+  const mountedRef = useRef(false);
+  const firstCardsRef = useRef(false);
+  if (!mountedRef.current) {
+    mountedRef.current = true;
+    traceMark("route.payment_pass.mounted");
+  }
   const [uiState, setUiState, resetUiState] = usePersistedPageState(
     "ui_state_transactions_pass",
     DEFAULT_PASS_UI_STATE,
@@ -155,28 +172,94 @@ export function PaymentPassAnalytics({ txs }: { txs: Transaction[] }) {
     ? "text-right tabular-nums font-semibold text-primary"
     : "text-right tabular-nums text-muted-foreground";
 
-  // Heavy step: classify the full warehouse once per data load.
-  const allAttempts = useMemo(() => buildPaymentAttempts(txs), [txs]);
+  // --- ClickHouse Payment Pass Analytics read path -----------------------
+  // clickhouse (default): the Edge Function is the single source of truth (incl.
+  // canonical warehouse decline metrics) and the browser performs NO transaction
+  // scan. Legacy is the emergency fallback if the Edge request fails.
+  const paMode = useMemo(() => paymentAnalyticsMode(), []);
+  const { user } = useAuth();
+  const userScopeHash = useMemo(() => hashUserScope(user?.id), [user?.id]);
+  const { version: warehouseVersion, ready: warehouseVersionReady } = useWarehouseVersion(paMode === "clickhouse");
+  const paQuery = useMemo<PaymentAnalyticsQuery>(
+    () => ({
+      dateBasis, dateFrom: dateFrom || null, dateTo: dateTo || null,
+      funnel: funnelFilter, campaignPath: campaignPathFilter, campaignId: campaignIdFilter, mediaBuyer: mediaBuyerFilter,
+      country: countryFilter, cardType: cardTypeFilter, stage: stageFilter, declineReason: declineReasonFilter,
+      transactionType: transactionTypeFilter, outcome: outcomeFilter,
+      groupBy, firstTxDimension, renewalDimension,
+    }),
+    [dateBasis, dateFrom, dateTo, funnelFilter, campaignPathFilter, campaignIdFilter, mediaBuyerFilter, countryFilter, cardTypeFilter, stageFilter, declineReasonFilter, transactionTypeFilter, outcomeFilter, groupBy, firstTxDimension, renewalDimension],
+  );
+  // Cached bundle (stale-while-revalidate). The QueryClient lives above the router,
+  // so this survives route unmount/remount — returning renders cached data instantly.
+  const {
+    chBundle,
+    chStatus,
+    isBackgroundRefreshing,
+    isInitialLoading,
+    progressPercent,
+    dataUpdatedAt,
+  } = usePaymentAnalyticsBundle({
+    query: paQuery,
+    userScopeHash,
+    warehouseVersion,
+    enabled: paMode === "clickhouse" && warehouseVersionReady,
+  });
+  // ClickHouse drives when active and the bundle is present. A failed background
+  // refresh keeps the cached bundle visible instead of dropping to the legacy scan.
+  const paDriving = paMode === "clickhouse" && chBundle != null;
+  useEffect(() => {
+    traceEvent("payment_pass.legacy_state", {
+      source: paMode,
+      driving_clickhouse: paDriving,
+      has_clickhouse_bundle: chBundle != null,
+      has_error: chStatus.error != null,
+      legacy_fallback_active: !paDriving && (paMode !== "clickhouse" || chStatus.error != null),
+    });
+  }, [paMode, paDriving, chBundle, chStatus.error]);
+
+  // Heavy step: classify the full warehouse once per data load. In ClickHouse
+  // mode this runs on an EMPTY list — the browser performs no transaction scan.
+  const allAttempts = useMemo(() => (paDriving || (paMode === "clickhouse" && chStatus.error === null) ? [] : buildPaymentAttempts(txs)), [paDriving, paMode, chStatus.error, txs]);
 
   const options = useMemo(
-    () => ({
-      funnels: uniqueSorted(allAttempts.map((a) => a.funnel)),
-      campaignPaths: uniqueSorted(allAttempts.map((a) => a.campaign_path)),
-      campaignIds: uniqueSorted(allAttempts.map((a) => a.campaign_id)),
-      mediaBuyers: uniqueSorted(allAttempts.map((a) => a.media_buyer)),
-      cardTypes: uniqueSorted(allAttempts.map((a) => a.card_type)),
-      transactionTypes: uniqueSorted(allAttempts.map((a) => a.transaction_type)),
-      declineReasons: uniqueSorted(
-        allAttempts.filter((a) => a.decline_reason).map((a) => a.decline_reason as string),
-      ),
-    }),
-    [allAttempts],
+    () =>
+      paDriving && chBundle
+        ? {
+            funnels: chBundle.options.funnels,
+            campaignPaths: chBundle.options.campaignPaths,
+            campaignIds: chBundle.options.campaignIds,
+            mediaBuyers: chBundle.options.mediaBuyers,
+            cardTypes: chBundle.options.cardTypes,
+            transactionTypes: chBundle.options.transactionTypes,
+            declineReasons: chBundle.options.declineReasons,
+          }
+        : {
+            funnels: uniqueSorted(allAttempts.map((a) => a.funnel)),
+            campaignPaths: uniqueSorted(allAttempts.map((a) => a.campaign_path)),
+            campaignIds: uniqueSorted(allAttempts.map((a) => a.campaign_id)),
+            mediaBuyers: uniqueSorted(allAttempts.map((a) => a.media_buyer)),
+            cardTypes: uniqueSorted(allAttempts.map((a) => a.card_type)),
+            transactionTypes: uniqueSorted(allAttempts.map((a) => a.transaction_type)),
+            declineReasons: uniqueSorted(
+              allAttempts.filter((a) => a.decline_reason).map((a) => a.decline_reason as string),
+            ),
+          },
+    [paDriving, chBundle, allAttempts],
   );
 
   // GEO options are CONTEXTUAL: only countries that still have data under the other active filters
   // (notably the selected funnel), each annotated with its trial count. The selected country is kept
   // in the list even if it drops to zero so the trigger always reflects the active selection.
   const geoOptions = useMemo(() => {
+    if (paDriving && chBundle) {
+      return chBundle.options.countries
+        .map((code) => {
+          const r = chBundle.trialByCountry.find((x) => x.key === code);
+          return { code, trials: r ? r.successful : 0 };
+        })
+        .sort((a, b) => b.trials - a.trials || a.code.localeCompare(b.code));
+    }
     const inContext = allAttempts.filter((a) => {
       const dateField = dateBasis === "cohort" ? a.cohort_date : a.event_date;
       if (dateFrom && (!dateField || dateField < dateFrom)) return false;
@@ -216,6 +299,8 @@ export function PaymentPassAnalytics({ txs }: { txs: Transaction[] }) {
     declineReasonFilter,
     transactionTypeFilter,
     countryFilter,
+    paDriving,
+    chBundle,
   ]);
 
   const filtered = useMemo(() => {
@@ -256,27 +341,43 @@ export function PaymentPassAnalytics({ txs }: { txs: Transaction[] }) {
   // Defer the expensive aggregations so filter clicks stay responsive.
   const attempts = useDeferredValue(filtered);
 
-  const summary = useMemo(() => summarizePaymentAttempts(attempts), [attempts]);
-  const funnelRows = useMemo(() => groupPaymentAttempts(attempts, "funnel"), [attempts]);
-  const stageRows = useMemo(() => paymentStageBreakdown(attempts), [attempts]);
-  const segmentRows = useMemo(() => groupPaymentAttempts(attempts, groupBy), [attempts, groupBy]);
+  const summary = useMemo(() => (paDriving && chBundle ? chBundle.summary : summarizePaymentAttempts(attempts)), [paDriving, chBundle, attempts]);
+  useEffect(() => {
+    if (firstCardsRef.current || summary.attempts <= 0) return;
+    firstCardsRef.current = true;
+    traceMark("payment_pass.first_cards_rendered", {
+      attempts: summary.attempts,
+      source: paDriving ? "clickhouse" : "legacy",
+      cached_or_network: chBundle != null && isBackgroundRefreshing ? "cached_refreshing" : chBundle != null ? "query_data" : "legacy",
+    });
+    traceMeasure("payment_pass.time_to_first_cards", "route.payment_pass.mounted", "payment_pass.first_cards_rendered", { attempts: summary.attempts });
+  }, [summary.attempts, paDriving, chBundle, isBackgroundRefreshing]);
+  const funnelRows = useMemo(() => (paDriving && chBundle ? chBundle.funnelRows : groupPaymentAttempts(attempts, "funnel")), [paDriving, chBundle, attempts]);
+  const stageRows = useMemo(() => (paDriving && chBundle ? chBundle.stageRows : paymentStageBreakdown(attempts)), [paDriving, chBundle, attempts]);
+  const segmentRows = useMemo(() => (paDriving && chBundle ? chBundle.segmentRows : groupPaymentAttempts(attempts, groupBy)), [paDriving, chBundle, attempts, groupBy]);
   const firstSummary = useMemo(
-    () => summarizePaymentAttempts(firstAttemptAttempts(attempts)),
-    [attempts],
+    () => (paDriving && chBundle ? chBundle.firstSummary : summarizePaymentAttempts(firstAttemptAttempts(attempts))),
+    [paDriving, chBundle, attempts],
   );
   const firstTxRows = useMemo(
-    () => firstTransactionBreakdown(attempts, firstTxDimension),
-    [attempts, firstTxDimension],
+    () => (paDriving && chBundle ? chBundle.firstTxRows : firstTransactionBreakdown(attempts, firstTxDimension)),
+    [paDriving, chBundle, attempts, firstTxDimension],
   );
-  const renewalRows = useMemo(() => renewalBreakdown(attempts), [attempts]);
+  const renewalRows = useMemo(() => (paDriving && chBundle ? chBundle.renewalRows : renewalBreakdown(attempts)), [paDriving, chBundle, attempts]);
   const renewalSegmentRows = useMemo(
-    () => groupPaymentAttempts(renewalAttempts(attempts), renewalDimension),
-    [attempts, renewalDimension],
+    () => (paDriving && chBundle ? chBundle.renewalSegmentRows : groupPaymentAttempts(renewalAttempts(attempts), renewalDimension)),
+    [paDriving, chBundle, attempts, renewalDimension],
   );
-  const declineRows = useMemo(() => declineReasonAnalytics(attempts), [attempts]);
-  const timePoints = useMemo(() => passRateByDay(attempts), [attempts]);
+  const declineRows = useMemo(() => (paDriving && chBundle ? chBundle.declineRows : declineReasonAnalytics(attempts)), [paDriving, chBundle, attempts]);
+  const timePoints = useMemo(() => (paDriving && chBundle ? chBundle.timePoints : passRateByDay(attempts)), [paDriving, chBundle, attempts]);
 
   const firstAttemptDecline = useMemo(() => {
+    if (paDriving && chBundle) {
+      return chBundle.firstDeclineRows
+        .map((r) => ({ reason: r.reason as string, n: r.failed_attempts }))
+        .sort((a, b) => b.n - a.n)
+        .slice(0, 5);
+    }
     const fails = firstAttemptAttempts(attempts).filter((a) => a.is_failed && a.decline_reason);
     const counts = new Map<string, number>();
     for (const a of fails) counts.set(a.decline_reason!, (counts.get(a.decline_reason!) ?? 0) + 1);
@@ -284,7 +385,7 @@ export function PaymentPassAnalytics({ txs }: { txs: Transaction[] }) {
       .map(([reason, n]) => ({ reason, n }))
       .sort((a, b) => b.n - a.n)
       .slice(0, 5);
-  }, [attempts]);
+  }, [paDriving, chBundle, attempts]);
 
   const segmentTotalPages = Math.max(1, Math.ceil(segmentRows.length / SEGMENT_PAGE_SIZE));
   const safeSegmentPage = Math.min(segmentPage, segmentTotalPages);
@@ -320,10 +421,10 @@ export function PaymentPassAnalytics({ txs }: { txs: Transaction[] }) {
   // failed), matching the decline-analytics style.
   const trialVolumeByCountry = useMemo(
     () =>
-      groupPaymentAttempts(attempts.filter((a) => a.stage === "trial_or_entry"), "country")
+      (paDriving && chBundle ? chBundle.trialByCountry : groupPaymentAttempts(attempts.filter((a) => a.stage === "trial_or_entry"), "country"))
         .slice()
         .sort((a, b) => b.attempts - a.attempts || b.successful - a.successful || a.label.localeCompare(b.label)),
-    [attempts],
+    [paDriving, chBundle, attempts],
   );
   // Bar length scales to the busiest country in the shown set (order-independent).
   const maxTrialAttempts = useMemo(
@@ -352,7 +453,7 @@ export function PaymentPassAnalytics({ txs }: { txs: Transaction[] }) {
   // Original line-chart view: pass rate per country, ordered alphabetically along the X axis.
   const trialPassByCountry = useMemo(
     () =>
-      groupPaymentAttempts(attempts.filter((a) => a.stage === "trial_or_entry"), "country")
+      (paDriving && chBundle ? chBundle.trialByCountry : groupPaymentAttempts(attempts.filter((a) => a.stage === "trial_or_entry"), "country"))
         .slice(0, 20)
         .map((r) => ({
           country: r.label,
@@ -362,8 +463,64 @@ export function PaymentPassAnalytics({ txs }: { txs: Transaction[] }) {
           failed: r.failed,
         }))
         .sort((a, b) => a.country.localeCompare(b.country)),
-    [attempts],
+    [paDriving, chBundle, attempts],
   );
+
+  const paymentAnalyticsViewModel = useMemo(
+    () => {
+      const authoritativeAttempts = paDriving && chBundle ? summary.attempts : attempts.length;
+      return {
+        source: paDriving ? "clickhouse" as const : "legacy" as const,
+        authoritativeAttempts,
+        globalEmpty: authoritativeAttempts === 0,
+        summary,
+        rowCounts: {
+          funnel: funnelRows.length,
+          stage: stageRows.length,
+          segment: segmentRows.length,
+          firstTransaction: firstTxRows.length,
+          renewal: renewalRows.length,
+          renewalSegment: renewalSegmentRows.length,
+          decline: declineRows.length,
+          firstDecline: chBundle?.firstDeclineRows.length ?? firstAttemptDecline.length,
+          timeSeries: timePoints.length,
+          trialByCountry: trialVolumeByCountry.length,
+        },
+      };
+    },
+    [
+      paDriving,
+      chBundle,
+      summary,
+      attempts.length,
+      funnelRows.length,
+      stageRows.length,
+      segmentRows.length,
+      firstTxRows.length,
+      renewalRows.length,
+      renewalSegmentRows.length,
+      declineRows.length,
+      firstAttemptDecline.length,
+      timePoints.length,
+      trialVolumeByCountry.length,
+    ],
+  );
+  const showGlobalEmptyState =
+    !isInitialLoading &&
+    !chStatus.error &&
+    paymentAnalyticsViewModel.globalEmpty;
+  useEffect(() => {
+    traceEvent("payment_pass.view_model", {
+      source: paymentAnalyticsViewModel.source,
+      authoritative_attempts: paymentAnalyticsViewModel.authoritativeAttempts,
+      global_empty: paymentAnalyticsViewModel.globalEmpty,
+      row_counts: paymentAnalyticsViewModel.rowCounts,
+      clickhouse_driving: paDriving,
+    });
+    if (import.meta.env.DEV && !(typeof process !== "undefined" && process.env.VITEST)) {
+      console.debug("[Payment Pass Analytics view model]", paymentAnalyticsViewModel);
+    }
+  }, [paymentAnalyticsViewModel, paDriving]);
 
   const hasFilters =
     dateFrom ||
@@ -515,6 +672,28 @@ export function PaymentPassAnalytics({ txs }: { txs: Transaction[] }) {
             Large dataset ({num(allAttempts.length)} attempts) — analytics may take a moment to recompute after filter changes.
           </p>
         )}
+        {paMode === "clickhouse" && (
+          <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+            <span className="font-medium text-foreground">Data source</span>
+            <span>engine: <span className="font-mono text-foreground">{paDriving ? "clickhouse" : "legacy (fallback)"}</span></span>
+            {/* Honest staged progress (estimated; no server row-level progress). */}
+            {isInitialLoading && (
+              <span className="flex items-center gap-2">Loading… {progressPercent}%<Progress value={progressPercent} className="h-1.5 w-24" /></span>
+            )}
+            {isBackgroundRefreshing && (
+              <span className="flex items-center gap-2">Updating… {progressPercent}%<Progress value={progressPercent} className="h-1.5 w-24" /></span>
+            )}
+            {!isInitialLoading && !isBackgroundRefreshing && chStatus.error && chBundle != null && (
+              <span className="text-warning">refresh failed · showing cached data</span>
+            )}
+            {!isInitialLoading && !isBackgroundRefreshing && paDriving && chBundle && !chStatus.error && (
+              <span>ClickHouse {chBundle.durationMs} ms{dataUpdatedAt ? ` · updated ${formatUpdatedAgo(dataUpdatedAt)}` : ""}</span>
+            )}
+            {paDriving && <span>total attempts: <span className="font-mono text-foreground">{num(paymentAnalyticsViewModel.authoritativeAttempts)}</span></span>}
+            {chStatus.error && chBundle == null && <span className="text-destructive">ClickHouse error — using legacy: {chStatus.error}</span>}
+            <span className="text-muted-foreground/70">decline metrics: warehouse-canonical</span>
+          </div>
+        )}
       </Card>
 
       {/* ---------------- A. Summary cards (Phase 4A) ---------------- */}
@@ -548,7 +727,7 @@ export function PaymentPassAnalytics({ txs }: { txs: Transaction[] }) {
         <KpiCard label="Renewal Pass Rate" value={pct(summary.renewal_pass_rate)} icon={<Percent className="h-4 w-4" />} />
       </div>
 
-      {attempts.length === 0 ? (
+      {showGlobalEmptyState ? (
         <Card className="p-10 text-center text-sm text-muted-foreground shadow-card">
           No payment attempts match your filters.
         </Card>

@@ -1,5 +1,10 @@
 import type { CohortRow, Transaction } from "@/services/types";
 import type { SubscriptionClean } from "@/types/subscriptions";
+import {
+  normalizeTransactionsToUsd,
+  type FxNormalizationDiagnostics,
+  type FxNormalizationResult,
+} from "@/services/currencyNormalization";
 
 export type DashboardCohort = CohortRow & {
   traffic_spend?: number | null;
@@ -86,6 +91,16 @@ export interface CashRevenueSummary {
   transactionCount: number;
 }
 
+export type DashboardFxSummary = {
+  nativeUsdRows: number;
+  convertedRows: number;
+  missingCurrencyRows: number;
+  missingFxRows: number;
+  invalidAmountRows: number;
+  excludedTransactions: number;
+  excludedAmountOriginal: number;
+};
+
 type DashboardTotals = {
   grossRevenue: number;
   netRevenue: number;
@@ -111,6 +126,22 @@ type DashboardTotals = {
 };
 
 const round2 = (value: number) => Math.round(value * 100) / 100;
+
+export function normalizeDashboardTransactions(transactions: Transaction[]): FxNormalizationResult {
+  return normalizeTransactionsToUsd(transactions);
+}
+
+export function buildDashboardFxSummary(diagnostics: FxNormalizationDiagnostics): DashboardFxSummary {
+  return {
+    nativeUsdRows: diagnostics.transactions_native_usd,
+    convertedRows: diagnostics.transactions_converted,
+    missingCurrencyRows: diagnostics.transactions_without_currency,
+    missingFxRows: diagnostics.transactions_missing_fx_rate,
+    invalidAmountRows: diagnostics.transactions_invalid_amount,
+    excludedTransactions: diagnostics.excluded_transactions,
+    excludedAmountOriginal: round2(diagnostics.excluded_amount_original),
+  };
+}
 
 function dateKey(value: string | null | undefined): string | null {
   if (!value) return null;
@@ -183,11 +214,12 @@ export function getCashRevenueByDateRange(
   transactions: Transaction[],
   filters: CashRevenueFilters = {},
 ): CashRevenueSummary {
+  const { transactions: usdTransactions } = normalizeDashboardTransactions(transactions);
   let cashRevenue = 0;
   let refunds = 0;
   let transactionCount = 0;
 
-  for (const transaction of transactions) {
+  for (const transaction of usdTransactions) {
     if (!matchesCashRevenueFilters(transaction, filters)) continue;
     refunds += refundTransactionAmount(transaction);
     if (!isCashRevenueTransaction(transaction)) continue;
@@ -393,9 +425,10 @@ export function buildTrialsByDay(transactions: Transaction[]): DailyTrialsRow[] 
 }
 
 export function buildUpsellsByDay(transactions: Transaction[]): DailyUpsellsRow[] {
+  const { transactions: usdTransactions } = normalizeDashboardTransactions(transactions);
   const rows = new Map<string, { users: Set<string>; revenue: number }>();
 
-  for (const transaction of transactions) {
+  for (const transaction of usdTransactions) {
     if (!isSuccessfulTransaction(transaction) || transaction.transaction_type !== "upsell") continue;
     const date = dateKey(transaction.event_time);
     if (!date) continue;
@@ -463,9 +496,10 @@ export function buildTrialsUpsellsByDay(transactions: Transaction[]): DailyTrial
 }
 
 export function buildRefundsByDay(transactions: Transaction[]): DailyRefundsRow[] {
+  const { transactions: usdTransactions } = normalizeDashboardTransactions(transactions);
   const rows = new Map<string, { count: number; amount: number }>();
 
-  for (const transaction of transactions) {
+  for (const transaction of usdTransactions) {
     const refundAmount = refundTransactionAmount(transaction);
     if (refundAmount <= 0) continue;
     const date = dateKey(transaction.event_time);

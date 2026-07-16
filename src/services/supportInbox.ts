@@ -54,6 +54,51 @@ export interface SupportMessage {
 }
 
 export interface SyncSupportMailSummary {
+  ok?: boolean;
+  action?: SupportMailSyncAction;
+  provider?: string;
+  mailbox?: string;
+  folder?: string;
+  status?: string;
+  connection?: "connected" | "failed" | "unknown";
+  config?: {
+    host: boolean;
+    port: boolean;
+    secure: boolean;
+    username: boolean;
+    password: boolean;
+  };
+  state?: SupportMailSyncState | null;
+  messages_discovered?: number;
+  messages_processed?: number;
+  messages_inserted?: number;
+  messages_updated?: number;
+  messages_skipped?: number;
+  messages_failed?: number;
+  last_seen_uid?: number | null;
+  uid_validity?: string | null;
+  highest_modseq?: string | null;
+  mailbox_messages?: number | null;
+  mailbox_uid_next?: number | null;
+  history_first_uid?: number | null;
+  history_last_uid?: number | null;
+  history_total_messages?: number | null;
+  history_imported_messages?: number | null;
+  history_remaining_messages?: number | null;
+  history_completed_at?: string | null;
+  current_uid?: number | null;
+  last_imported_uid?: number | null;
+  current_batch_total?: number | null;
+  current_batch_processed?: number | null;
+  last_batch_duration_ms?: number | null;
+  last_batch_messages_per_second?: number | null;
+  last_sync_imported?: number | null;
+  last_sync_new_messages?: number | null;
+  duration_ms?: number;
+  error_code?: string;
+  error?: string;
+  clickhouse?: unknown;
+  // Backward-compatible aliases used by the current Support page tests.
   synced: number;
   inserted: number;
   updated: number;
@@ -61,6 +106,54 @@ export interface SyncSupportMailSummary {
   matched_users: number;
   unmatched: number;
   latest_received_at: string | null;
+}
+
+export type SupportMailSyncAction =
+  | "test_connection"
+  | "status"
+  | "list_folders"
+  | "initial_sync"
+  | "continue_sync"
+  | "sync_new"
+  | "stop"
+  | "reset_cursor";
+
+export interface SupportMailSyncState {
+  status?: string;
+  sync_mode?: string | null;
+  uid_validity?: string | null;
+  last_seen_uid?: number | null;
+  highest_modseq?: string | null;
+  mailbox_messages?: number | null;
+  mailbox_uid_next?: number | null;
+  history_first_uid?: number | null;
+  history_last_uid?: number | null;
+  history_total_messages?: number | null;
+  history_imported_messages?: number | null;
+  history_remaining_messages?: number | null;
+  history_completed_at?: string | null;
+  current_uid?: number | null;
+  last_imported_uid?: number | null;
+  current_batch_total?: number | null;
+  current_batch_processed?: number | null;
+  current_batch_started_at?: string | null;
+  last_batch_duration_ms?: number | null;
+  last_batch_messages_per_second?: number | null;
+  last_sync_imported?: number | null;
+  last_sync_new_messages?: number | null;
+  messages_discovered?: number | null;
+  messages_processed?: number | null;
+  messages_inserted?: number | null;
+  messages_updated?: number | null;
+  messages_skipped?: number | null;
+  messages_failed?: number | null;
+  current_batch?: number | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  last_success_at?: string | null;
+  last_error_code?: string | null;
+  last_error_message_sanitized?: string | null;
+  updated_at?: string | null;
 }
 
 export interface SupportMessageFilters {
@@ -287,7 +380,32 @@ export async function listSupportMessages(): Promise<SupportMessage[]> {
   return (data ?? []) as SupportMessage[];
 }
 
-export async function syncSupportMail(): Promise<SyncSupportMailSummary> {
+function normalizeSyncSummary(payload: Partial<SyncSupportMailSummary>): SyncSupportMailSummary {
+  const processed = payload.last_sync_imported ?? payload.messages_processed ?? payload.synced ?? 0;
+  const inserted = payload.messages_inserted ?? payload.inserted ?? 0;
+  const updated = payload.messages_updated ?? payload.updated ?? 0;
+  const skipped = payload.messages_skipped ?? payload.skipped ?? 0;
+  const latest =
+    payload.latest_received_at ??
+    payload.state?.last_success_at ??
+    payload.state?.completed_at ??
+    null;
+  return {
+    ...payload,
+    synced: processed,
+    inserted,
+    updated,
+    skipped,
+    matched_users: payload.matched_users ?? inserted + updated,
+    unmatched: payload.unmatched ?? 0,
+    latest_received_at: latest,
+  };
+}
+
+export async function syncSupportMail(
+  action: SupportMailSyncAction = "sync_new",
+  options: Record<string, unknown> = {},
+): Promise<SyncSupportMailSummary> {
   const client = ensureSupabase();
   const { data: sessionData, error: sessionError } = await client.auth.getSession();
   const token = sessionData.session?.access_token;
@@ -300,10 +418,15 @@ export async function syncSupportMail(): Promise<SyncSupportMailSummary> {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
     },
+    body: JSON.stringify({ action, ...options }),
   });
   const payload = await response.json().catch(() => ({ error: "Invalid sync response." }));
   if (!response.ok) throw new Error(payload.error ?? `Support mail sync failed with HTTP ${response.status}`);
-  return payload as SyncSupportMailSummary;
+  return normalizeSyncSummary(payload as Partial<SyncSupportMailSummary>);
+}
+
+export async function getSupportMailStatus(): Promise<SyncSupportMailSummary> {
+  return syncSupportMail("status");
 }
 
 export function uniqueSupportValues(messages: SupportMessage[], key: keyof SupportMessage): string[] {

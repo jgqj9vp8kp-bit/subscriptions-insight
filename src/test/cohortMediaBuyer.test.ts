@@ -69,8 +69,8 @@ function userRows(
 const rows = [
   ...userRows("ivan_us_credit", "4", { country: "US", cardType: "credit", campaignId: "ivan-campaign", trialAmount: 1 }),
   ...userRows("ivan_ca_debit", "4", { country: "CA", cardType: "debit", campaignId: "ivan-campaign", trialAmount: 2 }),
-  ...userRows("artem_a_us_credit", "22", { country: "US", cardType: "credit", campaignId: "artem-a-campaign", trialAmount: 3 }),
-  ...userRows("artem_d_gb_prepaid", "19", { country: "GB", cardType: "prepaid", campaignId: "artem-d-campaign", trialAmount: 4 }),
+  ...userRows("artem_a_us_credit", "19", { country: "US", cardType: "credit", campaignId: "artem-a-campaign", trialAmount: 3 }),
+  ...userRows("artem_d_gb_prepaid", "22", { country: "GB", cardType: "prepaid", campaignId: "artem-d-campaign", trialAmount: 4 }),
   ...userRows("unknown_us_credit", null, { country: "US", cardType: "credit", campaignId: "unknown-campaign", trialAmount: 5 }),
 ];
 
@@ -84,8 +84,8 @@ describe("cohort Media Buyer attribution", () => {
 
   it("maps known utm_source values and defaults missing values to Unknown", () => {
     expect(mediaBuyerForUserTransactions(userRows("ivan", "4")).media_buyer).toBe("Ivan");
-    expect(mediaBuyerForUserTransactions(userRows("artem_a", "22")).media_buyer).toBe("Artem A");
-    expect(mediaBuyerForUserTransactions(userRows("artem_d", "19")).media_buyer).toBe("Artem D");
+    expect(mediaBuyerForUserTransactions(userRows("artem_a", "19")).media_buyer).toBe("Artem A");
+    expect(mediaBuyerForUserTransactions(userRows("artem_d", "22")).media_buyer).toBe("Artem D");
     expect(mediaBuyerForUserTransactions(userRows("unknown", null)).media_buyer).toBe("Unknown");
   });
 
@@ -95,7 +95,7 @@ describe("cohort Media Buyer attribution", () => {
       tx("fallback", "first_subscription", { event_time: "2026-05-08T00:00:00Z", metadata: { utm_source: "22" } }),
     ];
 
-    expect(mediaBuyerForUserTransactions(userTxs)).toEqual({ utm_source: "22", media_buyer: "Artem A" });
+    expect(mediaBuyerForUserTransactions(userTxs)).toEqual({ utm_source: "22", media_buyer: "Artem D" });
   });
 });
 

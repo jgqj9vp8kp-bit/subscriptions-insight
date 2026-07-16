@@ -17,9 +17,11 @@ import {
 } from "@/services/cohortReporting";
 import { normalizeCampaignPath } from "@/services/trafficImport";
 import { CARD_TYPE_VALUES } from "@/services/userCardType";
+import { mediaBuyerForUserTransactions } from "@/services/userMediaBuyer";
 import { isFailedPaymentTransaction, declineDetailsForTransaction } from "@/services/paymentFailures";
+import type { CapsuledFacebookRow } from "@/services/capsuledFacebook";
 import type { SubscriptionClean } from "@/types/subscriptions";
-import type { CardType, DeclineReason, Transaction } from "@/services/types";
+import type { CardType, DeclineReason, MediaBuyer, Transaction } from "@/services/types";
 
 // Spend attribution status for a Campaign ID. The Facebook traffic sheet is keyed by
 // (date, campaign_path) and carries NO campaign_id, so per-campaign spend is exact only when a
@@ -38,14 +40,24 @@ export interface FbAnalyticsFilters extends CohortFilters {
   selectedCountries?: string[];
   selectedCardTypes?: CardType[];
   campaignIdSearch?: string;
+  campaignNameSearch?: string;
+  adAccountFilter?: string;
+  mediaBuyerFilter?: MediaBuyer | string;
 }
 
 export interface FbAnalyticsRow {
   campaign_id: string;
   campaign_name: string | null;
   campaign_path: string;
+  ad_account_id: string | null;
+  ad_account_name: string | null;
   trial_users: number;
   upsell_users: number;
+  upsell_1_users: number;
+  upsell_2_users: number;
+  upsell_3_users: number;
+  token_buyers: number;
+  token_revenue: number;
   upsell_cr: number;
   first_subscription_users: number;
   trial_to_sub_cr: number;
@@ -56,8 +68,22 @@ export interface FbAnalyticsRow {
   net_revenue: number;
   spend: number | null;
   spend_status: FbSpendStatus;
+  fb_purchases: number;
+  cpp: number | null;
+  impressions: number;
+  clicks: number;
+  ctr: number | null;
+  cpc: number | null;
+  cpm: number | null;
+  outbound_clicks: number;
+  outbound_ctr: number | null;
+  currency: string | null;
   cac: number | null;
+  cost_per_first_sub: number | null;
   roas: number | null;
+  revenue_per_trial: number | null;
+  revenue_per_purchase: number | null;
+  profit: number | null;
   refund_users: number;
   refund_rate: number;
   failed_payment_users: number;
@@ -76,6 +102,8 @@ export interface FbAnalyticsSummary {
   spend: number | null;
   cac: number | null;
   roas: number | null;
+  fbPurchases: number;
+  profit: number | null;
 }
 
 export interface FbAnalyticsResult {
@@ -154,6 +182,13 @@ function searchMatches(row: FbAnalyticsRow, query: string): boolean {
   return `${row.campaign_id} ${row.campaign_name ?? ""}`.toLowerCase().includes(query);
 }
 
+function rowMatchesExtraFilters(row: FbAnalyticsRow, filters: FbAnalyticsFilters): boolean {
+  const campaignNameQuery = String(filters.campaignNameSearch ?? "").trim().toLowerCase();
+  if (campaignNameQuery && !String(row.campaign_name ?? "").toLowerCase().includes(campaignNameQuery)) return false;
+  if (filters.adAccountFilter && filters.adAccountFilter !== "all" && row.ad_account_id !== filters.adAccountFilter) return false;
+  return true;
+}
+
 function sum<T>(rows: T[], pick: (row: T) => number | null | undefined): number {
   return rows.reduce((total, row) => total + (pick(row) ?? 0), 0);
 }
@@ -170,6 +205,8 @@ function summarize(rows: FbAnalyticsRow[]): FbAnalyticsSummary {
   const spend = spendRows.length ? sum(spendRows, (row) => row.spend) : null;
   const spendTrialUsers = sum(spendRows, (row) => row.trial_users);
   const spendNetRevenue = sum(spendRows, (row) => row.net_revenue);
+  const fbPurchases = sum(rows, (row) => row.fb_purchases);
+  const profit = spend != null ? netRevenue - spend : null;
   return {
     campaignIdsCount: rows.length,
     trialUsers,
@@ -182,7 +219,38 @@ function summarize(rows: FbAnalyticsRow[]): FbAnalyticsSummary {
     spend,
     cac: spend != null && spendTrialUsers ? spend / spendTrialUsers : null,
     roas: spend ? spendNetRevenue / spend : null,
+    fbPurchases,
+    profit,
   };
+}
+
+function capsuledRowsByCampaign(rows: CapsuledFacebookRow[] = []): Map<string, CapsuledFacebookRow> {
+  const byId = new Map<string, CapsuledFacebookRow>();
+  for (const row of rows) {
+    const campaignId = row.campaign_id?.trim();
+    if (!campaignId) continue;
+    const current = byId.get(campaignId);
+    if (!current) {
+      byId.set(campaignId, { ...row });
+      continue;
+    }
+    current.campaign_name ||= row.campaign_name;
+    current.ad_account_id ||= row.ad_account_id;
+    current.ad_account_name ||= row.ad_account_name;
+    current.currency ||= row.currency;
+    current.spend += row.spend;
+    current.fb_purchases += row.fb_purchases;
+    current.impressions += row.impressions;
+    current.clicks += row.clicks;
+    current.outbound_clicks += row.outbound_clicks;
+    current.cpp = current.fb_purchases ? current.spend / current.fb_purchases : null;
+    current.ctr = current.impressions ? (current.clicks / current.impressions) * 100 : null;
+    current.cpc = current.clicks ? current.spend / current.clicks : null;
+    current.cpm = current.impressions ? (current.spend / current.impressions) * 1000 : null;
+    current.outbound_ctr = current.impressions ? (current.outbound_clicks / current.impressions) * 100 : null;
+    current.last_import_at = row.last_import_at > current.last_import_at ? row.last_import_at : current.last_import_at;
+  }
+  return byId;
 }
 
 export function sortFbAnalyticsRows(
@@ -203,12 +271,15 @@ export function buildFbAnalytics(params: {
   txs: Transaction[];
   subscriptions?: SubscriptionClean[];
   trafficByKey?: Map<string, TrafficAggregate>;
+  capsuledRows?: CapsuledFacebookRow[];
   filters?: FbAnalyticsFilters;
 }): FbAnalyticsResult {
   const filters = params.filters ?? {};
   const selectedCardTypes = normalizeCardTypes(filters.selectedCardTypes);
   const trafficSourceFilter = hasSuccessfulFacebookTrial(params.txs) ? "facebook" : "all";
   const parentTxs = filterTransactionsByTrialAttribution(params.txs, { trafficSourceFilter });
+  const parentTxsByUser = transactionsByUser(parentTxs);
+  const mediaBuyerFilter = String(filters.mediaBuyerFilter ?? "");
   const cohortFilters: CohortFilters = {
     funnelFilter: filters.funnelFilter,
     campaignPathFilter: filters.campaignPathFilter,
@@ -228,13 +299,23 @@ export function buildFbAnalytics(params: {
   const trialByUser = firstSuccessfulTrialByUser(parentTxs);
 
   // Pass 1: per-campaign cohorts + attributed trial users, and the campaign paths each one spans.
-  const computed = options.map((option) => {
+  const capsuledByCampaign = capsuledRowsByCampaign(params.capsuledRows);
+  const optionIds = new Set(options.map((option) => option.campaign_id));
+  const importedOnlyOptions = Array.from(capsuledByCampaign.keys())
+    .filter((campaignId) => !optionIds.has(campaignId))
+    .map((campaign_id) => ({ campaign_id, campaign_name: capsuledByCampaign.get(campaign_id)?.campaign_name ?? null, trial_count: 0 }));
+
+  const computed = [...options, ...importedOnlyOptions].map((option) => {
     const campaignTxs = filterTransactionsByTrialAttribution(parentTxs, {
       trafficSourceFilter,
       selectedCampaignIds: [option.campaign_id],
     });
+    const mediaFilteredCampaignTxs =
+      mediaBuyerFilter && mediaBuyerFilter !== "all"
+        ? campaignTxs.filter((tx) => mediaBuyerForUserTransactions(parentTxsByUser.get(tx.user_id) ?? [tx]).media_buyer === mediaBuyerFilter)
+        : campaignTxs;
     const cohorts = filterCohorts(
-      computeCohorts(campaignTxs, params.subscriptions ?? [], {
+      computeCohorts(mediaFilteredCampaignTxs, params.subscriptions ?? [], {
         selectedCountries: filters.selectedCountries,
         selectedCardTypes,
       }),
@@ -244,6 +325,7 @@ export function buildFbAnalytics(params: {
     for (const [userId, trial] of trialByUser) {
       if (campaignIdForTransaction(trial) !== option.campaign_id) continue;
       const list = byUser.get(userId) ?? [];
+      if (mediaBuyerFilter && mediaBuyerFilter !== "all" && mediaBuyerForUserTransactions(list).media_buyer !== mediaBuyerFilter) continue;
       const userCohorts = computeCohorts(list, [], {
         selectedCountries: filters.selectedCountries,
         selectedCardTypes,
@@ -268,6 +350,7 @@ export function buildFbAnalytics(params: {
 
   // Pass 2: build rows, computing spend whenever every campaign path is exclusive to this campaign.
   const rows = computed.map(({ option, cohorts, trialUserIds, cohortPaths }) => {
+    const capsuled = capsuledByCampaign.get(option.campaign_id);
     const paths = Array.from(trialUserIds)
       .map((userId) => trialByUser.get(userId)?.campaign_path || "unknown")
       .filter(Boolean);
@@ -281,7 +364,10 @@ export function buildFbAnalytics(params: {
       : [];
     let spend: number | null = null;
     let spend_status: FbSpendStatus;
-    if (!params.trafficByKey || spendRows.length === 0) {
+    if (capsuled) {
+      spend = capsuled.spend;
+      spend_status = "available";
+    } else if (!params.trafficByKey || spendRows.length === 0) {
       spend_status = "no_traffic_data";
     } else if (!cohortPaths.every(pathIsExclusive)) {
       // Exact per-campaign spend is impossible because another campaign shares this path.
@@ -291,9 +377,18 @@ export function buildFbAnalytics(params: {
       spend_status = "available";
     }
 
+    const upsell1Users = sum(cohorts, (cohort) => cohort.upsell_1_users);
+    const upsell2Users = sum(cohorts, (cohort) => cohort.upsell_2_users);
+    const upsell3Users = sum(cohorts, (cohort) => cohort.upsell_3_users);
+    const tokenBuyers = new Set(cohorts.flatMap((cohort) => cohort.token_buyer_user_ids ?? [])).size;
+    const tokenRevenue = sum(cohorts, (cohort) => cohort.token_net_revenue);
+    const firstSubscriptionUsers = sum(cohorts, (cohort) => cohort.first_subscription_users);
+    const fbPurchases = capsuled?.fb_purchases ?? 0;
+
     return {
       campaign_id: option.campaign_id,
       campaign_name:
+        capsuled?.campaign_name ??
         option.campaign_name ??
         Array.from(trialUserIds)
           .map((userId) => {
@@ -303,11 +398,18 @@ export function buildFbAnalytics(params: {
           .find(Boolean) ??
         null,
       campaign_path: campaignPathSummary(paths),
+      ad_account_id: capsuled?.ad_account_id ?? null,
+      ad_account_name: capsuled?.ad_account_name ?? null,
       trial_users: trialUsers,
       upsell_users: sum(cohorts, (cohort) => cohort.upsell_users),
+      upsell_1_users: upsell1Users,
+      upsell_2_users: upsell2Users,
+      upsell_3_users: upsell3Users,
+      token_buyers: tokenBuyers,
+      token_revenue: round2(tokenRevenue),
       upsell_cr: trialUsers ? (sum(cohorts, (cohort) => cohort.upsell_users) / trialUsers) * 100 : 0,
-      first_subscription_users: sum(cohorts, (cohort) => cohort.first_subscription_users),
-      trial_to_sub_cr: trialUsers ? (sum(cohorts, (cohort) => cohort.first_subscription_users) / trialUsers) * 100 : 0,
+      first_subscription_users: firstSubscriptionUsers,
+      trial_to_sub_cr: trialUsers ? (firstSubscriptionUsers / trialUsers) * 100 : 0,
       renewal_2_users: sum(cohorts, (cohort) => renewalUsersForLevel(cohort, 2)),
       renewal_3_users: sum(cohorts, (cohort) => renewalUsersForLevel(cohort, 3)),
       active_subscriptions: new Set(cohorts.flatMap((cohort) => cohort.active_subscription_user_ids)).size,
@@ -315,8 +417,22 @@ export function buildFbAnalytics(params: {
       net_revenue: round2(netRevenue),
       spend,
       spend_status,
+      fb_purchases: fbPurchases,
+      cpp: capsuled?.cpp ?? null,
+      impressions: capsuled?.impressions ?? 0,
+      clicks: capsuled?.clicks ?? 0,
+      ctr: capsuled?.ctr ?? null,
+      cpc: capsuled?.cpc ?? null,
+      cpm: capsuled?.cpm ?? null,
+      outbound_clicks: capsuled?.outbound_clicks ?? 0,
+      outbound_ctr: capsuled?.outbound_ctr ?? null,
+      currency: capsuled?.currency ?? null,
       cac: spend != null && trialUsers ? spend / trialUsers : null,
+      cost_per_first_sub: spend != null && firstSubscriptionUsers ? spend / firstSubscriptionUsers : null,
       roas: spend ? netRevenue / spend : null,
+      revenue_per_trial: trialUsers ? netRevenue / trialUsers : null,
+      revenue_per_purchase: fbPurchases ? netRevenue / fbPurchases : null,
+      profit: spend != null ? netRevenue - spend : null,
       refund_users: refundUsers,
       refund_rate: trialUsers ? (refundUsers / trialUsers) * 100 : 0,
       failed_payment_users: failedPaymentUsers(parentTxs, trialUserIds),
@@ -324,7 +440,9 @@ export function buildFbAnalytics(params: {
     } satisfies FbAnalyticsRow;
   });
 
-  const searchedRows = rows.filter((row) => searchMatches(row, String(filters.campaignIdSearch ?? "").trim().toLowerCase()));
+  const searchedRows = rows
+    .filter((row) => searchMatches(row, String(filters.campaignIdSearch ?? "").trim().toLowerCase()))
+    .filter((row) => rowMatchesExtraFilters(row, filters));
   return {
     rows: sortFbAnalyticsRows(searchedRows),
     summary: summarize(searchedRows),

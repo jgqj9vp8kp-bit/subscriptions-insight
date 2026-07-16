@@ -1,4 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { invalidateWarehouseAnalyticsCache } from "@/hooks/useCohortsCache";
 import {
   AlertCircle,
   CheckCircle2,
@@ -93,6 +95,18 @@ import {
   testFunnelFoxConnection,
 } from "@/services/funnelfoxApi";
 import {
+  getFunnelFoxSubscriptionsSyncState,
+  loadFunnelFoxSubscriptions,
+  runFunnelFoxSubscriptionsSync,
+  shouldShowPartialWarning,
+  subscriptionSyncUiStatus,
+  subscriptionSyncReport,
+  SUBSCRIPTION_SYNC_VERSION,
+  syncFunnelFoxSubscriptions,
+  type FunnelFoxSubscriptionsSyncResponse,
+  type FunnelFoxSubscriptionsSyncState,
+} from "@/services/funnelfoxSubscriptionsSync";
+import {
   clearSubscriptionsCache,
   getSubscriptionsCacheInfo,
   loadSubscriptionsFromCache,
@@ -150,6 +164,7 @@ import {
   refreshLocalAnalyticsCacheFromWarehouse,
   rollbackImportBatchAndRefresh,
 } from "@/services/analyticsAdapters";
+import { autoSyncClickHouseAfterImport } from "@/services/clickhouse";
 import type { Transaction } from "@/services/types";
 import type { SubscriptionClean } from "@/types/subscriptions";
 import type { TrafficMetric } from "@/services/trafficImport";
@@ -247,6 +262,7 @@ function duplicateBatchIds(batches: ImportBatchInfo[]): Set<string> {
 
 export default function ImportPage() {
   const { toast } = useToast();
+  const queryClient = useQueryClient();
   const fileRef = useRef<HTMLInputElement>(null);
   const meta = useDataStore((s) => s.meta);
   const transactions = useDataStore((s) => s.transactions);
@@ -300,6 +316,13 @@ export default function ImportPage() {
   const [funnelFoxConnectionError, setFunnelFoxConnectionError] = useState<string | null>(null);
   const [funnelFoxSyncMessage, setFunnelFoxSyncMessage] = useState<string | null>(null);
   const [funnelFoxSyncError, setFunnelFoxSyncError] = useState<string | null>(null);
+  // Staged, resumable FunnelFox subscriptions sync.
+  const [stagedSyncing, setStagedSyncing] = useState(false);
+  const [stagedSyncState, setStagedSyncState] = useState<FunnelFoxSubscriptionsSyncState | null>(null);
+  const [stagedSyncStep, setStagedSyncStep] = useState<FunnelFoxSubscriptionsSyncResponse | null>(null);
+  const [stagedSyncError, setStagedSyncError] = useState<string | null>(null);
+  const [stagedSyncMessage, setStagedSyncMessage] = useState<string | null>(null);
+  const cancelStagedSyncRef = useRef(false);
   const [retentionCurveDraft, setRetentionCurveDraft] = useState<string[]>(() => loadDefaultRetentionCurve().map(String));
   const [retentionCurveMessage, setRetentionCurveMessage] = useState<string | null>(null);
   const [maxRenewalColumns, setMaxRenewalColumns] = useState(loadMaxRenewalColumns);
@@ -310,6 +333,18 @@ export default function ImportPage() {
   const [warehouseError, setWarehouseError] = useState<string | null>(null);
   const [warehouseSummary, setWarehouseSummary] = useState<WarehouseImportSummary | null>(null);
   const [warehouseTransactionCount, setWarehouseTransactionCount] = useState<number | null>(null);
+  // Automatic post-import ClickHouse sync (reuses the Continue Backfill path).
+  const [clickHouseSyncPhase, setClickHouseSyncPhase] =
+    useState<"idle" | "syncing" | "done" | "skipped" | "failed">("idle");
+  const [clickHouseSyncMessage, setClickHouseSyncMessage] = useState<string | null>(null);
+  // Guards background setState after the page unmounts (the sync keeps running).
+  const isMountedRef = useRef(true);
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
   const [batchTransactionCounts, setBatchTransactionCounts] = useState<Map<string, number>>(new Map());
   const [expandedBatchId, setExpandedBatchId] = useState<string | null>(null);
   const [managementBusy, setManagementBusy] = useState(false);
@@ -553,6 +588,61 @@ export default function ImportPage() {
     }
   }
 
+  // Automatically synchronize the just-imported transactions into ClickHouse by
+  // reusing the exact "Continue Backfill" code path. Runs in the background so
+  // the import completes instantly; never throws (import stays successful).
+  async function triggerAutoClickHouseSync() {
+    if (!warehouseEnabled) return;
+    const setPhase = (phase: typeof clickHouseSyncPhase, message: string | null) => {
+      if (!isMountedRef.current) return;
+      setClickHouseSyncPhase(phase);
+      setClickHouseSyncMessage(message);
+    };
+    console.info("[auto-sync] Import completed → starting automatic ClickHouse synchronization");
+    setPhase("syncing", "Synchronizing ClickHouse…");
+    try {
+      const outcome = await autoSyncClickHouseAfterImport();
+      if (outcome.skipped) {
+        console.info("Auto sync skipped: synchronization already running");
+        setPhase("skipped", "ClickHouse sync already running — it will include these rows.");
+        return;
+      }
+      console.info(
+        `[auto-sync] rows processed: scanned ${outcome.rows_scanned}, inserted ${outcome.rows_inserted}; ` +
+          `cursor ${outcome.cursor_transaction_id ?? "—"}; status ${outcome.status}/${outcome.stopped_reason}; ` +
+          `${outcome.duration_ms}ms; completed`,
+      );
+      if (outcome.status === "failed") {
+        setPhase("failed", "ClickHouse sync failed. Transactions are saved — use Continue Backfill to retry.");
+        toast({
+          title: "ClickHouse sync failed",
+          description: "Import is saved in Supabase. Press Continue Backfill on Integrations to retry.",
+          variant: "destructive",
+        });
+        return;
+      }
+      setPhase("done", `Analytics updated — synced ${outcome.rows_inserted.toLocaleString("en-US")} new rows into ClickHouse.`);
+      // ClickHouse auto-sync completed successfully → advance the warehouse version
+      // and invalidate warehouse-dependent analytics caches (Cohorts, details,
+      // Users, Payment Analytics). Active pages refetch the new warehouse state;
+      // inactive pages refresh on next visit. Only runs AFTER sync completes, so a
+      // refetch never reads the pre-sync ClickHouse state.
+      void invalidateWarehouseAnalyticsCache(queryClient);
+      toast({
+        title: "Analytics updated",
+        description: `ClickHouse synchronized (+${outcome.rows_inserted.toLocaleString("en-US")} rows) in ${(outcome.duration_ms / 1000).toFixed(1)}s.`,
+      });
+    } catch (error) {
+      console.error("[auto-sync] automatic ClickHouse synchronization failed", error);
+      setPhase("failed", "ClickHouse sync failed. Transactions are saved — use Continue Backfill to retry.");
+      toast({
+        title: "ClickHouse sync failed",
+        description: "Import is saved in Supabase. Press Continue Backfill on Integrations to retry.",
+        variant: "destructive",
+      });
+    }
+  }
+
   async function confirmImport() {
     if (!parsed) return;
     if (requiredMissing.length) {
@@ -648,6 +738,11 @@ export default function ImportPage() {
           importMode,
         });
         setWarehouseSummary(summary);
+        // Import is committed to Supabase — kick off the automatic ClickHouse
+        // sync now (background). Placed before the local-cache refresh so a
+        // local-cache hiccup can never block warehouse synchronization, and it
+        // never blocks the import from completing (fire-and-forget).
+        void triggerAutoClickHouseSync();
         const warehouseRows = await refreshLocalAnalyticsCacheFromWarehouse();
         setWarehouseMessage(
           `Warehouse updated: ${summary.inserted} inserted, ${summary.updated} updated, ${summary.skipped} skipped, ${summary.failed} failed. Analytics now use ${warehouseRows.length} merged DB transactions.`,
@@ -843,6 +938,97 @@ export default function ImportPage() {
       setSyncingFunnelFox(false);
     }
   }
+
+  const refreshStagedSyncState = useCallback(async () => {
+    try {
+      const state = await getFunnelFoxSubscriptionsSyncState();
+      setStagedSyncState(state);
+    } catch (error) {
+      console.warn("Could not load FunnelFox subscriptions sync state.", error);
+    }
+  }, []);
+
+  // Load durable sync state + restore subscriptions from the durable table on mount.
+  const stagedSyncLoadedRef = useRef(false);
+  useEffect(() => {
+    if (stagedSyncLoadedRef.current) return;
+    stagedSyncLoadedRef.current = true;
+    void refreshStagedSyncState();
+  }, [refreshStagedSyncState]);
+
+  // Reload the store's subscriptions from the durable table after a sync (no manual "refresh cache").
+  const reloadSubscriptionsFromDurable = useCallback(async () => {
+    try {
+      const rows = await loadFunnelFoxSubscriptions();
+      if (rows.length) {
+        setSubscriptions(rows);
+        const cacheMetadata = await saveSubscriptionsToCache(rows, { last_sync_at: new Date().toISOString() });
+        setSubscriptionCacheInfo(cacheMetadata);
+      }
+      return rows.length;
+    } catch (error) {
+      // Do not silently fall back to stale/mock data — surface it.
+      setStagedSyncError(
+        `Sync saved to the server, but reloading it into the app failed: ${error instanceof Error ? error.message : "Unknown error"}.`,
+      );
+      return null;
+    }
+  }, [setSubscriptions]);
+
+  const runStagedSync = useCallback(
+    async (options: { fullReset?: boolean; dryRun?: boolean }) => {
+      setStagedSyncing(true);
+      setStagedSyncError(null);
+      setStagedSyncMessage(null);
+      setStagedSyncStep(null);
+      cancelStagedSyncRef.current = false;
+      try {
+        if (options.dryRun) {
+          const dry = await syncFunnelFoxSubscriptions({ dryRun: true });
+          setStagedSyncStep(dry);
+          const d = dry.diagnostics ?? {};
+          setStagedSyncMessage(
+            `Dry run: probed ${d.subscriptions_pages_probed ?? 0} page(s), ${d.subscriptions_rows_probed ?? 0} subscriptions, ${d.rows_with_email ?? 0} with email, ${d.rows_needing_detail ?? 0} need detail. No data written.`,
+          );
+          return;
+        }
+        const final = await runFunnelFoxSubscriptionsSync({
+          fullReset: options.fullReset,
+          onProgress: (res) => setStagedSyncStep(res),
+          shouldCancel: () => cancelStagedSyncRef.current,
+        });
+        await refreshStagedSyncState();
+        const restored = await reloadSubscriptionsFromDurable();
+        const summary = final.summary;
+        if (cancelStagedSyncRef.current) {
+          setStagedSyncMessage("Sync cancelled. Progress was saved — click Continue Sync to resume.");
+        } else if (final.all_stages_completed) {
+          setStagedSyncMessage(
+            `All FunnelFox subscriptions were synced. Saved ${summary?.subscriptions_saved ?? restored ?? 0}, email coverage ${summary?.subscriptions_with_email ?? 0}/${summary?.subscriptions_saved ?? 0}.`,
+          );
+        } else {
+          setStagedSyncMessage(
+            `Sync is partial (${final.stopped_reason ?? "stopped"}). Click Continue Sync to resume from the last cursor.`,
+          );
+        }
+      } catch (error) {
+        setStagedSyncError(error instanceof Error ? error.message : String(error));
+      } finally {
+        cancelStagedSyncRef.current = false;
+        setStagedSyncing(false);
+      }
+    },
+    [refreshStagedSyncState, reloadSubscriptionsFromDurable],
+  );
+
+  const onStartFullStagedSync = useCallback(() => runStagedSync({ fullReset: false }), [runStagedSync]);
+  const onContinueStagedSync = useCallback(() => runStagedSync({ fullReset: false }), [runStagedSync]);
+  const onForceFullResync = useCallback(() => runStagedSync({ fullReset: true }), [runStagedSync]);
+  const onDryRunStagedSync = useCallback(() => runStagedSync({ dryRun: true }), [runStagedSync]);
+  const onCancelStagedSync = useCallback(() => {
+    cancelStagedSyncRef.current = true;
+    setStagedSyncMessage("Cancelling after the current stage…");
+  }, []);
 
   async function onLoadSavedPalmerDataset() {
     try {
@@ -1822,6 +2008,22 @@ export default function ImportPage() {
           </div>
         )}
 
+        {clickHouseSyncPhase !== "idle" && clickHouseSyncMessage && (
+          <div
+            className={cn(
+              "mb-3 flex items-center gap-2 rounded-md border p-3 text-xs",
+              clickHouseSyncPhase === "syncing" && "border-primary/30 bg-primary/5 text-primary",
+              clickHouseSyncPhase === "done" && "border-success/30 bg-success/5 text-success",
+              clickHouseSyncPhase === "skipped" && "border-warning/30 bg-warning/5 text-muted-foreground",
+              clickHouseSyncPhase === "failed" && "border-destructive/30 bg-destructive/5 text-destructive",
+            )}
+          >
+            {clickHouseSyncPhase === "syncing" && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+            {clickHouseSyncPhase === "done" && <CheckCircle2 className="h-3.5 w-3.5" />}
+            <span>{clickHouseSyncMessage}</span>
+          </div>
+        )}
+
         <div className="overflow-x-auto rounded-md border border-border">
           {(() => {
             const dupIds = duplicateBatchIds(warehouseHistory);
@@ -2232,6 +2434,157 @@ export default function ImportPage() {
             <span className="font-medium tabular-nums text-foreground">{subscriptionEmailDiagnostics.missingEmail}</span>.
           </div>
         )}
+
+        {/* Staged, resumable sync — server-side, diagnosable. */}
+        {(() => {
+          const uiStatus = subscriptionSyncUiStatus(stagedSyncState, stagedSyncing);
+          const summary = stagedSyncStep?.summary ?? stagedSyncState?.stats ?? null;
+          const currentStage = stagedSyncStep?.stage ?? stagedSyncState?.current_stage ?? null;
+          const statusLabel: Record<typeof uiStatus, string> = {
+            never_synced: "Never synced",
+            syncing: "Syncing…",
+            partial: "Partial",
+            completed: "Completed",
+            inconsistent: "Completed with inconsistencies",
+            failed: "Failed",
+          };
+          const statusColor: Record<typeof uiStatus, string> = {
+            never_synced: "text-muted-foreground",
+            syncing: "text-primary",
+            partial: "text-warning",
+            completed: "text-success",
+            inconsistent: "text-destructive",
+            failed: "text-destructive",
+          };
+          const report = subscriptionSyncReport(stagedSyncState);
+          const num = (v: unknown) => (typeof v === "number" ? v.toLocaleString("en-US") : "—");
+          const str = (v: unknown) => (v == null || v === "" ? "—" : String(v));
+          const hasMore = summary?.list_has_more_on_last_page;
+          const coveragePct = summary?.subscriptions_coverage_percent;
+          // "Complete" ⇒ all stages done, stopped cleanly, and nothing still has more pages.
+          const isComplete =
+            stagedSyncState?.last_status === "completed" &&
+            (summary?.all_stages_completed ?? false) &&
+            (summary?.sync_stopped_reason === "completed" || summary?.sync_stopped_reason == null) &&
+            hasMore !== true;
+          const cards: Array<{ label: string; value: string }> = [
+            { label: "Subscriptions downloaded", value: num(summary?.subscriptions_scanned_total) },
+            { label: "Stored", value: num(summary?.subscriptions_saved) },
+            { label: "Saved this run", value: num(summary?.subscriptions_saved_this_run) },
+            { label: "Pages processed", value: num(summary?.list_pages_processed) },
+            { label: "Has more pages", value: hasMore == null ? "—" : hasMore ? "YES" : "no" },
+            { label: "Stop reason", value: str(summary?.sync_stopped_reason) },
+            { label: "Coverage", value: typeof coveragePct === "number" ? `${coveragePct}%` : "—" },
+            { label: "Details pending", value: num(summary?.details_pending) },
+            { label: "Profiles pending", value: num(summary?.profiles_pending) },
+            { label: "Emails found", value: num(summary?.subscriptions_with_email) },
+            { label: "Missing emails", value: num(summary?.missing_email_after_enrichment) },
+            { label: "Duration", value: summary?.duration_ms != null ? `${Math.round((summary.duration_ms as number) / 1000)}s` : "—" },
+          ];
+          return (
+            <div className="mt-4 rounded-md border border-border p-3">
+              <div className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1">
+                <span className="text-xs font-semibold text-foreground">Staged sync (resumable)</span>
+                <span className={cn("text-xs font-medium", statusColor[uiStatus])}>{statusLabel[uiStatus]}</span>
+                <span className="text-xs text-muted-foreground">
+                  version: <span className="font-mono text-foreground">{SUBSCRIPTION_SYNC_VERSION}</span>
+                </span>
+                {currentStage && (
+                  <span className="text-xs text-muted-foreground">
+                    stage: <span className="font-mono text-foreground">{currentStage}</span>
+                  </span>
+                )}
+                {stagedSyncState?.last_full_sync_at && (
+                  <span className="text-xs text-muted-foreground">
+                    last full sync: {new Date(stagedSyncState.last_full_sync_at).toLocaleString()}
+                  </span>
+                )}
+                {summary?.list_last_cursor ? (
+                  <span className="text-xs text-muted-foreground">
+                    last cursor: <span className="font-mono text-foreground">{String(summary.list_last_cursor).slice(0, 12)}…</span>
+                  </span>
+                ) : null}
+              </div>
+
+              {uiStatus === "inconsistent" && (
+                <div className="mb-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                  Synchronization completed with inconsistencies — stored {num(report?.total_stored)} but FunnelFox reports {num(report?.total_in_funnelfox)}. Click Force Full Resync.
+                </div>
+              )}
+              {summary && !isComplete && uiStatus !== "syncing" && uiStatus !== "never_synced" && uiStatus !== "inconsistent" && (
+                <div className="mb-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning">
+                  Subscription data may be incomplete. Click Continue Sync to finish, or Force Full Resync to rebuild.
+                </div>
+              )}
+
+              {report && (
+                <div className="mb-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
+                  <span className="text-muted-foreground">
+                    Integrity: <span className={cn("font-semibold", report.parity_check === "PASS" ? "text-success" : report.parity_check === "FAIL" ? "text-destructive" : "text-muted-foreground")}>{report.parity_check ?? "—"}</span>
+                  </span>
+                  <span className="text-muted-foreground">FunnelFox total: <span className="font-medium tabular-nums text-foreground">{num(report.total_in_funnelfox)}</span></span>
+                  <span className="text-muted-foreground">Stored: <span className="font-medium tabular-nums text-foreground">{num(report.total_stored)}</span></span>
+                  <span className="text-muted-foreground">Inserted: <span className="tabular-nums text-foreground">{num(report.inserted)}</span></span>
+                  <span className="text-muted-foreground">Updated: <span className="tabular-nums text-foreground">{num(report.updated)}</span></span>
+                  <span className="text-muted-foreground">Skipped: <span className="tabular-nums text-foreground">{num(report.skipped)}</span></span>
+                </div>
+              )}
+
+              {summary && (
+                <div className="mb-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+                  {cards.map((card) => (
+                    <div key={card.label} className="rounded border border-border/60 bg-muted/20 p-2">
+                      <div className="text-[10px] uppercase tracking-wide text-muted-foreground">{card.label}</div>
+                      <div className="text-sm font-semibold tabular-nums text-foreground">{card.value}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <div className="flex flex-wrap gap-2">
+                <Button type="button" size="sm" onClick={onStartFullStagedSync} disabled={stagedSyncing || syncingFunnelFox}>
+                  {stagedSyncing && <RefreshCw className="h-4 w-4 animate-spin" />}
+                  Start Full Sync
+                </Button>
+                <Button type="button" size="sm" variant="outline" onClick={onContinueStagedSync} disabled={stagedSyncing || syncingFunnelFox}>
+                  Continue Sync
+                </Button>
+                <Button type="button" size="sm" variant="outline" onClick={onForceFullResync} disabled={stagedSyncing || syncingFunnelFox}>
+                  Force Full Resync
+                </Button>
+                <Button type="button" size="sm" variant="outline" onClick={onDryRunStagedSync} disabled={stagedSyncing || syncingFunnelFox}>
+                  Dry Run
+                </Button>
+                {stagedSyncing && (
+                  <Button type="button" size="sm" variant="ghost" onClick={onCancelStagedSync}>
+                    Cancel Sync
+                  </Button>
+                )}
+              </div>
+
+              {uiStatus === "partial" && (
+                <div className="mt-2 text-xs text-warning">
+                  Sync is partial. Click Continue Sync to resume from the last cursor.
+                </div>
+              )}
+              {uiStatus === "completed" && !shouldShowPartialWarning(stagedSyncState) && (
+                <div className="mt-2 text-xs text-success">All FunnelFox subscriptions were synced.</div>
+              )}
+              {summary?.coverage_warning_message ? (
+                <div className="mt-2 text-xs text-warning">{summary.coverage_warning_message}</div>
+              ) : null}
+              {stagedSyncMessage && <div className="mt-2 text-xs text-muted-foreground">{stagedSyncMessage}</div>}
+              {(stagedSyncError || stagedSyncState?.last_error) && (
+                <div className="mt-2 flex items-center gap-2 text-xs text-destructive">
+                  <span>{stagedSyncError ?? stagedSyncState?.last_error}</span>
+                  <Button type="button" size="sm" variant="outline" className="h-6" onClick={onContinueStagedSync} disabled={stagedSyncing}>
+                    Retry
+                  </Button>
+                </div>
+              )}
+            </div>
+          );
+        })()}
       </Card>
 
       <Card className="mt-3 p-4 shadow-card">

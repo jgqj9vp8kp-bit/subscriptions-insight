@@ -25,6 +25,7 @@ import {
 import { useDataStore } from "@/store/dataStore";
 import type { TrafficMetric } from "@/services/trafficImport";
 import type { SubscriptionClean } from "@/types/subscriptions";
+import { traceAsync, traceEvent } from "@/services/performanceTrace";
 
 type AutoLoadStatus = "idle" | "loading" | "loaded" | "warning";
 
@@ -42,8 +43,9 @@ type ForecastingCloudPayload = {
   retention_curve?: number[];
 };
 
-export function SavedDataAutoLoader() {
+export function SavedDataAutoLoader({ loadTransactions = true }: { loadTransactions?: boolean }) {
   const didRun = useRef(false);
+  const transactionDidRun = useRef(false);
   const setImported = useDataStore((state) => state.setImported);
   const setSubscriptions = useDataStore((state) => state.setSubscriptions);
   const setTrafficMetrics = useDataStore((state) => state.setTrafficMetrics);
@@ -70,7 +72,8 @@ export function SavedDataAutoLoader() {
       // from DB". Loading the warehouse up front makes in-app analytics match the Export API (full
       // history across every import batch) with no manual refresh. The Palmer cache below is only a
       // fallback for when the warehouse is disabled, empty, or errors.
-      if (mounted) {
+      if (mounted && loadTransactions && !transactionDidRun.current) {
+        transactionDidRun.current = true;
         const warehouse = await autoLoadWarehouseIntoStore();
         if (warehouse.status === "loaded") {
           loadedCount += 1;
@@ -81,76 +84,82 @@ export function SavedDataAutoLoader() {
           if (warehouse.error) console.warn("Could not load warehouse transactions.", warehouse.error);
           warnings.push("Transaction warehouse");
         }
+      } else if (!loadTransactions) {
+        traceEvent("warehouse.global_hydration_deferred", { reason: "route_fast_path" });
       }
 
-      try {
-        if (useDataStore.getState().meta.source !== "mock") {
-          details.push("Palmer dataset already loaded");
-          throw new Error("__skip__");
-        }
-
-        let cached: PalmerDatasetCachePayload | null = null;
-        let source: RestoreSource = "local cache";
+      if (!loadTransactions) {
+        details.push("Transaction dataset restore deferred for this route");
+      } else {
         try {
-          cached = await loadLastPalmerDatasetFromCache();
-        } catch (error) {
-          console.warn("Could not read Palmer IndexedDB cache.", error);
-          warnings.push("Palmer local cache");
-        }
-
-        if (!cached) {
-          const cloud = await loadLatestCloudSnapshot<PalmerCloudPayload>("palmer").catch((error) => {
-            console.warn("Could not read Palmer cloud snapshot.", error);
-            warnings.push("Palmer cloud snapshot");
-            return null;
-          });
-          const payload = normalizePalmerCloudPayload(cloud?.payload);
-          const transactions = payload?.transactions;
-          if (transactions?.length) {
-            cached = {
-              transactions,
-              users: [],
-              cohorts: [],
-              rawPalmerRows: payload.rawPalmerRows,
-              metadata: {
-                file_name: String(cloud.metadata.file_name ?? cloud.name ?? "Palmer import"),
-                imported_at: String(cloud.metadata.imported_at ?? cloud.updated_at),
-                rows_count: Number(cloud.metadata.rows_count ?? payload.rawPalmerRows?.length ?? transactions.length),
-                transactions_count: Number(cloud.metadata.transactions_count ?? transactions.length),
-                cohorts_count: Number(cloud.metadata.cohorts_count ?? 0),
-                users_count: Number(cloud.metadata.users_count ?? 0),
-                source: "palmer_import",
-              },
-            };
-            void savePalmerDatasetToCache(
-              { transactions, rawPalmerRows: payload.rawPalmerRows },
-              cached.metadata,
-            ).catch((error) => console.warn("Could not warm Palmer IndexedDB cache.", error));
-            source = "cloud";
+          if (useDataStore.getState().meta.source !== "mock") {
+            details.push("Palmer dataset already loaded");
+            throw new Error("__skip__");
           }
-        }
 
-        if (cached && mounted && useDataStore.getState().meta.source === "mock") {
-          setImported(
-            cached.transactions,
-            {
-              source: "palmer_raw",
-              importMode: "palmer_raw",
-              fileName: cached.metadata.file_name,
-            },
-            cached.rawPalmerRows ?? [],
-          );
-          loadedCount += 1;
-          details.push(`Loaded Palmer dataset from ${source}`);
-        } else if (!cached) {
-          details.push("No saved Palmer dataset found");
-        }
-      } catch (error) {
-        if (error instanceof Error && error.message === "__skip__") {
-          // A user-loaded Palmer dataset is already in memory; keep it.
-        } else {
-          console.warn("Could not restore Palmer dataset.", error);
-          warnings.push("Palmer dataset");
+          let cached: PalmerDatasetCachePayload | null = null;
+          let source: RestoreSource = "local cache";
+          try {
+            cached = await traceAsync("palmer.persisted_cache_load", loadLastPalmerDatasetFromCache);
+          } catch (error) {
+            console.warn("Could not read Palmer IndexedDB cache.", error);
+            warnings.push("Palmer local cache");
+          }
+
+          if (!cached) {
+            const cloud = await traceAsync("palmer.cloud_snapshot_load", () => loadLatestCloudSnapshot<PalmerCloudPayload>("palmer")).catch((error) => {
+              console.warn("Could not read Palmer cloud snapshot.", error);
+              warnings.push("Palmer cloud snapshot");
+              return null;
+            });
+            const payload = normalizePalmerCloudPayload(cloud?.payload);
+            const transactions = payload?.transactions;
+            if (transactions?.length) {
+              cached = {
+                transactions,
+                users: [],
+                cohorts: [],
+                rawPalmerRows: payload.rawPalmerRows,
+                metadata: {
+                  file_name: String(cloud.metadata.file_name ?? cloud.name ?? "Palmer import"),
+                  imported_at: String(cloud.metadata.imported_at ?? cloud.updated_at),
+                  rows_count: Number(cloud.metadata.rows_count ?? payload.rawPalmerRows?.length ?? transactions.length),
+                  transactions_count: Number(cloud.metadata.transactions_count ?? transactions.length),
+                  cohorts_count: Number(cloud.metadata.cohorts_count ?? 0),
+                  users_count: Number(cloud.metadata.users_count ?? 0),
+                  source: "palmer_import",
+                },
+              };
+              void savePalmerDatasetToCache(
+                { transactions, rawPalmerRows: payload.rawPalmerRows },
+                cached.metadata,
+              ).catch((error) => console.warn("Could not warm Palmer IndexedDB cache.", error));
+              source = "cloud";
+            }
+          }
+
+          if (cached && mounted && useDataStore.getState().meta.source === "mock") {
+            setImported(
+              cached.transactions,
+              {
+                source: "palmer_raw",
+                importMode: "palmer_raw",
+                fileName: cached.metadata.file_name,
+              },
+              cached.rawPalmerRows ?? [],
+            );
+            loadedCount += 1;
+            details.push(`Loaded Palmer dataset from ${source}`);
+          } else if (!cached) {
+            details.push("No saved Palmer dataset found");
+          }
+        } catch (error) {
+          if (error instanceof Error && error.message === "__skip__") {
+            // A user-loaded Palmer dataset is already in memory; keep it.
+          } else {
+            console.warn("Could not restore Palmer dataset.", error);
+            warnings.push("Palmer dataset");
+          }
         }
       }
 
@@ -163,14 +172,14 @@ export function SavedDataAutoLoader() {
         let cached: SubscriptionCachePayload | null = null;
         let source: RestoreSource = "local cache";
         try {
-          cached = await loadSubscriptionsFromCache();
+          cached = await traceAsync("subscriptions.persisted_cache_load", loadSubscriptionsFromCache);
         } catch (error) {
           console.warn("Could not read FunnelFox IndexedDB cache.", error);
           warnings.push("FunnelFox local cache");
         }
 
         if (!cached) {
-          const cloud = await loadLatestCloudSnapshot<SubscriptionsCloudPayload>("funnelfox_subscriptions").catch((error) => {
+          const cloud = await traceAsync("subscriptions.cloud_snapshot_load", () => loadLatestCloudSnapshot<SubscriptionsCloudPayload>("funnelfox_subscriptions")).catch((error) => {
             console.warn("Could not read FunnelFox cloud snapshot.", error);
             warnings.push("FunnelFox cloud snapshot");
             return null;
@@ -219,14 +228,14 @@ export function SavedDataAutoLoader() {
         let cached: TrafficCachePayload | null = null;
         let source: RestoreSource = "local cache";
         try {
-          cached = await loadLastTrafficDataFromCache();
+          cached = await traceAsync("traffic.persisted_cache_load", loadLastTrafficDataFromCache);
         } catch (error) {
           console.warn("Could not read Facebook traffic IndexedDB cache.", error);
           warnings.push("Facebook traffic local cache");
         }
 
         if (!cached) {
-          const cloud = await loadLatestCloudSnapshot<TrafficCloudPayload>("facebook_traffic").catch((error) => {
+          const cloud = await traceAsync("traffic.cloud_snapshot_load", () => loadLatestCloudSnapshot<TrafficCloudPayload>("facebook_traffic")).catch((error) => {
             console.warn("Could not read Facebook traffic cloud snapshot.", error);
             warnings.push("Facebook traffic cloud snapshot");
             return null;
@@ -274,7 +283,7 @@ export function SavedDataAutoLoader() {
           throw new Error("__skip__");
         }
 
-        const cloud = await loadLatestCloudSnapshot<ForecastingCloudPayload>("forecasting_settings").catch((error) => {
+        const cloud = await traceAsync("forecasting.cloud_snapshot_load", () => loadLatestCloudSnapshot<ForecastingCloudPayload>("forecasting_settings")).catch((error) => {
           console.warn("Could not read forecasting settings cloud snapshot.", error);
           warnings.push("Forecasting settings cloud snapshot");
           return null;
@@ -332,7 +341,34 @@ export function SavedDataAutoLoader() {
     return () => {
       mounted = false;
     };
-  }, [setImported, setSubscriptions, setTrafficMetrics]);
+  }, [loadTransactions, setImported, setSubscriptions, setTrafficMetrics]);
+
+  useEffect(() => {
+    if (!loadTransactions || transactionDidRun.current) return;
+    transactionDidRun.current = true;
+    let mounted = true;
+    setStatus("loading");
+    setMessage("Loading saved transaction data...");
+    void autoLoadWarehouseIntoStore().then((warehouse) => {
+      if (!mounted) return;
+      if (warehouse.status === "loaded") {
+        setStatus("loaded");
+        setMessage("Loaded transactions from warehouse");
+      } else if (warehouse.status === "error") {
+        setStatus("warning");
+        setMessage("Could not load transaction warehouse.");
+      } else {
+        setStatus("loaded");
+        setMessage(warehouse.message);
+      }
+      window.setTimeout(() => {
+        if (mounted) setStatus("idle");
+      }, 4000);
+    });
+    return () => {
+      mounted = false;
+    };
+  }, [loadTransactions]);
 
   if (status === "idle" || !message) return null;
 

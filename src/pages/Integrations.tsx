@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Check, Copy, KeyRound, Loader2, Plug, RefreshCw, ShieldOff, Terminal } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { Button } from "@/components/ui/button";
@@ -32,6 +32,29 @@ import {
   type ApiExportLogRecord,
   type ApiKeyRecord,
 } from "@/services/integrations";
+import {
+  CAPSULED_FACEBOOK_LEVELS,
+  getCapsuledFacebookStatus,
+  listCapsuledFacebookRows,
+  syncCapsuledFacebookStats,
+  type CapsuledFacebookLevel,
+  type CapsuledFacebookSyncMetadata,
+} from "@/services/capsuledFacebook";
+import {
+  clickHouseStatusLabel,
+  getClickHouseSummary,
+  initializeClickHouseSchema,
+  runClickHouseBackfill,
+  runClickHouseValidation,
+  testClickHouseConnection,
+  type ClickHouseBackfillResult,
+  type ClickHouseHealth,
+  type ClickHouseSummary,
+  type ClickHouseValidationProgress,
+} from "@/services/clickhouse";
+import { campaignIdForTransaction, UNKNOWN_CAMPAIGN_ID } from "@/services/cohortFiltering";
+import { buildFbTrafficDiagnostics, type FbTrafficDiagnosticsResult } from "@/services/fbTrafficDiagnostics";
+import { useTransactions } from "@/services/sheets";
 
 const MEDIA_BUYERS = ["all", "Ivan", "Artem A", "Artem D", "Unknown"] as const;
 
@@ -43,10 +66,24 @@ const DEFAULT_TEST_FILTERS = {
   campaign_id: "",
 };
 
+const DEFAULT_CAPSULED_FILTERS = {
+  dateFrom: new Date(Date.now() - 6 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10),
+  dateTo: new Date().toISOString().slice(0, 10),
+  level: "campaign" as CapsuledFacebookLevel,
+};
+
 function formatDateTime(value: string | null): string {
   if (!value) return "-";
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+function formatNumber(value: number | null | undefined): string {
+  return typeof value === "number" && Number.isFinite(value) ? value.toLocaleString("en-US") : "-";
+}
+
+function formatMoney(value: number | null | undefined): string {
+  return typeof value === "number" && Number.isFinite(value) ? `$${value.toLocaleString("en-US", { maximumFractionDigits: 2 })}` : "-";
 }
 
 function buildExampleRequest(endpoint: string): string {
@@ -100,9 +137,14 @@ function CodeBlock({ value }: { value: string }) {
 
 export default function IntegrationsPage() {
   const { toast } = useToast();
+  const txs = useTransactions();
   const endpoint = useMemo(() => exportCampaignPerformanceEndpoint(), []);
   const [apiKeys, setApiKeys] = useState<ApiKeyRecord[]>([]);
   const [logs, setLogs] = useState<ApiExportLogRecord[]>([]);
+  const [capsuledStatus, setCapsuledStatus] = useState<CapsuledFacebookSyncMetadata | null>(null);
+  const [capsuledDiagnostics, setCapsuledDiagnostics] = useState<FbTrafficDiagnosticsResult | null>(null);
+  const [capsuledFilters, setCapsuledFilters] = useState(DEFAULT_CAPSULED_FILTERS);
+  const [capsuledSyncing, setCapsuledSyncing] = useState<"sync" | "force" | null>(null);
   const [loading, setLoading] = useState(false);
   const [creating, setCreating] = useState(false);
   const [revokingId, setRevokingId] = useState<string | null>(null);
@@ -112,16 +154,35 @@ export default function IntegrationsPage() {
   const [testFilters, setTestFilters] = useState(DEFAULT_TEST_FILTERS);
   const [testing, setTesting] = useState(false);
   const [testResponse, setTestResponse] = useState<string>("");
+  const [clickHouseHealth, setClickHouseHealth] = useState<ClickHouseHealth | null>(null);
+  const [clickHouseSummary, setClickHouseSummary] = useState<ClickHouseSummary | null>(null);
+  const [clickHouseLastBackfill, setClickHouseLastBackfill] = useState<ClickHouseBackfillResult | null>(null);
+  const [clickHouseValidation, setClickHouseValidation] = useState<ClickHouseValidationProgress | null>(null);
+  const [clickHouseValidationRunning, setClickHouseValidationRunning] = useState(false);
+  const clickHouseValidationStopRef = useRef(false);
+  const clickHouseValidationInFlightRef = useRef(false);
+  const [clickHouseTesting, setClickHouseTesting] = useState(false);
+  const [clickHouseAction, setClickHouseAction] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const [keys, exportLogs] = await Promise.all([
+      const [keys, exportLogs, status, rows, chSummary] = await Promise.all([
         listApiKeys(),
         listApiExportLogs(20),
+        getCapsuledFacebookStatus().catch(() => null),
+        listCapsuledFacebookRows().catch(() => []),
+        getClickHouseSummary().catch(() => null),
       ]);
       setApiKeys(keys);
       setLogs(exportLogs);
+      setCapsuledStatus(status);
+      setClickHouseSummary(chSummary);
+      const warehouseCampaignIds = txs
+        .filter((tx) => tx.status === "success" && tx.transaction_type === "trial")
+        .map(campaignIdForTransaction)
+        .filter((id) => id !== UNKNOWN_CAMPAIGN_ID);
+      setCapsuledDiagnostics(buildFbTrafficDiagnostics({ warehouseCampaignIds, capsuledRows: rows, selectedLevel: "campaign", latestSyncMetadata: status }));
     } catch (error) {
       toast({
         title: "Could not load integrations",
@@ -131,7 +192,7 @@ export default function IntegrationsPage() {
     } finally {
       setLoading(false);
     }
-  }, [toast]);
+  }, [toast, txs]);
 
   useEffect(() => {
     void refresh();
@@ -226,10 +287,407 @@ export default function IntegrationsPage() {
     }
   }
 
+  async function onTestClickHouse() {
+    setClickHouseTesting(true);
+    try {
+      const health = await testClickHouseConnection();
+      setClickHouseHealth(health);
+      toast({
+        title: health.connected ? "ClickHouse connected" : "ClickHouse not connected",
+        description: health.connected
+          ? `SELECT 1 succeeded${health.latency_ms != null ? ` in ${health.latency_ms} ms` : ""}.`
+          : health.error ?? "Connection could not be verified.",
+        variant: health.connected ? undefined : "destructive",
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown error";
+      setClickHouseHealth({ connected: false, error: message });
+      toast({ title: "ClickHouse test failed", description: message, variant: "destructive" });
+    } finally {
+      setClickHouseTesting(false);
+    }
+  }
+
+  async function runClickHouseAction<T>(action: string, work: () => Promise<T>, success: (result: T) => string) {
+    setClickHouseAction(action);
+    try {
+      const result = await work();
+      toast({ title: "ClickHouse updated", description: success(result) });
+      const [health, summary] = await Promise.all([
+        testClickHouseConnection().catch(() => null),
+        getClickHouseSummary().catch(() => null),
+      ]);
+      if (health) setClickHouseHealth(health);
+      setClickHouseSummary(summary);
+      return result;
+    } catch (error) {
+      toast({
+        title: "ClickHouse action failed",
+        description: error instanceof Error ? error.message : "Unknown error",
+        variant: "destructive",
+      });
+      return null;
+    } finally {
+      setClickHouseAction(null);
+    }
+  }
+
+  async function onInitializeClickHouse() {
+    await runClickHouseAction("init", initializeClickHouseSchema, (result) =>
+      `Schema ready: ${result.columns_count} columns, ${result.current_row_count.toLocaleString("en-US")} rows.`,
+    );
+  }
+
+  async function onBackfillClickHouse(mode: "continue" | "full_backfill", controlled = false) {
+    if (mode === "full_backfill" && !window.confirm("Run a full ClickHouse backfill from the beginning? This will not truncate ClickHouse or delete Supabase data.")) {
+      return;
+    }
+    const result = await runClickHouseAction(
+      controlled ? "controlled_backfill" : mode,
+      () => runClickHouseBackfill({
+        mode,
+        batch_size: controlled ? 1000 : 2000,
+        max_batches: controlled ? 2 : 10,
+        dry_run: false,
+        full_reset_cursor: mode === "full_backfill",
+      }),
+      (backfill) => `${backfill.status}: inserted ${backfill.rows_inserted.toLocaleString("en-US")} rows, stopped: ${backfill.stopped_reason}.`,
+    );
+    if (result) setClickHouseLastBackfill(result);
+  }
+
+  // Resumable validation: one Edge call processes a bounded chunk; the client
+  // loops start -> continue -> ... until completed/failed/stopped. Requests are
+  // strictly sequential (each awaited before the next) so they never overlap.
+  async function runValidationLoop(initialAction: "start" | "continue") {
+    if (clickHouseValidationInFlightRef.current || clickHouseValidationRunning) return;
+    clickHouseValidationStopRef.current = false;
+    setClickHouseValidationRunning(true);
+    let action: "start" | "continue" = initialAction;
+    try {
+      for (;;) {
+        clickHouseValidationInFlightRef.current = true;
+        let progress: ClickHouseValidationProgress;
+        try {
+          progress = await runClickHouseValidation({
+            action,
+            validation_scope: "imported_cursor_range",
+            page_size: 500,
+            max_pages: 3,
+          });
+        } finally {
+          clickHouseValidationInFlightRef.current = false;
+        }
+        setClickHouseValidation(progress);
+
+        if (progress.completed || progress.status === "completed") {
+          toast({
+            title: `Validation ${progress.parity_status ?? "completed"}`,
+            description: `${formatNumber(progress.source_rows)} source rows · missing ${progress.missing_ids ?? 0} · extra ${progress.extra_ids ?? 0} · duplicates ${progress.duplicate_ids ?? 0}.`,
+            variant: progress.parity_status === "PASS" ? undefined : "destructive",
+          });
+          break;
+        }
+        if (progress.status === "failed" || progress.stopped_reason === "source_error" || progress.stopped_reason === "clickhouse_error") {
+          toast({
+            title: "Validation paused",
+            description: `Stopped: ${progress.stopped_reason ?? "error"}. Progress saved — press Continue to resume.`,
+            variant: "destructive",
+          });
+          break;
+        }
+        if (clickHouseValidationStopRef.current) {
+          toast({ title: "Validation paused", description: "Stopped by user — press Continue to resume." });
+          break;
+        }
+        action = "continue";
+      }
+    } catch (error) {
+      toast({ title: "Validation failed", description: error instanceof Error ? error.message : "Unknown error", variant: "destructive" });
+    } finally {
+      clickHouseValidationInFlightRef.current = false;
+      setClickHouseValidationRunning(false);
+      getClickHouseSummary().then((summary) => setClickHouseSummary(summary)).catch(() => undefined);
+    }
+  }
+
+  function onStartValidation() {
+    void runValidationLoop("start");
+  }
+  function onContinueValidation() {
+    void runValidationLoop("continue");
+  }
+  function onStopValidation() {
+    clickHouseValidationStopRef.current = true;
+  }
+  async function onResetValidation() {
+    clickHouseValidationStopRef.current = true;
+    if (clickHouseValidationInFlightRef.current) return;
+    try {
+      const progress = await runClickHouseValidation({ action: "reset", validation_scope: "imported_cursor_range" });
+      setClickHouseValidation(progress);
+      toast({ title: "Validation reset", description: "Validation progress cleared. ClickHouse and warehouse data untouched." });
+    } catch (error) {
+      toast({ title: "Reset failed", description: error instanceof Error ? error.message : "Unknown error", variant: "destructive" });
+    }
+  }
+
+  async function onCapsuledSync(force: boolean) {
+    setCapsuledSyncing(force ? "force" : "sync");
+    try {
+      const result = await syncCapsuledFacebookStats({ ...capsuledFilters, force });
+      setCapsuledStatus(result.metadata);
+      const warehouseCampaignIds = txs
+        .filter((tx) => tx.status === "success" && tx.transaction_type === "trial")
+        .map(campaignIdForTransaction)
+        .filter((id) => id !== UNKNOWN_CAMPAIGN_ID);
+      const diagnostics = buildFbTrafficDiagnostics({ warehouseCampaignIds, capsuledRows: result.rows, selectedLevel: "campaign", latestSyncMetadata: result.metadata });
+      setCapsuledDiagnostics(diagnostics);
+      toast({
+        title: force ? "Capsuled force resync complete" : "Capsuled sync complete",
+        description: `Imported ${result.metadata.rowsImported} rows. Matched ${diagnostics.summary.matched_campaign_ids_count} Campaign IDs.`,
+      });
+      void refresh();
+    } catch (error) {
+      toast({
+        title: "Capsuled sync failed",
+        description: error instanceof Error ? error.message : "Unknown error",
+        variant: "destructive",
+      });
+    } finally {
+      setCapsuledSyncing(null);
+    }
+  }
+
   return (
     <AppLayout title="Integrations" description="Secure export access for external platforms">
       <section className="mb-4">
         <ExportApiHealth />
+      </section>
+
+      <section className="mb-4">
+        <Card className="p-4 shadow-card">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <div className="flex items-center gap-2">
+                <Plug className="h-4 w-4 text-primary" />
+                <h2 className="text-sm font-semibold text-foreground">Capsuled Facebook</h2>
+              </div>
+              <p className="mt-1 text-xs text-muted-foreground">Facebook metrics sync through the Supabase Edge Function only.</p>
+            </div>
+            <div className="text-right text-xs">
+              <div className="text-muted-foreground">Status</div>
+              <div className="mt-1 font-medium text-foreground">
+                {capsuledStatus?.connected ? "Connected" : capsuledStatus?.status === "failed" ? "Failed" : "Not synced"}
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-4 grid gap-3 md:grid-cols-3 xl:grid-cols-6">
+            <div className="space-y-2">
+              <Label className="text-xs text-muted-foreground">dateFrom</Label>
+              <Input
+                type="date"
+                value={capsuledFilters.dateFrom}
+                onChange={(event) => setCapsuledFilters((current) => ({ ...current, dateFrom: event.target.value }))}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label className="text-xs text-muted-foreground">dateTo</Label>
+              <Input
+                type="date"
+                value={capsuledFilters.dateTo}
+                onChange={(event) => setCapsuledFilters((current) => ({ ...current, dateTo: event.target.value }))}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label className="text-xs text-muted-foreground">level</Label>
+              <Select
+                value={capsuledFilters.level}
+                onValueChange={(value) => setCapsuledFilters((current) => ({ ...current, level: value as CapsuledFacebookLevel }))}
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {CAPSULED_FACEBOOK_LEVELS.map((level) => (
+                    <SelectItem key={level} value={level}>{level}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="flex items-end">
+              <Button type="button" className="w-full" onClick={() => onCapsuledSync(false)} disabled={Boolean(capsuledSyncing)}>
+                {capsuledSyncing === "sync" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                Sync
+              </Button>
+            </div>
+            <div className="flex items-end">
+              <Button type="button" variant="outline" className="w-full" onClick={() => onCapsuledSync(true)} disabled={Boolean(capsuledSyncing)}>
+                {capsuledSyncing === "force" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                Force Resync
+              </Button>
+            </div>
+            <div className="flex items-end">
+              <Button type="button" variant="outline" className="w-full" onClick={refresh} disabled={loading || Boolean(capsuledSyncing)}>
+                {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                Refresh
+              </Button>
+            </div>
+          </div>
+
+          <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+            <div><span className="text-xs text-muted-foreground">Last Sync</span><div className="text-sm font-medium">{formatDateTime(capsuledStatus?.lastSync ?? null)}</div></div>
+            <div><span className="text-xs text-muted-foreground">Last Status</span><div className="text-sm font-medium">{capsuledStatus?.status ?? "unknown"}</div></div>
+            <div><span className="text-xs text-muted-foreground">Last Level</span><div className="text-sm font-medium">{capsuledStatus?.level ?? "-"}</div></div>
+            <div><span className="text-xs text-muted-foreground">Last Date Range</span><div className="text-sm font-medium">{capsuledStatus?.dateFrom ?? "-"} to {capsuledStatus?.dateTo ?? "-"}</div></div>
+            <div><span className="text-xs text-muted-foreground">Rows Imported</span><div className="text-sm font-medium">{capsuledStatus?.rowsImported?.toLocaleString("en-US") ?? "0"}</div></div>
+            <div><span className="text-xs text-muted-foreground">API Freshness</span><div className="text-sm font-medium">{capsuledStatus?.apiFreshness ?? "-"}</div></div>
+            <div><span className="text-xs text-muted-foreground">Facebook Stats Date</span><div className="text-sm font-medium">{capsuledStatus?.facebookStatsDate ?? "-"}</div></div>
+            <div><span className="text-xs text-muted-foreground">Sync Duration</span><div className="text-sm font-medium">{capsuledStatus?.syncDurationMs == null ? "-" : `${capsuledStatus.syncDurationMs} ms`}</div></div>
+            <div><span className="text-xs text-muted-foreground">Unique Campaign IDs</span><div className="text-sm font-medium">{capsuledDiagnostics?.summary.capsuled_unique_campaign_ids_count.toLocaleString("en-US") ?? "0"}</div></div>
+            <div><span className="text-xs text-muted-foreground">Rows without Campaign ID</span><div className="text-sm font-medium">{capsuledDiagnostics?.summary.missing_campaign_id_rows_count.toLocaleString("en-US") ?? "0"}</div></div>
+            <div><span className="text-xs text-muted-foreground">Rows without Spend</span><div className="text-sm font-medium">{capsuledDiagnostics?.summary.rows_without_spend_count.toLocaleString("en-US") ?? "0"}</div></div>
+            <div><span className="text-xs text-muted-foreground">Duplicate Campaign IDs</span><div className="text-sm font-medium">{capsuledDiagnostics?.summary.duplicate_capsuled_campaign_ids_count.toLocaleString("en-US") ?? "0"}</div></div>
+            <div><span className="text-xs text-muted-foreground">Total Spend</span><div className="text-sm font-medium">${(capsuledDiagnostics?.summary.total_spend ?? 0).toLocaleString("en-US")}</div></div>
+            <div><span className="text-xs text-muted-foreground">FB Purchases</span><div className="text-sm font-medium">{(capsuledDiagnostics?.summary.total_fb_purchases ?? 0).toLocaleString("en-US")}</div></div>
+            <div><span className="text-xs text-muted-foreground">Failed Requests</span><div className="text-sm font-medium">{capsuledStatus?.failedRequests.length ?? 0}</div></div>
+            <div><span className="text-xs text-muted-foreground">Last API response</span><div className="truncate text-sm font-medium">{capsuledStatus?.lastApiResponse ?? "-"}</div></div>
+          </div>
+        </Card>
+      </section>
+
+      <section className="mb-4">
+        <Card className="p-4 shadow-card">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <div className="flex items-center gap-2">
+                <Plug className="h-4 w-4 text-primary" />
+                <h2 className="text-sm font-semibold text-foreground">ClickHouse Analytics Warehouse</h2>
+              </div>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Server-side connection only. Credentials are read from Supabase Edge Function Secrets and never exposed to the browser.
+              </p>
+            </div>
+            <div className="text-right text-xs">
+              <div className="text-muted-foreground">Status</div>
+              <div
+                className={`mt-1 font-medium ${
+                  clickHouseHealth?.connected
+                    ? "text-success"
+                    : clickHouseHealth
+                      ? "text-destructive"
+                      : "text-muted-foreground"
+                }`}
+              >
+                {clickHouseStatusLabel(clickHouseHealth)}
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-4 flex flex-wrap items-center gap-3">
+            <Button type="button" onClick={onTestClickHouse} disabled={clickHouseTesting}>
+              {clickHouseTesting ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+              Test Connection
+            </Button>
+            <Button type="button" variant="outline" onClick={onInitializeClickHouse} disabled={Boolean(clickHouseAction)}>
+              {clickHouseAction === "init" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
+              Initialize Schema
+            </Button>
+            <Button type="button" variant="outline" onClick={() => onBackfillClickHouse("continue", true)} disabled={Boolean(clickHouseAction)}>
+              {clickHouseAction === "controlled_backfill" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+              Run Controlled Backfill
+            </Button>
+            <Button type="button" variant="outline" onClick={() => onBackfillClickHouse("continue")} disabled={Boolean(clickHouseAction)}>
+              {clickHouseAction === "continue" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+              Continue Backfill
+            </Button>
+            <Button type="button" variant="outline" onClick={() => onBackfillClickHouse("full_backfill")} disabled={Boolean(clickHouseAction)}>
+              {clickHouseAction === "full_backfill" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+              Run Full Backfill
+            </Button>
+            <Button type="button" variant="outline" onClick={onStartValidation} disabled={clickHouseValidationRunning || Boolean(clickHouseAction)}>
+              {clickHouseValidationRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
+              Start Validation
+            </Button>
+            <Button type="button" variant="outline" onClick={onContinueValidation} disabled={clickHouseValidationRunning || Boolean(clickHouseAction)}>
+              <RefreshCw className="h-4 w-4" />
+              Continue Validation
+            </Button>
+            {clickHouseValidationRunning && (
+              <Button type="button" variant="outline" onClick={onStopValidation}>
+                Stop Validation
+              </Button>
+            )}
+            <Button type="button" variant="outline" onClick={onResetValidation} disabled={clickHouseValidationRunning}>
+              <ShieldOff className="h-4 w-4" />
+              Reset Validation
+            </Button>
+            <Button type="button" variant="outline" onClick={refresh} disabled={loading || Boolean(clickHouseAction)}>
+              {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+              Refresh Status
+            </Button>
+            {clickHouseHealth && (
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                {clickHouseHealth.database && (
+                  <span>
+                    database: <span className="font-mono text-foreground">{clickHouseHealth.database}</span>
+                  </span>
+                )}
+                {clickHouseHealth.latency_ms != null && (
+                  <span>
+                    latency: <span className="font-medium text-foreground">{clickHouseHealth.latency_ms} ms</span>
+                  </span>
+                )}
+                {clickHouseHealth.connected && (
+                  <span className="text-success">SELECT 1 OK</span>
+                )}
+              </div>
+            )}
+          </div>
+
+          <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+            <div><span className="text-xs text-muted-foreground">Connection</span><div className="text-sm font-medium">{clickHouseStatusLabel(clickHouseHealth)}</div></div>
+            <div><span className="text-xs text-muted-foreground">Database</span><div className="text-sm font-medium">{clickHouseHealth?.database ?? "-"}</div></div>
+            <div><span className="text-xs text-muted-foreground">Latency</span><div className="text-sm font-medium">{clickHouseHealth?.latency_ms == null ? "-" : `${clickHouseHealth.latency_ms} ms`}</div></div>
+            <div><span className="text-xs text-muted-foreground">Table exists</span><div className="text-sm font-medium">{clickHouseSummary?.error ? "Unknown" : clickHouseSummary ? "Yes" : "-"}</div></div>
+            <div><span className="text-xs text-muted-foreground">Current ClickHouse rows</span><div className="text-sm font-medium">{formatNumber(clickHouseSummary?.transaction_count ?? clickHouseSummary?.sync_state?.clickhouse_total ?? null)}</div></div>
+            <div><span className="text-xs text-muted-foreground">Status</span><div className="text-sm font-medium">{clickHouseSummary?.sync_state?.status ?? "never_started"}</div></div>
+            <div><span className="text-xs text-muted-foreground">Current stage</span><div className="text-sm font-medium">{clickHouseSummary?.sync_state?.current_stage ?? "-"}</div></div>
+            <div><span className="text-xs text-muted-foreground">Rows scanned</span><div className="text-sm font-medium">{formatNumber(clickHouseSummary?.sync_state?.rows_scanned)}</div></div>
+            <div><span className="text-xs text-muted-foreground">Rows inserted</span><div className="text-sm font-medium">{formatNumber(clickHouseSummary?.sync_state?.rows_inserted)}</div></div>
+            <div><span className="text-xs text-muted-foreground">Rows skipped</span><div className="text-sm font-medium">{formatNumber(clickHouseSummary?.sync_state?.rows_skipped)}</div></div>
+            <div><span className="text-xs text-muted-foreground">Batches processed</span><div className="text-sm font-medium">{formatNumber(clickHouseSummary?.sync_state?.batches_processed)}</div></div>
+            <div><span className="text-xs text-muted-foreground">Last cursor</span><div className="truncate text-sm font-medium">{clickHouseSummary?.sync_state?.cursor_updated_at ?? "-"}</div></div>
+            <div><span className="text-xs text-muted-foreground">Stopped reason</span><div className="text-sm font-medium">{clickHouseLastBackfill?.stopped_reason ?? clickHouseSummary?.sync_state?.stopped_reason ?? "-"}</div></div>
+            <div><span className="text-xs text-muted-foreground">Last sync</span><div className="text-sm font-medium">{formatDateTime(clickHouseSummary?.sync_state?.finished_at ?? null)}</div></div>
+            <div><span className="text-xs text-muted-foreground">Duration</span><div className="text-sm font-medium">{clickHouseSummary?.sync_state?.duration_ms == null ? "-" : `${clickHouseSummary.sync_state.duration_ms} ms`}</div></div>
+            <div><span className="text-xs text-muted-foreground">Validation</span><div className="text-sm font-medium">{clickHouseValidation?.parity_status ?? clickHouseSummary?.sync_state?.parity_status ?? "Never run"}</div></div>
+            <div><span className="text-xs text-muted-foreground">Validation status</span><div className="text-sm font-medium">{clickHouseValidation?.status ?? "-"}</div></div>
+            <div><span className="text-xs text-muted-foreground">Validation stage</span><div className="text-sm font-medium">{clickHouseValidation?.stage ?? "-"}</div></div>
+            <div><span className="text-xs text-muted-foreground">Rows processed / expected</span><div className="text-sm font-medium">{formatNumber(clickHouseValidation?.rows_processed)} / {formatNumber(clickHouseValidation?.source_rows_expected ?? null)}</div></div>
+            <div><span className="text-xs text-muted-foreground">Progress</span><div className="text-sm font-medium">{clickHouseValidation ? `${clickHouseValidation.progress_percent}%` : "-"}</div></div>
+            <div><span className="text-xs text-muted-foreground">Pages processed</span><div className="text-sm font-medium">{formatNumber(clickHouseValidation?.pages_processed)}</div></div>
+            <div><span className="text-xs text-muted-foreground">Validation cursor</span><div className="truncate text-sm font-medium">{clickHouseValidation?.current_cursor?.updated_at ?? "-"}</div></div>
+            <div><span className="text-xs text-muted-foreground">Validation stopped reason</span><div className="text-sm font-medium">{clickHouseValidation?.stopped_reason ?? "-"}</div></div>
+            <div><span className="text-xs text-muted-foreground">Source rows</span><div className="text-sm font-medium">{formatNumber(clickHouseValidation?.source_rows ?? clickHouseSummary?.sync_state?.source_total ?? null)}</div></div>
+            <div><span className="text-xs text-muted-foreground">Missing IDs</span><div className="text-sm font-medium">{formatNumber(clickHouseValidation?.missing_ids ?? null)}</div></div>
+            <div><span className="text-xs text-muted-foreground">Extra IDs</span><div className="text-sm font-medium">{formatNumber(clickHouseValidation?.extra_ids ?? null)}</div></div>
+            <div><span className="text-xs text-muted-foreground">Duplicate IDs</span><div className="text-sm font-medium">{formatNumber(clickHouseValidation?.duplicate_ids ?? null)}</div></div>
+            <div><span className="text-xs text-muted-foreground">Gross difference</span><div className="text-sm font-medium">{formatMoney(clickHouseValidation?.gross_difference ?? null)}</div></div>
+            <div><span className="text-xs text-muted-foreground">Net difference</span><div className="text-sm font-medium">{formatMoney(clickHouseValidation?.net_difference ?? null)}</div></div>
+            <div><span className="text-xs text-muted-foreground">Refund difference</span><div className="text-sm font-medium">{formatMoney(clickHouseValidation?.refund_difference ?? null)}</div></div>
+          </div>
+
+          {(clickHouseHealth?.error || clickHouseSummary?.error || clickHouseSummary?.sync_state?.last_error) && (
+            <div className="mt-3 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-xs text-destructive">
+              {clickHouseHealth?.error ?? clickHouseSummary?.error ?? clickHouseSummary?.sync_state?.last_error}
+            </div>
+          )}
+          <p className="mt-3 text-xs text-muted-foreground">
+            Phase 2 only initializes, backfills, and validates the warehouse. Analytics pages still read their existing sources.
+          </p>
+        </Card>
       </section>
 
       <section className="grid gap-4 xl:grid-cols-[minmax(0,1.1fr)_minmax(360px,0.9fr)]">

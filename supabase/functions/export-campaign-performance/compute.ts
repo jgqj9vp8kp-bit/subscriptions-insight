@@ -168,10 +168,11 @@ function utmSourceFor(tx: ComputeTxn): string | null {
 }
 
 function mediaBuyerFromUtmSource(value: unknown): string {
+  // Must match MEDIA_BUYER_BY_UTM_SOURCE in src/services/userMediaBuyer.ts.
   const normalized = normalize(value);
   if (normalized === "4") return "Ivan";
-  if (normalized === "22") return "Artem A";
-  if (normalized === "19") return "Artem D";
+  if (normalized === "19") return "Artem A";
+  if (normalized === "22") return "Artem D";
   return "Unknown";
 }
 

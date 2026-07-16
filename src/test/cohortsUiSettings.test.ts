@@ -307,6 +307,51 @@ describe("cohorts UI settings", () => {
     ]);
   });
 
+  it("appends Support columns to old saved views", () => {
+    const supportDefaults: CohortsUiSettingsDefaults = {
+      ...defaults,
+      defaultColumnOrder: ["cohort_date", "campaign_path", "trial_users", "support_users", "support_rate", "net_revenue"],
+      defaultColumnWidths: {
+        ...defaults.defaultColumnWidths,
+        support_users: 110,
+        support_rate: 110,
+      },
+      defaultColumnVisibility: {
+        ...defaults.defaultColumnVisibility,
+        support_users: true,
+        support_rate: true,
+      },
+      validWidthKeys: [...defaults.validWidthKeys, "support_users", "support_rate"],
+      validSortColumnIds: [...defaults.validSortColumnIds, "support_users", "support_rate"],
+    };
+
+    expect(sanitizeColumnOrder(["campaign_path", "trial_users"], supportDefaults.defaultColumnOrder)).toEqual([
+      "campaign_path",
+      "trial_users",
+      "cohort_date",
+      "support_users",
+      "support_rate",
+      "net_revenue",
+    ]);
+
+    const payload = buildCohortsUiSettingsPayload(
+      {
+        columnOrder: ["trial_users"],
+        columnWidths: {},
+        columnVisibility: { trial_users: true },
+        selectedView: null,
+        savedViews: [],
+        filters: {},
+        updatedAt: "2026-05-09T12:00:00.000Z",
+      },
+      supportDefaults,
+    );
+    expect(payload.columnOrder).toContain("support_users");
+    expect(payload.columnOrder).toContain("support_rate");
+    expect(payload.columnVisibility.support_users).toBe(true);
+    expect(payload.columnVisibility.support_rate).toBe(true);
+  });
+
   it("removes duplicate column IDs", () => {
     expect(sanitizeColumnOrder(["net_revenue", "net_revenue", "trial_users"], defaults.defaultColumnOrder)).toEqual([
       "net_revenue",

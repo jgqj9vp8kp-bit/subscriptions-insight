@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDown, ArrowUp, ArrowUpDown, Check, ChevronDown, Search, X } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { Button } from "@/components/ui/button";
@@ -24,6 +24,13 @@ import {
 } from "@/components/ui/table";
 import { useTransactions } from "@/services/sheets";
 import { computeCohorts, computeUsers, formatCurrency } from "@/services/analytics";
+import { usersDataSourceMode, type UsersQuery } from "@/services/usersDataSource";
+import { useAuth } from "@/hooks/useAuth";
+import { hashUserScope } from "@/services/analyticsCache";
+import { useWarehouseVersion } from "@/hooks/useAnalyticsCache";
+import { useUsersData } from "@/hooks/useUsersCache";
+import { formatUpdatedAgo } from "@/services/analyticsProgress";
+import { Progress } from "@/components/ui/progress";
 import { formatDateKey, toDateKey } from "@/services/dateKeys";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
@@ -42,6 +49,7 @@ import { useDataStore } from "@/store/dataStore";
 import { cn } from "@/lib/utils";
 import type { CardType, CohortRow, DeclineReason, DeclineStage, Transaction, UserAggregate } from "@/services/types";
 import { buildCohortId } from "@/services/cohortIdentity";
+import { traceEvent, traceMark, traceMeasure } from "@/services/performanceTrace";
 
 type SortKey =
   | "card_type"
@@ -341,8 +349,18 @@ function declineStageBarClass(stage: DeclineStage): string {
   return "bg-muted-foreground/50";
 }
 
+// Render the user table one page at a time so the DOM stays bounded for large
+// accounts. Summary/decline/totals are still computed over the full set.
+const USERS_PAGE_SIZE = 50;
+
 export default function UsersPage() {
   const txs = useTransactions();
+  const mountedRef = useRef(false);
+  const firstRowsRef = useRef(false);
+  if (!mountedRef.current) {
+    mountedRef.current = true;
+    traceMark("route.users.mounted");
+  }
   const rawPalmerRows = useDataStore((s) => s.rawPalmerRows);
   const subscriptions = useDataStore((s) => s.subscriptions);
   const [uiState, setUiState] = usePersistedPageState("ui_state_users", DEFAULT_USERS_UI_STATE);
@@ -406,9 +424,81 @@ export default function UsersPage() {
     [rawDeclineAnalyticsStages],
   );
 
+  // --- ClickHouse Users read path (Phase 9-11) --------------------------
+  // clickhouse (default): the Edge Function drives the table with server-side
+  // filtering/sorting/pagination and the browser performs NO transaction scan.
+  // Legacy is the fallback when: the flag is legacy, ClickHouse errors, a cohort
+  // selection is active (not reproduced server-side), or the Decline Analytics
+  // tab is open (it aggregates client-side — documented boundary).
+  const usersSource = useMemo(() => usersDataSourceMode(), []);
+  const { user } = useAuth();
+  const userScopeHash = useMemo(() => hashUserScope(user?.id), [user?.id]);
+  const { version: warehouseVersion, ready: warehouseVersionReady } = useWarehouseVersion(usersSource === "clickhouse");
+  const [appliedSearch] = useDebouncedValue(search, 300);
+  const [page, setPage] = useState(1);
+  // ClickHouse server-side query: filters + sort + pagination. Assembled here
+  // (before the fallback decision) so the cached list/summary status drives
+  // needLegacy. The QueryClient lives above the router, so this cache survives
+  // route unmount/remount — returning to Users renders cached rows instantly.
+  const usersQuery = useMemo<UsersQuery>(
+    () => ({
+      search: appliedSearch,
+      firstTrialFrom,
+      firstTrialTo,
+      firstSub: firstSubFilter,
+      refund: refundFilter,
+      paymentFailed: paymentFailedFilter,
+      failedAttempts: failedAttemptsFilter,
+      campaignPath: campaignPathFilter,
+      country: countryFilter,
+      cardTypes: selectedCardTypes,
+      declineReasons: selectedDeclineReasons,
+      sortField: sortKey,
+      sortDir,
+      page,
+      pageSize: USERS_PAGE_SIZE,
+    }),
+    [appliedSearch, firstTrialFrom, firstTrialTo, firstSubFilter, refundFilter, paymentFailedFilter, failedAttemptsFilter, campaignPathFilter, countryFilter, selectedCardTypes, selectedDeclineReasons, sortKey, sortDir, page],
+  );
+  const hasSelectedCohortsRaw = Array.isArray(rawSelectedCohortIds) && rawSelectedCohortIds.length > 0;
+  const usersServerEligible = usersSource === "clickhouse" && !hasSelectedCohortsRaw && mode !== "decline_analytics";
+  const {
+    chUsers,
+    chSummary,
+    chOptions,
+    chStatus,
+    isBackgroundRefreshing,
+    isInitialLoading,
+    progressPercent,
+    dataUpdatedAt,
+  } = useUsersData({
+    query: usersQuery,
+    userScopeHash,
+    warehouseVersion,
+    enabled: usersServerEligible && warehouseVersionReady,
+  });
+  // Legacy fallback (unchanged emergency path): legacy flag, a cohort selection /
+  // Decline tab (not reproduced server-side), or a ClickHouse error WITH no cached
+  // rows to keep showing. A failed background refresh keeps the cached rows.
+  const usersNeedLegacy = !usersServerEligible || (chStatus.error !== null && chUsers == null);
+  const usersClickHouseDriving = usersServerEligible && chUsers != null;
+  useEffect(() => {
+    traceEvent("users.legacy_state", {
+      need_legacy: usersNeedLegacy,
+      server_eligible: usersServerEligible,
+      has_clickhouse_result: chUsers != null,
+      has_error: chStatus.error != null,
+      mode,
+      cohort_filter_active: hasSelectedCohortsRaw,
+    });
+  }, [usersNeedLegacy, usersServerEligible, chUsers, chStatus.error, mode, hasSelectedCohortsRaw]);
+
+  // In ClickHouse mode the legacy compute + all transaction-derived memos run on
+  // an EMPTY list, so the Users route performs no warehouse scan. Real
+  // transactions are only used for the legacy fallback / Decline tab.
   const analyticsTxs = useMemo(
-    () => enrichTransactionDeclinesFromRawRows(backfillTransactionCardTypesFromRawRows(txs, rawPalmerRows), rawPalmerRows),
-    [txs, rawPalmerRows],
+    () => (usersNeedLegacy ? enrichTransactionDeclinesFromRawRows(backfillTransactionCardTypesFromRawRows(txs, rawPalmerRows), rawPalmerRows) : []),
+    [usersNeedLegacy, txs, rawPalmerRows],
   );
   const declineStagesByTransaction = useMemo(() => classifyDeclineStagesForTransactions(analyticsTxs), [analyticsTxs]);
   const cohorts = useMemo(() => computeCohorts(analyticsTxs, subscriptions), [analyticsTxs, subscriptions]);
@@ -435,12 +525,18 @@ export default function UsersPage() {
     [users, cohortByUser, campaignPathByUser, userSubscriptionFlags]
   );
   const campaignPathOptions = useMemo(
-    () => Array.from(new Set(usersWithCampaignPath.map((user) => user.campaign_path || "unknown"))).sort(),
-    [usersWithCampaignPath]
+    () =>
+      usersClickHouseDriving && chOptions
+        ? chOptions.campaign_path
+        : Array.from(new Set(usersWithCampaignPath.map((user) => user.campaign_path || "unknown"))).sort(),
+    [usersClickHouseDriving, chOptions, usersWithCampaignPath]
   );
   const countryOptions = useMemo(
-    () => Array.from(new Set(usersWithCampaignPath.map((user) => user.country_code).filter(Boolean) as string[])).sort(),
-    [usersWithCampaignPath]
+    () =>
+      usersClickHouseDriving && chOptions
+        ? chOptions.country.map((c) => c.country_code)
+        : Array.from(new Set(usersWithCampaignPath.map((user) => user.country_code).filter(Boolean) as string[])).sort(),
+    [usersClickHouseDriving, chOptions, usersWithCampaignPath]
   );
   const selectedCohortIdSet = useMemo(() => new Set(selectedCohortIds), [selectedCohortIds]);
   const selectedCohortMatchIdSet = useMemo(() => cohortSelectionMatchIds(selectedCohortIds), [selectedCohortIds]);
@@ -475,7 +571,6 @@ export default function UsersPage() {
   // keeps showing `search` instantly while the O(users) filter pass keys off the debounced value.
   // Every other Users filter stays synchronous because its heavy inputs (cohorts/users) are derived
   // from the dataset, not the filters — those memos do not re-run on a filter click.
-  const [appliedSearch] = useDebouncedValue(search, 300);
   const filtered = useMemo(() => {
     const q = appliedSearch.trim().toLowerCase();
     const fromDateKey = toDateKey(firstTrialFrom);
@@ -522,8 +617,6 @@ export default function UsersPage() {
   // Render the user table one page at a time so the DOM stays bounded for large accounts. Summary,
   // decline analytics and every total below are still computed from the full `filtered` set, so
   // pagination changes only what is rendered — never any metric.
-  const USERS_PAGE_SIZE = 50;
-  const [page, setPage] = useState(1);
   useEffect(() => {
     // `filtered` is memoized, so this fires only when the filter/sort set actually changes.
     setPage(1);
@@ -535,7 +628,45 @@ export default function UsersPage() {
     [filtered, safePage],
   );
 
+  // Reset to page 1 when the filter/sort set (excluding page) changes server-side.
+  const usersFilterKey = useMemo(() => JSON.stringify({ ...usersQuery, page: 0 }), [usersQuery]);
+  useEffect(() => {
+    if (!usersServerEligible) return;
+    setPage(1);
+  }, [usersFilterKey, usersServerEligible]);
+  // ClickHouse drives the rendered table + pagination when active; else legacy.
+  const tableRows = usersClickHouseDriving && chUsers ? chUsers.rows : pagedUsers;
+  const displayTotal = usersClickHouseDriving && chUsers ? chUsers.total : filtered.length;
+  const displayTotalPages = usersClickHouseDriving && chUsers ? chUsers.totalPages : totalPages;
+  const displaySafePage = usersClickHouseDriving && chUsers ? Math.min(page, displayTotalPages) : safePage;
+  useEffect(() => {
+    if (firstRowsRef.current || tableRows.length === 0) return;
+    firstRowsRef.current = true;
+    traceMark("users.first_table_row_rendered", {
+      row_count: tableRows.length,
+      source: usersClickHouseDriving ? "clickhouse" : "legacy",
+      cached_or_network: chUsers != null && isBackgroundRefreshing ? "cached_refreshing" : chUsers != null ? "query_data" : "legacy",
+    });
+    traceMeasure("users.time_to_first_row", "route.users.mounted", "users.first_table_row_rendered", { row_count: tableRows.length });
+  }, [tableRows.length, usersClickHouseDriving, chUsers, isBackgroundRefreshing]);
+
   const summary = useMemo(() => {
+    // ClickHouse mode: summary cards come from the server (over the full filtered
+    // set, not just the rendered page) — no browser transaction scan.
+    if (usersClickHouseDriving && chSummary) {
+      return {
+        users: chSummary.total_users,
+        trial_users: chSummary.trial_users,
+        upsell_users: chSummary.upsell_users,
+        first_sub_users: chSummary.first_subscription_users,
+        active_subscriptions: chSummary.active_subscription_users,
+        cancelled_users: chSummary.cancelled_users,
+        refund_users: chSummary.refund_users,
+        gross_revenue: chSummary.gross_revenue_usd,
+        net_revenue: chSummary.net_revenue_usd,
+        failed_payment_users: chSummary.failed_payment_users,
+      };
+    }
     const userIds = new Set(filtered.map((user) => user.user_id));
     const grossRevenue = analyticsTxs
       .filter((tx) => userIds.has(tx.user_id) && tx.status !== "failed")
@@ -552,7 +683,7 @@ export default function UsersPage() {
       net_revenue: filtered.reduce((sum, user) => sum + user.total_revenue, 0),
       failed_payment_users: filtered.filter((user) => user.has_failed_payment).length,
     };
-  }, [filtered, analyticsTxs]);
+  }, [usersClickHouseDriving, chSummary, filtered, analyticsTxs]);
 
   const declineAnalytics = useMemo(() => {
     const selectedUserIds = new Set(filtered.map((user) => user.user_id));
@@ -1054,6 +1185,43 @@ export default function UsersPage() {
           ))}
         </div>
 
+        {usersSource === "clickhouse" && (
+          <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 rounded-md border border-border bg-muted/20 px-3 py-2 text-xs">
+            <span className="font-medium text-foreground">Users data source</span>
+            <span>
+              engine:{" "}
+              <span className="font-mono text-foreground">{usersClickHouseDriving ? "clickhouse" : "legacy (fallback)"}</span>
+            </span>
+            {/* Honest staged progress (estimated; no server row-level progress). */}
+            {isInitialLoading && (
+              <span className="flex items-center gap-2 text-muted-foreground">
+                Loading users… {progressPercent}%
+                <Progress value={progressPercent} className="h-1.5 w-24" />
+              </span>
+            )}
+            {isBackgroundRefreshing && (
+              <span className="flex items-center gap-2 text-muted-foreground">
+                Updating… {progressPercent}%
+                <Progress value={progressPercent} className="h-1.5 w-24" />
+              </span>
+            )}
+            {!isInitialLoading && !isBackgroundRefreshing && chStatus.error && chUsers != null && (
+              <span className="text-warning">refresh failed · showing cached data</span>
+            )}
+            {!isInitialLoading && !isBackgroundRefreshing && usersClickHouseDriving && chUsers?.durationMs != null && !chStatus.error && (
+              <span>ClickHouse {chUsers.durationMs} ms{dataUpdatedAt ? ` · updated ${formatUpdatedAgo(dataUpdatedAt)}` : ""}</span>
+            )}
+            <span>total users: <span className="font-mono text-foreground">{displayTotal.toLocaleString("en-US")}</span></span>
+            {chUsers?.subscriptionDataStatus && (
+              <span>subscriptions: <span className="font-mono text-foreground">{chUsers.subscriptionDataStatus}</span></span>
+            )}
+            {chStatus.error && chUsers == null && <span className="text-destructive">ClickHouse error — using legacy: {chStatus.error}</span>}
+            {!usersClickHouseDriving && !chStatus.error && (hasSelectedCohortsRaw || mode === "decline_analytics") && (
+              <span className="text-warning">{mode === "decline_analytics" ? "Decline Analytics uses the client dataset (documented boundary)" : "cohort selection uses the client dataset"}</span>
+            )}
+          </div>
+        )}
+
         <div className="mt-4 overflow-x-auto rounded-lg border border-border">
           <Table>
             <TableHeader>
@@ -1128,7 +1296,7 @@ export default function UsersPage() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {pagedUsers.map((u) => (
+              {tableRows.map((u) => (
                 <TableRow key={u.user_id}>
                   <TableCell className="text-sm">{u.email || "—"}</TableCell>
                   <TableCell className="whitespace-nowrap">
@@ -1190,7 +1358,18 @@ export default function UsersPage() {
                   <TableCell className="text-right tabular-nums text-sm font-medium">{formatCurrency(u.user_ltv)}</TableCell>
                 </TableRow>
               ))}
-              {filtered.length === 0 && (
+              {/* Initial load (no cached rows yet): progress row, never the empty-state. */}
+              {isInitialLoading && tableRows.length === 0 && (
+                <TableRow>
+                  <TableCell colSpan={19} className="py-10">
+                    <div className="flex flex-col items-center gap-3 text-muted-foreground">
+                      <Progress value={progressPercent} className="h-2 w-full max-w-xs" />
+                      <span className="text-sm">Loading users… {progressPercent}%</span>
+                    </div>
+                  </TableCell>
+                </TableRow>
+              )}
+              {tableRows.length === 0 && !isInitialLoading && (
                 <TableRow>
                   <TableCell colSpan={19} className="text-center text-sm text-muted-foreground py-10">
                     <div className="space-y-3">
@@ -1212,16 +1391,16 @@ export default function UsersPage() {
             </TableBody>
           </Table>
         </div>
-        {filtered.length > USERS_PAGE_SIZE && (
+        {displayTotal > USERS_PAGE_SIZE && (
           <div className="mt-3 flex items-center justify-between text-xs text-muted-foreground">
             <span>
-              Showing {(safePage - 1) * USERS_PAGE_SIZE + 1}–{Math.min(safePage * USERS_PAGE_SIZE, filtered.length)} of {filtered.length}
+              Showing {(displaySafePage - 1) * USERS_PAGE_SIZE + 1}–{Math.min(displaySafePage * USERS_PAGE_SIZE, displayTotal)} of {displayTotal}
             </span>
             <div className="flex gap-2">
-              <Button variant="outline" size="sm" disabled={safePage <= 1} onClick={() => setPage(safePage - 1)}>
+              <Button variant="outline" size="sm" disabled={displaySafePage <= 1} onClick={() => setPage(displaySafePage - 1)}>
                 Previous
               </Button>
-              <Button variant="outline" size="sm" disabled={safePage >= totalPages} onClick={() => setPage(safePage + 1)}>
+              <Button variant="outline" size="sm" disabled={displaySafePage >= displayTotalPages} onClick={() => setPage(displaySafePage + 1)}>
                 Next
               </Button>
             </div>

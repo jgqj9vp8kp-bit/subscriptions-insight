@@ -107,8 +107,8 @@ describe("5. origin URL parsing", () => {
 describe("6. media buyer mapping", () => {
   it("maps numeric utm_source codes", () => {
     expect(mediaBuyerFromUtmSource("4")).toBe("Ivan");
-    expect(mediaBuyerFromUtmSource("22")).toBe("Artem A");
-    expect(mediaBuyerFromUtmSource("19")).toBe("Artem D");
+    expect(mediaBuyerFromUtmSource("19")).toBe("Artem A");
+    expect(mediaBuyerFromUtmSource("22")).toBe("Artem D");
     expect(mediaBuyerFromUtmSource("999")).toBe("Unknown");
   });
 });

@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { ArrowDown, ArrowUp, ArrowUpDown, Search, X } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { Card } from "@/components/ui/card";
@@ -26,11 +26,13 @@ import { useTransactions } from "@/services/sheets";
 import { formatCurrency } from "@/services/analytics";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
 import type { TransactionStatus, TransactionType } from "@/services/types";
+import { autoLoadWarehouseIntoStore } from "@/services/analyticsAdapters";
+import { traceEvent, traceMark } from "@/services/performanceTrace";
 
 type SortKey = "event_time" | "amount_usd";
 type SortDir = "asc" | "desc";
 
-const TYPES: TransactionType[] = ["trial", "upsell", "first_subscription", "renewal_2", "renewal_3", "renewal", "failed_payment", "refund", "chargeback", "unknown"];
+const TYPES: TransactionType[] = ["trial", "upsell", "first_subscription", "renewal_2", "renewal_3", "renewal", "token_purchase", "failed_payment", "refund", "chargeback", "unknown"];
 const STATUSES: TransactionStatus[] = ["success", "failed", "refunded", "chargeback"];
 const FUNNELS = ["past_life", "soulmate", "starseed", "unknown"] as const;
 
@@ -52,9 +54,24 @@ const DEFAULT_TRANSACTIONS_UI_STATE = {
 
 export default function TransactionsPage() {
   const txs = useTransactions();
+  const mountedRef = useRef(false);
   const [uiState, setUiState, resetUiState] = usePersistedPageState("ui_state_transactions", DEFAULT_TRANSACTIONS_UI_STATE);
   const { mode, search, typeFilter, funnelFilter, campaignPathFilter, statusFilter, dateFrom, dateTo, sortKey, sortDir, page } = uiState;
   const updateUiState = (patch: Partial<typeof DEFAULT_TRANSACTIONS_UI_STATE>) => setUiState((current) => ({ ...current, ...patch }));
+
+  if (!mountedRef.current) {
+    mountedRef.current = true;
+    traceMark("route.transactions.mounted");
+  }
+
+  useEffect(() => {
+    if (mode !== "list") {
+      traceEvent("warehouse.transactions_lazy_load_skipped", { reason: "payment_pass_tab" });
+      return;
+    }
+    traceEvent("warehouse.transactions_lazy_load_requested", { reason: "transaction_list_tab" });
+    void autoLoadWarehouseIntoStore();
+  }, [mode]);
 
   const campaignPathOptions = useMemo(() => Array.from(new Set(txs.map((t) => t.campaign_path || "unknown"))).sort(), [txs]);
 

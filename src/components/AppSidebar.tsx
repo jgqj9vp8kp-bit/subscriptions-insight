@@ -1,5 +1,11 @@
 import { BarChart3, Headphones, LayoutDashboard, Receipt, Users, UserPlus, Layers, Upload, Repeat, Calculator, Plug } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
 import { NavLink } from "@/components/NavLink";
+import { useAuth } from "@/hooks/useAuth";
+import { hashUserScope } from "@/services/cohortsCache";
+import { prefetchCohortsNav } from "@/hooks/useCohortsCache";
+import { cohortsDataSourceMode } from "@/services/cohortsDataSource";
+import { loadMaxRenewalColumns } from "@/services/dataSettings";
 import {
   Sidebar,
   SidebarContent,
@@ -30,6 +36,15 @@ const items = [
 export function AppSidebar() {
   const { state } = useSidebar();
   const collapsed = state === "collapsed";
+  const queryClient = useQueryClient();
+  const { user } = useAuth();
+
+  // Warm the Cohorts cache when the user shows intent to navigate there. Only in
+  // ClickHouse mode; respects staleTime (no duplicate when already fresh).
+  const prefetchCohorts = () => {
+    if (cohortsDataSourceMode() !== "clickhouse") return;
+    prefetchCohortsNav(queryClient, hashUserScope(user?.id), loadMaxRenewalColumns());
+  };
 
   return (
     <Sidebar collapsible="icon" className="border-r border-sidebar-border">
@@ -60,6 +75,8 @@ export function AppSidebar() {
                     <NavLink
                       to={item.url}
                       end={item.end}
+                      onMouseEnter={item.url === "/cohorts" ? prefetchCohorts : undefined}
+                      onFocus={item.url === "/cohorts" ? prefetchCohorts : undefined}
                       className="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
                       activeClassName="bg-sidebar-accent text-sidebar-accent-foreground font-medium"
                     >

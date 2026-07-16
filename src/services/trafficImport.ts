@@ -3,13 +3,24 @@ import { parseCSVText, type ParsedSheet } from "@/services/import";
 export interface TrafficMetric {
   date: string;
   campaign_path: string;
+  campaign_id?: string | null;
+  campaign_name?: string | null;
+  ad_account_id?: string | null;
+  ad_account_name?: string | null;
   trial_count: number;
   cac: number;
   spend: number;
+  fb_purchases?: number;
+  cpp?: number | null;
+  impressions?: number;
   clicks: number;
+  outbound_clicks?: number;
+  outbound_ctr?: number | null;
   cpc: number;
   cpm: number;
   ctr: number;
+  currency?: string | null;
+  last_import_at?: string;
   source: "facebook";
 }
 

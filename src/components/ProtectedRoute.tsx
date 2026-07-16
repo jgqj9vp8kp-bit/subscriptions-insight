@@ -2,10 +2,12 @@ import { Navigate, Outlet, useLocation } from "react-router-dom";
 import { Loader2 } from "lucide-react";
 import { useAuth } from "@/hooks/useAuth";
 import { SavedDataAutoLoader } from "@/components/SavedDataAutoLoader";
+import { shouldAutoLoadTransactionsForPath } from "@/services/transactionAutoLoadPolicy";
 
 export function ProtectedRoute() {
   const location = useLocation();
   const { configured, loading, user } = useAuth();
+  const loadTransactions = shouldAutoLoadTransactionsForPath(location.pathname);
 
   if (loading) {
     return (
@@ -24,7 +26,7 @@ export function ProtectedRoute() {
 
   return (
     <>
-      <SavedDataAutoLoader />
+      <SavedDataAutoLoader loadTransactions={loadTransactions} />
       <Outlet />
     </>
   );

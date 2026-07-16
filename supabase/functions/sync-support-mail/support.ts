@@ -22,14 +22,25 @@ export type SyncSupportSummary = {
 export type ParsedMailMessage = {
   uid: string;
   message_id: string;
+  normalized_message_id: string | null;
   thread_id: string | null;
+  in_reply_to: string | null;
+  references: string[];
   from_email: string | null;
   from_name: string | null;
+  reply_to_email: string | null;
   to_email: string | null;
+  cc_email: string | null;
   subject: string | null;
   body_text: string | null;
   body_html: string | null;
   received_at: string | null;
+  internal_date: string | null;
+  size: number | null;
+  flags: string[];
+  has_attachments: boolean;
+  attachment_count: number;
+  attachment_metadata: Array<{ filename: string | null; mime_type: string | null; size: number | null }>;
   raw_headers: Record<string, string>;
   raw_payload: Record<string, unknown>;
 };
@@ -76,10 +87,11 @@ const INTENT_KEYWORDS: Array<{ intent: SupportIntent; keywords: string[] }> = [
   { intent: "general_support", keywords: ["help", "question", "support"] },
 ];
 
+// Must match MEDIA_BUYER_BY_UTM_SOURCE in src/services/userMediaBuyer.ts.
 const MEDIA_BUYER_BY_UTM_SOURCE: Record<string, string> = {
   "4": "Ivan",
-  "22": "Artem A",
-  "19": "Artem D",
+  "19": "Artem A",
+  "22": "Artem D",
 };
 
 const CARD_TYPE_PATHS = [
@@ -92,6 +104,11 @@ const CARD_TYPE_PATHS = [
 
 export function normalizeSupportEmail(email: string | null | undefined): string {
   return String(email ?? "").trim().toLowerCase();
+}
+
+export function normalizeMessageId(value: string | null | undefined): string | null {
+  const normalized = String(value ?? "").trim().toLowerCase().replace(/^<|>$/g, "");
+  return normalized || null;
 }
 
 export function classifySupportIntent(subject: string | null | undefined, body: string | null | undefined): SupportIntent {
@@ -281,6 +298,25 @@ function decodeBody(content: string, encoding: string | undefined): string {
   return content.trim();
 }
 
+export function htmlToPlainText(html: string | null | undefined): string {
+  return String(html ?? "")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, "\"")
+    .replace(/&#39;/g, "'")
+    .replace(/\s+\n/g, "\n")
+    .replace(/\n\s+/g, "\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+}
+
 export function parseEmailAddress(value: string | null | undefined): { email: string | null; name: string | null } {
   const decoded = decodeMimeWords(value) ?? "";
   const match = decoded.match(/^(.*?)<([^>]+)>/);
@@ -302,7 +338,16 @@ function splitHeaderBody(raw: string): { headerRaw: string; bodyRaw: string } {
     : { headerRaw: normalized.slice(0, index), bodyRaw: normalized.slice(index + 2) };
 }
 
-function parseBodies(headerRaw: string, bodyRaw: string): { text: string | null; html: string | null } {
+function attachmentName(headers: Record<string, string>): string | null {
+  const source = `${headers["content-disposition"] ?? ""}; ${headers["content-type"] ?? ""}`;
+  return decodeMimeWords(source.match(/(?:filename|name)\*?=(?:"([^"]+)"|([^;]+))/i)?.[1] ?? source.match(/(?:filename|name)\*?=(?:"([^"]+)"|([^;]+))/i)?.[2])?.trim() ?? null;
+}
+
+function parseBodies(headerRaw: string, bodyRaw: string): {
+  text: string | null;
+  html: string | null;
+  attachments: Array<{ filename: string | null; mime_type: string | null; size: number | null }>;
+} {
   const headers = parseHeaders(headerRaw);
   const contentType = headers["content-type"] ?? "";
   const encoding = headers["content-transfer-encoding"];
@@ -310,12 +355,13 @@ function parseBodies(headerRaw: string, bodyRaw: string): { text: string | null;
   if (!boundary) {
     const body = decodeBody(bodyRaw, encoding);
     return contentType.toLowerCase().includes("text/html")
-      ? { text: null, html: body }
-      : { text: body || null, html: null };
+      ? { text: null, html: body, attachments: [] }
+      : { text: body || null, html: null, attachments: [] };
   }
 
   let text: string | null = null;
   let html: string | null = null;
+  const attachments: Array<{ filename: string | null; mime_type: string | null; size: number | null }> = [];
   const parts = bodyRaw.split(`--${boundary}`);
   for (const part of parts) {
     const trimmed = part.replace(/^--/, "").trim();
@@ -323,35 +369,61 @@ function parseBodies(headerRaw: string, bodyRaw: string): { text: string | null;
     const split = splitHeaderBody(trimmed);
     const partHeaders = parseHeaders(split.headerRaw);
     const partType = (partHeaders["content-type"] ?? "").toLowerCase();
+    const disposition = (partHeaders["content-disposition"] ?? "").toLowerCase();
+    if (disposition.includes("attachment") || /;\s*name=/i.test(partHeaders["content-type"] ?? "")) {
+      attachments.push({
+        filename: attachmentName(partHeaders),
+        mime_type: partType.split(";")[0]?.trim() || null,
+        size: split.bodyRaw.length || null,
+      });
+      continue;
+    }
     const decoded = decodeBody(split.bodyRaw, partHeaders["content-transfer-encoding"]);
     if (!text && partType.includes("text/plain")) text = decoded || null;
     if (!html && partType.includes("text/html")) html = decoded || null;
   }
-  return { text, html };
+  return { text, html, attachments };
 }
 
-export function parseRawEmail(raw: string, uid: string): ParsedMailMessage {
+export function parseRawEmail(raw: string, uid: string, meta: Partial<Pick<ParsedMailMessage, "internal_date" | "size" | "flags">> = {}): ParsedMailMessage {
   const { headerRaw, bodyRaw } = splitHeaderBody(raw);
   const headers = parseHeaders(headerRaw);
   const from = parseEmailAddress(headers.from);
+  const replyTo = parseEmailAddress(headers["reply-to"]);
   const to = parseEmailAddress(headers.to);
+  const cc = parseEmailAddress(headers.cc);
   const bodies = parseBodies(headerRaw, bodyRaw);
   const receivedAt = headers.date ? new Date(headers.date) : null;
-  const messageId = headers["message-id"] || `mailru:${uid}`;
+  const messageId = headers["message-id"] || `imap:${uid}`;
+  const normalizedMessageId = normalizeMessageId(messageId);
+  const references = (headers.references ?? "").split(/\s+/).map(normalizeMessageId).filter((value): value is string => Boolean(value));
+  const inReplyTo = normalizeMessageId(headers["in-reply-to"]);
+  const safeText = bodies.text?.trim() || htmlToPlainText(bodies.html);
 
   return {
     uid,
     message_id: messageId,
-    thread_id: headers["in-reply-to"] || headers.references || null,
+    normalized_message_id: normalizedMessageId,
+    thread_id: inReplyTo || references[0] || normalizedMessageId,
+    in_reply_to: inReplyTo,
+    references,
     from_email: from.email,
     from_name: from.name,
+    reply_to_email: replyTo.email,
     to_email: to.email,
+    cc_email: cc.email,
     subject: decodeMimeWords(headers.subject),
-    body_text: bodies.text,
+    body_text: safeText || null,
     body_html: bodies.html,
     received_at: receivedAt && !Number.isNaN(receivedAt.getTime()) ? receivedAt.toISOString() : null,
+    internal_date: meta.internal_date ?? null,
+    size: meta.size ?? raw.length,
+    flags: meta.flags ?? [],
+    has_attachments: bodies.attachments.length > 0,
+    attachment_count: bodies.attachments.length,
+    attachment_metadata: bodies.attachments,
     raw_headers: headers,
-    raw_payload: { uid, content_type: headers["content-type"] ?? null },
+    raw_payload: { uid, content_type: headers["content-type"] ?? null, size: meta.size ?? raw.length },
   };
 }
 

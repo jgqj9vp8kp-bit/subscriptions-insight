@@ -67,7 +67,7 @@ function userRows(
 const rows: Transaction[] = [
   ...userRows("ivan-1", { campaignName: "Ivan Alpha", utmSource: "4", failed: true }),
   ...userRows("ivan-2", { campaignName: "Ivan Alpha", utmSource: "4", upsell: false }),
-  ...userRows("artem-a-1", { campaignId: "campaign-2", campaignName: "Artem A Beta", path: "soulmate", funnel: "soulmate", utmSource: "22" }),
+  ...userRows("artem-a-1", { campaignId: "campaign-2", campaignName: "Artem A Beta", path: "soulmate", funnel: "soulmate", utmSource: "19" }),
   ...userRows("unknown-1", { campaignId: "campaign-3", campaignName: "Unknown Gamma", utmSource: null, trialAt: "2026-06-01T00:00:00Z", firstSub: false }),
 ];
 
@@ -119,7 +119,7 @@ describe("campaign performance export", () => {
   it("aggregates users from different media buyers into one campaign row", () => {
     const mixed = [
       ...userRows("buyer-ivan", { campaignId: "campaign-mixed", utmSource: "4" }),
-      ...userRows("buyer-artem", { campaignId: "campaign-mixed", utmSource: "22" }),
+      ...userRows("buyer-artem", { campaignId: "campaign-mixed", utmSource: "19" }),
     ];
 
     const result = buildCampaignPerformanceExport({ txs: mixed });

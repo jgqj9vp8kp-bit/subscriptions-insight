@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import UsersPage from "@/pages/Users";
 import { useDataStore } from "@/store/dataStore";
 import type { Transaction } from "@/services/types";
@@ -13,7 +14,28 @@ vi.mock("@/services/sheets", () => ({
   useTransactions: vi.fn(),
 }));
 
+// These tests validate the legacy client-side Users rendering/filtering, which
+// remains the fallback after the ClickHouse migration. Force legacy mode so the
+// page renders synchronously from the store (the ClickHouse read path has its
+// own unit tests + live end-to-end verification).
+vi.mock("@/services/usersDataSource", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/services/usersDataSource")>();
+  return { ...actual, usersDataSourceMode: () => "legacy" as const };
+});
+
+// The page now uses useAuth (cache scope) + TanStack Query; provide both so the
+// legacy render path (queries disabled in legacy mode) mounts without providers.
+vi.mock("@/hooks/useAuth", () => ({ useAuth: () => ({ user: { id: "test-user" } }) }));
+
 import { useTransactions } from "@/services/sheets";
+
+function renderPage() {
+  return render(
+    <QueryClientProvider client={new QueryClient()}>
+      <UsersPage />
+    </QueryClientProvider>,
+  );
+}
 
 function tx(overrides: Partial<Transaction> = {}): Transaction {
   return {
@@ -50,7 +72,7 @@ describe("Users page", () => {
   it("displays user country code when available", () => {
     vi.mocked(useTransactions).mockReturnValue([tx()]);
 
-    render(<UsersPage />);
+    renderPage();
 
     expect(screen.getByText("US")).toBeInTheDocument();
   });
@@ -60,7 +82,7 @@ describe("Users page", () => {
       tx({ card_type: "prepaid", raw: { paymentInstrumentBinDataAccountFundingType: "prepaid" } }),
     ]);
 
-    render(<UsersPage />);
+    renderPage();
 
     expect(screen.getByText("Prepaid")).toBeInTheDocument();
   });
@@ -82,7 +104,7 @@ describe("Users page", () => {
       }),
     ]);
 
-    render(<UsersPage />);
+    renderPage();
 
     expect(screen.getByText("prepaid@example.com")).toBeInTheDocument();
     expect(screen.queryByText("credit@example.com")).not.toBeInTheDocument();
@@ -111,7 +133,7 @@ describe("Users page", () => {
       }),
     ]);
 
-    render(<UsersPage />);
+    renderPage();
 
     expect(screen.getByText("prepaid@example.com")).toBeInTheDocument();
     expect(screen.getByText("debit@example.com")).toBeInTheDocument();
@@ -141,7 +163,7 @@ describe("Users page", () => {
       }),
     ]);
 
-    render(<UsersPage />);
+    renderPage();
 
     const rows = screen.getAllByRole("row");
     expect(rows[1]).toHaveTextContent("credit@example.com");
@@ -159,7 +181,7 @@ describe("Users page", () => {
       }),
     ]);
 
-    render(<UsersPage />);
+    renderPage();
 
     expect(screen.getByText("Yes")).toBeInTheDocument();
     expect(screen.getByText("insufficient_funds")).toBeInTheDocument();
@@ -196,7 +218,7 @@ describe("Users page", () => {
       }),
     ]);
 
-    render(<UsersPage />);
+    renderPage();
 
     expect(screen.getByText("stage@example.com")).toBeInTheDocument();
     expect(screen.getByText("After First Subscription")).toBeInTheDocument();
@@ -220,7 +242,7 @@ describe("Users page", () => {
       }),
     ]);
 
-    render(<UsersPage />);
+    renderPage();
 
     expect(screen.getByText("failed@example.com")).toBeInTheDocument();
     expect(screen.queryByText("success@example.com")).not.toBeInTheDocument();
@@ -247,7 +269,7 @@ describe("Users page", () => {
       }),
     ]);
 
-    render(<UsersPage />);
+    renderPage();
 
     expect(screen.getByText("unsupported@example.com")).toBeInTheDocument();
     expect(screen.queryByText("funds@example.com")).not.toBeInTheDocument();
@@ -289,7 +311,7 @@ describe("Users page", () => {
       }),
     ]);
 
-    render(<UsersPage />);
+    renderPage();
 
     expect(screen.getByText("multi@example.com")).toBeInTheDocument();
     expect(screen.queryByText("single@example.com")).not.toBeInTheDocument();
@@ -323,7 +345,7 @@ describe("Users page", () => {
       }),
     ]);
 
-    render(<UsersPage />);
+    renderPage();
 
     const rows = screen.getAllByRole("row");
     expect(rows[1]).toHaveTextContent("multi@example.com");
@@ -391,7 +413,7 @@ describe("Users page", () => {
       cohortTx({ user_id: "b", email: "b@example.com", campaign_path: "campaign-b", event_time: "2026-01-02T10:00:00.000Z" }),
     ]);
 
-    render(<UsersPage />);
+    renderPage();
 
     expect(screen.getByText("Cohorts")).toBeInTheDocument();
     expect(screen.getAllByText("campaign-a").length).toBeGreaterThan(0);
@@ -405,7 +427,7 @@ describe("Users page", () => {
       cohortTx({ user_id: "b", email: "b@example.com", campaign_path: "campaign-b", event_time: "2026-01-02T10:00:00.000Z" }),
     ]);
 
-    render(<UsersPage />);
+    renderPage();
     clickCohort("campaign-a");
 
     expect(screen.getByText("a@example.com")).toBeInTheDocument();
@@ -431,7 +453,7 @@ describe("Users page", () => {
       cohortTx({ user_id: "other", email: "other@example.com", campaign_path: "campaign-b", event_time: "2026-01-02T10:00:00.000Z" }),
     ]);
 
-    render(<UsersPage />);
+    renderPage();
     clickCohort("campaign-a");
 
     expect(screen.getByText("trial@example.com")).toBeInTheDocument();
@@ -464,7 +486,7 @@ describe("Users page", () => {
       }),
     ]);
 
-    render(<UsersPage />);
+    renderPage();
 
     expect(screen.getByText("trial@example.com")).toBeInTheDocument();
     expect(screen.getByText("payment@example.com")).toBeInTheDocument();
@@ -499,7 +521,7 @@ describe("Users page", () => {
       }),
     ]);
 
-    render(<UsersPage />);
+    renderPage();
 
     expect(screen.getByText("No users match selected cohorts and filters.")).toBeInTheDocument();
     expect(screen.getByText(/First sub: Has First Sub/)).toBeInTheDocument();
@@ -519,7 +541,7 @@ describe("Users page", () => {
       cohortTx({ user_id: "c", email: "c@example.com", campaign_path: "campaign-c", event_time: "2026-01-03T10:00:00.000Z" }),
     ]);
 
-    render(<UsersPage />);
+    renderPage();
     clickCohort("campaign-a");
     clickCohort("campaign-b");
 
@@ -534,7 +556,7 @@ describe("Users page", () => {
       cohortTx({ user_id: "b", email: "b@example.com", campaign_path: "campaign-b", event_time: "2026-01-02T10:00:00.000Z" }),
     ]);
 
-    render(<UsersPage />);
+    renderPage();
     clickCohort("campaign-a");
     fireEvent.click(screen.getByRole("button", { name: "Clear" }));
 
@@ -559,7 +581,7 @@ describe("Users page", () => {
       cohortTx({ user_id: "b", email: "b@example.com", campaign_path: "campaign-b", event_time: "2026-01-02T10:00:00.000Z" }),
     ]);
 
-    render(<UsersPage />);
+    renderPage();
     clickCohort("campaign-a");
 
     expect(screen.getByText("Users").parentElement).toHaveTextContent("1");
@@ -574,7 +596,7 @@ describe("Users page", () => {
       cohortTx({ user_id: "debit", email: "debit@example.com", campaign_path: "campaign-a", card_type: "debit" }),
     ]);
 
-    render(<UsersPage />);
+    renderPage();
     clickCohort("campaign-a");
 
     expect(screen.getByText("credit@example.com")).toBeInTheDocument();
@@ -589,7 +611,7 @@ describe("Users page", () => {
       cohortTx({ user_id: "other", email: "other@example.com", campaign_path: "campaign-b", event_time: "2026-01-02T10:00:00.000Z", amount_usd: 20, gross_amount_usd: 20, net_amount_usd: 20 }),
     ]);
 
-    render(<UsersPage />);
+    renderPage();
     clickCohort("campaign-a");
 
     const rows = screen.getAllByRole("row");
@@ -603,7 +625,7 @@ describe("Users page", () => {
       cohortTx({ user_id: "a", email: "a@example.com", campaign_path: "campaign-a" }),
     ]);
 
-    render(<UsersPage />);
+    renderPage();
 
     expect(screen.getByText("a@example.com")).toBeInTheDocument();
     switchToDeclineAnalytics();
@@ -637,7 +659,7 @@ describe("Users page", () => {
       }),
     ]);
 
-    render(<UsersPage />);
+    renderPage();
 
     expect(summaryCard("Failed Users")).toHaveTextContent("2");
     expect(summaryCard("Failed Transactions")).toHaveTextContent("3");
@@ -671,7 +693,7 @@ describe("Users page", () => {
       }),
     ]);
 
-    render(<UsersPage />);
+    renderPage();
 
     expect(summaryCard("Failed Transactions")).toHaveTextContent("1");
     expect(screen.getAllByText("do_not_honor").length).toBeGreaterThan(0);
@@ -697,7 +719,7 @@ describe("Users page", () => {
       }),
     ]);
 
-    render(<UsersPage />);
+    renderPage();
     clickCohort("campaign-a");
 
     expect(summaryCard("Failed Transactions")).toHaveTextContent("1");
@@ -750,7 +772,7 @@ describe("Users page", () => {
       }),
     ]);
 
-    render(<UsersPage />);
+    renderPage();
 
     expect(summaryCard("Failed Transactions")).toHaveTextContent("2");
     expect(summaryCard("Declines After Trial")).toHaveTextContent("1");
@@ -798,7 +820,7 @@ describe("Users page", () => {
       }),
     ]);
 
-    render(<UsersPage />);
+    renderPage();
 
     expect(summaryCard("Failed Transactions")).toHaveTextContent("1");
     expect(summaryCard("Declines After Trial")).toHaveTextContent("0");
@@ -813,7 +835,7 @@ describe("Users page", () => {
       cohortTx({ user_id: "a", email: "a@example.com", campaign_path: "campaign-a" }),
     ]);
 
-    render(<UsersPage />);
+    renderPage();
 
     expect(screen.getByText("No declined payments found for selected users.")).toBeInTheDocument();
   });
@@ -844,7 +866,7 @@ describe("Users page", () => {
       }),
     ]);
 
-    render(<UsersPage />);
+    renderPage();
 
     const reasonTable = screen.getByRole("table", { name: "Decline reason breakdown" });
     let rows = within(reasonTable).getAllByRole("row");

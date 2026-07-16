@@ -77,6 +77,8 @@ export interface CohortReportTotals {
   revenueD7: number;
   revenueD30: number;
   revenueD60: number;
+  /** Weighted realized 1-month LTV: sum(net_revenue_1m) / sum(trial_users). */
+  ltv1mPerUser: number;
   trafficSpend: number;
   hasTrafficSpend: boolean;
   hasCompleteTrafficSpend: boolean;
@@ -96,6 +98,67 @@ export interface CohortReportTotals {
   trialToFirstSubscriptionCr: number;
   firstSubscriptionToRenewal2Cr: number;
   renewal2ToRenewal3Cr: number;
+  monetization: CohortMonetizationTotals;
+}
+
+/** Monetization totals: user counts sum across cohorts (a user belongs to exactly
+ * one cohort), CRs are always recomputed from the summed totals — never averaged. */
+export interface CohortMonetizationTotals {
+  upsell1Users: number;
+  upsell2Users: number;
+  upsell3Users: number;
+  upsellExtraUsers: number;
+  upsell1Revenue: number;
+  upsell2Revenue: number;
+  upsell3Revenue: number;
+  upsellExtraRevenue: number;
+  upsell1Cr: number;
+  upsell2Cr: number;
+  upsell3Cr: number;
+  funnelUpsellUsers: number;
+  funnelUpsellRevenue: number;
+  tokenBuyers: number;
+  tokenBuyerCr: number;
+  tokenPurchases: number;
+  tokenGrossRevenue: number;
+  tokenNetRevenue: number;
+  avgTokenRevenuePerTrial: number;
+  avgTokenRevenuePerBuyer: number;
+  addonRevenue: number;
+}
+
+export function computeCohortMonetizationTotals(cohorts: CohortRow[], totalTrialUsers: number): CohortMonetizationTotals {
+  const sum = (pick: (c: CohortRow) => number | undefined) =>
+    cohorts.reduce((total, cohort) => total + (pick(cohort) ?? 0), 0);
+  const upsell1Users = sum((c) => c.upsell_1_users);
+  const upsell2Users = sum((c) => c.upsell_2_users);
+  const upsell3Users = sum((c) => c.upsell_3_users);
+  // Token buyers are deduped by user id across cohorts, mirroring refund/active users.
+  const tokenBuyers = new Set(cohorts.flatMap((c) => c.token_buyer_user_ids ?? [])).size;
+  const tokenNetRevenue = sum((c) => c.token_net_revenue);
+  return {
+    upsell1Users,
+    upsell2Users,
+    upsell3Users,
+    upsellExtraUsers: sum((c) => c.upsell_extra_users),
+    upsell1Revenue: sum((c) => c.upsell_1_revenue),
+    upsell2Revenue: sum((c) => c.upsell_2_revenue),
+    upsell3Revenue: sum((c) => c.upsell_3_revenue),
+    upsellExtraRevenue: sum((c) => c.upsell_extra_revenue),
+    upsell1Cr: totalTrialUsers ? (upsell1Users / totalTrialUsers) * 100 : 0,
+    upsell2Cr: totalTrialUsers ? (upsell2Users / totalTrialUsers) * 100 : 0,
+    upsell3Cr: totalTrialUsers ? (upsell3Users / totalTrialUsers) * 100 : 0,
+    funnelUpsellUsers: sum((c) => c.funnel_upsell_users),
+    funnelUpsellRevenue: sum((c) => c.funnel_upsell_revenue),
+    tokenBuyers,
+    tokenBuyerCr: totalTrialUsers ? (tokenBuyers / totalTrialUsers) * 100 : 0,
+    tokenPurchases: sum((c) => c.token_purchases),
+    tokenGrossRevenue: sum((c) => c.token_gross_revenue),
+    tokenNetRevenue,
+    avgTokenRevenuePerTrial: totalTrialUsers ? tokenNetRevenue / totalTrialUsers : 0,
+    avgTokenRevenuePerBuyer: tokenBuyers ? tokenNetRevenue / tokenBuyers : 0,
+    addonRevenue: sum((c) => c.addon_revenue),
+  };
 }
 
 function normalizeCohortDate(date: string): string {
@@ -192,8 +255,10 @@ export function computeCohortReportTotals(
   }
   const totalRenewalUsers = sum((c) => c.renewal_users);
   const totalRefundUsers = new Set(cohorts.flatMap((c) => c.refunded_user_ids)).size;
+  // Active Users = unique active cohort users; Active Subscriptions = unique
+  // active subscription_ids — both deduped across all visible cohorts.
   const totalActiveUsers = new Set(cohorts.flatMap((c) => c.active_user_ids)).size;
-  const totalActiveSubscriptions = new Set(cohorts.flatMap((c) => c.active_subscription_user_ids)).size;
+  const totalActiveSubscriptions = new Set(cohorts.flatMap((c) => c.active_subscription_ids ?? [])).size;
   const totalCancelledUsers = new Set(cohorts.flatMap((c) => c.cancelled_user_ids)).size;
   const totalUserCancelledUsers = new Set(cohorts.flatMap((c) => c.user_cancelled_user_ids)).size;
   const totalAutoCancelledUsers = new Set(cohorts.flatMap((c) => c.auto_cancelled_user_ids)).size;
@@ -246,6 +311,8 @@ export function computeCohortReportTotals(
     revenueD7: totalRevenueD7,
     revenueD30: totalRevenueD30,
     revenueD60: totalRevenueD60,
+    // Weighted, NOT the average of per-cohort ltv_1m_per_user.
+    ltv1mPerUser: totalTrialUsers ? totalRevenueD30 / totalTrialUsers : 0,
     trafficSpend: totalTrafficSpend,
     hasTrafficSpend,
     hasCompleteTrafficSpend,
@@ -265,5 +332,35 @@ export function computeCohortReportTotals(
     trialToFirstSubscriptionCr: totalTrialUsers ? (totalFirstSubscriptionUsers / totalTrialUsers) * 100 : 0,
     firstSubscriptionToRenewal2Cr: totalFirstSubscriptionUsers ? (totalRenewal2Users / totalFirstSubscriptionUsers) * 100 : 0,
     renewal2ToRenewal3Cr: totalRenewal2Users ? (totalRenewal3Users / totalRenewal2Users) * 100 : 0,
+    monetization: computeCohortMonetizationTotals(cohorts, totalTrialUsers),
+  };
+}
+
+/** Number of realized-revenue days needed before a cohort's 1M LTV is complete. */
+export const LTV_1M_MATURITY_DAYS = 30;
+
+export interface CohortMaturity {
+  /** Whole days between the cohort start date and `nowMs`. */
+  age_days: number;
+  /** True once the cohort has at least 30 days of realized revenue. */
+  matured: boolean;
+  /** Days of revenue actually available so far (capped at 30). */
+  available_days: number;
+}
+
+/**
+ * 1M-LTV maturity for a cohort. `nowMs` is injected (never read from the clock
+ * here) so callers stay deterministic and analytics stays clock-free.
+ */
+export function cohortMaturity(cohortDate: string, nowMs: number): CohortMaturity {
+  const startMs = Date.parse(`${String(cohortDate ?? "").slice(0, 10)}T00:00:00.000Z`);
+  if (!Number.isFinite(startMs) || !Number.isFinite(nowMs)) {
+    return { age_days: 0, matured: false, available_days: 0 };
+  }
+  const ageDays = Math.max(0, Math.floor((nowMs - startMs) / (24 * 60 * 60 * 1000)));
+  return {
+    age_days: ageDays,
+    matured: ageDays >= LTV_1M_MATURITY_DAYS,
+    available_days: Math.min(ageDays, LTV_1M_MATURITY_DAYS),
   };
 }

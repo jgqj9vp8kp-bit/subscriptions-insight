@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useEffect, useMemo } from "react";
 import {
   Activity,
   CreditCard,
@@ -54,17 +54,20 @@ import {
   buildCancellationsByDay,
   buildDashboardKpis,
   buildFunnelChart,
+  buildDashboardFxSummary,
   buildRefundTrend,
   buildRefundsByDay,
   buildRevenueTrend,
   buildRoasTrend,
   buildTrialsUpsellsByDay,
   getCashRevenueByDateRange,
+  normalizeDashboardTransactions,
   type DashboardKpi,
 } from "@/services/dashboard";
 import { useDataStore } from "@/store/dataStore";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
+import { autoLoadWarehouseIntoStoreWithOptions } from "@/services/analyticsAdapters";
 
 const FILTER_DEBOUNCE_MS = 300;
 
@@ -235,6 +238,10 @@ function formatRoas(value: number | null | undefined): string {
   return value == null ? "—" : `${value.toFixed(2)}x`;
 }
 
+function formatFxCount(value: number): string {
+  return value.toLocaleString();
+}
+
 function sum<T>(rows: T[], pick: (row: T) => number | null | undefined): number {
   return rows.reduce((total, row) => total + (pick(row) ?? 0), 0);
 }
@@ -326,6 +333,7 @@ function TrialsUpsellsTooltip({
 
 export default function Dashboard() {
   const txs = useTransactions();
+  const dataStoreSource = useDataStore((s) => s.meta.source);
   const subscriptions = useDataStore((s) => s.subscriptions);
   const trafficMetrics = useDataStore((s) => s.trafficMetrics);
   const [uiState, setUiState, resetUiState] = usePersistedPageState("ui_state_dashboard", DEFAULT_DASHBOARD_UI_STATE);
@@ -348,7 +356,26 @@ export default function Dashboard() {
     cohortDateTo: appliedCohortDateTo,
   } = appliedFilters;
 
-  const allCohorts = useMemo(() => computeCohorts(txs, subscriptions), [txs, subscriptions]);
+  useEffect(() => {
+    if (dataStoreSource === "transaction_warehouse") return;
+    let cancelled = false;
+    void autoLoadWarehouseIntoStoreWithOptions({ replaceExisting: true }).then((result) => {
+      if (cancelled || result.status !== "error") return;
+      console.warn("Dashboard could not refresh transactions from warehouse.", result.error ?? result.message);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [dataStoreSource]);
+
+  const dashboardFx = useMemo(() => {
+    const started = Date.now();
+    const result = normalizeDashboardTransactions(txs);
+    return { ...result, durationMs: Date.now() - started };
+  }, [txs]);
+  const dashboardTransactions = dashboardFx.transactions;
+
+  const allCohorts = useMemo(() => computeCohorts(dashboardTransactions, subscriptions), [dashboardTransactions, subscriptions]);
   const filteredTrafficMetrics = useMemo(
     () => trafficMetrics.filter((row) => appliedSourceFilter === "all" || row.source === appliedSourceFilter),
     [appliedSourceFilter, trafficMetrics],
@@ -385,14 +412,14 @@ export default function Dashboard() {
 
   const cashRevenueSummary = useMemo(
     () =>
-      getCashRevenueByDateRange(txs, {
+      getCashRevenueByDateRange(dashboardTransactions, {
         dateFrom: appliedCohortDateFrom,
         dateTo: appliedCohortDateTo,
         funnelFilter: appliedFunnelFilter,
         campaignPathFilter: appliedCampaignPathFilter,
         sourceFilter: appliedSourceFilter,
       }),
-    [appliedCampaignPathFilter, appliedCohortDateFrom, appliedCohortDateTo, appliedFunnelFilter, appliedSourceFilter, txs],
+    [appliedCampaignPathFilter, appliedCohortDateFrom, appliedCohortDateTo, appliedFunnelFilter, appliedSourceFilter, dashboardTransactions],
   );
 
   const kpiMap = useMemo(() => {
@@ -409,7 +436,7 @@ export default function Dashboard() {
   const refundTrend = useMemo(() => buildRefundTrend(dashboardCohorts), [dashboardCohorts]);
   const dailyTransactions = useMemo(
     () =>
-      txs.filter((transaction) => {
+      dashboardTransactions.filter((transaction) => {
         const eventDate = dateKey(transaction.event_time);
         if (!eventDate) return false;
         if (appliedCohortDateFrom && eventDate < appliedCohortDateFrom) return false;
@@ -419,7 +446,11 @@ export default function Dashboard() {
         if (appliedSourceFilter !== "all" && transaction.traffic_source !== appliedSourceFilter) return false;
         return true;
       }),
-    [txs, appliedCohortDateFrom, appliedCohortDateTo, appliedFunnelFilter, appliedCampaignPathFilter, appliedSourceFilter],
+    [dashboardTransactions, appliedCohortDateFrom, appliedCohortDateTo, appliedFunnelFilter, appliedCampaignPathFilter, appliedSourceFilter],
+  );
+  const dashboardFxSummary = useMemo(
+    () => buildDashboardFxSummary(normalizeDashboardTransactions(dailyTransactions).diagnostics),
+    [dailyTransactions],
   );
   const dailySubscriptions = useMemo(
     () =>
@@ -587,6 +618,20 @@ export default function Dashboard() {
           <span className="text-xs text-muted-foreground">
             {cohorts.length} of {allCohorts.length} cohorts
           </span>
+        </div>
+        <div
+          className={`mt-2 text-xs ${
+            dashboardFxSummary.excludedTransactions > 0 ? "text-warning" : "text-muted-foreground"
+          }`}
+        >
+          FX: {formatFxCount(dashboardFxSummary.nativeUsdRows)} native USD · {formatFxCount(dashboardFxSummary.convertedRows)} converted ·{" "}
+          {formatFxCount(dashboardFxSummary.missingCurrencyRows)} missing currency · {formatFxCount(dashboardFxSummary.missingFxRows)} missing FX
+          {dashboardFxSummary.invalidAmountRows > 0 ? ` · ${formatFxCount(dashboardFxSummary.invalidAmountRows)} invalid amount` : ""}
+          {dashboardFxSummary.excludedTransactions > 0
+            ? ` · excluded ${formatFxCount(dashboardFxSummary.excludedTransactions)} rows / ${dashboardFxSummary.excludedAmountOriginal.toLocaleString(undefined, { maximumFractionDigits: 2 })} original units`
+            : ""}
+          {" · data source: warehouse FX fields · "}
+          {dashboardFx.durationMs} ms
         </div>
       </Card>
 

@@ -8,6 +8,8 @@ import type {
 import { cardTypeFromSource } from "@/services/userCardType";
 import { declineDetailsForTransaction } from "@/services/paymentFailures";
 import { buildCohortId } from "@/services/cohortIdentity";
+import { isTokenPurchaseTransaction } from "@/services/monetization";
+import { APP_ADDON_WINDOW_HOURS } from "@/services/monetizationProductMap";
 
 export type RawPalmerRow = Record<string, unknown>;
 
@@ -398,6 +400,11 @@ export function classifyUserTransactions(rows: Transaction[]): Transaction[] {
       if (statusType) {
         transaction_type = statusType;
         classification_reason = `${tx.status} Palmer status`;
+      } else if (isTokenPurchaseTransaction(tx)) {
+        // Web-app token/minute packs are add-on revenue: they must never
+        // occupy a trial/first_subscription/renewal slot in the lifecycle.
+        transaction_type = "token_purchase";
+        classification_reason = "Token/minute pack product → token_purchase";
       } else if (trialTs === null && isUpsellByMetadata) {
         transaction_type = "upsell";
         classification_reason = "Metadata ff_billing_reason contains upsell";
@@ -417,6 +424,17 @@ export function classifyUserTransactions(rows: Transaction[]): Transaction[] {
         classification_reason = isUpsellByMetadata
           ? "Metadata ff_billing_reason contains upsell"
           : "Common upsell amount within 0–60 minutes after trial";
+      } else if (
+        // Subscription auto-charges never fire this early (earliest observed
+        // billing horizon is 70h): an unmarked success inside the trial window
+        // is an in-app purchase (token/minute pack), not a first_subscription.
+        trialTs !== null &&
+        eventTs >= trialTs &&
+        eventTs - trialTs <= APP_ADDON_WINDOW_HOURS * HOUR &&
+        !isUpsellByMetadata
+      ) {
+        transaction_type = "token_purchase";
+        classification_reason = "In-app purchase within trial window → token_purchase";
       } else if (firstSubscriptionTs === null && !isUpsellByMetadata) {
         firstSubscriptionTs = eventTs;
         transaction_type = "first_subscription";

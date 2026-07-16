@@ -1,5 +1,6 @@
 import type { CardType, CohortRow, MediaBuyer, PlanBreakdownRow, Transaction, UserAggregate } from "./types";
 import type { SubscriptionClean } from "@/types/subscriptions";
+import { isSubscriptionActiveNow } from "@/services/subscriptionTransform";
 import { countryCodeForUserTransactions, normalizeCountryCode } from "@/services/userCountry";
 import { CARD_TYPE_VALUES, cardTypeForUserTransactions } from "@/services/userCardType";
 import { MEDIA_BUYER_VALUES, mediaBuyerForUserTransactions } from "@/services/userMediaBuyer";
@@ -10,6 +11,24 @@ import {
   MAX_SUPPORTED_RENEWAL_COLUMNS,
   sanitizeMaxRenewalColumns,
 } from "@/services/dataSettings";
+import {
+  addTokenPurchaseToPacks,
+  addUnknownProduct,
+  createTokenPackAccumulator,
+  createUnknownProductAccumulator,
+  finalizeTokenPacks,
+  finalizeUnknownProducts,
+  hasAddonMarker,
+  hasUpsellMarker,
+  isTokenPurchaseTransaction,
+  type UnknownProductRow,
+} from "@/services/monetization";
+import { APP_ADDON_WINDOW_HOURS } from "@/services/monetizationProductMap";
+import {
+  normalizeTransactionsToUsd,
+  type FxNormalizationDiagnostics,
+} from "@/services/currencyNormalization";
+import type { CohortCurrencyBreakdownRow } from "@/services/types";
 
 const DAY = 24 * 60 * 60 * 1000;
 export const DEFAULT_MAX_RENEWAL_DEPTH = DEFAULT_MAX_RENEWAL_COLUMNS;
@@ -50,7 +69,8 @@ const FAILED_STATUS_TOKENS = [
 const initialPlanTransactionForUser = (txs: Transaction[]) =>
   [...txs]
     .sort((a, b) => (a.event_time < b.event_time ? -1 : 1))
-    .find((t) => t.status === "success" && t.transaction_type !== "upsell");
+    // Token packs are add-on purchases, never a price plan.
+    .find((t) => t.status === "success" && t.transaction_type !== "upsell" && t.transaction_type !== "token_purchase");
 const planNameFromPrice = (price: number | null) => (price == null ? "Unknown" : formatCurrency(price));
 const normalizeEmailKey = (email: string | null | undefined) => email?.trim().toLowerCase() || "";
 const transactionDay = (t: Transaction, daysFromCohort: number) =>
@@ -200,6 +220,47 @@ export interface ComputeCohortsOptions {
   selectedCountries?: string[];
   selectedCardTypes?: CardType[];
   selectedMediaBuyers?: MediaBuyer[];
+  /** Filter users by the ORIGINAL currency of their trial charge (e.g. ["MXN"]). */
+  selectedCurrencies?: string[];
+  /** Reference "now" (ms) for currently-active subscription metrics. Defaults to Date.now() once per call. */
+  now?: number;
+}
+
+/**
+ * Active subscription_ids grouped by normalized email, computed once against a
+ * single `nowMs`. Active Users and Active Subscriptions are BOTH derived from
+ * this one set: a user is active iff their email owns >=1 active subscription,
+ * and Active Subscriptions counts the unique subscription_ids. Subscriptions
+ * are deduped by subscription_id so a resynced duplicate cannot inflate.
+ */
+function activeSubscriptionIdsByEmail(
+  subscriptions: SubscriptionClean[],
+  nowMs: number,
+): Map<string, Set<string>> {
+  const byEmail = new Map<string, Set<string>>();
+  const seenSubIds = new Set<string>();
+  for (const sub of subscriptions) {
+    if (!isSubscriptionActiveNow(sub, nowMs)) continue;
+    const email = normalizeEmailKey(sub.email);
+    if (!email) continue; // no email → cannot attribute to a warehouse cohort user
+    const subId = sub.subscription_id?.trim();
+    if (!subId || seenSubIds.has(subId)) continue; // dedup by subscription_id
+    seenSubIds.add(subId);
+    const set = byEmail.get(email) ?? new Set<string>();
+    set.add(subId);
+    byEmail.set(email, set);
+  }
+  return byEmail;
+}
+
+/** Original charge currency of the user's first successful trial (fallback: first transaction). */
+export function currencyForUserTransactions(txs: Transaction[]): string | null {
+  const sorted = [...txs].sort((a, b) => (a.event_time < b.event_time ? -1 : 1));
+  const trial = sorted.find((t) => t.status === "success" && t.transaction_type === "trial");
+  const source = trial ?? sorted[0];
+  if (!source) return null;
+  const currency = String(source.original_currency ?? source.currency ?? "").trim().toUpperCase();
+  return currency || null;
 }
 
 function normalizeCountryFilter(countries: unknown): Set<string> {
@@ -400,9 +461,10 @@ export function computeUsers(txs: Transaction[]): UserAggregate[] {
     .sort((a, b) => b.total_revenue - a.total_revenue);
 }
 
+// Active Users / Active Subscriptions no longer live here — they are derived
+// from the injected-now active-subscription set. These flags feed only the
+// cancellation metrics (Cancelled / Cancelled Active), which are out of scope.
 type SubscriptionFlags = {
-  active: boolean;
-  activeSubscription: boolean;
   cancelled: boolean;
   cancelledActive: boolean;
   userCancel: boolean;
@@ -567,16 +629,12 @@ function subscriptionFlagsByEmail(txs: Transaction[], subscriptions: Subscriptio
     const email = normalizeEmailKey(sub.email);
     if (!email) continue;
     const flags = result.get(email) ?? {
-      active: false,
-      activeSubscription: false,
       cancelled: false,
       cancelledActive: false,
       userCancel: false,
       autoCancel: false,
       autoCancelWithFailedTransaction: false,
     };
-    flags.active = flags.active || sub.is_active_now;
-    flags.activeSubscription = flags.activeSubscription || (sub.status === "active" && sub.renews === true);
     flags.cancelled = flags.cancelled || sub.is_cancelled;
     flags.cancelledActive = flags.cancelledActive || (sub.is_cancelled && sub.is_active_now);
     const cancellation = classifyCancellation(sub, failuresByEmail.get(email));
@@ -590,18 +648,63 @@ function subscriptionFlagsByEmail(txs: Transaction[], subscriptions: Subscriptio
   return result;
 }
 
+/** Attribution health of web-app token purchases within the filtered dataset. */
+export interface TokenAttributionDiagnostics {
+  token_purchases_total: number;
+  token_purchases_matched: number;
+  token_purchases_matched_by_email: number;
+  token_purchases_unmatched: number;
+  token_unmatched_amount: number;
+}
+
+/** Dataset-level monetization diagnostics (token attribution + unmapped products). */
+export interface MonetizationDiagnostics extends TokenAttributionDiagnostics {
+  /** Products that need mapping in monetizationProductMap.ts (Phase 8 debug output). */
+  unknown_products: UnknownProductRow[];
+  /** Gross revenue of explicit one-time/add-on rows that could not be classified. */
+  unknown_addon_revenue: number;
+}
+
+export interface CohortComputationResult {
+  cohorts: CohortRow[];
+  tokenDiagnostics: MonetizationDiagnostics;
+  fxDiagnostics: FxNormalizationDiagnostics;
+}
+
 export function computeCohorts(
   txs: Transaction[],
   subscriptions: SubscriptionClean[] = [],
   options: ComputeCohortsOptions = {},
 ): CohortRow[] {
-  const analyticsTxs = dedupeTransactionsForAnalytics(txs);
+  return computeCohortsWithDiagnostics(txs, subscriptions, options).cohorts;
+}
+
+const isTokenRelatedTransaction = (t: Transaction) =>
+  t.transaction_type === "token_purchase" ||
+  ((t.status === "refunded" || t.status === "chargeback") && isTokenPurchaseTransaction(t));
+
+export function computeCohortsWithDiagnostics(
+  txs: Transaction[],
+  subscriptions: SubscriptionClean[] = [],
+  options: ComputeCohortsOptions = {},
+): CohortComputationResult {
+  // All money fields below this line are USD; original amounts/currencies are
+  // preserved per transaction for the currency breakdown.
+  const { transactions: usdTxs, diagnostics: fxDiagnostics } = normalizeTransactionsToUsd(txs);
+  const analyticsTxs = dedupeTransactionsForAnalytics(usdTxs);
   const selectedCountries = normalizeCountryFilter(options.selectedCountries);
   const selectedCardTypes = normalizeCardTypeFilter(options.selectedCardTypes);
   const selectedMediaBuyers = normalizeMediaBuyerFilter(options.selectedMediaBuyers);
+  const selectedCurrencies = new Set(
+    (Array.isArray(options.selectedCurrencies) ? options.selectedCurrencies : [])
+      .map((currency) => String(currency ?? "").trim().toUpperCase())
+      .filter(Boolean),
+  );
   const userFilteredIds = new Set<string>();
   const txsByUserForFilters = new Map<string, Transaction[]>();
-  if (selectedCountries.size > 0 || selectedCardTypes.size > 0 || selectedMediaBuyers.size > 0) {
+  const hasUserFilters =
+    selectedCountries.size > 0 || selectedCardTypes.size > 0 || selectedMediaBuyers.size > 0 || selectedCurrencies.size > 0;
+  if (hasUserFilters) {
     for (const tx of analyticsTxs) {
       const list = txsByUserForFilters.get(tx.user_id) ?? [];
       list.push(tx);
@@ -612,15 +715,18 @@ export function computeCohorts(
       if (selectedCountries.size > 0 && (!country || !selectedCountries.has(country))) return;
       if (selectedCardTypes.size > 0 && !selectedCardTypes.has(cardTypeForUserTransactions(list))) return;
       if (selectedMediaBuyers.size > 0 && !selectedMediaBuyers.has(mediaBuyerForUserTransactions(list).media_buyer)) return;
+      if (selectedCurrencies.size > 0) {
+        const currency = currencyForUserTransactions(list);
+        if (!currency || !selectedCurrencies.has(currency)) return;
+      }
       userFilteredIds.add(userId);
     });
   }
   // Cohort membership is anchored to the exact trial timestamp; the displayed
   // date is only a label. This keeps D0/D7/D30 windows aligned per user.
-  const userFilteredTxs =
-    selectedCountries.size > 0 || selectedCardTypes.size > 0 || selectedMediaBuyers.size > 0
-      ? analyticsTxs.filter((tx) => userFilteredIds.has(tx.user_id))
-      : analyticsTxs;
+  const userFilteredTxs = hasUserFilters
+    ? analyticsTxs.filter((tx) => userFilteredIds.has(tx.user_id))
+    : analyticsTxs;
   const trials = userFilteredTxs.filter((t) => t.transaction_type === "trial" && t.status === "success");
   const cohortByUser = new Map<string, { id: string; date: string; funnel: Transaction["funnel"]; campaignPath: string; ts: number }>();
   for (const t of [...trials].sort((a, b) => (a.event_time < b.event_time ? -1 : 1))) {
@@ -651,7 +757,59 @@ export function computeCohorts(
     userTxs.set(t.user_id, list);
   }
   const subscriptionFlags = subscriptionFlagsByEmail(userFilteredTxs, subscriptions);
+  // "Now" is stamped once per computation so active metrics are deterministic
+  // within a call and reflect the current moment (not the last sync).
+  const nowMs = typeof options.now === "number" ? options.now : Date.now();
+  const activeSubsByEmail = activeSubscriptionIdsByEmail(subscriptions, nowMs);
   const maxRenewalDepth = sanitizeMaxRenewalColumns(options.maxRenewalDepth ?? DEFAULT_MAX_RENEWAL_DEPTH);
+
+  // Web-app token purchases can arrive under a different customer id than the
+  // funnel purchase. Attribute them to the buyer's cohort by user_id first,
+  // then by normalized email; anything else is reported as unmatched token
+  // revenue and excluded from cohort metrics.
+  const cohortUidByEmail = new Map<string, string>();
+  userTxs.forEach((list, uid) => {
+    if (!cohortByUser.has(uid)) return;
+    for (const t of list) {
+      const email = normalizeEmailKey(t.email);
+      if (email && !cohortUidByEmail.has(email)) cohortUidByEmail.set(email, uid);
+    }
+  });
+
+  const extraTokenTxsByUid = new Map<string, Transaction[]>();
+  const unknownProducts = createUnknownProductAccumulator();
+  let unknown_addon_revenue = 0;
+  const tokenDiagnostics: TokenAttributionDiagnostics = {
+    token_purchases_total: 0,
+    token_purchases_matched: 0,
+    token_purchases_matched_by_email: 0,
+    token_purchases_unmatched: 0,
+    token_unmatched_amount: 0,
+  };
+  for (const t of userFilteredTxs) {
+    if (!isTokenRelatedTransaction(t)) continue;
+    const isSuccessfulTokenPurchase = t.status === "success" && t.transaction_type === "token_purchase";
+    if (isSuccessfulTokenPurchase) tokenDiagnostics.token_purchases_total += 1;
+    if (cohortByUser.has(t.user_id)) {
+      // Already inside the cohort user's own transaction list.
+      if (isSuccessfulTokenPurchase) tokenDiagnostics.token_purchases_matched += 1;
+      continue;
+    }
+    const emailUid = cohortUidByEmail.get(normalizeEmailKey(t.email));
+    if (emailUid) {
+      const list = extraTokenTxsByUid.get(emailUid) ?? [];
+      list.push(t);
+      extraTokenTxsByUid.set(emailUid, list);
+      if (isSuccessfulTokenPurchase) {
+        tokenDiagnostics.token_purchases_matched += 1;
+        tokenDiagnostics.token_purchases_matched_by_email += 1;
+      }
+    } else if (isSuccessfulTokenPurchase) {
+      tokenDiagnostics.token_purchases_unmatched += 1;
+      tokenDiagnostics.token_unmatched_amount += grossAmount(t);
+    }
+  }
+  tokenDiagnostics.token_unmatched_amount = round2(tokenDiagnostics.token_unmatched_amount);
 
   const rows: CohortRow[] = [];
   groups.forEach((group, cohort_id) => {
@@ -662,8 +820,11 @@ export function computeCohorts(
     const renewalUserCountsByLevel = createRenewalCountsByLevel(maxRenewalDepth);
     let renewal_users = 0;
     const refundedUserIds = new Set<string>();
+    // Active Users = cohort uids with >=1 currently-active subscription.
+    // Active Subscriptions = unique active subscription_ids across the cohort.
+    // Both come from the SAME activeSubsByEmail set (never counted separately).
     const activeUserIds = new Set<string>();
-    const activeSubscriptionUserIds = new Set<string>();
+    const activeSubscriptionIds = new Set<string>();
     const cancelledUserIds = new Set<string>();
     const userCancelledUserIds = new Set<string>();
     const autoCancelledUserIds = new Set<string>();
@@ -672,6 +833,38 @@ export function computeCohorts(
     let trial_revenue = 0, upsell_revenue = 0, first_subscription_revenue = 0, renewal_revenue = 0;
     let amount_refunded = 0, gross_revenue = 0;
     let revenue_d0 = 0, revenue_d7 = 0, revenue_d14 = 0, revenue_d30 = 0, revenue_d60 = 0, revenue_d37 = 0, revenue_d67 = 0, revenue_total = 0;
+    // Monetization: multi-upsell slots + token pack purchases. Slots are
+    // assigned by the ORDER of the user's successful upsell purchases (the
+    // audit showed no ordinal signal on the payments themselves).
+    const upsellSlotUserIds = [new Set<string>(), new Set<string>(), new Set<string>()] as const;
+    const upsellSlotRevenue = [0, 0, 0];
+    const upsellExtraUserIds = new Set<string>();
+    let upsell_extra_revenue = 0;
+    const funnelUpsellUserIds = new Set<string>();
+    let funnel_upsell_revenue = 0;
+    const tokenBuyerIds = new Set<string>();
+    let token_purchases = 0, token_gross_revenue = 0, token_refund_amount = 0;
+    const tokenPacks = createTokenPackAccumulator();
+    // Per-currency revenue mix (original charge currency vs USD-normalized).
+    type MutableCurrencyRow = {
+      trialUsers: number; transactions: number; grossOriginal: number;
+      grossUsd: number; netUsd: number; refundsUsd: number;
+      trialPriceOriginalSum: number; trialPriceUsdSum: number; trialPriceCount: number;
+    };
+    const currencyRows = new Map<string, MutableCurrencyRow>();
+    const currencyRowFor = (currency: string): MutableCurrencyRow => {
+      const row = currencyRows.get(currency) ?? {
+        trialUsers: 0, transactions: 0, grossOriginal: 0,
+        grossUsd: 0, netUsd: 0, refundsUsd: 0,
+        trialPriceOriginalSum: 0, trialPriceUsdSum: 0, trialPriceCount: 0,
+      };
+      currencyRows.set(currency, row);
+      return row;
+    };
+    const txCurrency = (t: Transaction) =>
+      String(t.original_currency ?? t.currency ?? "").trim().toUpperCase() || "UNKNOWN";
+    let fx_missing_amount = 0;
+    let fx_missing_transactions = 0;
 
     for (const uid of userIds) {
       const list = userTxs.get(uid) ?? [];
@@ -697,6 +890,18 @@ export function computeCohorts(
       subscriptionLevelByPayment.forEach((level) => {
         if (level <= maxRenewalDepth) subscriptionLevels.add(level);
       });
+      // Upsell slot = 1-based position of each successful upsell purchase in
+      // the user's chronological order (list is time-ascending after dedupe).
+      const upsellSlotByPayment = new Map<Transaction, number>();
+      {
+        let upsellPosition = 0;
+        for (const t of list) {
+          if (t.status !== "success" || t.transaction_type !== "upsell") continue;
+          if (new Date(t.event_time).getTime() < userCohort.ts) continue;
+          upsellPosition += 1;
+          upsellSlotByPayment.set(t, upsellPosition);
+        }
+      }
       for (const t of list) {
         const dt = (new Date(t.event_time).getTime() - userCohort.ts) / DAY;
         if (dt < 0) continue;
@@ -704,6 +909,16 @@ export function computeCohorts(
         amount_refunded += refunded;
         userRefundAmount += refunded;
         if (plan) plan.amount_refunded += refunded;
+        // Token refunds: same-row amountRefunded on settled token rows plus
+        // dedicated refund/chargeback rows whose product matches a token pack.
+        if (isTokenRelatedTransaction(t)) token_refund_amount += refunded;
+        // Currency mix: refunds are USD after normalization; missing-FX rows
+        // are excluded from USD metrics and reported per cohort.
+        currencyRowFor(txCurrency(t)).refundsUsd += refunded;
+        if (t.fx_status === "missing_currency" || t.fx_status === "missing_fx_rate" || t.fx_status === "invalid_amount") {
+          fx_missing_transactions += 1;
+          if (t.status === "success") fx_missing_amount += t.original_gross_amount ?? 0;
+        }
         if (t.status !== "success") continue;
         const gross = grossAmount(t);
         const net = netAmount(t);
@@ -725,8 +940,56 @@ export function computeCohorts(
           if (day <= 30) plan.revenue_d30 += net;
           if (day <= 60) plan.revenue_d60 += net;
         }
+        {
+          const currencyRow = currencyRowFor(txCurrency(t));
+          currencyRow.transactions += 1;
+          currencyRow.grossOriginal += t.original_gross_amount ?? gross;
+          currencyRow.grossUsd += gross;
+          currencyRow.netUsd += net;
+          if (t.transaction_type === "trial") {
+            currencyRow.trialUsers += 1;
+            currencyRow.trialPriceOriginalSum += t.original_gross_amount ?? gross;
+            currencyRow.trialPriceUsdSum += gross;
+            currencyRow.trialPriceCount += 1;
+          }
+        }
         if (t.transaction_type === "trial") trial_revenue += net;
         if (t.transaction_type === "upsell") upsell_revenue += net;
+        if (t.transaction_type === "token_purchase") {
+          token_purchases += 1;
+          token_gross_revenue += gross;
+          tokenBuyerIds.add(uid);
+          addTokenPurchaseToPacks(tokenPacks, t, gross);
+          // Auto-classified by the trial-window rule but not (yet) present in
+          // monetizationProductMap — surface it so the mapping gets confirmed.
+          if (!isTokenPurchaseTransaction(t)) addUnknownProduct(unknownProducts, t, "token_candidate");
+        } else if (t.transaction_type === "upsell") {
+          // Upsell N Gross Rev is defined on gross amounts (spec), unlike the
+          // net-based generic upsell_revenue above.
+          const position = upsellSlotByPayment.get(t);
+          funnelUpsellUserIds.add(uid);
+          funnel_upsell_revenue += gross;
+          if (position != null && position <= 3) {
+            upsellSlotUserIds[position - 1].add(uid);
+            upsellSlotRevenue[position - 1] += gross;
+          } else {
+            upsellExtraUserIds.add(uid);
+            upsell_extra_revenue += gross;
+          }
+        } else if (t.transaction_type === "unknown" && hasAddonMarker(t)) {
+          // Explicit one-time/add-on rows that no rule could classify.
+          addUnknownProduct(unknownProducts, t, "addon_candidate");
+          unknown_addon_revenue += gross;
+        } else if (
+          // Unmapped in-app purchase candidates: an unmarked successful charge
+          // this soon after the trial cannot be a subscription payment — it
+          // needs an entry in monetizationProductMap.ts (Phase 8 diagnostics).
+          t.transaction_type !== "trial" &&
+          dt * DAY < APP_ADDON_WINDOW_HOURS * 60 * 60 * 1000 &&
+          !hasUpsellMarker(t)
+        ) {
+          addUnknownProduct(unknownProducts, t, "token_candidate");
+        }
         // First-sub / renewal revenue follow the canonical sequence position (NOT transaction_type),
         // so the revenue split matches the renewal_*_users counts exactly. Level 1 = First Sub;
         // levels >= 2 = renewals (uncapped, so the renewal_revenue total stays complete).
@@ -739,13 +1002,30 @@ export function computeCohorts(
         }
         if (t.transaction_type === "upsell" && t.status === "success") hasUpsell = true;
       }
+      // Token purchases matched by email (different customer id, same person).
+      // They count toward token/add-on metrics only — existing cohort revenue
+      // definitions (gross/net/revenue_dN) intentionally stay unchanged.
+      for (const t of extraTokenTxsByUid.get(uid) ?? []) {
+        const dt = (new Date(t.event_time).getTime() - userCohort.ts) / DAY;
+        if (dt < 0) continue;
+        token_refund_amount += refundAmount(t);
+        if (t.status !== "success" || t.transaction_type !== "token_purchase") continue;
+        const gross = grossAmount(t);
+        token_purchases += 1;
+        token_gross_revenue += gross;
+        tokenBuyerIds.add(uid);
+        addTokenPurchaseToPacks(tokenPacks, { product: t.product, user_id: uid }, gross);
+      }
       const hasRenewal = renewalLevelsThrough(maxRenewalDepth).some((level) => subscriptionLevels.has(level));
       if (hasUpsell) upsell_users += 1;
       if (subscriptionLevels.has(1)) first_subscription_users += 1;
       incrementRenewalCountsByLevel(renewalUserCountsByLevel, subscriptionLevels, maxRenewalDepth);
       if (hasRenewal) renewal_users += 1;
-      if (subFlags?.active) activeUserIds.add(uid);
-      if (subFlags?.activeSubscription) activeSubscriptionUserIds.add(uid);
+      const userActiveSubIds = userEmail ? activeSubsByEmail.get(userEmail) : undefined;
+      if (userActiveSubIds && userActiveSubIds.size > 0) {
+        activeUserIds.add(uid);
+        for (const subId of userActiveSubIds) activeSubscriptionIds.add(subId);
+      }
       if (subFlags?.cancelled) cancelledUserIds.add(uid);
       if (subFlags?.autoCancelWithFailedTransaction) autoCancelledUserIds.add(uid);
       else if (subFlags?.userCancel) userCancelledUserIds.add(uid);
@@ -754,8 +1034,10 @@ export function computeCohorts(
       if (userRefundAmount > 0) refundedUserIds.add(uid);
       if (plan) {
         plan.trial_users += 1;
-        if (subFlags?.active) plan.active_users += 1;
-        if (subFlags?.activeSubscription) plan.active_subscriptions += 1;
+        if (userActiveSubIds && userActiveSubIds.size > 0) {
+          plan.active_users += 1;
+          plan.active_subscriptions += userActiveSubIds.size;
+        }
         if (subFlags?.cancelled) plan.cancelled_users += 1;
         if (subFlags?.autoCancelWithFailedTransaction) plan.auto_cancelled_users += 1;
         else if (subFlags?.userCancel) plan.user_cancelled_users += 1;
@@ -769,12 +1051,14 @@ export function computeCohorts(
     }
     const refund_users = refundedUserIds.size;
     const active_users = activeUserIds.size;
-    const active_subscriptions = activeSubscriptionUserIds.size;
+    const active_subscriptions = activeSubscriptionIds.size;
     const cancelled_users = cancelledUserIds.size;
     const user_cancelled_users = userCancelledUserIds.size;
     const auto_cancelled_users = autoCancelledUserIds.size;
     const cancelled_active_users = cancelledActiveUserIds.size;
     const netRevenue = gross_revenue - amount_refunded;
+    const token_buyers = tokenBuyerIds.size;
+    const token_net_revenue = round2(token_gross_revenue - token_refund_amount);
     const renewalUserCounts = staticRenewalCountsFromLevels(renewalUserCountsByLevel);
     planBreakdown.forEach((plan) => {
       Object.assign(plan, staticRenewalCountsFromLevels(plan.renewal_users_by_level));
@@ -790,7 +1074,9 @@ export function computeCohorts(
       active_rate: trial_users ? (active_users / trial_users) * 100 : 0,
       active_subscriptions,
       active_subscriptions_rate: trial_users ? (active_subscriptions / trial_users) * 100 : 0,
-      active_subscription_user_ids: Array.from(activeSubscriptionUserIds),
+      // Active users and the unique active subscription_ids, for total-row dedup.
+      active_subscription_user_ids: Array.from(activeUserIds),
+      active_subscription_ids: Array.from(activeSubscriptionIds),
       cancelled_users,
       cancellation_rate: trial_users ? (cancelled_users / trial_users) * 100 : 0,
       user_cancelled_users,
@@ -817,6 +1103,51 @@ export function computeCohorts(
       upsell_revenue: round2(upsell_revenue),
       first_subscription_revenue: round2(first_subscription_revenue),
       renewal_revenue: round2(renewal_revenue),
+      upsell_1_users: upsellSlotUserIds[0].size,
+      upsell_2_users: upsellSlotUserIds[1].size,
+      upsell_3_users: upsellSlotUserIds[2].size,
+      upsell_extra_users: upsellExtraUserIds.size,
+      upsell_1_revenue: round2(upsellSlotRevenue[0]),
+      upsell_2_revenue: round2(upsellSlotRevenue[1]),
+      upsell_3_revenue: round2(upsellSlotRevenue[2]),
+      upsell_extra_revenue: round2(upsell_extra_revenue),
+      upsell_1_cr: trial_users ? (upsellSlotUserIds[0].size / trial_users) * 100 : 0,
+      upsell_2_cr: trial_users ? (upsellSlotUserIds[1].size / trial_users) * 100 : 0,
+      upsell_3_cr: trial_users ? (upsellSlotUserIds[2].size / trial_users) * 100 : 0,
+      funnel_upsell_users: funnelUpsellUserIds.size,
+      funnel_upsell_revenue: round2(funnel_upsell_revenue),
+      token_buyers,
+      token_buyer_cr: trial_users ? (token_buyers / trial_users) * 100 : 0,
+      token_purchases,
+      token_gross_revenue: round2(token_gross_revenue),
+      token_net_revenue,
+      avg_token_revenue_per_trial: trial_users ? round2(token_net_revenue / trial_users) : 0,
+      avg_token_revenue_per_buyer: token_buyers ? round2(token_net_revenue / token_buyers) : 0,
+      // Spec formula: Upsell 1 Rev + Upsell 2 Rev + Upsell 3 Rev + Token Net Rev
+      // (gross upsell slots; extra/4th+ upsells are reported separately).
+      addon_revenue: round2(upsellSlotRevenue[0] + upsellSlotRevenue[1] + upsellSlotRevenue[2] + token_net_revenue),
+      token_buyer_user_ids: Array.from(tokenBuyerIds),
+      token_pack_breakdown: finalizeTokenPacks(tokenPacks),
+      currency_breakdown: Array.from(currencyRows.entries())
+        .map(([currency, row]): CohortCurrencyBreakdownRow => ({
+          currency,
+          trial_users: row.trialUsers,
+          transactions: row.transactions,
+          gross_original: round2(row.grossOriginal),
+          gross_usd: round2(row.grossUsd),
+          net_usd: round2(row.netUsd),
+          refunds_usd: round2(row.refundsUsd),
+          avg_trial_price_original: row.trialPriceCount ? round2(row.trialPriceOriginalSum / row.trialPriceCount) : null,
+          avg_trial_price_usd: row.trialPriceCount ? round2(row.trialPriceUsdSum / row.trialPriceCount) : null,
+        }))
+        .sort((a, b) => b.gross_usd - a.gross_usd || a.currency.localeCompare(b.currency)),
+      currency_mix: Array.from(currencyRows.entries())
+        .filter(([, row]) => row.trialUsers > 0)
+        .sort((a, b) => b[1].trialUsers - a[1].trialUsers)
+        .map(([currency, row]) => `${currency} ${row.trialUsers}`)
+        .join(" · "),
+      fx_missing_amount: round2(fx_missing_amount),
+      fx_missing_transactions,
       amount_refunded: round2(amount_refunded),
       refund_rate: trial_users ? (refund_users / trial_users) * 100 : 0,
       gross_revenue: round2(gross_revenue),
@@ -838,10 +1169,23 @@ export function computeCohorts(
       ltv_d7: round2(revenue_d7 / trial_users),
       ltv_d14: round2(revenue_d14 / trial_users),
       ltv_d30: round2(revenue_d30 / trial_users),
+      // Realized 1-month LTV. net = USD-normalized net (refunds already
+      // subtracted); revenue_d30 sums only day<=30, so post-30d revenue is
+      // excluded. Named field for the "LTV 1M / User" column.
+      net_revenue_1m: round2(revenue_d30),
+      ltv_1m_per_user: trial_users ? round2(revenue_d30 / trial_users) : 0,
     });
   });
 
-  return rows.sort((a, b) => (a.cohort_date < b.cohort_date ? 1 : -1));
+  return {
+    cohorts: rows.sort((a, b) => (a.cohort_date < b.cohort_date ? 1 : -1)),
+    tokenDiagnostics: {
+      ...tokenDiagnostics,
+      unknown_products: finalizeUnknownProducts(unknownProducts),
+      unknown_addon_revenue: round2(unknown_addon_revenue),
+    },
+    fxDiagnostics,
+  };
 }
 
 function round2(n: number) {

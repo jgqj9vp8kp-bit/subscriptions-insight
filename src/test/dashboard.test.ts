@@ -12,8 +12,11 @@ import {
   buildTrialsUpsellsByDay,
   buildUpsellsByDay,
   getCashRevenueByDateRange,
+  buildDashboardFxSummary,
+  normalizeDashboardTransactions,
   type DashboardCohort,
 } from "@/services/dashboard";
+import { FX_RATES_TO_USD } from "@/services/fxRates";
 import type { Transaction } from "@/services/types";
 import type { SubscriptionClean } from "@/types/subscriptions";
 
@@ -317,6 +320,91 @@ describe("dashboard data builders", () => {
 
     expect(getCashRevenueByDateRange(rows).cashRevenue).toBe(209.94);
     expect(getCashRevenueByDateRange(rows).transactionCount).toBe(6);
+  });
+
+  it("normalizes mixed-currency cash revenue to USD before summing", () => {
+    const rows = [
+      transaction({ transaction_id: "usd", transaction_type: "trial", gross_amount_usd: 10, net_amount_usd: 10, currency: "USD" }),
+      transaction({ transaction_id: "mxn", transaction_type: "trial", amount_usd: 279, gross_amount_usd: 279, net_amount_usd: 279, currency: "MXN" }),
+    ];
+
+    const summary = getCashRevenueByDateRange(rows);
+
+    expect(summary.cashRevenue).toBeCloseTo(10 + 279 * FX_RATES_TO_USD.MXN, 2);
+    expect(summary.cashRevenue).not.toBe(289);
+    expect(summary.cashNetRevenue).toBeCloseTo(summary.cashRevenue, 2);
+  });
+
+  it("excludes missing-FX rows from Dashboard USD cash revenue and reports diagnostics", () => {
+    const rows = [
+      transaction({ transaction_id: "usd", transaction_type: "trial", gross_amount_usd: 10, currency: "USD" }),
+      transaction({ transaction_id: "unknown-fx", transaction_type: "first_subscription", amount_usd: 100, gross_amount_usd: 100, net_amount_usd: 100, currency: "XYZ" }),
+      transaction({ transaction_id: "missing-currency", transaction_type: "upsell", amount_usd: 50, gross_amount_usd: 50, net_amount_usd: 50, currency: "" }),
+    ];
+
+    const normalized = normalizeDashboardTransactions(rows);
+    const fx = buildDashboardFxSummary(normalized.diagnostics);
+    const summary = getCashRevenueByDateRange(normalized.transactions);
+
+    expect(summary.cashRevenue).toBe(10);
+    expect(summary.transactionCount).toBe(3);
+    expect(fx.nativeUsdRows).toBe(1);
+    expect(fx.missingFxRows).toBe(1);
+    expect(fx.missingCurrencyRows).toBe(1);
+    expect(fx.excludedTransactions).toBe(2);
+    expect(fx.excludedAmountOriginal).toBe(150);
+  });
+
+  it("does not double-convert Dashboard transactions that already carry fx_status", () => {
+    const rows = [
+      transaction({ transaction_id: "mxn", transaction_type: "trial", amount_usd: 279, gross_amount_usd: 279, net_amount_usd: 279, currency: "MXN" }),
+    ];
+
+    const once = normalizeDashboardTransactions(rows);
+    const twice = normalizeDashboardTransactions(once.transactions);
+
+    expect(once.transactions[0].gross_amount_usd).toBeCloseTo(279 * FX_RATES_TO_USD.MXN, 2);
+    expect(twice.transactions[0].gross_amount_usd).toBeCloseTo(279 * FX_RATES_TO_USD.MXN, 2);
+    expect(getCashRevenueByDateRange(twice.transactions).cashRevenue).toBeCloseTo(279 * FX_RATES_TO_USD.MXN, 2);
+  });
+
+  it("uses normalized USD refund amounts for cash net revenue and daily refund charts", () => {
+    const rows = [
+      transaction({
+        transaction_id: "mxn-refunded-sale",
+        transaction_type: "trial",
+        amount_usd: 100,
+        gross_amount_usd: 100,
+        refund_amount_usd: 25,
+        net_amount_usd: 75,
+        currency: "MXN",
+        is_refunded: true,
+      }),
+    ];
+
+    const expectedGross = 100 * FX_RATES_TO_USD.MXN;
+    const expectedRefund = 25 * FX_RATES_TO_USD.MXN;
+
+    expect(getCashRevenueByDateRange(rows).cashRevenue).toBeCloseTo(expectedGross, 2);
+    expect(getCashRevenueByDateRange(rows).cashNetRevenue).toBeCloseTo(expectedGross - expectedRefund, 2);
+    expect(buildRefundsByDay(rows)).toEqual([
+      { date: "2026-03-18", refund_count: 1, refund_amount: Math.round(expectedRefund * 100) / 100 },
+    ]);
+  });
+
+  it("uses normalized USD upsell revenue in daily activity", () => {
+    const rows = [
+      transaction({ transaction_id: "mxn-upsell", user_id: "u1", transaction_type: "upsell", amount_usd: 279, gross_amount_usd: 279, net_amount_usd: 279, currency: "MXN" }),
+      transaction({ transaction_id: "usd-upsell", user_id: "u2", transaction_type: "upsell", amount_usd: 10, gross_amount_usd: 10, net_amount_usd: 10, currency: "USD" }),
+    ];
+
+    expect(buildUpsellsByDay(rows)).toEqual([
+      {
+        date: "2026-03-18",
+        upsell_users: 2,
+        upsell_revenue: Math.round((279 * FX_RATES_TO_USD.MXN + 10) * 100) / 100,
+      },
+    ]);
   });
 
   it("excludes failed, unknown, and refund-only rows from cash revenue", () => {
