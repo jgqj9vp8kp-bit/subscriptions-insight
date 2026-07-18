@@ -66,16 +66,20 @@ export interface CohortsKeyParts {
   userScopeHash: string;
   dataSource: "clickhouse" | "legacy";
   warehouseVersion: string;
+  /** FB warehouse fingerprint — a SEPARATE lifecycle from the transaction/cohort
+   * snapshot version: an FB sync must re-key Cohorts without a cohort rebuild. */
+  fbWarehouseVersion?: string;
   request: CohortRequest;
 }
 
-export function cohortsListKey(parts: CohortsKeyParts): [string, "list", string, string, string, NormalizedCohortRequest] {
+export function cohortsListKey(parts: CohortsKeyParts): [string, "list", string, string, string, string, NormalizedCohortRequest] {
   return [
     COHORTS_QUERY_ROOT,
     "list",
     parts.userScopeHash,
     parts.dataSource,
     parts.warehouseVersion,
+    parts.fbWarehouseVersion ?? "fbwhv_unknown",
     normalizeCohortRequest(parts.request),
   ];
 }

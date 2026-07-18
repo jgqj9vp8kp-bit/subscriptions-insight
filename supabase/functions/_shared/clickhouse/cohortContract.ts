@@ -140,6 +140,25 @@ export interface CohortAggregateRow {
   fx_missing_transactions: number;
   fx_missing_amount: number;
 
+  // FB Analytics metrics joined by (campaign_id, cohort_date) from
+  // fact_facebook_stats (see fbCohortStats.ts). Optional: absent on responses
+  // from the dynamic fallback path or pre-FB cached bundles.
+  fb_spend?: number;
+  fb_currency?: string | null;
+  fb_purchases?: number;
+  fb_cpp?: number | null;
+  fb_impressions?: number;
+  fb_reach?: number;
+  fb_clicks?: number;
+  fb_link_clicks?: number;
+  fb_ctr?: number | null;
+  fb_cpc?: number | null;
+  fb_cpm?: number | null;
+  fb_purchase_value?: number;
+  fb_roas?: number | null;
+  fb_campaigns_matched?: number;
+  fb_match_status?: string;
+
   // Non-reversible id-hash sets for cross-cohort dedup of the totals row only.
   dedup: {
     active_user_hashes: string[];
@@ -309,6 +328,10 @@ export interface CohortResponse {
   filter_options_diagnostics?: CohortFilterOptionsDiagnostics;
   fx_diagnostics?: CohortFxDiagnostics;
   token_diagnostics?: CohortTokenDiagnostics;
+  /** FB Analytics totals over deduplicated (campaign_id, date) pairs of the visible rows. */
+  fb_totals?: import("./fbCohortStats.ts").FbCohortTotals;
+  /** FB join health for this bundle (source rows, match rate, freshness, warehouse version). */
+  fb_diagnostics?: import("./fbCohortStats.ts").FbCohortDiagnostics;
   diagnostics: CohortDiagnostics;
   error?: string;
 }

@@ -68,12 +68,14 @@ export function useCohortsListQuery(params: {
   dataSource: "clickhouse" | "legacy";
   userScopeHash: string;
   warehouseVersion: string;
+  /** FB warehouse fingerprint — re-keys the report after an FB sync (separate lifecycle). */
+  fbWarehouseVersion?: string;
   enabled: boolean;
 }): UseCohortsListResult {
-  const { request, dataSource, userScopeHash, warehouseVersion, enabled } = params;
+  const { request, dataSource, userScopeHash, warehouseVersion, fbWarehouseVersion, enabled } = params;
   const queryKey = useMemo(
-    () => cohortsListKey({ userScopeHash, dataSource, warehouseVersion, request }),
-    [userScopeHash, dataSource, warehouseVersion, request],
+    () => cohortsListKey({ userScopeHash, dataSource, warehouseVersion, fbWarehouseVersion, request }),
+    [userScopeHash, dataSource, warehouseVersion, fbWarehouseVersion, request],
   );
   const activeKey = useMemo(() => JSON.stringify(normalizeCohortRequest(request)), [request]);
   const queryHash = useMemo(() => traceHash(queryKey), [queryKey]);

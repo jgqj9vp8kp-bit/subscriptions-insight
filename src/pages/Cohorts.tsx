@@ -39,6 +39,19 @@ import { normalizeCampaignPath, type TrafficMetric } from "@/services/trafficImp
 import type { CardType, CohortRow, MediaBuyer, PlanBreakdownRow } from "@/services/types";
 import { cohortsDataSourceMode } from "@/services/cohortsDataSource";
 import { deriveCohortSnapshotHealth, ensureCohortSnapshotRebuild } from "@/services/cohortSnapshotHealth";
+import {
+  FB_COHORT_COLUMN_LABELS,
+  FB_COHORT_COLUMNS,
+  FB_COHORT_DEFAULT_COLUMNS,
+  FB_COHORT_OPTIONAL_COLUMNS,
+  fbCohortCellText,
+  formatFbInt,
+  formatFbPct,
+  formatFbRoas,
+  formatFbUsd,
+} from "@/services/fbCohortFormatting";
+import { useFbWarehouseStatus } from "@/hooks/useFbWarehouse";
+import { buildCohortsExportTable, cohortsTableToCsv } from "@/services/cohortsExport";
 import { pruneInvalidCohortSelections } from "@/services/cohortFilterSelection";
 import type { CohortRequest } from "../../supabase/functions/_shared/clickhouse/cohortContract";
 import { useAuth } from "@/hooks/useAuth";
@@ -134,6 +147,9 @@ const COLUMN_ORDER_BEFORE_RENEWALS = [
   "cohort_date",
   "campaign_path",
   "funnel",
+  // FB Analytics (campaign_id + cohort_date join): Spend / FB Purchases / CPP
+  // lead the row per spec; the remaining FB columns live at the end, hidden.
+  ...FB_COHORT_DEFAULT_COLUMNS,
   "trial_users",
   "support_users",
   "support_rate",
@@ -154,6 +170,9 @@ const COLUMN_ORDER_BEFORE_RENEWALS = [
   "trial_to_first_subscription_cr",
   "first_subscription_to_renewal_2_cr",
   "renewal_2_to_renewal_3_cr",
+  "renewal_3_to_renewal_4_cr",
+  "renewal_4_to_renewal_5_cr",
+  "renewal_5_to_renewal_6_cr",
 ] as const;
 
 // Multi-upsell + token/minute pack monetization columns (hidden by default,
@@ -201,6 +220,7 @@ const COLUMN_ORDER_AFTER_RENEWALS = [
   "ltv_1m_per_user",
   ...MONETIZATION_COLUMNS,
   ...FX_COLUMNS,
+  ...FB_COHORT_OPTIONAL_COLUMNS,
   "traffic_spend",
   "trial_cost",
   "profit",
@@ -254,6 +274,9 @@ const STATIC_COLUMN_LABELS: Record<string, string> = {
   trial_to_first_subscription_cr: "→ Sub CR",
   first_subscription_to_renewal_2_cr: "Sub → Renewal 2 CR",
   renewal_2_to_renewal_3_cr: "Renewal 2 → 3 CR",
+  renewal_3_to_renewal_4_cr: "Renewal 3 → 4 CR",
+  renewal_4_to_renewal_5_cr: "Renewal 4 → 5 CR",
+  renewal_5_to_renewal_6_cr: "Renewal 5 → 6 CR",
   renewal_2_users: "Renewal 2",
   renewal_3_users: "Renewal 3",
   renewal_4_users: "Renewal 4",
@@ -310,6 +333,8 @@ const STATIC_COLUMN_LABELS: Record<string, string> = {
   roas_d7: "ROAS D7",
   roas_1m: "ROAS 1M",
   roas_2m: "ROAS 2M",
+  // FB Analytics columns (server-joined by campaign_id + cohort_date).
+  ...FB_COHORT_COLUMN_LABELS,
 };
 
 function columnLabel(id: CohortColumnId): string {
@@ -342,6 +367,9 @@ const COLUMN_MIN_WIDTHS: Record<string, number> = {
   trial_to_first_subscription_cr: 90,
   first_subscription_to_renewal_2_cr: 140,
   renewal_2_to_renewal_3_cr: 130,
+  renewal_3_to_renewal_4_cr: 130,
+  renewal_4_to_renewal_5_cr: 130,
+  renewal_5_to_renewal_6_cr: 130,
   renewal_2_users: 90,
   renewal_3_users: 90,
   renewal_4_users: 90,
@@ -383,6 +411,25 @@ const COLUMN_MIN_WIDTHS: Record<string, number> = {
   currency_mix: 150,
   fx_missing_amount: 130,
   fx_missing_transactions: 120,
+  fb_spend: 100,
+  fb_purchases: 110,
+  fb_cpp: 90,
+  fb_impressions: 110,
+  fb_reach: 90,
+  fb_clicks: 90,
+  fb_link_clicks: 100,
+  fb_ctr: 90,
+  fb_cpc: 90,
+  fb_cpm: 90,
+  fb_purchase_value: 130,
+  fb_roas: 90,
+  fb_cac: 110,
+  fb_cost_per_trial: 120,
+  fb_cost_per_upsell: 130,
+  fb_gross_roas: 110,
+  fb_net_roas: 110,
+  fb_profit: 100,
+  fb_margin: 100,
   traffic_spend: 90,
   trial_cost: 90,
   profit: 90,
@@ -538,7 +585,7 @@ function persistColumnOrder(order: CohortColumnId[]) {
 // ---- Column visibility ----
 // Monetization columns stay in the Columns selector but are hidden by default:
 // the table is already wide, and the built-in "Monetization" view surfaces them.
-const DEFAULT_HIDDEN: CohortColumnId[] = [...MONETIZATION_COLUMNS, ...FX_COLUMNS];
+const DEFAULT_HIDDEN: CohortColumnId[] = [...MONETIZATION_COLUMNS, ...FX_COLUMNS, ...FB_COHORT_OPTIONAL_COLUMNS];
 
 function defaultColumnVisibility(defaultColumnOrder = DEFAULT_COLUMN_ORDER): Record<CohortColumnId, boolean> {
   return Object.fromEntries(defaultColumnOrder.map((id) => [id, !DEFAULT_HIDDEN.includes(id)])) as Record<
@@ -1011,6 +1058,9 @@ export default function CohortsPage() {
   // produced by the cached cohorts query defined just above `needLegacy` below.
   const userScopeHash = useMemo(() => hashUserScope(user?.id), [user?.id]);
   const { version: warehouseVersion, ready: warehouseVersionReady } = useWarehouseVersion(cohortsSource === "clickhouse");
+  // FB warehouse fingerprint (separate lifecycle from the cohort snapshot): an
+  // FB sync re-keys this report so cached Spend can never outlive the sync.
+  const { version: fbWarehouseVersion } = useFbWarehouseStatus(cohortsSource === "clickhouse");
   const [uiState, setUiState, resetUiState] = usePersistedPageState("ui_state_cohorts", DEFAULT_COHORTS_UI_STATE);
   const {
     funnelFilter,
@@ -1416,6 +1466,7 @@ export default function CohortsPage() {
     dataSource: cohortsSource,
     userScopeHash,
     warehouseVersion,
+    fbWarehouseVersion,
     // Gate on the warehouse version being settled so the key is stable on the
     // first fetch (avoids a wasted re-key/double fetch on the first-ever visit).
     enabled: cohortsSource === "clickhouse" && warehouseVersionReady,
@@ -1777,6 +1828,35 @@ export default function CohortsPage() {
     [effectiveFilteredCohorts, sortColumn, sortDirection, trafficByKey]
   );
   const hasUsers = useMemo(() => new Set(txs.map((t) => t.user_id)).size > 0, [txs]);
+
+  // Export the CURRENTLY visible table (visible columns, current order, current
+  // sort/filters) to CSV or XLSX. Values resolve through the same field/traffic
+  // resolver as sorting, so exports include every FB column automatically.
+  const exportCohortsTable = async (format: "csv" | "xlsx") => {
+    const exportColumns = columnOrder.filter((id) => columnVisibility[id] !== false);
+    const table = buildCohortsExportTable({
+      cohorts,
+      columnOrder: exportColumns,
+      columnLabel,
+      trafficForCohort: (cohort) => trafficForCohort(cohort, trafficByKey),
+    });
+    const stamp = new Date().toISOString().slice(0, 10);
+    if (format === "csv") {
+      const blob = new Blob(["\uFEFF", cohortsTableToCsv(table)], { type: "text/csv;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `cohorts-${stamp}.csv`;
+      link.click();
+      URL.revokeObjectURL(url);
+      return;
+    }
+    const XLSX = await import("xlsx");
+    const sheet = XLSX.utils.aoa_to_sheet([table.headers, ...table.rows]);
+    const book = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(book, sheet, "Cohorts");
+    XLSX.writeFile(book, `cohorts-${stamp}.xlsx`);
+  };
   useEffect(() => {
     if (firstRowsRef.current || cohorts.length === 0) return;
     firstRowsRef.current = true;
@@ -1921,6 +2001,9 @@ export default function CohortsPage() {
   const maxSubCR = Math.max(0, ...cohorts.map((c) => c.trial_to_first_subscription_cr));
   const maxRenewal2CR = Math.max(0, ...cohorts.map((c) => c.first_subscription_to_renewal_2_cr));
   const maxRenewal3CR = Math.max(0, ...cohorts.map((c) => c.renewal_2_to_renewal_3_cr));
+  const maxRenewal4CR = Math.max(0, ...cohorts.map((c) => c.renewal_3_to_renewal_4_cr ?? 0));
+  const maxRenewal5CR = Math.max(0, ...cohorts.map((c) => c.renewal_4_to_renewal_5_cr ?? 0));
+  const maxRenewal6CR = Math.max(0, ...cohorts.map((c) => c.renewal_5_to_renewal_6_cr ?? 0));
   const totals = useMemo(() => {
     const sum = (pick: (c: (typeof cohorts)[number]) => number) =>
       cohorts.reduce((total, cohort) => total + pick(cohort), 0);
@@ -2018,6 +2101,11 @@ export default function CohortsPage() {
       trialToFirstSubscriptionCr: totalTrialUsers ? (totalFirstSubscriptionUsers / totalTrialUsers) * 100 : 0,
       firstSubscriptionToRenewal2Cr: totalFirstSubscriptionUsers ? (totalRenewal2Users / totalFirstSubscriptionUsers) * 100 : 0,
       renewal2ToRenewal3Cr: totalRenewal2Users ? (totalRenewal3Users / totalRenewal2Users) * 100 : 0,
+      // Renewal N → N+1 total CRs recomputed from summed level totals; null when
+      // the denominator level is empty so the row renders "—", never NaN.
+      renewal3ToRenewal4Cr: totalRenewal3Users ? (totalRenewal4Users / totalRenewal3Users) * 100 : null,
+      renewal4ToRenewal5Cr: totalRenewal4Users ? (totalRenewal5Users / totalRenewal4Users) * 100 : null,
+      renewal5ToRenewal6Cr: totalRenewal5Users ? (totalRenewal6Users / totalRenewal5Users) * 100 : null,
       // Monetization total CRs are recomputed from summed totals, not averaged.
       monetization: computeCohortMonetizationTotals(cohorts, totalTrialUsers),
       fxMissingTransactions: sum((c) => c.fx_missing_transactions ?? 0),
@@ -2191,8 +2279,38 @@ export default function CohortsPage() {
         return <TableCell key={id} className={`${className} font-medium`} style={heatStyle(c.trial_to_first_subscription_cr, maxSubCR)}>{formatPct(c.trial_to_first_subscription_cr)}</TableCell>;
       case "first_subscription_to_renewal_2_cr":
         return <TableCell key={id} className={`${className} font-medium`} style={heatStyle(c.first_subscription_to_renewal_2_cr, maxRenewal2CR)}>{formatPct(c.first_subscription_to_renewal_2_cr)}</TableCell>;
+      case "fb_spend":
+      case "fb_purchases":
+      case "fb_cpp":
+      case "fb_impressions":
+      case "fb_reach":
+      case "fb_clicks":
+      case "fb_link_clicks":
+      case "fb_ctr":
+      case "fb_cpc":
+      case "fb_cpm":
+      case "fb_purchase_value":
+      case "fb_roas":
+      case "fb_cac":
+      case "fb_cost_per_trial":
+      case "fb_cost_per_upsell":
+      case "fb_gross_roas":
+      case "fb_net_roas":
+      case "fb_profit":
+      case "fb_margin": {
+        const text = fbCohortCellText(c, id);
+        return <TableCell key={id} className={className}>{text === "—" ? dash : text}</TableCell>;
+      }
       case "renewal_2_to_renewal_3_cr":
         return <TableCell key={id} className={`${className} font-medium`} style={heatStyle(c.renewal_2_to_renewal_3_cr, maxRenewal3CR)}>{formatPct(c.renewal_2_to_renewal_3_cr)}</TableCell>;
+      // Renewal N → N+1 CR: "—" when the denominator level has no users yet.
+      // `?? 0` guards rows rehydrated from a pre-v3 cache that lacks the fields.
+      case "renewal_3_to_renewal_4_cr":
+        return <TableCell key={id} className={`${className} font-medium`} style={heatStyle(c.renewal_3_to_renewal_4_cr ?? 0, maxRenewal4CR)}>{renewalUsersForLevel(c, 3) > 0 ? formatPct(c.renewal_3_to_renewal_4_cr ?? 0) : dash}</TableCell>;
+      case "renewal_4_to_renewal_5_cr":
+        return <TableCell key={id} className={`${className} font-medium`} style={heatStyle(c.renewal_4_to_renewal_5_cr ?? 0, maxRenewal5CR)}>{renewalUsersForLevel(c, 4) > 0 ? formatPct(c.renewal_4_to_renewal_5_cr ?? 0) : dash}</TableCell>;
+      case "renewal_5_to_renewal_6_cr":
+        return <TableCell key={id} className={`${className} font-medium`} style={heatStyle(c.renewal_5_to_renewal_6_cr ?? 0, maxRenewal6CR)}>{renewalUsersForLevel(c, 5) > 0 ? formatPct(c.renewal_5_to_renewal_6_cr ?? 0) : dash}</TableCell>;
       case "renewal_users":
         return <TableCell key={id} className={className}>{c.renewal_users}</TableCell>;
       case "refund_users":
@@ -2349,6 +2467,12 @@ export default function CohortsPage() {
         return <TableCell key={id} className={className}>{formatPct(plan.first_subscription_to_renewal_2_cr)}</TableCell>;
       case "renewal_2_to_renewal_3_cr":
         return <TableCell key={id} className={className}>{formatPct(plan.renewal_2_to_renewal_3_cr)}</TableCell>;
+      case "renewal_3_to_renewal_4_cr":
+        return <TableCell key={id} className={className}>{plan.renewal_3_users > 0 ? formatPct(plan.renewal_3_to_renewal_4_cr ?? 0) : dash}</TableCell>;
+      case "renewal_4_to_renewal_5_cr":
+        return <TableCell key={id} className={className}>{plan.renewal_4_users > 0 ? formatPct(plan.renewal_4_to_renewal_5_cr ?? 0) : dash}</TableCell>;
+      case "renewal_5_to_renewal_6_cr":
+        return <TableCell key={id} className={className}>{plan.renewal_5_users > 0 ? formatPct(plan.renewal_5_to_renewal_6_cr ?? 0) : dash}</TableCell>;
       case "renewal_users":
         return <TableCell key={id} className={className}>{plan.renewal_users}</TableCell>;
       case "refund_users":
@@ -2402,6 +2526,25 @@ export default function CohortsPage() {
       case "currency_mix":
       case "fx_missing_amount":
       case "fx_missing_transactions":
+      case "fb_spend":
+      case "fb_purchases":
+      case "fb_cpp":
+      case "fb_impressions":
+      case "fb_reach":
+      case "fb_clicks":
+      case "fb_link_clicks":
+      case "fb_ctr":
+      case "fb_cpc":
+      case "fb_cpm":
+      case "fb_purchase_value":
+      case "fb_roas":
+      case "fb_cac":
+      case "fb_cost_per_trial":
+      case "fb_cost_per_upsell":
+      case "fb_gross_roas":
+      case "fb_net_roas":
+      case "fb_profit":
+      case "fb_margin":
         return <TableCell key={id} className={className}>{dash}</TableCell>;
       case "traffic_spend":
       case "profit":
@@ -2427,7 +2570,50 @@ export default function CohortsPage() {
     if (renewalLevel != null) {
       return <TableCell key={id} className={className}>{totals.renewalTotalsByLevel[renewalLevel] ?? 0}</TableCell>;
     }
+    // FB totals come from the SERVER bundle: sums over deduplicated
+    // (campaign_id, date) pairs of the visible rows — never row-sum here, or a
+    // campaign feeding several funnels on one day would double-count.
+    const fbT = clickHouseDriving ? chResult?.fbTotals : undefined;
     switch (id) {
+      case "fb_spend":
+        return <TableCell key={id} className={className}>{fbT ? formatFbUsd(fbT.fb_spend) : dash}</TableCell>;
+      case "fb_purchases":
+        return <TableCell key={id} className={className}>{fbT ? formatFbInt(fbT.fb_purchases) : dash}</TableCell>;
+      case "fb_cpp":
+        return <TableCell key={id} className={className}>{fbT?.fb_cpp != null ? formatFbUsd(fbT.fb_cpp) : dash}</TableCell>;
+      case "fb_impressions":
+        return <TableCell key={id} className={className}>{fbT ? formatFbInt(fbT.fb_impressions) : dash}</TableCell>;
+      case "fb_reach":
+        // Reach is not additive across campaigns/days — totals are unavailable.
+        return <TableCell key={id} className={className}>{dash}</TableCell>;
+      case "fb_clicks":
+        return <TableCell key={id} className={className}>{fbT ? formatFbInt(fbT.fb_clicks) : dash}</TableCell>;
+      case "fb_link_clicks":
+        return <TableCell key={id} className={className}>{fbT?.fb_link_clicks ? formatFbInt(fbT.fb_link_clicks) : dash}</TableCell>;
+      case "fb_ctr":
+        return <TableCell key={id} className={className}>{fbT?.fb_ctr != null ? formatFbPct(fbT.fb_ctr) : dash}</TableCell>;
+      case "fb_cpc":
+        return <TableCell key={id} className={className}>{fbT?.fb_cpc != null ? formatFbUsd(fbT.fb_cpc) : dash}</TableCell>;
+      case "fb_cpm":
+        return <TableCell key={id} className={className}>{fbT?.fb_cpm != null ? formatFbUsd(fbT.fb_cpm) : dash}</TableCell>;
+      case "fb_purchase_value":
+        return <TableCell key={id} className={className}>{fbT?.fb_purchase_value ? formatFbUsd(fbT.fb_purchase_value) : dash}</TableCell>;
+      case "fb_roas":
+        return <TableCell key={id} className={className}>{fbT?.fb_roas != null ? formatFbRoas(fbT.fb_roas) : dash}</TableCell>;
+      case "fb_cac":
+        return <TableCell key={id} className={className}>{fbT && totals.totalFirstSubscriptionUsers > 0 ? formatFbUsd(fbT.fb_spend / totals.totalFirstSubscriptionUsers) : dash}</TableCell>;
+      case "fb_cost_per_trial":
+        return <TableCell key={id} className={className}>{fbT && totals.totalTrialUsers > 0 ? formatFbUsd(fbT.fb_spend / totals.totalTrialUsers) : dash}</TableCell>;
+      case "fb_cost_per_upsell":
+        return <TableCell key={id} className={className}>{fbT && totals.totalUpsellUsers > 0 ? formatFbUsd(fbT.fb_spend / totals.totalUpsellUsers) : dash}</TableCell>;
+      case "fb_gross_roas":
+        return <TableCell key={id} className={className}>{fbT && fbT.fb_spend > 0 ? formatFbRoas(totals.grossRevenue / fbT.fb_spend) : dash}</TableCell>;
+      case "fb_net_roas":
+        return <TableCell key={id} className={className}>{fbT && fbT.fb_spend > 0 ? formatFbRoas(totals.netRevenue / fbT.fb_spend) : dash}</TableCell>;
+      case "fb_profit":
+        return <TableCell key={id} className={className}>{fbT ? formatFbUsd(totals.netRevenue - fbT.fb_spend) : dash}</TableCell>;
+      case "fb_margin":
+        return <TableCell key={id} className={className}>{fbT && totals.netRevenue > 0 ? formatFbPct(((totals.netRevenue - fbT.fb_spend) / totals.netRevenue) * 100) : dash}</TableCell>;
       case "cohort_date":
       case "campaign_path":
       case "funnel":
@@ -2472,6 +2658,12 @@ export default function CohortsPage() {
         return <TableCell key={id} className={className}>{formatPct(totals.firstSubscriptionToRenewal2Cr)}</TableCell>;
       case "renewal_2_to_renewal_3_cr":
         return <TableCell key={id} className={className}>{formatPct(totals.renewal2ToRenewal3Cr)}</TableCell>;
+      case "renewal_3_to_renewal_4_cr":
+        return <TableCell key={id} className={className}>{totals.renewal3ToRenewal4Cr != null ? formatPct(totals.renewal3ToRenewal4Cr) : dash}</TableCell>;
+      case "renewal_4_to_renewal_5_cr":
+        return <TableCell key={id} className={className}>{totals.renewal4ToRenewal5Cr != null ? formatPct(totals.renewal4ToRenewal5Cr) : dash}</TableCell>;
+      case "renewal_5_to_renewal_6_cr":
+        return <TableCell key={id} className={className}>{totals.renewal5ToRenewal6Cr != null ? formatPct(totals.renewal5ToRenewal6Cr) : dash}</TableCell>;
       case "renewal_users":
         return <TableCell key={id} className={className}>{totals.totalRenewalUsers}</TableCell>;
       case "refund_users":
@@ -2891,6 +3083,12 @@ export default function CohortsPage() {
                 </div>
               </PopoverContent>
             </Popover>
+            <Button type="button" variant="outline" size="sm" className="h-9" onClick={() => void exportCohortsTable("csv")}>
+              Export CSV
+            </Button>
+            <Button type="button" variant="outline" size="sm" className="h-9" onClick={() => void exportCohortsTable("xlsx")}>
+              Export XLSX
+            </Button>
             <Popover open={columnsPopoverOpen} onOpenChange={setColumnsPopoverOpen}>
               <PopoverTrigger asChild>
                 <Button type="button" variant="outline" size="sm" className="h-9">Columns</Button>
@@ -3048,6 +3246,16 @@ export default function CohortsPage() {
                   support: <span className="font-mono text-foreground">{chResult.diagnostics.support_data_status}</span>
                   {typeof chResult.diagnostics.support_matched_cohort_users === "number" && (
                     <> · users {formatRowsCount(chResult.diagnostics.support_matched_cohort_users)}</>
+                  )}
+                </span>
+              )}
+              {clickHouseDriving && chResult?.fbDiagnostics && (
+                <span>
+                  fb: <span className={chResult.fbDiagnostics.fb_data_status === "ready" ? "font-mono text-foreground" : "font-mono text-warning"}>{chResult.fbDiagnostics.fb_data_status}</span>
+                  {" · rows "}{formatRowsCount(chResult.fbDiagnostics.fb_source_rows)}
+                  {" · matched "}{formatRowsCount(chResult.fbDiagnostics.fb_matched_cohort_rows)}/{formatRowsCount(chResult.fbDiagnostics.fb_matched_cohort_rows + chResult.fbDiagnostics.fb_unmatched_cohort_rows)}
+                  {chResult.fbDiagnostics.fb_last_sync_at && (
+                    <> · sync {formatUpdatedAgo(Date.parse(chResult.fbDiagnostics.fb_last_sync_at))}</>
                   )}
                 </span>
               )}

@@ -7,7 +7,10 @@
 
 import type { ClickHouseSummary } from "@/services/clickhouse";
 
-export const ANALYTICS_CACHE_SCHEMA_VERSION = 2;
+// v3: CohortRow grew renewal_3_to_renewal_4_cr / 4→5 / 5→6.
+// v4: CohortRow grew the FB Analytics block (fb_spend…fb_match_status) and the
+// bundle carries fb_totals/fb_diagnostics — pre-FB bundles must be discarded.
+export const ANALYTICS_CACHE_SCHEMA_VERSION = 4;
 
 export const WAREHOUSE_VERSION_KEY = ["clickhouse", "warehouse-version"] as const;
 export const SUPPORT_WAREHOUSE_VERSION_KEY = ["clickhouse", "support-warehouse-version"] as const;

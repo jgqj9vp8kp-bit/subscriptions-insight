@@ -28,6 +28,7 @@ import {
   optionsDiagnostics as buildOptionsDiagnostics,
   type FilterOptionsResult,
 } from "./cohortFilterOptions.ts";
+import { computeFbCohortStats, fbCohortRowKey } from "./fbCohortStats.ts";
 import type {
   CohortFilters,
   CohortRequest,
@@ -750,6 +751,30 @@ export async function runMaterializedCohortList(input: {
   const rows = rawRows.map((row) => toAggregateRow(row));
   const totals = computeTotals(rows);
   const options = filterOptionsFromRows(optionRows, optionFiltersApplied(nreq.filters, nreq.dateFrom, nreq.dateTo));
+
+  // FB Analytics join (campaign_id + cohort_date): computed AFTER the cohort
+  // report so totals deduplicate campaign/day pairs over the rows that actually
+  // survived post-filters. A failure here never degrades the cohort report —
+  // FB fields are simply absent and the page renders "—".
+  const visibleKeys = new Set(rows.map((r) => fbCohortRowKey(r.cohort_date, r.funnel, r.campaign_path)));
+  const fbStats = await computeFbCohortStats({
+    clickhouse: input.clickhouse,
+    supabase: input.supabase,
+    authUserId: input.authUserId,
+    active,
+    filters: nreq.filters,
+    dateFrom: nreq.dateFrom,
+    dateTo: nreq.dateTo,
+    visibleKeys,
+  }).catch(() => null);
+  if (fbStats) {
+    for (const row of rows) {
+      const fb = fbStats.perRow[fbCohortRowKey(row.cohort_date, row.funnel, row.campaign_path)];
+      if (fb) Object.assign(row, fb);
+      else Object.assign(row, { fb_spend: 0, fb_purchases: 0, fb_impressions: 0, fb_reach: 0, fb_clicks: 0, fb_link_clicks: 0, fb_purchase_value: 0, fb_cpp: null, fb_cpc: null, fb_cpm: null, fb_ctr: null, fb_roas: null, fb_currency: null, fb_campaigns_matched: 0, fb_match_status: "missing_cohort_campaign_id" });
+    }
+  }
+
   return {
     ok: true,
     source: "clickhouse",
@@ -761,6 +786,7 @@ export async function runMaterializedCohortList(input: {
     filter_options_diagnostics: optionsDiagnostics(nreq, options, optionsDurationMs),
     fx_diagnostics: fx,
     token_diagnostics: tokenDiagnosticsFromRows(rows),
+    ...(fbStats ? { fb_totals: fbStats.totals, fb_diagnostics: fbStats.diagnostics } : {}),
     diagnostics: snapshotDiagnostics(state, nreq, subStatus, support, totals.support_users, currentWarehouse),
   };
 }

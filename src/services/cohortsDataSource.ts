@@ -12,6 +12,7 @@
 
 import { computeCohortsWithDiagnostics, type ComputeCohortsOptions, type MonetizationDiagnostics } from "@/services/analytics";
 import { buildCohortId } from "@/services/cohortIdentity";
+import { deriveFbBusinessMetrics } from "@/services/fbCohortFormatting";
 import { runClickHouseCohorts, runClickHouseCohortDetails } from "@/services/clickhouse";
 import { publicRuntimeConfig } from "@/config/publicRuntimeConfig";
 import type { CardType, CohortRow, Funnel, MediaBuyer, Transaction } from "@/services/types";
@@ -68,6 +69,9 @@ export interface CohortsSourceResult {
   /** Dataset-level FX/token diagnostics for the panels (clickhouse source only). */
   fxDiagnostics?: FxNormalizationDiagnostics;
   tokenDiagnostics?: MonetizationDiagnostics;
+  /** FB Analytics totals (deduplicated campaign/day pairs) + join health (clickhouse source only). */
+  fbTotals?: CohortResponse["fb_totals"];
+  fbDiagnostics?: CohortResponse["fb_diagnostics"];
 }
 
 // Non-reversible synthetic ids sized to a count. Because each user belongs to
@@ -177,6 +181,9 @@ export function mapAggregateToCohortRow(agg: CohortAggregateRow): CohortRow {
     trial_to_first_subscription_cr: div(agg.first_subscription_users, trial),
     first_subscription_to_renewal_2_cr: div(renewalN(2), agg.first_subscription_users),
     renewal_2_to_renewal_3_cr: div(renewalN(3), renewalN(2)),
+    renewal_3_to_renewal_4_cr: div(renewalN(4), renewalN(3)),
+    renewal_4_to_renewal_5_cr: div(renewalN(5), renewalN(4)),
+    renewal_5_to_renewal_6_cr: div(renewalN(6), renewalN(5)),
     revenue_d0: agg.revenue_d0,
     revenue_d7: agg.revenue_d7,
     revenue_d14: agg.revenue_d14,
@@ -188,6 +195,32 @@ export function mapAggregateToCohortRow(agg: CohortAggregateRow): CohortRow {
     ltv_d7: trial ? round2(agg.revenue_d7 / trial) : 0,
     ltv_d14: trial ? round2(agg.revenue_d14 / trial) : 0,
     ltv_d30: trial ? round2(agg.revenue_d30 / trial) : 0,
+    // FB Analytics metrics: server-joined by (campaign_id, cohort_date). Copied
+    // verbatim; business ratios derive from this row's own server values.
+    fb_spend: agg.fb_spend,
+    fb_currency: agg.fb_currency,
+    fb_purchases: agg.fb_purchases,
+    fb_cpp: agg.fb_cpp,
+    fb_impressions: agg.fb_impressions,
+    fb_reach: agg.fb_reach,
+    fb_clicks: agg.fb_clicks,
+    fb_link_clicks: agg.fb_link_clicks,
+    fb_ctr: agg.fb_ctr,
+    fb_cpc: agg.fb_cpc,
+    fb_cpm: agg.fb_cpm,
+    fb_purchase_value: agg.fb_purchase_value,
+    fb_roas: agg.fb_roas,
+    fb_campaigns_matched: agg.fb_campaigns_matched,
+    fb_match_status: agg.fb_match_status,
+    ...deriveFbBusinessMetrics({
+      fb_spend: agg.fb_spend,
+      fb_match_status: agg.fb_match_status,
+      trial_users: trial,
+      first_subscription_users: agg.first_subscription_users,
+      upsell_users: agg.upsell_users,
+      gross_revenue: gross,
+      net_revenue: net,
+    }),
   };
 }
 
@@ -227,6 +260,8 @@ export async function loadCohortsFromClickHouse(request: CohortRequest): Promise
     tokenDiagnostics: response.token_diagnostics
       ? ({ ...response.token_diagnostics, unknown_products: [] } as unknown as MonetizationDiagnostics)
       : undefined,
+    fbTotals: response.fb_totals,
+    fbDiagnostics: response.fb_diagnostics,
   };
 }
 

@@ -136,6 +136,9 @@ export interface PlanBreakdownRow {
   trial_to_first_subscription_cr: number;
   first_subscription_to_renewal_2_cr: number;
   renewal_2_to_renewal_3_cr: number;
+  renewal_3_to_renewal_4_cr: number;
+  renewal_4_to_renewal_5_cr: number;
+  renewal_5_to_renewal_6_cr: number;
   refund_rate: number;
   gross_revenue: number;
   amount_refunded: number;
@@ -202,7 +205,36 @@ export interface CohortCurrencyBreakdownRow {
   avg_trial_price_usd: number | null;
 }
 
-export interface CohortRow extends CohortMonetizationFields {
+// FB Analytics metrics joined server-side by (campaign_id, cohort_date).
+// All optional: absent on legacy-engine rows and pre-FB cached bundles — the
+// UI renders "—" for absent values, never NaN/Infinity.
+export interface CohortFbFields {
+  fb_spend?: number;
+  fb_currency?: string | null;
+  fb_purchases?: number;
+  fb_cpp?: number | null;
+  fb_impressions?: number;
+  fb_reach?: number;
+  fb_clicks?: number;
+  fb_link_clicks?: number;
+  fb_ctr?: number | null;
+  fb_cpc?: number | null;
+  fb_cpm?: number | null;
+  fb_purchase_value?: number;
+  fb_roas?: number | null;
+  fb_campaigns_matched?: number;
+  fb_match_status?: string;
+  /** Cohort-side business ratios derived from server row values (null when denominator is 0). */
+  fb_cac?: number | null;
+  fb_cost_per_trial?: number | null;
+  fb_cost_per_upsell?: number | null;
+  fb_gross_roas?: number | null;
+  fb_net_roas?: number | null;
+  fb_profit?: number | null;
+  fb_margin?: number | null;
+}
+
+export interface CohortRow extends CohortMonetizationFields, CohortFbFields {
   cohort_id: string;
   cohort_date: string;
   funnel: Funnel;
@@ -253,6 +285,10 @@ export interface CohortRow extends CohortMonetizationFields {
   trial_to_first_subscription_cr: number;
   first_subscription_to_renewal_2_cr: number;
   renewal_2_to_renewal_3_cr: number;
+  /** Renewal N → N+1 conversion: renewal_{N+1}_users / renewal_N_users × 100 (0 when the denominator is 0; the UI renders "—"). */
+  renewal_3_to_renewal_4_cr: number;
+  renewal_4_to_renewal_5_cr: number;
+  renewal_5_to_renewal_6_cr: number;
   revenue_d0: number;
   revenue_d7: number;
   revenue_d14: number;

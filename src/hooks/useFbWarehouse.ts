@@ -123,11 +123,14 @@ export function useFbReportQuery(params: {
   };
 }
 
-/** Invalidate the FB warehouse version + every fb-analytics query (after a sync). */
+/** Invalidate the FB warehouse version + every FB-dependent report (after a sync).
+ * Cohorts embeds FB metrics (joined by campaign_id + cohort_date), so its
+ * bundles re-key/refetch too — WITHOUT touching the cohort membership snapshot. */
 export function useInvalidateFbWarehouse(): () => Promise<void> {
   const client = useQueryClient();
   return async () => {
     await client.invalidateQueries({ queryKey: [...FB_WAREHOUSE_VERSION_KEY] });
     await client.invalidateQueries({ queryKey: ["fb-analytics"] });
+    await client.invalidateQueries({ queryKey: ["cohorts"] });
   };
 }
