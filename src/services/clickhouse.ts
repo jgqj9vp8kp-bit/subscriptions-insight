@@ -8,6 +8,7 @@ import type {
 import type {
   UsersRequest,
   UsersResponse,
+  UsersDeclineResponse,
   UsersDetailsResponse,
 } from "../../supabase/functions/_shared/clickhouse/usersContract";
 import type {
@@ -491,6 +492,10 @@ export async function runClickHouseUsers(request: UsersRequest): Promise<UsersRe
 
 export async function runClickHouseUserDetails(request: UsersRequest): Promise<UsersDetailsResponse> {
   return clickHouseRequest<UsersDetailsResponse>(CLICKHOUSE_USERS_FUNCTION, request as Record<string, unknown>);
+}
+
+export async function runClickHouseUsersDecline(request: UsersRequest): Promise<UsersDeclineResponse> {
+  return clickHouseRequest<UsersDeclineResponse>(CLICKHOUSE_USERS_FUNCTION, request as Record<string, unknown>);
 }
 
 // --- Payment Pass Analytics read path (clickhouse-payment-analytics) -------

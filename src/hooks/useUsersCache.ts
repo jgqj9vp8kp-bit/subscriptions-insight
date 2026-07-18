@@ -10,12 +10,15 @@ import {
   loadUsersFromClickHouse,
   loadUsersSummaryFromClickHouse,
   loadUserOptionsFromClickHouse,
+  loadUsersDeclineFromClickHouse,
+  type UsersDeclineQuery,
+  type UsersDeclineResponse,
   type UsersQuery,
   type UsersSourceResult,
   type UsersSummary,
   type UsersFilterOptions,
 } from "@/services/usersDataSource";
-import { usersListKey, usersSummaryKey, usersOptionsKey, normalizeUsersRequest } from "@/services/usersCache";
+import { usersListKey, usersSummaryKey, usersOptionsKey, usersDeclineKey, normalizeUsersRequest, normalizeUsersDeclineRequest } from "@/services/usersCache";
 import { recordDuration } from "@/services/analyticsProgress";
 import { GC_MS, STALE_MS, transientRetry, useAnalyticsProgress } from "@/hooks/useAnalyticsCache";
 import { traceEvent, traceHash, traceRequest } from "@/services/performanceTrace";
@@ -43,12 +46,15 @@ export function useUsersData(params: {
   userScopeHash: string;
   warehouseVersion: string;
   enabled: boolean;
+  /** Options can stay live (e.g. on the Decline tab) while list/summary are off. */
+  optionsEnabled?: boolean;
 }): UseUsersDataResult {
   const { query, userScopeHash, warehouseVersion, enabled } = params;
+  const optionsEnabled = params.optionsEnabled ?? enabled;
 
   const listKey = useMemo(() => usersListKey({ userScopeHash, warehouseVersion, request: query }), [userScopeHash, warehouseVersion, query]);
   const summaryKey = useMemo(() => usersSummaryKey({ userScopeHash, warehouseVersion, request: query }), [userScopeHash, warehouseVersion, query]);
-  const optionsKey = useMemo(() => usersOptionsKey({ userScopeHash, warehouseVersion }), [userScopeHash, warehouseVersion]);
+  const optionsKey = useMemo(() => usersOptionsKey({ userScopeHash, warehouseVersion, request: query }), [userScopeHash, warehouseVersion, query]);
   const activeKey = useMemo(() => JSON.stringify(normalizeUsersRequest(query, { includePage: true })), [query]);
   const listHash = useMemo(() => traceHash(listKey), [listKey]);
   const summaryHash = useMemo(() => traceHash(summaryKey), [summaryKey]);
@@ -89,10 +95,12 @@ export function useUsersData(params: {
     queryFn: () => traceRequest(
       "users.options_request",
       `users:options:${optionsHash}`,
-      () => loadUserOptionsFromClickHouse(),
+      () => loadUserOptionsFromClickHouse(query),
       { query_hash: optionsHash, edge_function: "clickhouse-users" },
     ),
+    placeholderData: keepPreviousData,
     ...common,
+    enabled: optionsEnabled,
   });
 
   const chUsers = (listQ.data as UsersSourceResult | undefined) ?? null;
@@ -134,5 +142,67 @@ export function useUsersData(params: {
     isInitialLoading: listQ.isFetching && chUsers == null,
     progressPercent: progress.percent,
     dataUpdatedAt: listQ.dataUpdatedAt,
+  };
+}
+
+// Decline Analytics bundle (action=decline): one cached query per normalized
+// (user filters + reason/stage display filters + country sort) — no pagination.
+// Same stale-while-revalidate + keep-previous behavior as the list, so
+// navigating away/back or toggling a sort renders cached rows instantly.
+export interface UseUsersDeclineDataResult {
+  chDecline: UsersDeclineResponse | null;
+  chDeclineStatus: UsersStatus;
+  isBackgroundRefreshing: boolean;
+  isInitialLoading: boolean;
+  progressPercent: number;
+  dataUpdatedAt: number;
+}
+
+export function useUsersDeclineData(params: {
+  query: UsersDeclineQuery;
+  userScopeHash: string;
+  warehouseVersion: string;
+  enabled: boolean;
+}): UseUsersDeclineDataResult {
+  const { query, userScopeHash, warehouseVersion, enabled } = params;
+  const declineKey = useMemo(() => usersDeclineKey({ userScopeHash, warehouseVersion, request: query }), [userScopeHash, warehouseVersion, query]);
+  const declineHash = useMemo(() => traceHash(declineKey), [declineKey]);
+  const activeKey = useMemo(() => JSON.stringify(normalizeUsersDeclineRequest(query)), [query]);
+
+  const declineQ = useQuery({
+    queryKey: declineKey,
+    queryFn: async () => {
+      const started = Date.now();
+      const res = await traceRequest(
+        "users.decline_request",
+        `users:decline:${declineHash}`,
+        () => loadUsersDeclineFromClickHouse(query),
+        { query_hash: declineHash, edge_function: "clickhouse-users" },
+      );
+      recordDuration(Date.now() - started, NS);
+      return res;
+    },
+    placeholderData: keepPreviousData,
+    enabled,
+    staleTime: STALE_MS,
+    gcTime: GC_MS,
+    retry: transientRetry,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: true,
+  });
+
+  const chDecline = (declineQ.data as UsersDeclineResponse | undefined) ?? null;
+  const error = declineQ.isError
+    ? (declineQ.error instanceof Error ? declineQ.error.message : "ClickHouse users decline request failed")
+    : null;
+  const progress = useAnalyticsProgress({ isFetching: declineQ.isFetching && enabled, status: declineQ.status, activeKey, ns: NS });
+
+  return {
+    chDecline,
+    chDeclineStatus: { loading: enabled && declineQ.isFetching, error },
+    isBackgroundRefreshing: declineQ.isFetching && chDecline != null,
+    isInitialLoading: declineQ.isFetching && chDecline == null,
+    progressPercent: progress.percent,
+    dataUpdatedAt: declineQ.dataUpdatedAt,
   };
 }

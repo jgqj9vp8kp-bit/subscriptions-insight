@@ -666,8 +666,13 @@ describe("Users page", () => {
     expect(summaryCard("Decline Rate")).toHaveTextContent("100.0%");
     expect(summaryCard("Top Decline Reason")).toHaveTextContent("insufficient_funds");
     expect(summaryCard("Avg Failed Attempts")).toHaveTextContent("1.50");
-    expect(screen.getByText("66.7%")).toBeInTheDocument();
-    expect(screen.getByText("33.3%")).toBeInTheDocument();
+    // Share is % of ALL scoped transactions (2 successful + 3 failed = 5):
+    // insufficient_funds 2/5, do_not_honor 1/5. The success counter card shows
+    // the successful count with its share of all transactions.
+    expect(summaryCard("Total Transactions")).toHaveTextContent("5");
+    expect(summaryCard("Successful Transactions")).toHaveTextContent("2 · 40.0%");
+    expect(screen.getByText("40.0%")).toBeInTheDocument();
+    expect(screen.getByText("20.0%")).toBeInTheDocument();
     expect(screen.getByLabelText("insufficient_funds total decline volume")).toHaveStyle({ width: "100%" });
     expect(screen.getByLabelText("do_not_honor total decline volume")).toHaveStyle({ width: "50%" });
   });

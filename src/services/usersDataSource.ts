@@ -6,7 +6,7 @@
 // two engines never run at once. Legacy code is never removed.
 
 import { computeUsers } from "@/services/analytics";
-import { runClickHouseUsers, runClickHouseUserDetails } from "@/services/clickhouse";
+import { runClickHouseUsers, runClickHouseUserDetails, runClickHouseUsersDecline } from "@/services/clickhouse";
 import { publicRuntimeConfig } from "@/config/publicRuntimeConfig";
 import type { CardType, DeclineReason, DeclineStage, Funnel, MediaBuyer, Transaction, UserAggregate } from "@/services/types";
 import type {
@@ -15,8 +15,12 @@ import type {
   UsersRow,
   UsersSummary,
   UsersFilterOptions,
+  UsersDeclineResponse,
   UsersDetailsResponse,
 } from "../../supabase/functions/_shared/clickhouse/usersContract";
+import { UNKNOWN_COUNTRY } from "../../supabase/functions/_shared/clickhouse/usersContract";
+
+export { UNKNOWN_COUNTRY };
 
 export type UsersDataSourceMode = "legacy" | "clickhouse";
 
@@ -155,10 +159,45 @@ export async function loadUsersSummaryFromClickHouse(query: UsersQuery): Promise
   return (response.summary && "total_users" in response.summary) ? (response.summary as UsersSummary) : null;
 }
 
-export async function loadUserOptionsFromClickHouse(): Promise<UsersFilterOptions | null> {
-  const response = await runClickHouseUsers({ action: "options" });
+// Options carry the active filters so the server can scope the country list to
+// the current selection (all filters except Country itself). Other dimensions
+// stay global, as before.
+export async function loadUserOptionsFromClickHouse(query?: UsersQuery): Promise<UsersFilterOptions | null> {
+  const request: UsersRequest = query ? { ...buildUsersRequest(query), action: "options" } : { action: "options" };
+  const response = await runClickHouseUsers(request);
   if (!response.ok) throw new Error(response.error || "ClickHouse users options failed.");
   return (response.filter_options && "funnel" in response.filter_options) ? (response.filter_options as UsersFilterOptions) : null;
+}
+
+// --- Decline Analytics (server bundle) -------------------------------------
+
+// The decline tab's query: the same user-scope filters as the table (search,
+// dates, tri-states, campaign, country, ...) plus the tab's reason/stage
+// display filters and the server-side country-breakdown sort.
+export interface UsersDeclineQuery extends Omit<UsersQuery, "sortField" | "sortDir" | "page" | "pageSize"> {
+  analyticsReasons?: string[];
+  analyticsStages?: string[];
+  countrySortField: string;
+  countrySortDir: "asc" | "desc";
+}
+
+export function buildUsersDeclineRequest(q: UsersDeclineQuery): UsersRequest {
+  const base = buildUsersRequest({ ...q, sortField: "first_trial_date", sortDir: "desc", page: 1, pageSize: 1 });
+  return {
+    ...base,
+    action: "decline",
+    decline: {
+      reasons: q.analyticsReasons ?? [],
+      stages: q.analyticsStages ?? [],
+      country_sort: { field: q.countrySortField, direction: q.countrySortDir },
+    },
+  };
+}
+
+export async function loadUsersDeclineFromClickHouse(query: UsersDeclineQuery): Promise<UsersDeclineResponse> {
+  const response = await runClickHouseUsersDecline(buildUsersDeclineRequest(query));
+  if (!response.ok) throw new Error(response.error || "ClickHouse users decline request failed.");
+  return response;
 }
 
 export async function loadUserDetailsFromClickHouse(userId: string): Promise<UsersDetailsResponse> {
@@ -172,4 +211,30 @@ export function loadUsersFromLegacy(txs: Transaction[]): UserAggregate[] {
   return computeUsers(txs);
 }
 
-export type { UsersRow, UsersSummary, UsersFilterOptions, UsersResponse };
+export interface CountryOptionEntry {
+  country_code: string;
+  user_count: number;
+}
+
+// Legacy country filter options (mirrors the Cohorts page country filter):
+// only the countries present among the CURRENTLY SCOPED users (every active
+// filter except Country itself — including a cohort selection), counted by
+// TRIAL users. A→Z with Unknown pinned last; countries whose scoped users have
+// no trials stay listed (decline analytics also covers failed-only users) with
+// a zero count.
+export function buildLegacyCountryOptions(
+  rows: Array<Pick<UserAggregate, "country_code" | "first_trial_date">>,
+): CountryOptionEntry[] {
+  const byCountry = new Map<string, number>();
+  for (const row of rows) {
+    const code = row.country_code || UNKNOWN_COUNTRY;
+    byCountry.set(code, (byCountry.get(code) ?? 0) + (row.first_trial_date ? 1 : 0));
+  }
+  return Array.from(byCountry.entries())
+    .map(([country_code, trials]) => ({ country_code, user_count: trials }))
+    .sort((a, b) =>
+      Number(a.country_code === UNKNOWN_COUNTRY) - Number(b.country_code === UNKNOWN_COUNTRY) ||
+      a.country_code.localeCompare(b.country_code));
+}
+
+export type { UsersRow, UsersSummary, UsersFilterOptions, UsersResponse, UsersDeclineResponse };

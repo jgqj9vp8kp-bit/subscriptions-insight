@@ -299,6 +299,20 @@ export function declineMessageFromRecord(record: DeclineReasonRecord): string | 
   );
 }
 
+// Label for the Decline Analytics per-reason drill-down: the raw processor
+// message behind a failed attempt. Prefers the human-readable network result
+// message ("Suspected fraud", "Security violation", …) over the normalized
+// token ("do_not_honor"); classification itself is untouched.
+export function declineBreakdownMessageForTransaction(tx: Transaction): string {
+  const record = declineReasonRecordsFromTransaction(tx).find((entry) => Object.keys(entry).length > 0) ?? {};
+  return (
+    compact(record.payment_method_result_message) ||
+    compact(record.message) ||
+    compact(record.decline_reason) ||
+    "unknown"
+  );
+}
+
 export function declineDetailsForTransaction(tx: Transaction): { reason: DeclineReason; message: string | null; date: string } | null {
   if (!isFailedPaymentTransaction(tx)) return null;
   const records = declineReasonRecordsFromTransaction(tx).filter((record) => Object.keys(record).length > 0);

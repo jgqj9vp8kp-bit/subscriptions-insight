@@ -84,15 +84,17 @@ describe("useUsersData — SWR", () => {
     expect(result.current.chUsers?.rows[0].user_id).toBe("kept");
   });
 
-  it("options are cached once — a filter change does NOT refetch options", async () => {
+  it("options ignore country/page changes but refetch when a scoping filter changes (dependent country options)", async () => {
     loadList.mockResolvedValue(listResult([{ user_id: "x" }]));
     loadOptions.mockResolvedValue({ funnel: ["a"] });
     const { rerender } = mount(q());
     await waitFor(() => expect(loadOptions).toHaveBeenCalledTimes(1));
-    rerender({ query: q({ country: "US" }) }); // filter change → new list, same options key
+    rerender({ query: q({ country: "US" }) }); // country change → new list, SAME options key
     await waitFor(() => expect(loadList).toHaveBeenCalledTimes(2));
-    expect(loadOptions).toHaveBeenCalledTimes(1); // options NOT refetched
-    expect(client.getQueryData(usersOptionsKey({ userScopeHash: SCOPE, warehouseVersion: WHV }))).toEqual({ funnel: ["a"] });
+    expect(loadOptions).toHaveBeenCalledTimes(1); // options NOT refetched for country/page
+    expect(client.getQueryData(usersOptionsKey({ userScopeHash: SCOPE, warehouseVersion: WHV, request: q({ country: "US" }) }))).toEqual({ funnel: ["a"] });
+    rerender({ query: q({ country: "US", firstSub: "has" }) }); // scoping filter → options scope changes
+    await waitFor(() => expect(loadOptions).toHaveBeenCalledTimes(2));
   });
 
   it("disabled (legacy mode) never fetches and drives no rows", async () => {

@@ -46,12 +46,18 @@ describe("users cache keys", () => {
     expect(hashKey(usersListKey(parts(q())))).not.toBe(hashKey(usersListKey(parts(q({ search: "abc" })))));
   });
 
-  it("options key is request-independent (one entry per user + warehouse version)", () => {
-    const k1 = usersOptionsKey({ userScopeHash: "u_1", warehouseVersion: "whv_x" });
-    const k2 = usersOptionsKey({ userScopeHash: "u_1", warehouseVersion: "whv_x" });
+  it("options key follows the filter scope minus country/sort/page (dependent country options)", () => {
+    const k1 = usersOptionsKey(parts(q()));
+    const k2 = usersOptionsKey(parts(q()));
     expect(hashKey(k1)).toBe(hashKey(k2));
     expect(k1[0]).toBe("users");
     expect(k1[1]).toBe("options");
+    // Country / sort / page changes never refetch options…
+    expect(hashKey(usersOptionsKey(parts(q({ country: "US" }))))).toBe(hashKey(k1));
+    expect(hashKey(usersOptionsKey(parts(q({ sortField: "country_code", sortDir: "asc" }))))).toBe(hashKey(k1));
+    expect(hashKey(usersOptionsKey(parts(q({ page: 4 }))))).toBe(hashKey(k1));
+    // …but a scoping filter change does (the country list narrows with it).
+    expect(hashKey(usersOptionsKey(parts(q({ firstSub: "has" }))))).not.toBe(hashKey(k1));
   });
 
   it("isolated by user; busted by warehouse version", () => {

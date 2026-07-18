@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDown, ArrowUp, ArrowUpDown, Check, ChevronDown, Search, X } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { Button } from "@/components/ui/button";
@@ -24,11 +24,11 @@ import {
 } from "@/components/ui/table";
 import { useTransactions } from "@/services/sheets";
 import { computeCohorts, computeUsers, formatCurrency } from "@/services/analytics";
-import { usersDataSourceMode, type UsersQuery } from "@/services/usersDataSource";
+import { UNKNOWN_COUNTRY, buildLegacyCountryOptions, usersDataSourceMode, type UsersDeclineQuery, type UsersQuery } from "@/services/usersDataSource";
 import { useAuth } from "@/hooks/useAuth";
 import { hashUserScope } from "@/services/analyticsCache";
 import { useWarehouseVersion } from "@/hooks/useAnalyticsCache";
-import { useUsersData } from "@/hooks/useUsersCache";
+import { useUsersData, useUsersDeclineData } from "@/hooks/useUsersCache";
 import { formatUpdatedAgo } from "@/services/analyticsProgress";
 import { Progress } from "@/components/ui/progress";
 import { formatDateKey, toDateKey } from "@/services/dateKeys";
@@ -40,6 +40,7 @@ import {
   DECLINE_REASON_VALUES,
   DECLINE_STAGE_VALUES,
   classifyDeclineStagesForTransactions,
+  declineBreakdownMessageForTransaction,
   declineDetailsForTransaction,
   declineStageLabel,
   enrichTransactionDeclinesFromRawRows,
@@ -72,6 +73,22 @@ type FailedAttemptsFilter = "all" | "gte1" | "gte3" | "gte5";
 type CohortExplorerSortKey = "date" | "trial_users" | "net_revenue";
 type UsersPageMode = "users_table" | "decline_analytics";
 type DeclineSortKey = "reason" | "failed_users" | "failed_transactions" | "share" | "avg_attempts" | "latest_failed_date";
+// Sort fields of the server-computed Decline Analytics country breakdown
+// (mirrors the Edge Function allowlist; sorting runs over the FULL country set).
+type DeclineCountrySortKey =
+  | "country"
+  | "total_attempts"
+  | "successful"
+  | "failed"
+  | "pass_rate"
+  | "pass_rate_ex_if"
+  | "insufficient_funds"
+  | "users_with_attempts"
+  | "users_with_success"
+  | "user_pass_rate"
+  | "first_attempt_pass_rate"
+  | "first_sub_pass_rate"
+  | "renewal_pass_rate";
 type UserExplorerRow = UserAggregate & {
   campaign_path: string;
   cohort_id: string | null;
@@ -98,6 +115,16 @@ interface CohortMembershipLookup {
   byEmail: Map<string, Set<string>>;
 }
 
+// Raw-processor-message drill-down of one reason row ("fraud_suspected" →
+// "Suspected fraud" / "Fraud/Security (Mastercard use only)" / "fraudulent" /
+// "Security violation" …); share is % within the parent reason.
+interface DeclineMessageBreakdownRow {
+  message: string;
+  failed_users: number;
+  failed_transactions: number;
+  share: number;
+}
+
 interface DeclineBreakdownRow {
   reason: DeclineReason;
   failed_users: number;
@@ -107,6 +134,7 @@ interface DeclineBreakdownRow {
   latest_failed_date: string | null;
   stage_counts: Record<DeclineStage, number>;
   top_stage: DeclineStage;
+  messages: DeclineMessageBreakdownRow[];
 }
 
 interface DeclineStageBreakdownRow {
@@ -136,6 +164,8 @@ const DEFAULT_USERS_UI_STATE = {
   declineAnalyticsStages: [] as DeclineStage[],
   declineSortKey: "failed_transactions" as DeclineSortKey,
   declineSortDir: "desc" as "asc" | "desc",
+  declineCountrySortKey: "total_attempts" as DeclineCountrySortKey,
+  declineCountrySortDir: "desc" as "asc" | "desc",
   firstSubFilter: "all" as FirstSubFilter,
   refundFilter: "all" as RefundFilter,
   firstTrialFrom: "",
@@ -383,6 +413,8 @@ export default function UsersPage() {
     declineAnalyticsStages: rawDeclineAnalyticsStages,
     declineSortKey,
     declineSortDir,
+    declineCountrySortKey,
+    declineCountrySortDir,
     firstSubFilter,
     refundFilter,
     firstTrialFrom,
@@ -425,17 +457,23 @@ export default function UsersPage() {
   );
 
   // --- ClickHouse Users read path (Phase 9-11) --------------------------
-  // clickhouse (default): the Edge Function drives the table with server-side
-  // filtering/sorting/pagination and the browser performs NO transaction scan.
-  // Legacy is the fallback when: the flag is legacy, ClickHouse errors, a cohort
-  // selection is active (not reproduced server-side), or the Decline Analytics
-  // tab is open (it aggregates client-side — documented boundary).
+  // clickhouse (default): the Edge Function drives the table AND the Decline
+  // Analytics tab with server-side filtering/sorting/aggregation; the browser
+  // performs NO transaction scan. Legacy is the fallback when: the flag is
+  // legacy, ClickHouse errors, or a cohort selection is active (not reproduced
+  // server-side).
   const usersSource = useMemo(() => usersDataSourceMode(), []);
   const { user } = useAuth();
   const userScopeHash = useMemo(() => hashUserScope(user?.id), [user?.id]);
   const { version: warehouseVersion, ready: warehouseVersionReady } = useWarehouseVersion(usersSource === "clickhouse");
   const [appliedSearch] = useDebouncedValue(search, 300);
   const [page, setPage] = useState(1);
+  // Which decline reasons are expanded to their raw-message breakdown.
+  // Transient exploration state — intentionally not persisted.
+  const [expandedDeclineReasons, setExpandedDeclineReasons] = useState<string[]>([]);
+  const toggleDeclineReasonExpanded = (reason: string) =>
+    setExpandedDeclineReasons((current) =>
+      current.includes(reason) ? current.filter((value) => value !== reason) : [...current, reason]);
   // ClickHouse server-side query: filters + sort + pagination. Assembled here
   // (before the fallback decision) so the cached list/summary status drives
   // needLegacy. The QueryClient lives above the router, so this cache survives
@@ -462,6 +500,30 @@ export default function UsersPage() {
   );
   const hasSelectedCohortsRaw = Array.isArray(rawSelectedCohortIds) && rawSelectedCohortIds.length > 0;
   const usersServerEligible = usersSource === "clickhouse" && !hasSelectedCohortsRaw && mode !== "decline_analytics";
+  // Decline Analytics ClickHouse path: the bundle (totals + reason/stage rows +
+  // country breakdown) is computed server-side over the SAME filtered user set.
+  // Cohort selections are still a legacy boundary (not reproduced server-side).
+  const declineServerEligible = usersSource === "clickhouse" && !hasSelectedCohortsRaw && mode === "decline_analytics";
+  const declineQuery = useMemo<UsersDeclineQuery>(
+    () => ({
+      search: appliedSearch,
+      firstTrialFrom,
+      firstTrialTo,
+      firstSub: firstSubFilter,
+      refund: refundFilter,
+      paymentFailed: paymentFailedFilter,
+      failedAttempts: failedAttemptsFilter,
+      campaignPath: campaignPathFilter,
+      country: countryFilter,
+      cardTypes: selectedCardTypes,
+      declineReasons: selectedDeclineReasons,
+      analyticsReasons: declineAnalyticsReasons,
+      analyticsStages: declineAnalyticsStages,
+      countrySortField: declineCountrySortKey,
+      countrySortDir: declineCountrySortDir,
+    }),
+    [appliedSearch, firstTrialFrom, firstTrialTo, firstSubFilter, refundFilter, paymentFailedFilter, failedAttemptsFilter, campaignPathFilter, countryFilter, selectedCardTypes, selectedDeclineReasons, declineAnalyticsReasons, declineAnalyticsStages, declineCountrySortKey, declineCountrySortDir],
+  );
   const {
     chUsers,
     chSummary,
@@ -476,26 +538,48 @@ export default function UsersPage() {
     userScopeHash,
     warehouseVersion,
     enabled: usersServerEligible && warehouseVersionReady,
+    // Filter options (incl. the dependent country list) stay live on the
+    // Decline tab, where list/summary queries are not needed.
+    optionsEnabled: (usersServerEligible || declineServerEligible) && warehouseVersionReady,
   });
-  // Legacy fallback (unchanged emergency path): legacy flag, a cohort selection /
-  // Decline tab (not reproduced server-side), or a ClickHouse error WITH no cached
-  // rows to keep showing. A failed background refresh keeps the cached rows.
-  const usersNeedLegacy = !usersServerEligible || (chStatus.error !== null && chUsers == null);
+  const {
+    chDecline,
+    chDeclineStatus,
+    isBackgroundRefreshing: isDeclineBackgroundRefreshing,
+    isInitialLoading: isDeclineInitialLoading,
+    progressPercent: declineProgressPercent,
+  } = useUsersDeclineData({
+    query: declineQuery,
+    userScopeHash,
+    warehouseVersion,
+    enabled: declineServerEligible && warehouseVersionReady,
+  });
+  // Legacy fallback (unchanged emergency path): legacy flag, a cohort selection
+  // (not reproduced server-side), or a ClickHouse error WITH no cached data to
+  // keep showing. A failed background refresh keeps the cached rows.
+  const usersNeedLegacy =
+    (!usersServerEligible && !declineServerEligible) ||
+    (usersServerEligible && chStatus.error !== null && chUsers == null) ||
+    (declineServerEligible && chDeclineStatus.error !== null && chDecline == null);
   const usersClickHouseDriving = usersServerEligible && chUsers != null;
+  const declineClickHouseDriving = declineServerEligible && chDecline != null;
   useEffect(() => {
     traceEvent("users.legacy_state", {
       need_legacy: usersNeedLegacy,
       server_eligible: usersServerEligible,
+      decline_server_eligible: declineServerEligible,
       has_clickhouse_result: chUsers != null,
+      has_decline_result: chDecline != null,
       has_error: chStatus.error != null,
+      has_decline_error: chDeclineStatus.error != null,
       mode,
       cohort_filter_active: hasSelectedCohortsRaw,
     });
-  }, [usersNeedLegacy, usersServerEligible, chUsers, chStatus.error, mode, hasSelectedCohortsRaw]);
+  }, [usersNeedLegacy, usersServerEligible, declineServerEligible, chUsers, chDecline, chStatus.error, chDeclineStatus.error, mode, hasSelectedCohortsRaw]);
 
   // In ClickHouse mode the legacy compute + all transaction-derived memos run on
-  // an EMPTY list, so the Users route performs no warehouse scan. Real
-  // transactions are only used for the legacy fallback / Decline tab.
+  // an EMPTY list, so the Users route performs no warehouse scan (on either
+  // tab). Real transactions are only used for the legacy fallback.
   const analyticsTxs = useMemo(
     () => (usersNeedLegacy ? enrichTransactionDeclinesFromRawRows(backfillTransactionCardTypesFromRawRows(txs, rawPalmerRows), rawPalmerRows) : []),
     [usersNeedLegacy, txs, rawPalmerRows],
@@ -524,20 +608,18 @@ export default function UsersPage() {
       }),
     [users, cohortByUser, campaignPathByUser, userSubscriptionFlags]
   );
+  const usersAnyServerDriving = usersClickHouseDriving || declineClickHouseDriving;
   const campaignPathOptions = useMemo(
     () =>
-      usersClickHouseDriving && chOptions
+      usersAnyServerDriving && chOptions
         ? chOptions.campaign_path
         : Array.from(new Set(usersWithCampaignPath.map((user) => user.campaign_path || "unknown"))).sort(),
-    [usersClickHouseDriving, chOptions, usersWithCampaignPath]
+    [usersAnyServerDriving, chOptions, usersWithCampaignPath]
   );
-  const countryOptions = useMemo(
-    () =>
-      usersClickHouseDriving && chOptions
-        ? chOptions.country.map((c) => c.country_code)
-        : Array.from(new Set(usersWithCampaignPath.map((user) => user.country_code).filter(Boolean) as string[])).sort(),
-    [usersClickHouseDriving, chOptions, usersWithCampaignPath]
-  );
+  // Country options: server mode returns the dependent list (scoped by every
+  // active filter except Country) WITH unique-user counts and the Unknown
+  // bucket; the legacy fallback derives codes client-side and appends Unknown
+  // when uncountried users exist (counts unavailable there).
   const selectedCohortIdSet = useMemo(() => new Set(selectedCohortIds), [selectedCohortIds]);
   const selectedCohortMatchIdSet = useMemo(() => cohortSelectionMatchIds(selectedCohortIds), [selectedCohortIds]);
   const hasSelectedCohorts = selectedCohortIds.length > 0;
@@ -571,17 +653,20 @@ export default function UsersPage() {
   // keeps showing `search` instantly while the O(users) filter pass keys off the debounced value.
   // Every other Users filter stays synchronous because its heavy inputs (cohorts/users) are derived
   // from the dataset, not the filters — those memos do not re-run on a filter click.
-  const filtered = useMemo(() => {
+  //
+  // Split on the Country dimension: `filteredExceptCountry` applies every filter
+  // EXCEPT Country (this scope also feeds the dependent country options, like
+  // the Cohorts page country filter), and `filtered` applies Country + sort.
+  const filteredExceptCountry = useMemo(() => {
     const q = appliedSearch.trim().toLowerCase();
     const fromDateKey = toDateKey(firstTrialFrom);
     const toDateKeyValue = toDateKey(firstTrialTo);
     const hasFirstTrialFilter = Boolean(fromDateKey || toDateKeyValue);
     const failedAttemptsThreshold = failedAttemptsFilter === "gte5" ? 5 : failedAttemptsFilter === "gte3" ? 3 : failedAttemptsFilter === "gte1" ? 1 : 0;
-    const list = usersWithCampaignPath.filter((u) => {
+    return usersWithCampaignPath.filter((u) => {
       if (!userMatchesSelectedCohorts(u, selectedCohortMatchIdSet, cohortMembership)) return false;
       if (q && !u.email.toLowerCase().includes(q) && !u.user_id.toLowerCase().includes(q)) return false;
       if (!hasSelectedCohorts && campaignPathFilter !== "all" && u.campaign_path !== campaignPathFilter) return false;
-      if (countryFilter !== "all" && u.country_code !== countryFilter) return false;
       if (selectedCardTypes.length > 0 && !selectedCardTypes.includes(u.card_type)) return false;
       if (paymentFailedFilter === "has" && !u.has_failed_payment) return false;
       if (paymentFailedFilter === "none" && u.has_failed_payment) return false;
@@ -600,6 +685,17 @@ export default function UsersPage() {
       }
       return true;
     });
+  }, [usersWithCampaignPath, hasSelectedCohorts, selectedCohortMatchIdSet, cohortMembership, appliedSearch, campaignPathFilter, selectedCardTypes, paymentFailedFilter, selectedDeclineReasons, failedAttemptsFilter, firstSubFilter, refundFilter, firstTrialFrom, firstTrialTo]);
+
+  const filtered = useMemo(() => {
+    const list = filteredExceptCountry.filter((u) => {
+      if (countryFilter !== "all") {
+        // Unknown selects users with no attributed country (parity with server).
+        if (countryFilter === UNKNOWN_COUNTRY) { if (u.country_code) return false; }
+        else if (u.country_code !== countryFilter) return false;
+      }
+      return true;
+    });
     list.sort((a, b) => {
       const av = sortKey === "first_trial_date" ? toDateKey(a.first_trial_date) : a[sortKey] ?? "";
       const bv = sortKey === "first_trial_date" ? toDateKey(b.first_trial_date) : b[sortKey] ?? "";
@@ -612,7 +708,20 @@ export default function UsersPage() {
       return sortDir === "asc" ? cmp : -cmp;
     });
     return list;
-  }, [usersWithCampaignPath, hasSelectedCohorts, selectedCohortMatchIdSet, cohortMembership, appliedSearch, campaignPathFilter, countryFilter, selectedCardTypes, paymentFailedFilter, selectedDeclineReasons, failedAttemptsFilter, firstSubFilter, refundFilter, firstTrialFrom, firstTrialTo, sortKey, sortDir]);
+  }, [filteredExceptCountry, countryFilter, sortKey, sortDir]);
+
+  // Country options (both tabs): only countries of the CURRENTLY SCOPED users
+  // (every active filter except Country — including a cohort selection), with
+  // TRIAL-user counts, exactly like the Cohorts page country filter. The server
+  // path returns the same shape from the dependent options action; the legacy
+  // path derives it from the scoped client set.
+  const countryOptions = useMemo(
+    () =>
+      usersAnyServerDriving && chOptions
+        ? chOptions.country
+        : buildLegacyCountryOptions(filteredExceptCountry),
+    [usersAnyServerDriving, chOptions, filteredExceptCountry],
+  );
 
   // Render the user table one page at a time so the DOM stays bounded for large accounts. Summary,
   // decline analytics and every total below are still computed from the full `filtered` set, so
@@ -685,22 +794,75 @@ export default function UsersPage() {
     };
   }, [usersClickHouseDriving, chSummary, filtered, analyticsTxs]);
 
-  const declineAnalytics = useMemo(() => {
+  // Server-side Decline Analytics: map the ClickHouse bundle onto the exact
+  // view-model the tab renders. The reason-table sort still runs over the FULL
+  // reason set (bounded by the reason taxonomy, returned entirely by the
+  // server) with the same comparator as the legacy path.
+  const declineServerAnalytics = useMemo(() => {
+    if (!declineClickHouseDriving || !chDecline) return null;
+    const rows: DeclineBreakdownRow[] = chDecline.reason_rows.map((row) => ({
+      reason: row.reason as DeclineReason,
+      failed_users: row.failed_users,
+      failed_transactions: row.failed_transactions,
+      share: row.share * 100,
+      avg_attempts: row.avg_attempts,
+      latest_failed_date: row.latest_failed_date,
+      stage_counts: { ...createDeclineStageCounts(), ...row.stage_counts },
+      top_stage: row.top_stage as DeclineStage,
+      // ?? [] guards cached bundles produced before the drill-down existed.
+      messages: (row.messages ?? []).map((m) => ({ ...m, share: m.share * 100 })),
+    }));
+    rows.sort((a, b) => {
+      const av = a[declineSortKey];
+      const bv = b[declineSortKey];
+      const cmp = av == null && bv == null ? 0 : av == null ? 1 : bv == null ? -1 : av < bv ? -1 : av > bv ? 1 : 0;
+      return declineSortDir === "asc" ? cmp : -cmp;
+    });
+    const stageRows: DeclineStageBreakdownRow[] = chDecline.stage_rows.map((row) => ({
+      stage: row.stage as DeclineStage,
+      failed_users: row.failed_users,
+      failed_transactions: row.failed_transactions,
+      share: row.share * 100,
+      top_reason: (row.top_reason as DeclineReason | null) ?? null,
+    }));
+    return {
+      selectedUsers: chDecline.totals.selected_users,
+      failedUsers: chDecline.totals.failed_users,
+      failedTransactions: chDecline.totals.failed_transactions,
+      // ?? 0 guards cached bundles produced before these totals existed.
+      successfulTransactions: chDecline.totals.successful_transactions ?? 0,
+      totalTransactions: chDecline.totals.total_transactions ?? 0,
+      declineRate: (chDecline.totals.decline_rate ?? 0) * 100,
+      topReason: (chDecline.totals.top_reason as DeclineReason | null) ?? null,
+      avgAttempts: chDecline.totals.avg_attempts ?? 0,
+      rows,
+      stageRows,
+      stageTotals: { ...createDeclineStageCounts(), ...chDecline.totals.stage_totals },
+    };
+  }, [declineClickHouseDriving, chDecline, declineSortKey, declineSortDir]);
+
+  const legacyDeclineAnalytics = useMemo(() => {
     const selectedUserIds = new Set(filtered.map((user) => user.user_id));
     const selectedEmails = new Set(filtered.map((user) => emailKey(user.email)).filter(Boolean));
     const selectedReasonSet = new Set(declineAnalyticsReasons);
     const selectedStageSet = new Set(declineAnalyticsStages);
-    const byReason = new Map<DeclineReason, { users: Set<string>; transactions: number; latest: string | null; stageCounts: Record<DeclineStage, number> }>();
+    const byReason = new Map<DeclineReason, { users: Set<string>; transactions: number; latest: string | null; stageCounts: Record<DeclineStage, number>; messages: Map<string, { users: Set<string>; transactions: number }> }>();
     const byStage = new Map<DeclineStage, { users: Set<string>; transactions: number; reasons: Map<DeclineReason, number> }>();
     const failedUsers = new Set<string>();
     const stageTotals = createDeclineStageCounts();
     let failedTransactions = 0;
+    // Share-of-all denominator: successful + ALL failed transactions of the
+    // scoped users; the reason/stage display filters never narrow it.
+    let successfulTransactions = 0;
+    let failedTransactionsAll = 0;
 
     if (!filtered.length) {
       return {
         selectedUsers: 0,
         failedUsers: 0,
         failedTransactions: 0,
+        successfulTransactions: 0,
+        totalTransactions: 0,
         declineRate: 0,
         topReason: null as DeclineReason | null,
         avgAttempts: 0,
@@ -711,9 +873,11 @@ export default function UsersPage() {
     }
 
     for (const tx of analyticsTxs) {
-      if (!isFailedPaymentTransaction(tx)) continue;
       const userMatches = selectedUserIds.has(tx.user_id) || selectedEmails.has(emailKey(tx.email));
       if (!userMatches) continue;
+      if (tx.status === "success") successfulTransactions += 1;
+      if (!isFailedPaymentTransaction(tx)) continue;
+      failedTransactionsAll += 1;
       const details = declineDetailsForTransaction(tx);
       const reason = details?.reason ?? "unknown";
       const stage = declineStagesByTransaction.get(tx.transaction_id) ?? tx.normalized_decline_stage ?? "unknown";
@@ -724,12 +888,17 @@ export default function UsersPage() {
       failedTransactions += 1;
       stageTotals[stage] += 1;
 
-      const row = byReason.get(reason) ?? { users: new Set<string>(), transactions: 0, latest: null, stageCounts: createDeclineStageCounts() };
+      const row = byReason.get(reason) ?? { users: new Set<string>(), transactions: 0, latest: null, stageCounts: createDeclineStageCounts(), messages: new Map<string, { users: Set<string>; transactions: number }>() };
       row.users.add(userKey);
       row.transactions += 1;
       row.stageCounts[stage] += 1;
       const eventTime = details?.date ?? tx.event_time;
       if (!row.latest || eventTime > row.latest) row.latest = eventTime;
+      const messageLabel = declineBreakdownMessageForTransaction(tx);
+      const messageRow = row.messages.get(messageLabel) ?? { users: new Set<string>(), transactions: 0 };
+      messageRow.users.add(userKey);
+      messageRow.transactions += 1;
+      row.messages.set(messageLabel, messageRow);
       byReason.set(reason, row);
 
       const stageRow = byStage.get(stage) ?? { users: new Set<string>(), transactions: 0, reasons: new Map<DeclineReason, number>() };
@@ -748,6 +917,14 @@ export default function UsersPage() {
       latest_failed_date: row.latest,
       stage_counts: row.stageCounts,
       top_stage: topStageFromCounts(row.stageCounts),
+      messages: Array.from(row.messages.entries())
+        .map(([message, m]) => ({
+          message,
+          failed_users: m.users.size,
+          failed_transactions: m.transactions,
+          share: row.transactions ? (m.transactions / row.transactions) * 100 : 0,
+        }))
+        .sort((a, b) => b.failed_transactions - a.failed_transactions || a.message.localeCompare(b.message)),
     }));
 
     const stageRows = DECLINE_STAGE_VALUES
@@ -779,6 +956,8 @@ export default function UsersPage() {
       selectedUsers: filtered.length,
       failedUsers: failedUsers.size,
       failedTransactions,
+      successfulTransactions,
+      totalTransactions: successfulTransactions + failedTransactionsAll,
       declineRate: filtered.length ? (failedUsers.size / filtered.length) * 100 : 0,
       topReason,
       avgAttempts: failedUsers.size ? failedTransactions / failedUsers.size : 0,
@@ -787,6 +966,9 @@ export default function UsersPage() {
       stageTotals,
     };
   }, [filtered, analyticsTxs, declineAnalyticsReasons, declineAnalyticsStages, declineStagesByTransaction, declineSortKey, declineSortDir]);
+  // ClickHouse drives the Decline tab when available; legacy remains the
+  // unchanged fallback (cohort selections, legacy flag, or a server error).
+  const declineAnalytics = declineServerAnalytics ?? legacyDeclineAnalytics;
 
   const hasFirstTrialFilter = Boolean(firstTrialFrom || firstTrialTo);
 
@@ -837,6 +1019,17 @@ export default function UsersPage() {
   const declineIcon = (key: DeclineSortKey) =>
     declineSortKey !== key ? <ArrowUpDown className="h-3 w-3 opacity-40" /> :
     declineSortDir === "asc" ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />;
+  // Country breakdown sort is SERVER-side: changing it changes the decline
+  // bundle query key; the Edge Function sorts the full country set.
+  const toggleDeclineCountrySort = (key: DeclineCountrySortKey) => {
+    if (declineCountrySortKey === key) updateUiState({ declineCountrySortDir: declineCountrySortDir === "asc" ? "desc" : "asc" });
+    else updateUiState({ declineCountrySortKey: key, declineCountrySortDir: key === "country" ? "asc" : "desc" });
+  };
+  const declineCountryIcon = (key: DeclineCountrySortKey) =>
+    declineCountrySortKey !== key ? <ArrowUpDown className="h-3 w-3 opacity-40" /> :
+    declineCountrySortDir === "asc" ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />;
+  // Rates are fractions (0..1) or null when the denominator is 0 — never NaN.
+  const formatRate = (value: number | null) => (value == null ? "—" : formatPct(value * 100));
   const toggleCohortSelection = (cohortId: string) => {
     const next = selectedCohortIds.includes(cohortId)
       ? selectedCohortIds.filter((value) => value !== cohortId)
@@ -857,9 +1050,17 @@ export default function UsersPage() {
     { label: "Net Rev", value: formatCurrency(summary.net_revenue) },
     { label: "Failed Payment Users", value: String(summary.failed_payment_users) },
   ];
+  // Share-of-all denominator + success counter for the decline section.
+  const declineSuccessShare = declineAnalytics.totalTransactions
+    ? (declineAnalytics.successfulTransactions / declineAnalytics.totalTransactions) * 100
+    : 0;
+  const declineShareOfAll = (failedTransactions: number) =>
+    declineAnalytics.totalTransactions ? (failedTransactions / declineAnalytics.totalTransactions) * 100 : 0;
   const declineSummaryCards = [
     { label: "Failed Users", value: String(declineAnalytics.failedUsers) },
     { label: "Failed Transactions", value: String(declineAnalytics.failedTransactions) },
+    { label: "Total Transactions", value: String(declineAnalytics.totalTransactions) },
+    { label: "Successful Transactions", value: `${declineAnalytics.successfulTransactions} · ${formatPct(declineSuccessShare)}` },
     { label: "Decline Rate", value: formatPct(declineAnalytics.declineRate) },
     { label: "Top Decline Reason", value: declineAnalytics.topReason ?? "—" },
     { label: "Avg Failed Attempts", value: declineAnalytics.avgAttempts.toFixed(2) },
@@ -1037,8 +1238,11 @@ export default function UsersPage() {
             <SelectTrigger className="h-9 w-[170px]"><SelectValue placeholder="Country" /></SelectTrigger>
             <SelectContent>
               <SelectItem value="all">All countries</SelectItem>
-              {countryOptions.map((country) => (
-                <SelectItem key={country} value={country}>{country}</SelectItem>
+              {countryOptions.map((option) => (
+                <SelectItem key={option.country_code} value={option.country_code}>
+                  {option.country_code}
+                  {option.user_count > 0 ? ` · ${option.user_count}` : ""}
+                </SelectItem>
               ))}
             </SelectContent>
           </Select>
@@ -1216,8 +1420,8 @@ export default function UsersPage() {
               <span>subscriptions: <span className="font-mono text-foreground">{chUsers.subscriptionDataStatus}</span></span>
             )}
             {chStatus.error && chUsers == null && <span className="text-destructive">ClickHouse error — using legacy: {chStatus.error}</span>}
-            {!usersClickHouseDriving && !chStatus.error && (hasSelectedCohortsRaw || mode === "decline_analytics") && (
-              <span className="text-warning">{mode === "decline_analytics" ? "Decline Analytics uses the client dataset (documented boundary)" : "cohort selection uses the client dataset"}</span>
+            {!usersClickHouseDriving && !chStatus.error && hasSelectedCohortsRaw && (
+              <span className="text-warning">cohort selection uses the client dataset</span>
             )}
           </div>
         )}
@@ -1466,9 +1670,71 @@ export default function UsersPage() {
                   </div>
                 </PopoverContent>
               </Popover>
+              {/* Same shared Country filter as the Users Table (one user-level
+                  country attribution scopes both sections). */}
+              <Select value={countryFilter} onValueChange={(value) => updateUiState({ countryFilter: value })}>
+                <SelectTrigger className="h-9 w-[170px]"><SelectValue placeholder="Country" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All countries</SelectItem>
+                  {countryOptions.map((option) => (
+                    <SelectItem key={option.country_code} value={option.country_code}>
+                      {option.country_code}
+                      {option.user_count > 0 ? ` · ${option.user_count}` : ""}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
 
-            {declineAnalytics.selectedUsers === 0 ? (
+            {usersSource === "clickhouse" && (
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-md border border-border bg-muted/20 px-3 py-2 text-xs">
+                <span className="font-medium text-foreground">Decline data source</span>
+                <span>
+                  engine:{" "}
+                  <span className="font-mono text-foreground">{declineClickHouseDriving ? "clickhouse" : "legacy (fallback)"}</span>
+                </span>
+                {isDeclineInitialLoading && (
+                  <span className="flex items-center gap-2 text-muted-foreground">
+                    Loading decline analytics… {declineProgressPercent}%
+                    <Progress value={declineProgressPercent} className="h-1.5 w-24" />
+                  </span>
+                )}
+                {isDeclineBackgroundRefreshing && (
+                  <span className="flex items-center gap-2 text-muted-foreground">
+                    Updating… {declineProgressPercent}%
+                    <Progress value={declineProgressPercent} className="h-1.5 w-24" />
+                  </span>
+                )}
+                {!isDeclineInitialLoading && !isDeclineBackgroundRefreshing && chDeclineStatus.error && chDecline != null && (
+                  <span className="text-warning">refresh failed · showing cached data</span>
+                )}
+                {!isDeclineInitialLoading && !isDeclineBackgroundRefreshing && declineClickHouseDriving && chDecline && !chDeclineStatus.error && (
+                  <span>ClickHouse {chDecline.query_duration_ms} ms</span>
+                )}
+                {declineClickHouseDriving && chDecline && (
+                  <span>
+                    users with country: <span className="font-mono text-foreground">{chDecline.diagnostics.users_with_country.toLocaleString("en-US")}</span>
+                    {" · "}unknown: <span className="font-mono text-foreground">{chDecline.diagnostics.users_without_country.toLocaleString("en-US")}</span>
+                    {" · "}countries: <span className="font-mono text-foreground">{chDecline.diagnostics.unique_countries.toLocaleString("en-US")}</span>
+                  </span>
+                )}
+                {chDeclineStatus.error && chDecline == null && (
+                  <span className="text-destructive">ClickHouse error — using legacy: {chDeclineStatus.error}</span>
+                )}
+                {!declineClickHouseDriving && !chDeclineStatus.error && hasSelectedCohortsRaw && (
+                  <span className="text-warning">cohort selection uses the client dataset</span>
+                )}
+              </div>
+            )}
+
+            {declineServerEligible && isDeclineInitialLoading && chDecline == null ? (
+              <div className="rounded-md border border-dashed border-border px-4 py-10">
+                <div className="flex flex-col items-center gap-3 text-muted-foreground">
+                  <Progress value={declineProgressPercent} className="h-2 w-full max-w-xs" />
+                  <span className="text-sm">Loading decline analytics… {declineProgressPercent}%</span>
+                </div>
+              </div>
+            ) : declineAnalytics.selectedUsers === 0 ? (
               <div className="rounded-md border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">
                 <div className="space-y-3">
                   <div>
@@ -1597,7 +1863,7 @@ export default function UsersPage() {
                         </TableHead>
                         <TableHead className="text-right">
                           <button onClick={() => toggleDeclineSort("share")} className="inline-flex items-center gap-1 hover:text-foreground">
-                            Share {declineIcon("share")}
+                            Share of All Tx {declineIcon("share")}
                           </button>
                         </TableHead>
                         <TableHead className="text-right">
@@ -1614,35 +1880,202 @@ export default function UsersPage() {
                       </TableRow>
                     </TableHeader>
                     <TableBody>
-                      {declineAnalytics.rows.map((row) => (
-                        <TableRow key={row.reason}>
-                          <TableCell>
-                            <span className={cn("inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium", declineReasonBadgeClass(row.reason))}>
-                              {row.reason}
-                            </span>
-                          </TableCell>
-                          <TableCell className="text-right tabular-nums">{row.failed_users}</TableCell>
-                          <TableCell className="text-right tabular-nums">{row.failed_transactions}</TableCell>
-                          <TableCell className="text-right tabular-nums">{formatPct(row.share)}</TableCell>
-                          <TableCell className="text-right tabular-nums">{row.avg_attempts.toFixed(2)}</TableCell>
-                          <TableCell>
-                            <div className="flex flex-wrap gap-1">
-                              {DECLINE_STAGE_VALUES.filter((stage) => row.stage_counts[stage] > 0).map((stage) => (
-                                <span key={stage} className={cn("inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium", declineStageBadgeClass(stage))}>
-                                  {declineStageLabel(stage)} · {row.stage_counts[stage]}
-                                </span>
-                              ))}
-                            </div>
-                          </TableCell>
-                          <TableCell className="text-xs text-muted-foreground tabular-nums">
-                            {row.latest_failed_date ? formatDateKey(row.latest_failed_date) : "—"}
-                          </TableCell>
-                        </TableRow>
-                      ))}
+                      {declineAnalytics.rows.map((row) => {
+                        const expanded = expandedDeclineReasons.includes(row.reason);
+                        return (
+                          <Fragment key={row.reason}>
+                            <TableRow>
+                              <TableCell>
+                                {/* Click the reason to drill into the raw processor
+                                    messages behind it (e.g. fraud_suspected →
+                                    "Suspected fraud" / "Fraud/Security" / …). */}
+                                <button
+                                  type="button"
+                                  onClick={() => toggleDeclineReasonExpanded(row.reason)}
+                                  aria-expanded={expanded}
+                                  aria-label={`Toggle ${row.reason} message breakdown`}
+                                  className="inline-flex items-center gap-1 hover:opacity-80"
+                                >
+                                  <ChevronDown className={cn("h-3.5 w-3.5 text-muted-foreground transition-transform", !expanded && "-rotate-90")} />
+                                  <span className={cn("inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium", declineReasonBadgeClass(row.reason))}>
+                                    {row.reason}
+                                  </span>
+                                </button>
+                              </TableCell>
+                              <TableCell className="text-right tabular-nums">{row.failed_users}</TableCell>
+                              <TableCell className="text-right tabular-nums">{row.failed_transactions}</TableCell>
+                              {/* % of ALL scoped transactions (successful + failed), not of
+                                  failed only. Sorting still keys off row.share — the ordering
+                                  is identical (same numerator, constant denominator). */}
+                              <TableCell className="text-right tabular-nums">{formatPct(declineShareOfAll(row.failed_transactions))}</TableCell>
+                              <TableCell className="text-right tabular-nums">{row.avg_attempts.toFixed(2)}</TableCell>
+                              <TableCell>
+                                <div className="flex flex-wrap gap-1">
+                                  {DECLINE_STAGE_VALUES.filter((stage) => row.stage_counts[stage] > 0).map((stage) => (
+                                    <span key={stage} className={cn("inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium", declineStageBadgeClass(stage))}>
+                                      {declineStageLabel(stage)} · {row.stage_counts[stage]}
+                                    </span>
+                                  ))}
+                                </div>
+                              </TableCell>
+                              <TableCell className="text-xs text-muted-foreground tabular-nums">
+                                {row.latest_failed_date ? formatDateKey(row.latest_failed_date) : "—"}
+                              </TableCell>
+                            </TableRow>
+                            {expanded && (
+                              <TableRow className="bg-muted/20 hover:bg-muted/20">
+                                <TableCell colSpan={7} className="py-2">
+                                  {row.messages.length === 0 ? (
+                                    <div className="px-6 text-xs text-muted-foreground">No raw decline message data for this reason.</div>
+                                  ) : (
+                                    <div className="space-y-1 px-6" aria-label={`${row.reason} message breakdown`}>
+                                      <div className="grid grid-cols-[minmax(220px,1fr)_100px_140px_80px] gap-2 text-[11px] uppercase tracking-wide text-muted-foreground">
+                                        <span>Raw Message</span>
+                                        <span className="text-right">Failed Users</span>
+                                        <span className="text-right">Failed Transactions</span>
+                                        <span className="text-right">Share</span>
+                                      </div>
+                                      {row.messages.map((messageRow) => (
+                                        <div key={messageRow.message} className="grid grid-cols-[minmax(220px,1fr)_100px_140px_80px] gap-2 text-xs">
+                                          <span className="truncate" title={messageRow.message}>{messageRow.message}</span>
+                                          <span className="text-right tabular-nums">{messageRow.failed_users}</span>
+                                          <span className="text-right tabular-nums">{messageRow.failed_transactions}</span>
+                                          <span className="text-right tabular-nums">{formatPct(messageRow.share)}</span>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
+                                </TableCell>
+                              </TableRow>
+                            )}
+                          </Fragment>
+                        );
+                      })}
                     </TableBody>
                   </Table>
                 </div>
               </>
+            )}
+
+            {/* Decline Analytics by Country: server-computed over the user-level
+                authoritative country (same attribution as the User Table).
+                Sorting is server-side over the full country set; Unknown is
+                always last on country sorts. Rendered whenever the ClickHouse
+                bundle drives the tab — pass rates are meaningful even when the
+                current scope has zero failed transactions. */}
+            {declineClickHouseDriving && chDecline && declineAnalytics.selectedUsers > 0 && (
+              <div className="overflow-x-auto rounded-lg border border-border">
+                <Table aria-label="Decline analytics by country">
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>
+                        <button onClick={() => toggleDeclineCountrySort("country")} className="inline-flex items-center gap-1 hover:text-foreground">
+                          Country {declineCountryIcon("country")}
+                        </button>
+                      </TableHead>
+                      <TableHead className="text-right">
+                        <button onClick={() => toggleDeclineCountrySort("total_attempts")} className="inline-flex items-center gap-1 hover:text-foreground">
+                          Total Attempts {declineCountryIcon("total_attempts")}
+                        </button>
+                      </TableHead>
+                      <TableHead className="text-right">
+                        <button onClick={() => toggleDeclineCountrySort("successful")} className="inline-flex items-center gap-1 hover:text-foreground">
+                          Successful {declineCountryIcon("successful")}
+                        </button>
+                      </TableHead>
+                      <TableHead className="text-right">
+                        <button onClick={() => toggleDeclineCountrySort("failed")} className="inline-flex items-center gap-1 hover:text-foreground">
+                          Failed {declineCountryIcon("failed")}
+                        </button>
+                      </TableHead>
+                      <TableHead className="text-right">
+                        <button onClick={() => toggleDeclineCountrySort("pass_rate")} className="inline-flex items-center gap-1 hover:text-foreground">
+                          Overall Pass Rate {declineCountryIcon("pass_rate")}
+                        </button>
+                      </TableHead>
+                      <TableHead className="text-right">
+                        <button onClick={() => toggleDeclineCountrySort("pass_rate_ex_if")} className="inline-flex items-center gap-1 hover:text-foreground">
+                          Pass Rate Excl. IF {declineCountryIcon("pass_rate_ex_if")}
+                        </button>
+                      </TableHead>
+                      <TableHead className="text-right">
+                        <button onClick={() => toggleDeclineCountrySort("insufficient_funds")} className="inline-flex items-center gap-1 hover:text-foreground">
+                          Insufficient Funds {declineCountryIcon("insufficient_funds")}
+                        </button>
+                      </TableHead>
+                      <TableHead>Top Decline Reason</TableHead>
+                      <TableHead className="text-right">
+                        <button onClick={() => toggleDeclineCountrySort("users_with_attempts")} className="inline-flex items-center gap-1 hover:text-foreground">
+                          Users w/ Attempts {declineCountryIcon("users_with_attempts")}
+                        </button>
+                      </TableHead>
+                      <TableHead className="text-right">
+                        <button onClick={() => toggleDeclineCountrySort("users_with_success")} className="inline-flex items-center gap-1 hover:text-foreground">
+                          Users w/ Success {declineCountryIcon("users_with_success")}
+                        </button>
+                      </TableHead>
+                      <TableHead className="text-right">
+                        <button onClick={() => toggleDeclineCountrySort("user_pass_rate")} className="inline-flex items-center gap-1 hover:text-foreground">
+                          User Pass Rate {declineCountryIcon("user_pass_rate")}
+                        </button>
+                      </TableHead>
+                      <TableHead className="text-right">
+                        <button onClick={() => toggleDeclineCountrySort("first_attempt_pass_rate")} className="inline-flex items-center gap-1 hover:text-foreground">
+                          First Attempt PR {declineCountryIcon("first_attempt_pass_rate")}
+                        </button>
+                      </TableHead>
+                      <TableHead className="text-right">
+                        <button onClick={() => toggleDeclineCountrySort("first_sub_pass_rate")} className="inline-flex items-center gap-1 hover:text-foreground">
+                          First Sub PR {declineCountryIcon("first_sub_pass_rate")}
+                        </button>
+                      </TableHead>
+                      <TableHead className="text-right">
+                        <button onClick={() => toggleDeclineCountrySort("renewal_pass_rate")} className="inline-flex items-center gap-1 hover:text-foreground">
+                          Renewal PR {declineCountryIcon("renewal_pass_rate")}
+                        </button>
+                      </TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {chDecline.country_rows.map((row) => (
+                      <TableRow key={row.country}>
+                        <TableCell className="text-sm tabular-nums">{row.country}</TableCell>
+                        <TableCell className="text-right tabular-nums">{row.total_attempts}</TableCell>
+                        <TableCell className="text-right tabular-nums">{row.successful}</TableCell>
+                        <TableCell className="text-right tabular-nums">{row.failed}</TableCell>
+                        <TableCell className="text-right tabular-nums">{formatRate(row.pass_rate)}</TableCell>
+                        <TableCell className="text-right tabular-nums">{formatRate(row.pass_rate_ex_if)}</TableCell>
+                        <TableCell className="text-right tabular-nums">{row.insufficient_funds}</TableCell>
+                        <TableCell className="text-xs text-muted-foreground">{row.top_decline_reason ?? "—"}</TableCell>
+                        <TableCell className="text-right tabular-nums">{row.users_with_attempts}</TableCell>
+                        <TableCell className="text-right tabular-nums">{row.users_with_success}</TableCell>
+                        <TableCell className="text-right tabular-nums">{formatRate(row.user_pass_rate)}</TableCell>
+                        <TableCell className="text-right tabular-nums">{formatRate(row.first_attempt_pass_rate)}</TableCell>
+                        <TableCell className="text-right tabular-nums">{formatRate(row.first_sub_pass_rate)}</TableCell>
+                        <TableCell className="text-right tabular-nums">{formatRate(row.renewal_pass_rate)}</TableCell>
+                      </TableRow>
+                    ))}
+                    {/* Additive totals (rates recomputed from summed components —
+                        never an average of country rates). */}
+                    <TableRow className="bg-muted/30 font-medium">
+                      <TableCell className="text-sm">All countries</TableCell>
+                      <TableCell className="text-right tabular-nums">{chDecline.country_totals.total_attempts}</TableCell>
+                      <TableCell className="text-right tabular-nums">{chDecline.country_totals.successful}</TableCell>
+                      <TableCell className="text-right tabular-nums">{chDecline.country_totals.failed}</TableCell>
+                      <TableCell className="text-right tabular-nums">{formatRate(chDecline.country_totals.pass_rate)}</TableCell>
+                      <TableCell className="text-right tabular-nums">{formatRate(chDecline.country_totals.pass_rate_ex_if)}</TableCell>
+                      <TableCell className="text-right tabular-nums">{chDecline.country_totals.insufficient_funds}</TableCell>
+                      <TableCell className="text-xs text-muted-foreground">—</TableCell>
+                      <TableCell className="text-right tabular-nums">{chDecline.country_totals.users_with_attempts}</TableCell>
+                      <TableCell className="text-right tabular-nums">{chDecline.country_totals.users_with_success}</TableCell>
+                      <TableCell className="text-right tabular-nums">{formatRate(chDecline.country_totals.user_pass_rate)}</TableCell>
+                      <TableCell className="text-right tabular-nums">{formatRate(chDecline.country_totals.first_attempt_pass_rate)}</TableCell>
+                      <TableCell className="text-right tabular-nums">{formatRate(chDecline.country_totals.first_sub_pass_rate)}</TableCell>
+                      <TableCell className="text-right tabular-nums">{formatRate(chDecline.country_totals.renewal_pass_rate)}</TableCell>
+                    </TableRow>
+                  </TableBody>
+                </Table>
+              </div>
             )}
           </TabsContent>
         </Tabs>

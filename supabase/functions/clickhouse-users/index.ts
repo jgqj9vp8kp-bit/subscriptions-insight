@@ -9,6 +9,7 @@ import { createClickHouseClient } from "../_shared/clickhouse/client.ts";
 import { jsonResponse, methodNotAllowed, optionsResponse, parseJsonBody, requireSupabaseUser } from "../_shared/clickhouse/http.ts";
 import {
   normalizeUsersAction,
+  runUsersDecline,
   runUsersDetails,
   runUsersList,
   runUsersOptions,
@@ -54,6 +55,7 @@ Deno.serve(async (req: Request) => {
     if (action === "options") return jsonResponse(await withTimeout(runUsersOptions({ authUserId: auth.id, clickhouse: ch, request }), QUERY_TIMEOUT_MS));
     if (action === "summary") return jsonResponse(await withTimeout(runUsersSummary({ authUserId: auth.id, clickhouse: ch, request }), QUERY_TIMEOUT_MS));
     if (action === "details") return jsonResponse(await withTimeout(runUsersDetails({ authUserId: auth.id, clickhouse: ch, request }), QUERY_TIMEOUT_MS));
+    if (action === "decline") return jsonResponse(await withTimeout(runUsersDecline({ authUserId: auth.id, clickhouse: ch, request }), QUERY_TIMEOUT_MS));
     return jsonResponse(await withTimeout(runUsersList({ authUserId: auth.id, clickhouse: ch, request }), QUERY_TIMEOUT_MS));
   } catch (error) {
     const status = error instanceof UsersRequestError ? 400 : 502;

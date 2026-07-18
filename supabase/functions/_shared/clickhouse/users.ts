@@ -18,6 +18,10 @@ import {
   cancelledSubscriptionExpr,
 } from "./factSubscriptions.ts";
 import type {
+  UsersDeclineCountryRow,
+  UsersDeclineReasonRow,
+  UsersDeclineResponse,
+  UsersDeclineStageRow,
   UsersDetailsResponse,
   UsersFilters,
   UsersRequest,
@@ -27,6 +31,7 @@ import type {
   UsersTriState,
   SubscriptionDataStatus,
 } from "./usersContract.ts";
+import { UNKNOWN_COUNTRY } from "./usersContract.ts";
 
 const CH = CLASSIFIER_TABLE;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -72,11 +77,12 @@ function b(v: unknown): boolean {
   return v === 1 || v === true || v === "1" || v === "true";
 }
 
-export function normalizeUsersAction(action: unknown): "list" | "details" | "options" | "summary" {
+export function normalizeUsersAction(action: unknown): "list" | "details" | "options" | "summary" | "decline" {
   switch (action) {
     case "details": return "details";
     case "options": return "options";
     case "summary": return "summary";
+    case "decline": return "decline";
     case "list":
     case undefined:
     case null: return "list";
@@ -101,8 +107,35 @@ function stringArray(v: unknown, field: string): string[] {
   return out;
 }
 
+// Country filter values match the stored (already canonical) warehouse codes
+// exactly; only the Unknown sentinel is folded case-insensitively so
+// "unknown"/"UNKNOWN" never split into distinct filter values.
+function countryArray(v: unknown): string[] {
+  return Array.from(new Set(
+    stringArray(v, "country").map((value) => (value.toLowerCase() === UNKNOWN_COUNTRY.toLowerCase() ? UNKNOWN_COUNTRY : value)),
+  ));
+}
+
+// Allowlisted sort fields for the decline country breakdown (sorted server-side
+// over the FULL country result set; Unknown is always last for country sorts).
+const DECLINE_COUNTRY_SORT_ALLOWLIST = new Set([
+  "country",
+  "total_attempts",
+  "successful",
+  "failed",
+  "pass_rate",
+  "pass_rate_ex_if",
+  "insufficient_funds",
+  "users_with_attempts",
+  "users_with_success",
+  "user_pass_rate",
+  "first_attempt_pass_rate",
+  "first_sub_pass_rate",
+  "renewal_pass_rate",
+]);
+
 export interface NormalizedUsersRequest {
-  action: "list" | "details" | "options" | "summary";
+  action: "list" | "details" | "options" | "summary" | "decline";
   dateFrom: string | null;
   dateTo: string | null;
   filters: UsersFilters;
@@ -112,6 +145,9 @@ export interface NormalizedUsersRequest {
   pageSize: number;
   nowIso: string;
   userId: string | null;
+  declineReasons: string[];
+  declineStages: string[];
+  declineCountrySort: { field: string; direction: "asc" | "desc" };
 }
 
 export function normalizeUsersRequest(req: UsersRequest): NormalizedUsersRequest {
@@ -124,6 +160,10 @@ export function normalizeUsersRequest(req: UsersRequest): NormalizedUsersRequest
   const nowMs = req.now ? Date.parse(s(req.now)) : Date.now();
   // ClickHouse DateTime64 param format: "YYYY-MM-DD HH:MM:SS.mmm" (space, no Z).
   const nowIso = new Date(Number.isFinite(nowMs) ? nowMs : Date.now()).toISOString().replace("T", " ").replace("Z", "");
+  const declineCountrySortField = s(req.decline?.country_sort?.field || "total_attempts");
+  if (!DECLINE_COUNTRY_SORT_ALLOWLIST.has(declineCountrySortField)) {
+    throw new UsersRequestError(`Unsupported decline country sort field: ${declineCountrySortField}`);
+  }
   return {
     action: normalizeUsersAction(req.action),
     dateFrom: validDate(req.date_from, "date_from"),
@@ -138,7 +178,7 @@ export function normalizeUsersRequest(req: UsersRequest): NormalizedUsersRequest
       campaign_path: stringArray(f.campaign_path, "campaign_path"),
       campaign_id: stringArray(f.campaign_id, "campaign_id"),
       media_buyer: stringArray(f.media_buyer, "media_buyer"),
-      country: stringArray(f.country, "country"),
+      country: countryArray(f.country),
       card_type: stringArray(f.card_type, "card_type"),
       currency: stringArray(f.currency, "currency"),
       decline_reason: stringArray(f.decline_reason, "decline_reason"),
@@ -150,6 +190,12 @@ export function normalizeUsersRequest(req: UsersRequest): NormalizedUsersRequest
     pageSize,
     nowIso,
     userId: req.user_id ? s(req.user_id) : null,
+    declineReasons: stringArray(req.decline?.reasons, "decline.reasons"),
+    declineStages: stringArray(req.decline?.stages, "decline.stages"),
+    declineCountrySort: {
+      field: declineCountrySortField,
+      direction: req.decline?.country_sort?.direction === "asc" ? "asc" : "desc",
+    },
   };
 }
 
@@ -162,6 +208,19 @@ function inClause(column: string, values: string[], prefix: string, params: Reco
     return `{${key}:String}`;
   });
   return `${column} IN (${ph.join(", ")})`;
+}
+
+// Country filter over useragg. The Unknown sentinel selects users whose
+// authoritative country is NULL (no attributed country); real codes match the
+// stored values exactly. Mixed selections OR the two conditions.
+function countryClause(values: string[], params: Record<string, unknown>): string {
+  if (!values.length) return "";
+  const wantsUnknown = values.includes(UNKNOWN_COUNTRY);
+  const codes = values.filter((value) => value !== UNKNOWN_COUNTRY);
+  const codesClause = inClause("country_code", codes, "co", params);
+  if (wantsUnknown && codesClause) return `(${codesClause} OR country_code IS NULL)`;
+  if (wantsUnknown) return `country_code IS NULL`;
+  return codesClause;
 }
 
 // The per-user aggregate CTEs (classifier + lifecycle + all-rows + join).
@@ -297,7 +356,7 @@ function userWhere(nreq: NormalizedUsersRequest, params: Record<string, unknown>
   if (f.active_subscription === "yes") c.push(`active_subscription`);
   if (f.active_subscription === "no") c.push(`NOT active_subscription`);
   if (f.failed_attempts_min > 0) { params.fa_min = f.failed_attempts_min; c.push(`failed_payment_count >= {fa_min:UInt32}`); }
-  const country = inClause("country_code", f.country, "co", params); if (country) c.push(country);
+  const country = countryClause(f.country, params); if (country) c.push(country);
   const card = inClause("card_type", f.card_type, "ct", params); if (card) c.push(card);
   const cpath = inClause("campaign_path", f.campaign_path, "cp", params); if (cpath) c.push(cpath);
   const fun = inClause("cohort_funnel", f.funnel, "fn", params); if (fun) c.push(fun);
@@ -489,10 +548,17 @@ export async function runUsersOptions(input: { authUserId: string; clickhouse: C
   const nreq = normalizeUsersRequest(input.request);
   const params: Record<string, unknown> = {};
   const cte = userAggCTE(input.authUserId, params, nreq.nowIso);
+  // Country options are DEPENDENT: they respect every active filter EXCEPT the
+  // country filter itself, so the dropdown only lists countries of the
+  // currently scoped users. The per-option count is TRIAL users — the same
+  // semantics as the Cohorts page country filter. The Unknown bucket (users
+  // with no attributed country) is a first-class option. Other dimensions keep
+  // their original global (unfiltered) behavior.
+  const countryScopeWhere = userWhere({ ...nreq, filters: { ...nreq.filters, country: [] } }, params);
   const sql = `${cte}
 SELECT 'funnel' dim, cohort_funnel value, '' label, count() cnt FROM useragg WHERE cohort_funnel != '' GROUP BY cohort_funnel
 UNION ALL SELECT 'campaign_path' dim, campaign_path value, '' label, count() FROM useragg WHERE campaign_path != '' GROUP BY campaign_path
-UNION ALL SELECT 'country' dim, ifNull(country_code, '') value, '' label, count() FROM useragg WHERE country_code IS NOT NULL GROUP BY country_code
+UNION ALL SELECT 'country' dim, ifNull(country_code, '${UNKNOWN_COUNTRY}') value, '' label, countIf(first_trial_date IS NOT NULL) FROM useragg ${countryScopeWhere} GROUP BY ifNull(country_code, '${UNKNOWN_COUNTRY}')
 UNION ALL SELECT 'card_type' dim, card_type value, '' label, count() FROM useragg WHERE card_type != '' GROUP BY card_type
 UNION ALL SELECT 'media_buyer' dim, media_buyer value, '' label, count() FROM useragg WHERE media_buyer != '' GROUP BY media_buyer
 UNION ALL SELECT 'currency' dim, first_trial_currency value, '' label, count() FROM useragg WHERE first_trial_currency != '' GROUP BY first_trial_currency
@@ -511,13 +577,420 @@ FORMAT JSONEachRow`;
     else if (row.dim === "currency") fo.currency.push(v);
   }
   fo.funnel.sort(); fo.campaign_path.sort(); fo.currency.sort();
-  fo.country.sort((x, y) => x.country_code.localeCompare(y.country_code));
+  // A→Z with Unknown pinned last (mirrors the Unknown-last sort of the table).
+  fo.country.sort((x, y) =>
+    Number(x.country_code === UNKNOWN_COUNTRY) - Number(y.country_code === UNKNOWN_COUNTRY) || x.country_code.localeCompare(y.country_code));
   return {
     ok: true, source: "clickhouse", generated_at: new Date().toISOString(), query_duration_ms: Date.now() - started,
     pagination: { page: 1, page_size: 0, total_rows: 0, total_pages: 1 },
     rows: [], summary: {}, filter_options: fo,
     diagnostics: { users_scanned: 0, transactions_scanned: 0, missing_identity: 0, missing_fx: 0, subscription_data_status: await subscriptionDataStatus(input.clickhouse, input.authUserId) },
   };
+}
+
+// ---- action=decline: server-side Decline Analytics ------------------------
+//
+// Reproduces the legacy client Decline Analytics tab (reason/stage breakdowns
+// over the failed transactions of the filtered users) fully in ClickHouse, and
+// adds the country breakdown. The user scope is the SAME filtered useragg the
+// list/summary actions use (one shared user-level country attribution), and the
+// decline classification is the SAME stored decline_reason / payment_stage the
+// Users table already displays — no new classifier.
+//
+// Query plan: materialize ONE scratch table with every transaction row of the
+// selected users (classifier runs once), then run all aggregations against it.
+// Same MergeTree-scratch pattern as the proven payment-analytics module.
+
+const LIFE_SET = "('first_subscription','renewal_2','renewal_3','renewal')";
+const IF_REASON = "insufficient_funds";
+const DECLINE_STAGE_KEYS = ["after_trial", "after_first_subscription", "after_renewal", "unknown"] as const;
+
+function rate(numerator: number, denominator: number): number | null {
+  return denominator > 0 ? numerator / denominator : null;
+}
+
+function declineScratchTableName(): string {
+  return `ud_staged_${crypto.randomUUID().replace(/-/g, "")}`;
+}
+
+// Raw processor message of a failed attempt, extracted from the stored
+// raw_payload declineReasons blob at query time (no schema change). The blob is
+// either a Python-repr string (single quotes) or real JSON (double quotes), so
+// both quoting styles are tried; precedence mirrors the client drill-down
+// label: payment_method_result_message → message → normalized decline_reason.
+// The field-name patterns are anchored by the opening quote, so `message` never
+// matches the tail of `..._result_message` / `..._advice_message`.
+function declineMessageSQL(rawColumn: string, reasonColumn: string): string {
+  const single = (field: string) => `extract(${rawColumn}, '\\'${field}\\': \\'([^\\']+)\\'')`;
+  const double = (field: string) => `extract(${rawColumn}, '"${field}": "([^"]+)"')`;
+  const candidates = [
+    single("payment_method_result_message"),
+    double("payment_method_result_message"),
+    single("message"),
+    double("message"),
+  ];
+  const branches = candidates.map((expr) => `${expr} != '', ${expr}`).join(",\n    ");
+  return `multiIf(
+    ${branches},
+    ${reasonColumn} != '', ${reasonColumn},
+    'unknown')`;
+}
+
+// Every transaction row of the users matching the request filters, with the
+// user's authoritative country (identical attribution to the User Table),
+// normalized decline reason/stage on failed rows, the row number (first
+// attempt) and the inferred subscription level of the attempt. The sequential
+// stage/level inference reproduces the shadow-proven payment-analytics staged
+// CTE.
+async function materializeDeclineScratch(client: ClickHouseClientLike, authUserId: string, nreq: NormalizedUsersRequest, table: string): Promise<void> {
+  const params: Record<string, unknown> = {};
+  const cte = userAggCTE(authUserId, params, nreq.nowIso);
+  const where = userWhere(nreq, params);
+  const sql = `CREATE TABLE ${table} ENGINE = MergeTree ORDER BY tuple() AS ${cte},
+selected AS (
+  SELECT user_id, ifNull(country_code, '${UNKNOWN_COUNTRY}') ucountry FROM useragg ${where}
+),
+-- ClickHouse rejects an alias placed after FINAL (FROM t FINAL AS c → syntax
+-- error at the following JOIN), so the FINAL scan lives in its own CTE and the
+-- join list below stays free of FINAL modifiers.
+txs AS (
+  SELECT user_id, transaction_id, event_time, is_success, is_failed, decline_reason, payment_stage, raw_payload
+  FROM ${CH} FINAL
+  WHERE auth_user_id = {auth_user_id:String}
+),
+att AS (
+  SELECT c.user_id uid, c.transaction_id tid, toUnixTimestamp64Milli(c.event_time) ets,
+    toString(toDate(c.event_time)) event_day,
+    sel.ucountry ucountry,
+    c.is_success is_success, c.is_failed is_failed,
+    if(c.is_failed = 1, if(c.decline_reason = '', 'unknown', c.decline_reason), '') reason,
+    if(c.is_failed = 1, if(c.payment_stage IN ('after_trial', 'after_first_subscription', 'after_renewal'), c.payment_stage, 'unknown'), '') stage,
+    if(c.is_failed = 1, ${declineMessageSQL("c.raw_payload", "c.decline_reason")}, '') dmsg,
+    ifNull(f.lt, '') lt, ifNull(f.lvl, 0) lvl
+  FROM txs AS c
+  INNER JOIN selected AS sel ON sel.user_id = c.user_id
+  LEFT JOIN fin AS f ON f.uid = c.user_id AND f.tid = c.transaction_id
+),
+seqd AS (
+  SELECT *,
+    max(if(is_success = 1 AND lt IN ${LIFE_SET}, lvl, 0)) OVER (PARTITION BY uid ORDER BY ets, tid ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) seq_before,
+    max(if(is_success = 1 AND lt = 'trial', 1, 0)) OVER (PARTITION BY uid ORDER BY ets, tid ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) entry_before,
+    row_number() OVER (PARTITION BY uid ORDER BY ets, tid) rn
+  FROM att
+)
+SELECT uid, ucountry, is_success, is_failed, rn, event_day, reason, stage, dmsg,
+  multiIf(
+    is_success = 1 AND lt IN ('upsell', 'trial'), CAST(NULL AS Nullable(Int32)),
+    is_success = 1 AND lt IN ${LIFE_SET}, CAST(lvl AS Nullable(Int32)),
+    is_success = 1, CAST(NULL AS Nullable(Int32)),
+    seq_before >= 1, CAST(seq_before + 1 AS Nullable(Int32)),
+    entry_before >= 1, CAST(1 AS Nullable(Int32)),
+    CAST(NULL AS Nullable(Int32))) sub_level
+FROM seqd`;
+  await client.command({ query: sql, query_params: params });
+}
+
+async function dropDeclineScratch(client: ClickHouseClientLike, table: string): Promise<void> {
+  try { await client.command({ query: `DROP TABLE IF EXISTS ${table}` }); } catch { /* best-effort cleanup */ }
+}
+
+// Self-heal orphaned scratch tables (isolate torn down before its DROP ran).
+// Age-bounded far beyond the request lifetime; name pattern validated. Best-effort.
+async function sweepStaleDeclineTables(client: ClickHouseClientLike): Promise<void> {
+  try {
+    const rs = await client.query({
+      query: `SELECT name FROM system.tables WHERE database = currentDatabase() AND name LIKE 'ud_staged_%' AND metadata_modification_time < now() - INTERVAL 10 MINUTE\nFORMAT JSONEachRow`,
+      format: "JSONEachRow",
+    });
+    for (const r of (await rs.json()) as Array<{ name?: string }>) {
+      const name = String(r.name ?? "");
+      if (/^ud_staged_[0-9a-f]{32}$/.test(name)) await client.command({ query: `DROP TABLE IF EXISTS ${name}` });
+    }
+  } catch { /* best-effort */ }
+}
+
+// Reason/stage display filters narrow ONLY the failed-transaction aggregations
+// (exactly like the legacy tab). Parameter-safe; "1" when no filter is active.
+function declineDisplayFilterCondition(nreq: NormalizedUsersRequest, params: Record<string, unknown>): string {
+  const parts: string[] = [];
+  const reasons = inClause("reason", nreq.declineReasons, "dar", params); if (reasons) parts.push(reasons);
+  const stages = inClause("stage", nreq.declineStages, "das", params); if (stages) parts.push(stages);
+  return parts.length ? parts.join(" AND ") : "1";
+}
+
+function topStageOf(counts: Record<string, number>): string {
+  return [...DECLINE_STAGE_KEYS].sort((a, b) => counts[b] - counts[a] || DECLINE_STAGE_KEYS.indexOf(a) - DECLINE_STAGE_KEYS.indexOf(b))[0] ?? "unknown";
+}
+
+function toCountryRow(country: string, r: Record<string, unknown>): UsersDeclineCountryRow {
+  const totalAttempts = n(r.total_attempts), successful = n(r.successful);
+  const insufficientFunds = n(r.insufficient_funds);
+  const usersWithAttempts = n(r.users_with_attempts), usersWithSuccess = n(r.users_with_success);
+  const firstAttempts = n(r.first_attempts), firstSuccess = n(r.first_success);
+  const firstSubAttempts = n(r.first_sub_attempts), firstSubSuccess = n(r.first_sub_success);
+  const renewalAttempts = n(r.renewal_attempts), renewalSuccess = n(r.renewal_success);
+  return {
+    country,
+    total_attempts: totalAttempts,
+    successful,
+    failed: n(r.failed),
+    pass_rate: rate(successful, totalAttempts),
+    insufficient_funds: insufficientFunds,
+    pass_rate_ex_if: rate(successful, totalAttempts - insufficientFunds),
+    top_decline_reason: null,
+    users_with_attempts: usersWithAttempts,
+    users_with_success: usersWithSuccess,
+    user_pass_rate: rate(usersWithSuccess, usersWithAttempts),
+    first_attempts: firstAttempts,
+    first_success: firstSuccess,
+    first_attempt_pass_rate: rate(firstSuccess, firstAttempts),
+    first_sub_attempts: firstSubAttempts,
+    first_sub_success: firstSubSuccess,
+    first_sub_pass_rate: rate(firstSubSuccess, firstSubAttempts),
+    renewal_attempts: renewalAttempts,
+    renewal_success: renewalSuccess,
+    renewal_pass_rate: rate(renewalSuccess, renewalAttempts),
+  };
+}
+
+// Server-side sort over the FULL country result set (never a page slice).
+// Country sorts pin Unknown last in BOTH directions; null rates always sort
+// last; ties resolve by country A→Z so pagination-free rendering is stable.
+function sortCountryRows(rows: UsersDeclineCountryRow[], field: string, direction: "asc" | "desc"): void {
+  const dir = direction === "asc" ? 1 : -1;
+  const unknownLast = (row: UsersDeclineCountryRow) => (row.country === UNKNOWN_COUNTRY ? 1 : 0);
+  rows.sort((a, b) => {
+    if (field === "country") {
+      return unknownLast(a) - unknownLast(b) || dir * a.country.localeCompare(b.country);
+    }
+    const av = a[field as keyof UsersDeclineCountryRow] as number | null;
+    const bv = b[field as keyof UsersDeclineCountryRow] as number | null;
+    const aNull = av == null, bNull = bv == null;
+    if (aNull !== bNull) return aNull ? 1 : -1;
+    const cmp = aNull || bNull ? 0 : av - bv;
+    return dir * cmp || unknownLast(a) - unknownLast(b) || a.country.localeCompare(b.country);
+  });
+}
+
+export async function runUsersDecline(input: { authUserId: string; clickhouse: ClickHouseClientLike; request: UsersRequest }): Promise<UsersDeclineResponse> {
+  const started = Date.now();
+  const nreq = normalizeUsersRequest(input.request);
+  const client = input.clickhouse;
+  const table = declineScratchTableName();
+  await Promise.all([
+    materializeDeclineScratch(client, input.authUserId, nreq, table),
+    sweepStaleDeclineTables(client),
+  ]);
+  try {
+    const rfParams: Record<string, unknown> = {};
+    const rf = declineDisplayFilterCondition(nreq, rfParams);
+
+    const totalsSql = `SELECT
+  uniqExact(uid) selected_users,
+  uniqExactIf(uid, is_failed = 1 AND ${rf}) failed_users,
+  countIf(is_failed = 1 AND ${rf}) failed_transactions,
+  countIf(is_success = 1) successful_transactions,
+  countIf(is_failed = 1) failed_transactions_all,
+  countIf(is_failed = 1 AND ${rf} AND stage = 'after_trial') st_after_trial,
+  countIf(is_failed = 1 AND ${rf} AND stage = 'after_first_subscription') st_after_first_subscription,
+  countIf(is_failed = 1 AND ${rf} AND stage = 'after_renewal') st_after_renewal,
+  countIf(is_failed = 1 AND ${rf} AND stage = 'unknown') st_unknown,
+  uniqExactIf(uid, ucountry != '${UNKNOWN_COUNTRY}') users_with_country,
+  uniqExactIf(uid, ucountry = '${UNKNOWN_COUNTRY}') users_without_country,
+  countIf(ucountry != '${UNKNOWN_COUNTRY}') attempts_with_country,
+  countIf(ucountry = '${UNKNOWN_COUNTRY}') attempts_without_country,
+  uniqExactIf(ucountry, ucountry != '${UNKNOWN_COUNTRY}') unique_countries
+FROM ${table}
+FORMAT JSONEachRow`;
+
+    const reasonSql = `SELECT reason,
+  uniqExact(uid) failed_users, count() failed_transactions, max(event_day) latest_failed_date,
+  countIf(stage = 'after_trial') st_after_trial,
+  countIf(stage = 'after_first_subscription') st_after_first_subscription,
+  countIf(stage = 'after_renewal') st_after_renewal,
+  countIf(stage = 'unknown') st_unknown
+FROM ${table} WHERE is_failed = 1 AND ${rf} GROUP BY reason
+FORMAT JSONEachRow`;
+
+    const stageSql = `SELECT stage, uniqExact(uid) failed_users, count() failed_transactions
+FROM ${table} WHERE is_failed = 1 AND ${rf} GROUP BY stage
+FORMAT JSONEachRow`;
+
+    // Per-reason raw-message drill-down (same display-filter scope as the
+    // reason table itself).
+    const reasonMessageSql = `SELECT reason, dmsg, uniqExact(uid) failed_users, count() failed_transactions
+FROM ${table} WHERE is_failed = 1 AND ${rf} GROUP BY reason, dmsg
+FORMAT JSONEachRow`;
+
+    const countrySql = `SELECT ucountry country,
+  count() total_attempts, sum(is_success) successful, sum(is_failed) failed,
+  uniqExact(uid) users_with_attempts, uniqExactIf(uid, is_success = 1) users_with_success,
+  countIf(rn = 1) first_attempts, countIf(rn = 1 AND is_success = 1) first_success,
+  countIf(sub_level = 1) first_sub_attempts, countIf(sub_level = 1 AND is_success = 1) first_sub_success,
+  countIf(sub_level >= 2) renewal_attempts, countIf(sub_level >= 2 AND is_success = 1) renewal_success,
+  countIf(is_failed = 1 AND reason = '${IF_REASON}') insufficient_funds
+FROM ${table} GROUP BY ucountry
+FORMAT JSONEachRow`;
+
+    const countryReasonSql = `SELECT ucountry country, reason, count() c
+FROM ${table} WHERE is_failed = 1 AND reason != '' GROUP BY ucountry, reason
+FORMAT JSONEachRow`;
+
+    const run = async (query: string, params: Record<string, unknown>) => {
+      const rs = await client.query({ query, query_params: params, format: "JSONEachRow" });
+      return (await rs.json()) as Array<Record<string, unknown>>;
+    };
+    const [totalsRaw, reasonRaw, stageRaw, reasonMessageRaw, countryRaw, countryReasonRaw] = await Promise.all([
+      run(totalsSql, rfParams),
+      run(reasonSql, rfParams),
+      run(stageSql, rfParams),
+      run(reasonMessageSql, rfParams),
+      run(countrySql, {}),
+      run(countryReasonSql, {}),
+    ]);
+
+    const t = totalsRaw[0] ?? {};
+    const failedTransactions = n(t.failed_transactions);
+    const failedUsers = n(t.failed_users);
+    const selectedUsers = n(t.selected_users);
+
+    // Raw-message drill-down grouped under its reason; within a reason the
+    // messages sort by failed transactions desc, then A→Z, with the share
+    // computed against the reason's own failed-transaction count.
+    const messagesByReason = new Map<string, Array<{ message: string; failed_users: number; failed_transactions: number }>>();
+    for (const r of reasonMessageRaw) {
+      const reason = s(r.reason) || "unknown";
+      const list = messagesByReason.get(reason) ?? [];
+      list.push({
+        message: s(r.dmsg) || "unknown",
+        failed_users: n(r.failed_users),
+        failed_transactions: n(r.failed_transactions),
+      });
+      messagesByReason.set(reason, list);
+    }
+
+    const reasonRows: UsersDeclineReasonRow[] = reasonRaw.map((r) => {
+      const stageCounts = {
+        after_trial: n(r.st_after_trial),
+        after_first_subscription: n(r.st_after_first_subscription),
+        after_renewal: n(r.st_after_renewal),
+        unknown: n(r.st_unknown),
+      };
+      const transactions = n(r.failed_transactions);
+      const users = n(r.failed_users);
+      const reason = s(r.reason) || "unknown";
+      const messages = (messagesByReason.get(reason) ?? [])
+        .map((m) => ({ ...m, share: transactions > 0 ? m.failed_transactions / transactions : 0 }))
+        .sort((a, b) => b.failed_transactions - a.failed_transactions || a.message.localeCompare(b.message));
+      return {
+        reason,
+        failed_users: users,
+        failed_transactions: transactions,
+        share: failedTransactions > 0 ? transactions / failedTransactions : 0,
+        avg_attempts: users > 0 ? transactions / users : 0,
+        latest_failed_date: r.latest_failed_date ? s(r.latest_failed_date) : null,
+        stage_counts: stageCounts,
+        top_stage: topStageOf(stageCounts),
+        messages,
+      };
+    });
+    reasonRows.sort((a, b) => b.failed_transactions - a.failed_transactions || a.reason.localeCompare(b.reason));
+
+    // Per-stage top reason from the per-reason stage counts (same data the
+    // legacy tab used); ties resolve alphabetically like the client.
+    const stageRows: UsersDeclineStageRow[] = DECLINE_STAGE_KEYS
+      .map((stage) => {
+        const row = stageRaw.find((r) => s(r.stage) === stage);
+        let topReason: string | null = null;
+        let topCount = 0;
+        for (const reasonRow of [...reasonRows].sort((a, b) => a.reason.localeCompare(b.reason))) {
+          const count = reasonRow.stage_counts[stage] ?? 0;
+          if (count > topCount) { topCount = count; topReason = reasonRow.reason; }
+        }
+        const transactions = n(row?.failed_transactions);
+        return {
+          stage,
+          failed_users: n(row?.failed_users),
+          failed_transactions: transactions,
+          share: failedTransactions > 0 && transactions > 0 ? transactions / failedTransactions : 0,
+          top_reason: topReason,
+        };
+      })
+      .filter((row) => row.failed_transactions > 0);
+
+    const countryRows: UsersDeclineCountryRow[] = countryRaw.map((r) => toCountryRow(s(r.country) || UNKNOWN_COUNTRY, r));
+    // Top decline reason per country: most failed transactions, ties A→Z.
+    const bestReasonByCountry = new Map<string, { reason: string; count: number }>();
+    for (const r of countryReasonRaw) {
+      const country = s(r.country) || UNKNOWN_COUNTRY;
+      const reason = s(r.reason);
+      const count = n(r.c);
+      const current = bestReasonByCountry.get(country);
+      if (!current || count > current.count || (count === current.count && reason < current.reason)) {
+        bestReasonByCountry.set(country, { reason, count });
+      }
+    }
+    for (const row of countryRows) {
+      row.top_decline_reason = bestReasonByCountry.get(row.country)?.reason ?? null;
+    }
+    sortCountryRows(countryRows, nreq.declineCountrySort.field, nreq.declineCountrySort.direction);
+
+    // Additive totals over the country rows — rates recomputed from summed
+    // components, NEVER averaged across country rates.
+    const sum = (pick: (row: UsersDeclineCountryRow) => number) => countryRows.reduce((acc, row) => acc + pick(row), 0);
+    const countryTotals = toCountryRow("all", {
+      total_attempts: sum((r) => r.total_attempts), successful: sum((r) => r.successful), failed: sum((r) => r.failed),
+      users_with_attempts: sum((r) => r.users_with_attempts), users_with_success: sum((r) => r.users_with_success),
+      first_attempts: sum((r) => r.first_attempts), first_success: sum((r) => r.first_success),
+      first_sub_attempts: sum((r) => r.first_sub_attempts), first_sub_success: sum((r) => r.first_sub_success),
+      renewal_attempts: sum((r) => r.renewal_attempts), renewal_success: sum((r) => r.renewal_success),
+      insufficient_funds: sum((r) => r.insufficient_funds),
+    });
+
+    return {
+      ok: true,
+      source: "clickhouse",
+      generated_at: new Date().toISOString(),
+      query_duration_ms: Date.now() - started,
+      totals: {
+        selected_users: selectedUsers,
+        failed_users: failedUsers,
+        failed_transactions: failedTransactions,
+        successful_transactions: n(t.successful_transactions),
+        // Denominator for share-of-all percentages: successful + ALL failed
+        // (independent of the reason/stage display filters).
+        total_transactions: n(t.successful_transactions) + n(t.failed_transactions_all),
+        decline_rate: rate(failedUsers, selectedUsers),
+        top_reason: reasonRows[0]?.reason ?? null,
+        avg_attempts: rate(failedTransactions, failedUsers),
+        stage_totals: {
+          after_trial: n(t.st_after_trial),
+          after_first_subscription: n(t.st_after_first_subscription),
+          after_renewal: n(t.st_after_renewal),
+          unknown: n(t.st_unknown),
+        },
+      },
+      reason_rows: reasonRows,
+      stage_rows: stageRows,
+      country_rows: countryRows,
+      country_totals: countryTotals,
+      country_sort: nreq.declineCountrySort,
+      applied_filters: {
+        countries: nreq.filters.country,
+        reasons: nreq.declineReasons,
+        stages: nreq.declineStages,
+      },
+      diagnostics: {
+        users_with_country: n(t.users_with_country),
+        users_without_country: n(t.users_without_country),
+        attempts_with_country: n(t.attempts_with_country),
+        attempts_without_country: n(t.attempts_without_country),
+        unique_countries: n(t.unique_countries),
+      },
+    };
+  } finally {
+    await dropDeclineScratch(client, table);
+  }
 }
 
 export async function runUsersDetails(input: { authUserId: string; clickhouse: ClickHouseClientLike; request: UsersRequest }): Promise<UsersDetailsResponse> {

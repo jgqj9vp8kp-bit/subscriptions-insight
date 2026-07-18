@@ -3,10 +3,15 @@
 // raw_payload / normalized_payload / credentials. Email is returned because the
 // current Users table displays it (single PII surface, column 1).
 
-export type UsersAction = "list" | "details" | "options" | "summary";
+export type UsersAction = "list" | "details" | "options" | "summary" | "decline";
 export type UsersTriState = "all" | "yes" | "no";
 export type UsersSortDirection = "asc" | "desc";
 export type SubscriptionDataStatus = "empty_source" | "ready" | "partial" | "failed";
+
+// Canonical sentinel for "no country attributed". Users whose authoritative
+// country is empty/NULL are filterable and displayed under this value; it is
+// never mixed with real ISO codes and always sorts last.
+export const UNKNOWN_COUNTRY = "Unknown";
 
 export interface UsersFilters {
   first_sub: UsersTriState;
@@ -35,6 +40,15 @@ export interface UsersPagination {
   page_size: number;
 }
 
+// action=decline extras: the Decline Analytics display filters (reason/stage
+// narrow only the failed-transaction aggregations, exactly like the legacy tab)
+// and the server-side sort of the country breakdown.
+export interface UsersDeclineParams {
+  reasons?: string[];
+  stages?: string[];
+  country_sort?: { field: string; direction: UsersSortDirection };
+}
+
 export interface UsersRequest {
   action?: UsersAction | string;
   date_from?: string | null;
@@ -45,6 +59,8 @@ export interface UsersRequest {
   now?: string;
   /** For action=details: the exact canonical user to expand. */
   user_id?: string;
+  /** For action=decline: reason/stage display filters + country sort. */
+  decline?: UsersDeclineParams;
 }
 
 // One canonical user. Lifecycle fields come from the authoritative classifier;
@@ -186,5 +202,121 @@ export interface UsersDetailsResponse {
     cancelled_at: string | null;
     subscription_data_status: SubscriptionDataStatus;
   };
+  error?: string;
+}
+
+// ---- action=decline (server-side Decline Analytics bundle) -----------------
+// Aggregates only: no emails, no user ids, no transaction ids, no raw decline
+// payloads. All rates are fractions (0..1) or null when the denominator is 0.
+
+export interface UsersDeclineTotals {
+  selected_users: number;
+  failed_users: number;
+  failed_transactions: number;
+  /**
+   * Successful transactions of the selected users. Unlike failed_transactions,
+   * the reason/stage display filters never narrow this (they only apply to
+   * failed rows).
+   */
+  successful_transactions: number;
+  /**
+   * successful + ALL failed transactions of the selected users — the
+   * denominator for "share of all transactions" percentages.
+   */
+  total_transactions: number;
+  /** failed_users / selected_users; null when selected_users = 0. */
+  decline_rate: number | null;
+  top_reason: string | null;
+  /** failed_transactions / failed_users; null when failed_users = 0. */
+  avg_attempts: number | null;
+  stage_totals: Record<string, number>;
+}
+
+// Raw-processor-message drill-down of one decline reason (e.g. fraud_suspected
+// splits into "Suspected fraud", "Fraud/Security (Mastercard use only)",
+// "fraudulent", "Security violation", …). The label prefers the network result
+// message over the normalized token; share is within the parent reason.
+export interface UsersDeclineMessageRow {
+  message: string;
+  failed_users: number;
+  failed_transactions: number;
+  /** Share of the parent reason's failed transactions (0..1). */
+  share: number;
+}
+
+export interface UsersDeclineReasonRow {
+  reason: string;
+  failed_users: number;
+  failed_transactions: number;
+  /** Share of all filtered failed transactions (0..1). */
+  share: number;
+  avg_attempts: number;
+  latest_failed_date: string | null;
+  stage_counts: Record<string, number>;
+  top_stage: string;
+  messages: UsersDeclineMessageRow[];
+}
+
+export interface UsersDeclineStageRow {
+  stage: string;
+  failed_users: number;
+  failed_transactions: number;
+  share: number;
+  top_reason: string | null;
+}
+
+// One row per authoritative user-level country (same attribution as the User
+// Table). "Attempts" are transaction rows of the selected users — identical to
+// the proven payment-analytics attempt semantics.
+export interface UsersDeclineCountryRow {
+  country: string;
+  total_attempts: number;
+  successful: number;
+  failed: number;
+  pass_rate: number | null;
+  insufficient_funds: number;
+  /** successful / (total_attempts - insufficient_funds); null when denominator = 0. */
+  pass_rate_ex_if: number | null;
+  top_decline_reason: string | null;
+  users_with_attempts: number;
+  users_with_success: number;
+  user_pass_rate: number | null;
+  first_attempts: number;
+  first_success: number;
+  first_attempt_pass_rate: number | null;
+  first_sub_attempts: number;
+  first_sub_success: number;
+  first_sub_pass_rate: number | null;
+  renewal_attempts: number;
+  renewal_success: number;
+  renewal_pass_rate: number | null;
+}
+
+export interface UsersDeclineDiagnostics {
+  users_with_country: number;
+  users_without_country: number;
+  attempts_with_country: number;
+  attempts_without_country: number;
+  unique_countries: number;
+}
+
+export interface UsersDeclineResponse {
+  ok: boolean;
+  source: "clickhouse";
+  generated_at: string;
+  query_duration_ms: number;
+  totals: UsersDeclineTotals;
+  reason_rows: UsersDeclineReasonRow[];
+  stage_rows: UsersDeclineStageRow[];
+  country_rows: UsersDeclineCountryRow[];
+  /** Additive totals over country_rows (never an average of country rates). */
+  country_totals: UsersDeclineCountryRow;
+  country_sort: { field: string; direction: UsersSortDirection };
+  applied_filters: {
+    countries: string[];
+    reasons: string[];
+    stages: string[];
+  };
+  diagnostics: UsersDeclineDiagnostics;
   error?: string;
 }
