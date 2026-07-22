@@ -173,27 +173,37 @@ ENGINE = MergeTree
 ORDER BY (auth_user_id, batch_id, check_name)
 `;
 
+// The six rev.2 spend buckets are FIRST-CLASS columns. The partition identity
+// source_spend = allocated_campaign + no_user + unknown_funnel + unknown_campaign
+// always holds by construction; user_allocated_spend (Model 1) is reported
+// BESIDE the partition and is never forced to match anything.
 const CREATE_FB_RECON_SNAPSHOTS_SQL = `
 CREATE TABLE IF NOT EXISTS ${FB_RECON_SNAPSHOTS_TABLE} (
   auth_user_id String,
   snapshot_id UUID,
   computed_at DateTime64(3, 'UTC'),
-  published_seq_max UInt64,
   window_from Date,
   window_to Date,
+  source_spend Decimal(18, 4),
+  funnel_resolved_spend Decimal(18, 4),
+  user_allocated_spend Decimal(18, 4),
+  allocated_campaign_spend Decimal(18, 4),
+  no_user_spend Decimal(18, 4),
+  unknown_funnel_spend Decimal(18, 4),
+  unknown_campaign_spend Decimal(18, 4),
+  allocation_basis LowCardinality(String),
+  campaigns_total UInt32,
+  campaigns_allocated UInt32,
+  campaigns_no_user UInt32,
+  campaigns_unknown_funnel UInt32,
+  campaigns_unknown UInt32,
+  suggested_share_pct Float64,
   coverage_pct Float64,
-  coverage_by_buyer String,
-  coverage_by_account String,
-  allocation_pct Float64,
-  allocated_spend Decimal(18, 4),
-  unallocated_spend Decimal(18, 4),
-  missing_campaign_count UInt32,
-  missing_campaigns String,
-  unknown_source_pct Float64,
-  overallocated_keys UInt32,
+  known_gap_days UInt32,
   dq_warn_count UInt32,
   dq_fail_count UInt32,
-  health LowCardinality(String)
+  health LowCardinality(String),
+  details String
 )
 ENGINE = MergeTree
 ORDER BY (auth_user_id, computed_at)

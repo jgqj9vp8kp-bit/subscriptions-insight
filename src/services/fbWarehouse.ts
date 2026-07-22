@@ -6,6 +6,7 @@
 import { runClickHouseFacebook } from "@/services/clickhouse";
 import { sortUniq } from "@/services/analyticsCache";
 import type { FunnelSpendResult } from "../../supabase/functions/_shared/clickhouse/fbCampaignResolution.ts";
+import type { FbReconSnapshotRow } from "../../supabase/functions/_shared/clickhouse/fbReconSnapshot.ts";
 import type {
   FbChartPoint,
   FbDiagnostics,
@@ -194,6 +195,23 @@ export async function loadFbFunnelSuggestions(apply = false): Promise<{
   error?: string;
 }> {
   return runClickHouseFacebook({ action: "funnel_suggestions", apply });
+}
+
+/** Wave 4: compute AND STORE a reconciliation health snapshot (six spend buckets,
+ * campaign states, coverage, DQ, green/yellow/red). */
+export async function runFbReconSnapshot(dateFrom?: string, dateTo?: string): Promise<{ ok: boolean; snapshot: FbReconSnapshotRow; error?: string }> {
+  return runClickHouseFacebook<{ ok: boolean; snapshot: FbReconSnapshotRow; error?: string }>({
+    action: "recon_snapshot",
+    ...(dateFrom ? { date_from: dateFrom } : {}),
+    ...(dateTo ? { date_to: dateTo } : {}),
+  });
+}
+
+export async function loadFbReconHistory(limit = 30): Promise<{ ok: boolean; snapshots: Array<Record<string, unknown>>; error?: string }> {
+  return runClickHouseFacebook<{ ok: boolean; snapshots: Array<Record<string, unknown>>; error?: string }>({
+    action: "recon_history",
+    limit,
+  });
 }
 
 /** Model 2: full funnel spend (zero-user campaigns included, provenance-tagged). */

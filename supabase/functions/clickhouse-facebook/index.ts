@@ -34,6 +34,7 @@ import {
   runFunnelSpend,
   seedConfirmedCampaignAliases,
 } from "../_shared/clickhouse/fbCampaignResolution.ts";
+import { listFbReconSnapshots, runFbReconSnapshot } from "../_shared/clickhouse/fbReconSnapshot.ts";
 import {
   buildFbDiagnostics,
   createCapsuledFetcher,
@@ -99,6 +100,34 @@ Deno.serve(async (req: Request) => {
     const ch = client;
     // Idempotent CREATE IF NOT EXISTS so read actions work before the first sync.
     await ensureFactFacebookStatsSchema(ch);
+
+    if (action === "recon_snapshot") {
+      // Wave 4: compute AND STORE a reconciliation health snapshot (six spend
+      // buckets, campaign states, coverage, DQ). Defaults to a 30-day window.
+      const today = new Date().toISOString().slice(0, 10);
+      const defaultFrom = new Date(Date.now() - 29 * 86_400_000).toISOString().slice(0, 10);
+      const snapshot = await withTimeout(
+        runFbReconSnapshot({
+          clickhouse: ch,
+          supabase: auth.supabase,
+          authUserId: auth.id,
+          dateFrom: typeof body.date_from === "string" ? body.date_from : defaultFrom,
+          dateTo: typeof body.date_to === "string" ? body.date_to : today,
+        }),
+        READ_TIMEOUT_MS,
+        "Recon snapshot",
+      );
+      return jsonResponse({ ok: true, action, snapshot });
+    }
+
+    if (action === "recon_history") {
+      const snapshots = await withTimeout(
+        listFbReconSnapshots(ch, auth.id, typeof body.limit === "number" ? body.limit : 30),
+        READ_TIMEOUT_MS,
+        "Recon history",
+      );
+      return jsonResponse({ ok: true, action, snapshots });
+    }
 
     if (action === "seed_campaign_aliases") {
       // Wave 3: migrate the audited confirmed alias pairs into the mapping table.
