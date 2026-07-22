@@ -59,6 +59,9 @@ import {
   type FbAnalyticsRow,
   type FbAnalyticsSortKey,
 } from "@/services/fbAnalytics";
+import { fbAnalyticsSource, fetchFbAnalyticsSummary } from "@/services/fbAnalyticsSummaryClient";
+import { reconcileFbAnalyticsSummaries } from "../../supabase/functions/_shared/clickhouse/fbAnalyticsSummary.ts";
+import { useQuery } from "@tanstack/react-query";
 import {
   getCapsuledFacebookStatus,
   listCapsuledFacebookRows,
@@ -608,10 +611,32 @@ export default function FBAnalyticsPage() {
     return { dateFrom: isoDateDaysAgo(30), dateTo: new Date().toISOString().slice(0, 10) };
   }, [appliedFbFilters.cohortDateFrom, appliedFbFilters.cohortDateTo]);
 
-  const result = useMemo(
+  const clientResult = useMemo(
     () => buildFbAnalytics({ txs: enrichedTxs, subscriptions, trafficByKey, capsuledRows: campaignLevelCapsuledRows, filters: appliedFbFilters }),
     [enrichedTxs, subscriptions, trafficByKey, campaignLevelCapsuledRows, appliedFbFilters],
   );
+  // Parity-first server path (VITE_FB_ANALYTICS_SOURCE=server): render the Edge Function
+  // summary when available, keep the client compute as the always-on fallback, and in DEV
+  // reconcile both so formula drift is caught before the client compute is ever gated off.
+  const serverSummaryEnabled = fbAnalyticsSource() === "server";
+  const serverSummaryQuery = useQuery({
+    queryKey: ["fb-analytics-summary", appliedFbFilters],
+    queryFn: () => fetchFbAnalyticsSummary(appliedFbFilters),
+    enabled: serverSummaryEnabled,
+    staleTime: 60_000,
+  });
+  const serverSummary = serverSummaryEnabled && serverSummaryQuery.data?.ok ? serverSummaryQuery.data : null;
+  const result = useMemo(
+    () => (serverSummary ? { rows: serverSummary.rows, summary: serverSummary.summary } : clientResult),
+    [serverSummary, clientResult],
+  );
+  useEffect(() => {
+    if (!import.meta.env.DEV || !serverSummary) return;
+    const mismatches = reconcileFbAnalyticsSummaries(serverSummary.summary, clientResult.summary);
+    if (mismatches.length) {
+      console.warn("[FB Analytics] Server summary does not reconcile with the client compute", { mismatches, meta: serverSummary.meta });
+    }
+  }, [serverSummary, clientResult]);
   const warehouseCampaignIds = useMemo(
     () => result.rows.filter((row) => row.trial_users > 0).map((row) => row.campaign_id),
     [result.rows],

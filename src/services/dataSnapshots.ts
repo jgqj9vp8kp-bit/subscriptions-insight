@@ -1,5 +1,11 @@
 import { compressToEncodedURIComponent, decompressFromEncodedURIComponent } from "lz-string";
 import { supabase } from "@/services/supabaseClient";
+import {
+  SNAPSHOT_COMPRESSION_ALGORITHM,
+  isCompressedSnapshotEnvelope,
+  resolveSnapshotEnvelope,
+  type CompressedSnapshotEnvelope,
+} from "../../supabase/functions/_shared/clickhouse/snapshotEnvelope.ts";
 
 export type DatasetType =
   | "palmer"
@@ -29,15 +35,8 @@ export type SaveCloudSnapshotInput<TPayload> = {
 };
 
 const SNAPSHOT_COMPRESSION_THRESHOLD_KB = 256;
-const SNAPSHOT_COMPRESSION_ALGORITHM = "lz-string-uri-v1";
 
-type CompressedSnapshotPayload = {
-  __subengine_compressed: true;
-  algorithm: typeof SNAPSHOT_COMPRESSION_ALGORITHM;
-  data: string;
-  original_size_kb: number;
-  compressed_size_kb: number;
-};
+type CompressedSnapshotPayload = CompressedSnapshotEnvelope;
 
 export function jsonSizeKb(value: unknown): number {
   try {
@@ -54,14 +53,7 @@ function stringSizeKb(value: string): number {
   return Math.round((bytes / 1024) * 10) / 10;
 }
 
-function isCompressedSnapshotPayload(value: unknown): value is CompressedSnapshotPayload {
-  return Boolean(value)
-    && typeof value === "object"
-    && !Array.isArray(value)
-    && (value as Record<string, unknown>).__subengine_compressed === true
-    && (value as Record<string, unknown>).algorithm === SNAPSHOT_COMPRESSION_ALGORITHM
-    && typeof (value as Record<string, unknown>).data === "string";
-}
+const isCompressedSnapshotPayload = isCompressedSnapshotEnvelope;
 
 export function prepareSnapshotPayload<TPayload>(
   payload: TPayload,
@@ -104,16 +96,11 @@ export function prepareSnapshotPayload<TPayload>(
 }
 
 export function resolveSnapshotPayload<TPayload>(payload: unknown): TPayload | null {
-  if (!isCompressedSnapshotPayload(payload)) return payload as TPayload;
-
-  try {
-    const decompressed = decompressFromEncodedURIComponent(payload.data);
-    if (!decompressed) return null;
-    return JSON.parse(decompressed) as TPayload;
-  } catch (error) {
-    console.warn("Could not decompress cloud snapshot payload.", error);
-    return null;
+  const resolved = resolveSnapshotEnvelope<TPayload>(payload, decompressFromEncodedURIComponent);
+  if (resolved === null && isCompressedSnapshotPayload(payload)) {
+    console.warn("Could not decompress cloud snapshot payload.");
   }
+  return resolved;
 }
 
 async function currentUserId(): Promise<string | null> {
