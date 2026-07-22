@@ -34,6 +34,7 @@ import {
   getFbSyncState,
   normalizeFbFilters,
   normalizeFbLevel,
+  runFacebookSourceProbe,
   runFacebookStatsSync,
   runFbCharts,
   runFbFilterOptions,
@@ -90,6 +91,24 @@ Deno.serve(async (req: Request) => {
     const ch = client;
     // Idempotent CREATE IF NOT EXISTS so read actions work before the first sync.
     await ensureFactFacebookStatsSchema(ch);
+
+    if (action === "source_probe") {
+      // READ-ONLY: no ClickHouse/Postgres writes; drives the backfill-vs-known-gap
+      // decision for missing windows (Warehouse V2 Phase 2).
+      const token = Deno.env.get("CAPSULED_API_TOKEN");
+      const baseUrl = Deno.env.get("CAPSULED_API_BASE_URL") || "https://capsuled.space";
+      if (!token) return jsonResponse({ ok: false, error: "CAPSULED_API_TOKEN is not configured." }, 500);
+      const probe = await withTimeout(
+        runFacebookSourceProbe({
+          fetcher: createCapsuledFetcher({ token, baseUrl }),
+          dateFrom: typeof body.date_from === "string" ? body.date_from : null,
+          dateTo: typeof body.date_to === "string" ? body.date_to : null,
+        }),
+        SYNC_TIMEOUT_MS,
+        "Facebook source probe",
+      );
+      return jsonResponse({ ok: true, action, ...probe });
+    }
 
     if (action === "sync") {
       const token = Deno.env.get("CAPSULED_API_TOKEN");

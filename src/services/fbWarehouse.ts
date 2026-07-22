@@ -12,6 +12,7 @@ import type {
   FbLevel,
   FbListRow,
   FbReportResponse,
+  FbSourceProbeResult,
   FbSyncResult,
 } from "../../supabase/functions/_shared/clickhouse/facebookStats";
 
@@ -159,5 +160,30 @@ export async function runFbSync(mode: "incremental" | "full", lastDays?: number)
     action: "sync",
     mode,
     ...(lastDays ? { last_days: lastDays } : {}),
+  });
+}
+
+/** READ-ONLY source probe (Warehouse V2 Phase 2): asks Capsuled whether it can
+ * still serve a window (defaults server-side to the audited 2026-05-08..06-14
+ * gap). data_available → backfill via runFbBackfillWindow; empty → record a
+ * known gap with this result as evidence. */
+export async function probeFbSource(dateFrom?: string, dateTo?: string): Promise<FbSourceProbeResult & { ok: boolean; error?: string }> {
+  return runClickHouseFacebook<FbSourceProbeResult & { ok: boolean; error?: string }>({
+    action: "source_probe",
+    ...(dateFrom ? { date_from: dateFrom } : {}),
+    ...(dateTo ? { date_to: dateTo } : {}),
+  });
+}
+
+/** Backfill a specific window into BOTH warehouses (V1 + V2 dual-write): the
+ * existing full-mode sync honours explicit dates; trigger_source marks the runs
+ * as backfills in the append-only history. */
+export async function runFbBackfillWindow(dateFrom: string, dateTo: string): Promise<FbSyncResult & { ok: boolean; error?: string }> {
+  return runClickHouseFacebook<FbSyncResult & { ok: boolean; error?: string }>({
+    action: "sync",
+    mode: "full",
+    date_from: dateFrom,
+    date_to: dateTo,
+    trigger_source: "backfill",
   });
 }

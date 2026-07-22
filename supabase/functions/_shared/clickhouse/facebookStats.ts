@@ -738,6 +738,70 @@ export async function runFacebookStatsSync(input: {
   }
 }
 
+// ---- Source probe (Warehouse V2 Phase 2) ------------------------------------
+
+/** The campaign-metrics window proven missing by the 2026-07-19 data quality
+ * audit: 0 rows across 38 days, unrecoverable from any internal storage. */
+export const FB_KNOWN_GAP_WINDOW = { date_from: "2026-05-08", date_to: "2026-06-14" } as const;
+
+export interface FbSourceProbeResult {
+  date_from: string;
+  date_to: string;
+  expected_days: number;
+  days_with_data: number;
+  rows_found: number;
+  spend_total: number;
+  purchases_total: number;
+  per_day: Array<{ date: string; spend: number; fb_purchases: number }>;
+  fb_stats_to: string | null;
+  api_last_import_at: string | null;
+  api_requests: number;
+  api_payload_bytes: number;
+  api_latency_ms: number;
+  verdict: "data_available" | "empty";
+}
+
+/** READ-ONLY probe: asks the source whether it can still serve a window, using
+ * the same day-level scan the sync trusts as ground truth. Writes NOTHING — the
+ * outcome drives a human decision: backfill (full sync with explicit dates) when
+ * data comes back, or a facebook_known_gaps record with this result as evidence
+ * when it does not. */
+export async function runFacebookSourceProbe(input: {
+  fetcher: CapsuledFetcher;
+  dateFrom?: string | null;
+  dateTo?: string | null;
+}): Promise<FbSourceProbeResult> {
+  const dateFrom = validDate(input.dateFrom, "date_from") ?? FB_KNOWN_GAP_WINDOW.date_from;
+  const dateTo = validDate(input.dateTo, "date_to") ?? FB_KNOWN_GAP_WINDOW.date_to;
+  if (dayDiff(dateFrom, dateTo) < 0) throw new FacebookStatsRequestError("date_from must be <= date_to.");
+
+  const stats: CapsuledFetchStats = { requests: 0, payload_bytes: 0, api_latency_ms: 0, splits: 0, failed_attempts: [] };
+  const scan = await fetchLevelRows({ fetcher: input.fetcher, level: "day", dateFrom, dateTo, stats });
+
+  const perDay = scan.rows
+    .filter(isRecord)
+    .map((row) => ({ date: s(row.date || row.dateFrom).slice(0, 10), spend: round2(n(row.spend)), fb_purchases: n(row.fbPurchases) }))
+    .filter((row) => DATE_RE.test(row.date) && row.date >= dateFrom && row.date <= dateTo)
+    .sort((a, b) => a.date.localeCompare(b.date));
+
+  return {
+    date_from: dateFrom,
+    date_to: dateTo,
+    expected_days: dayDiff(dateFrom, dateTo) + 1,
+    days_with_data: new Set(perDay.map((row) => row.date)).size,
+    rows_found: perDay.length,
+    spend_total: round2(perDay.reduce((total, row) => total + row.spend, 0)),
+    purchases_total: perDay.reduce((total, row) => total + row.fb_purchases, 0),
+    per_day: perDay,
+    fb_stats_to: s(scan.envelope.dataFreshness?.fbStatsTo) || null,
+    api_last_import_at: s(scan.envelope.dataFreshness?.lastImportAt) || null,
+    api_requests: stats.requests,
+    api_payload_bytes: stats.payload_bytes,
+    api_latency_ms: stats.api_latency_ms,
+    verdict: perDay.length > 0 ? "data_available" : "empty",
+  };
+}
+
 // ---- Read actions -----------------------------------------------------------
 
 export interface FbReadFilters {
