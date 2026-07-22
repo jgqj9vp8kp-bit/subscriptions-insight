@@ -6,6 +6,7 @@ import {
   campaignNameForTransaction,
   filterCohorts,
   filterTransactionsByTrialAttribution,
+  normalizeCampaignId,
   type CohortFilters,
 } from "@/services/cohortFiltering";
 import {
@@ -305,15 +306,49 @@ export function buildFbAnalytics(params: {
     .filter((campaignId) => !optionIds.has(campaignId))
     .map((campaign_id) => ({ campaign_id, campaign_name: capsuledByCampaign.get(campaign_id)?.campaign_name ?? null, trial_count: 0 }));
 
-  const computed = [...options, ...importedOnlyOptions].map((option) => {
-    const campaignTxs = filterTransactionsByTrialAttribution(parentTxs, {
-      trafficSourceFilter,
-      selectedCampaignIds: [option.campaign_id],
+  // One linear pass replaces the per-campaign filterTransactionsByTrialAttribution rescans
+  // (same predicate: a user's transactions belong to every campaign where they have a
+  // matching successful trial). Original transaction order is preserved per campaign.
+  const trialCampaignsByUser = new Map<string, Set<string>>();
+  for (const tx of parentTxs) {
+    if (tx.status !== "success" || tx.transaction_type !== "trial") continue;
+    if (trafficSourceFilter !== "all" && tx.traffic_source !== trafficSourceFilter) continue;
+    const set = trialCampaignsByUser.get(tx.user_id) ?? new Set<string>();
+    set.add(campaignIdForTransaction(tx));
+    trialCampaignsByUser.set(tx.user_id, set);
+  }
+  const txsByCampaign = new Map<string, Transaction[]>();
+  for (const tx of parentTxs) {
+    const campaigns = trialCampaignsByUser.get(tx.user_id);
+    if (!campaigns) continue;
+    for (const campaignId of campaigns) {
+      const list = txsByCampaign.get(campaignId) ?? [];
+      list.push(tx);
+      txsByCampaign.set(campaignId, list);
+    }
+  }
+  // Trial-user attribution stays keyed by the user's FIRST successful trial.
+  const firstTrialUsersByCampaign = new Map<string, string[]>();
+  for (const [userId, trial] of trialByUser) {
+    const campaignId = campaignIdForTransaction(trial);
+    const list = firstTrialUsersByCampaign.get(campaignId) ?? [];
+    list.push(userId);
+    firstTrialUsersByCampaign.set(campaignId, list);
+  }
+  const hasMediaBuyerFilter = Boolean(mediaBuyerFilter && mediaBuyerFilter !== "all");
+  const mediaBuyerByUser = new Map<string, string>();
+  if (hasMediaBuyerFilter) {
+    parentTxsByUser.forEach((list, userId) => {
+      mediaBuyerByUser.set(userId, mediaBuyerForUserTransactions(list).media_buyer);
     });
-    const mediaFilteredCampaignTxs =
-      mediaBuyerFilter && mediaBuyerFilter !== "all"
-        ? campaignTxs.filter((tx) => mediaBuyerForUserTransactions(parentTxsByUser.get(tx.user_id) ?? [tx]).media_buyer === mediaBuyerFilter)
-        : campaignTxs;
+  }
+  const userPassesCohortFilters = new Map<string, boolean>();
+
+  const computed = [...options, ...importedOnlyOptions].map((option) => {
+    const campaignTxs = txsByCampaign.get(normalizeCampaignId(option.campaign_id)) ?? [];
+    const mediaFilteredCampaignTxs = hasMediaBuyerFilter
+      ? campaignTxs.filter((tx) => mediaBuyerByUser.get(tx.user_id) === mediaBuyerFilter)
+      : campaignTxs;
     const cohorts = filterCohorts(
       computeCohorts(mediaFilteredCampaignTxs, params.subscriptions ?? [], {
         selectedCountries: filters.selectedCountries,
@@ -322,15 +357,18 @@ export function buildFbAnalytics(params: {
       cohortFilters,
     );
     const trialUserIds = new Set<string>();
-    for (const [userId, trial] of trialByUser) {
-      if (campaignIdForTransaction(trial) !== option.campaign_id) continue;
-      const list = byUser.get(userId) ?? [];
-      if (mediaBuyerFilter && mediaBuyerFilter !== "all" && mediaBuyerForUserTransactions(list).media_buyer !== mediaBuyerFilter) continue;
-      const userCohorts = computeCohorts(list, [], {
-        selectedCountries: filters.selectedCountries,
-        selectedCardTypes,
-      });
-      if (filterCohorts(userCohorts, cohortFilters).length) trialUserIds.add(userId);
+    for (const userId of firstTrialUsersByCampaign.get(option.campaign_id) ?? []) {
+      if (hasMediaBuyerFilter && mediaBuyerByUser.get(userId) !== mediaBuyerFilter) continue;
+      let passes = userPassesCohortFilters.get(userId);
+      if (passes === undefined) {
+        const userCohorts = computeCohorts(byUser.get(userId) ?? [], [], {
+          selectedCountries: filters.selectedCountries,
+          selectedCardTypes,
+        });
+        passes = filterCohorts(userCohorts, cohortFilters).length > 0;
+        userPassesCohortFilters.set(userId, passes);
+      }
+      if (passes) trialUserIds.add(userId);
     }
     const cohortPaths = Array.from(new Set(cohorts.map((cohort) => normalizeCampaignPath(cohort.campaign_path))));
     return { option, cohorts, trialUserIds, cohortPaths };

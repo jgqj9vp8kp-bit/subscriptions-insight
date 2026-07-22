@@ -145,6 +145,24 @@ describe("FB Analytics", () => {
     ]);
   });
 
+  it("keeps a user with successful trials in two campaigns inside both campaign rows, attributing the trial user to the first trial only", () => {
+    const multi: Transaction[] = [
+      tx("m1", "trial", { campaign_id: "111", event_time: "2026-05-01T00:00:00Z" }),
+      tx("m1", "trial", { campaign_id: "222", event_time: "2026-05-03T00:00:00Z", transaction_id: "m1-second-trial" }),
+      tx("m1", "first_subscription", { campaign_id: "111", event_time: "2026-05-08T00:00:00Z" }),
+      tx("m2", "trial", { campaign_id: "222", event_time: "2026-05-01T00:00:00Z" }),
+    ];
+
+    const result = buildFbAnalytics({ txs: multi });
+    const byId = new Map(result.rows.map((row) => [row.campaign_id, row]));
+
+    // Campaign 222 is an option through m2's first trial; m1's full history joins that row too
+    // (any-matching-trial attribution), while m1 counts as a trial USER only under campaign 111.
+    expect(byId.get("111")).toMatchObject({ trial_users: 1, first_subscription_users: 1 });
+    expect(byId.get("222")).toMatchObject({ trial_users: 2, first_subscription_users: 1 });
+    expect(byId.get("222")?.failed_payment_users).toBe(0);
+  });
+
   it("counts failed payment users and top decline reason inside trial-user campaign groups", () => {
     const result = buildFbAnalytics({ txs: rows, filters: { campaignIdSearch: "Alpha" } });
 
