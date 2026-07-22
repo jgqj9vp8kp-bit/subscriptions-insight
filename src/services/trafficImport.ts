@@ -1,28 +1,7 @@
 import { parseCSVText, type ParsedSheet } from "@/services/import";
+import { normalizeCampaignPath, type TrafficMetric } from "../../supabase/functions/_shared/clickhouse/trafficMetric.ts";
 
-export interface TrafficMetric {
-  date: string;
-  campaign_path: string;
-  campaign_id?: string | null;
-  campaign_name?: string | null;
-  ad_account_id?: string | null;
-  ad_account_name?: string | null;
-  trial_count: number;
-  cac: number;
-  spend: number;
-  fb_purchases?: number;
-  cpp?: number | null;
-  impressions?: number;
-  clicks: number;
-  outbound_clicks?: number;
-  outbound_ctr?: number | null;
-  cpc: number;
-  cpm: number;
-  ctr: number;
-  currency?: string | null;
-  last_import_at?: string;
-  source: "facebook";
-}
+export { normalizeCampaignPath, type TrafficMetric };
 
 export interface GoogleSheetReference {
   sheetId: string;
@@ -84,14 +63,6 @@ function uniqueTabs(tabs: GoogleSheetTab[]): GoogleSheetTab[] {
   });
 }
 
-export function normalizeCampaignPath(value: string | null | undefined): string {
-  return String(value ?? "")
-    .trim()
-    .replace(/^["']+|["']+$/g, "")
-    .trim()
-    .replace(/^\/+/, "")
-    .toLowerCase();
-}
 
 export function parseTrafficNumber(value: unknown): number {
   const raw = String(value ?? "").trim();

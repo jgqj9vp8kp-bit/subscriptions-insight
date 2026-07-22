@@ -2,32 +2,16 @@ import { supabase } from "@/services/supabaseClient";
 import { campaignIdForTransaction, UNKNOWN_CAMPAIGN_ID } from "@/services/cohortFiltering";
 import type { Transaction } from "@/services/types";
 
-export const CAPSULED_FACEBOOK_LEVELS = ["account", "campaign", "adset", "ad", "day"] as const;
-
-export type CapsuledFacebookLevel = (typeof CAPSULED_FACEBOOK_LEVELS)[number];
-
-export interface CapsuledFacebookRow {
-  date_from: string;
-  date_to: string;
-  level: CapsuledFacebookLevel;
-  campaign_id: string | null;
-  campaign_name: string | null;
-  ad_account_id: string | null;
-  ad_account_name: string | null;
-  spend: number;
-  fb_purchases: number;
-  cpp: number | null;
-  impressions: number;
-  clicks: number;
-  ctr: number | null;
-  cpc: number | null;
-  cpm: number | null;
-  outbound_clicks: number;
-  outbound_ctr: number | null;
-  currency: string | null;
-  last_import_at: string;
-  raw_payload: unknown;
-}
+export {
+  CAPSULED_FACEBOOK_LEVELS,
+  type CapsuledFacebookLevel,
+  type CapsuledFacebookRow,
+} from "../../supabase/functions/_shared/clickhouse/trafficMetric.ts";
+import {
+  CAPSULED_FACEBOOK_LEVELS,
+  type CapsuledFacebookLevel,
+  type CapsuledFacebookRow,
+} from "../../supabase/functions/_shared/clickhouse/trafficMetric.ts";
 
 export interface CapsuledFacebookSyncMetadata {
   syncId?: string;
