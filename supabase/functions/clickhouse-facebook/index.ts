@@ -27,6 +27,14 @@ import {
   listFbWarehouseVersions,
 } from "../_shared/clickhouse/fbSyncHistory.ts";
 import {
+  buildCampaignFunnelSuggestions,
+  funnelEvidenceQueries,
+  insertCampaignFunnelSuggestions,
+  loadActiveCampaignFunnelMap,
+  runFunnelSpend,
+  seedConfirmedCampaignAliases,
+} from "../_shared/clickhouse/fbCampaignResolution.ts";
+import {
   buildFbDiagnostics,
   createCapsuledFetcher,
   FacebookStatsRequestError,
@@ -91,6 +99,54 @@ Deno.serve(async (req: Request) => {
     const ch = client;
     // Idempotent CREATE IF NOT EXISTS so read actions work before the first sync.
     await ensureFactFacebookStatsSchema(ch);
+
+    if (action === "seed_campaign_aliases") {
+      // Wave 3: migrate the audited confirmed alias pairs into the mapping table.
+      const result = await seedConfirmedCampaignAliases(auth.supabase, auth.id);
+      return jsonResponse({ ok: true, action, ...result });
+    }
+
+    if (action === "funnel_suggestions") {
+      // Wave 3 Layer B collector: compute the automatable evidence rungs; insert
+      // only when apply=true (and only rows that survive existing resolutions).
+      const queries = funnelEvidenceQueries();
+      const [authoritative, names, existing] = await Promise.all([
+        ch.query({ query: queries.authoritativeSql, query_params: { auth_user_id: auth.id }, format: "JSONEachRow" })
+          .then(async (rs) => (await rs.json()) as Array<{ campaign_id: string; funnel: string; users: number }>),
+        ch.query({ query: queries.namesSql, query_params: { auth_user_id: auth.id }, format: "JSONEachRow" })
+          .then(async (rs) => (await rs.json()) as Array<{ campaign_id: string; campaign_name: string }>),
+        loadActiveCampaignFunnelMap(auth.supabase, auth.id),
+      ]);
+      const suggestions = buildCampaignFunnelSuggestions({
+        authoritative: authoritative.map((row) => ({ ...row, users: Number(row.users) || 0 })),
+        campaignNames: names,
+        existing,
+        knownFunnels: ["past_life", "soulmate", "starseed"],
+      });
+      let applied = 0;
+      if (body.apply === true) {
+        applied = await insertCampaignFunnelSuggestions(auth.supabase, auth.id, suggestions);
+      }
+      return jsonResponse({ ok: true, action, suggestions, applied });
+    }
+
+    if (action === "funnel_spend") {
+      // Model 2 (rev.2): full funnel spend — source campaign spend resolved via
+      // Layer B, zero-user campaigns included, provenance-tagged. Never forced to
+      // match the user-attributed allocation.
+      const result = await withTimeout(
+        runFunnelSpend({
+          clickhouse: ch,
+          supabase: auth.supabase,
+          authUserId: auth.id,
+          dateFrom: typeof body.date_from === "string" ? body.date_from : null,
+          dateTo: typeof body.date_to === "string" ? body.date_to : null,
+        }),
+        READ_TIMEOUT_MS,
+        "Funnel spend",
+      );
+      return jsonResponse({ ok: true, action, ...result });
+    }
 
     if (action === "source_probe") {
       // READ-ONLY: no ClickHouse/Postgres writes; drives the backfill-vs-known-gap

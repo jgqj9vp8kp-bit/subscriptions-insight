@@ -5,6 +5,7 @@
 
 import { runClickHouseFacebook } from "@/services/clickhouse";
 import { sortUniq } from "@/services/analyticsCache";
+import type { FunnelSpendResult } from "../../supabase/functions/_shared/clickhouse/fbCampaignResolution.ts";
 import type {
   FbChartPoint,
   FbDiagnostics,
@@ -170,6 +171,35 @@ export async function runFbSync(mode: "incremental" | "full", lastDays?: number)
 export async function probeFbSource(dateFrom?: string, dateTo?: string): Promise<FbSourceProbeResult & { ok: boolean; error?: string }> {
   return runClickHouseFacebook<FbSourceProbeResult & { ok: boolean; error?: string }>({
     action: "source_probe",
+    ...(dateFrom ? { date_from: dateFrom } : {}),
+    ...(dateTo ? { date_to: dateTo } : {}),
+  });
+}
+
+/** Wave 3 Layer A: migrate the audited confirmed alias pairs into
+ * facebook_campaign_mapping (idempotent — existing active pairs are skipped). */
+export async function seedFbCampaignAliases(): Promise<{ ok: boolean; inserted: number; existing: number; error?: string }> {
+  return runClickHouseFacebook<{ ok: boolean; inserted: number; existing: number; error?: string }>({
+    action: "seed_campaign_aliases",
+  });
+}
+
+/** Wave 3 Layer B collector: compute campaign->funnel evidence (stable funnel
+ * across authoritative users -> confirmed; name token -> suggested only).
+ * apply=false returns the suggestions for review without writing anything. */
+export async function loadFbFunnelSuggestions(apply = false): Promise<{
+  ok: boolean;
+  suggestions: Array<{ fb_campaign_id: string; funnel: string; match_kind: string; evidence_source: string; confidence: number }>;
+  applied: number;
+  error?: string;
+}> {
+  return runClickHouseFacebook({ action: "funnel_suggestions", apply });
+}
+
+/** Model 2: full funnel spend (zero-user campaigns included, provenance-tagged). */
+export async function loadFbFunnelSpend(dateFrom?: string, dateTo?: string): Promise<FunnelSpendResult & { ok: boolean; error?: string }> {
+  return runClickHouseFacebook<FunnelSpendResult & { ok: boolean; error?: string }>({
+    action: "funnel_spend",
     ...(dateFrom ? { date_from: dateFrom } : {}),
     ...(dateTo ? { date_to: dateTo } : {}),
   });
