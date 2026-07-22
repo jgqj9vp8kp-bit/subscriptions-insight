@@ -21,7 +21,7 @@ import { useAuth } from "@/hooks/useAuth";
 import { hashUserScope } from "@/services/analyticsCache";
 import { formatUpdatedAgo } from "@/services/analyticsProgress";
 import { useFbReportQuery, useFbWarehouseStatus, useInvalidateFbWarehouse } from "@/hooks/useFbWarehouse";
-import { runFbSync, type FbLevel, type FbListRow, type FbReportQuery } from "@/services/fbWarehouse";
+import { runFbReconSnapshot, runFbSync, type FbLevel, type FbListRow, type FbReportQuery } from "@/services/fbWarehouse";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
 
 const LEVEL_TABS: Array<{ value: FbLevel; label: string }> = [
@@ -146,6 +146,11 @@ export function FbWarehouseAnalytics(): JSX.Element {
         description: `${result.mode}: API ${int(result.api_rows)} rows → +${int(result.rows_inserted)} new, ${int(result.rows_updated)} updated · ${(result.duration_ms / 1000).toFixed(1)}s · ${result.api_requests} API calls`,
       });
       await invalidateFbWarehouse();
+      // Wave 4: every publish leaves a stored reconciliation health snapshot.
+      // Fire-and-forget — recon must never make a successful sync look failed.
+      void runFbReconSnapshot().catch((reconError) =>
+        console.warn("Recon snapshot after sync failed.", reconError),
+      );
     } catch (err) {
       toast({
         title: "FB sync failed",
