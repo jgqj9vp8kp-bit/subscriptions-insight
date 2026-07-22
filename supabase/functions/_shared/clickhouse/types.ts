@@ -39,6 +39,8 @@ export interface SupabaseQueryBuilder extends PromiseLike<SupabaseQueryResult> {
   or(filters: string): SupabaseQueryBuilder;
   in(column: string, values: unknown[]): SupabaseQueryBuilder;
   lte(column: string, value: unknown): SupabaseQueryBuilder;
+  /** Paged reads (server-side summary functions). Optional: fakes without it stay valid. */
+  range?(from: number, to: number): SupabaseQueryBuilder;
   maybeSingle(): Promise<SupabaseQueryResult>;
   upsert(values: unknown, options?: Record<string, unknown>): Promise<SupabaseQueryResult>;
   /** Append-only history writes (Facebook Warehouse V2 Phase 1). Optional: fakes without them stay valid — the history layer is fail-safe. */

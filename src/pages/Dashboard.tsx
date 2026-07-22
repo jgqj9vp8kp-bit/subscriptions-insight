@@ -1,4 +1,7 @@
 import { useEffect, useMemo } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { dashboardSource, fetchDashboardSummary } from "@/services/dashboardSummaryClient";
+import { reconcileNumericRecords } from "../../supabase/functions/_shared/clickhouse/dashboardSummary.ts";
 import {
   Activity,
   CreditCard,
@@ -521,6 +524,33 @@ export default function Dashboard() {
 
   const cohortGrossRevenue = useMemo(() => sum(dashboardCohorts, (cohort) => cohort.gross_revenue), [dashboardCohorts]);
   const cashCohortDifference = cashRevenueSummary.cashRevenue - cohortGrossRevenue;
+
+  // Parity-first server path (VITE_DASHBOARD_SOURCE=server): fetch the Edge Function
+  // summary and, in DEV, reconcile it against the client compute. Rendering stays on
+  // the client compute until real-data parity is confirmed (log-only phase).
+  const serverDashboardEnabled = dashboardSource() === "server";
+  const serverDashboardQuery = useQuery({
+    queryKey: ["dashboard-summary", appliedFilters],
+    queryFn: () => fetchDashboardSummary(appliedFilters),
+    enabled: serverDashboardEnabled,
+    staleTime: 60_000,
+  });
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    const server = serverDashboardQuery.data;
+    if (!server?.ok) return;
+    const mismatches = [
+      ...reconcileNumericRecords("totals", server.totals as unknown as Record<string, unknown>, summary as unknown as Record<string, unknown>),
+      ...reconcileNumericRecords(
+        "cashRevenue",
+        server.cashRevenueSummary as unknown as Record<string, unknown>,
+        cashRevenueSummary as unknown as Record<string, unknown>,
+      ),
+    ];
+    if (mismatches.length) {
+      console.warn("[Dashboard] Server summary does not reconcile with the client compute", { mismatches, meta: server.meta });
+    }
+  }, [serverDashboardQuery.data, summary, cashRevenueSummary]);
 
   const projectKpis = useMemo(
     () => PROJECT_KPIS.map((label) => kpiMap.get(label)).filter(Boolean) as DashboardKpi[],

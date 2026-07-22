@@ -1,15 +1,15 @@
 // Server-side FB Analytics summary: assembles the EXACT inputs the FBAnalytics page
-// feeds into buildFbAnalytics — from the same cloud snapshots the client restores —
-// and runs the same compute verbatim. Parity-first: no reinterpretation of formulas.
-//
-// Input chain reproduced from src/pages/FBAnalytics.tsx:
-//   store.setImported: txs = backfillTransactionCardTypesFromRawRows(payload.transactions, rawRows)
-//   page: enrichedTxs = enrichTransactionDeclinesFromRawRows(backfill(txs, rawRows), rawRows)
-// backfill only fills rows whose card_type is missing/"unknown", so applying it once here
-// is byte-equal to the store+page double application.
+// feeds into buildFbAnalytics and runs the same compute verbatim. Transactions come
+// pre-resolved by serverTransactionsSource (warehouse-first with palmer-snapshot
+// fallback — the same policy the browser store follows); this module reproduces the
+// page chain on top:
+//   page: enrichedTxs = enrichTransactionDeclinesFromRawRows(backfill(storeTxs, rawRows), rawRows)
+// backfill only fills rows whose card_type is missing/"unknown", so re-applying it over
+// already-backfilled store transactions is byte-equal to the page's double application.
 
 import type { SubscriptionClean } from "./subscriptionTypes.ts";
 import type { CapsuledFacebookRow, TrafficMetric } from "./trafficMetric.ts";
+import type { Transaction } from "./serviceTypes.ts";
 import { backfillTransactionCardTypesFromRawRows, type RawPalmerRow } from "./palmerTransform.ts";
 import { enrichTransactionDeclinesFromRawRows } from "./paymentFailures.ts";
 import { aggregateTrafficMetrics } from "./cohortReporting.ts";
@@ -19,7 +19,6 @@ import {
   type FbAnalyticsRow,
   type FbAnalyticsSummary,
 } from "./fbAnalyticsCompute.ts";
-import { normalizePalmerCloudPayload } from "./palmerCloudSnapshot.ts";
 
 export const FB_ANALYTICS_SUMMARY_FUNCTION = "fb-analytics-summary";
 
@@ -30,6 +29,7 @@ export interface FbAnalyticsSummaryRequest {
 /** Input fingerprints so a parity check can tell formula divergence from input skew. */
 export interface FbAnalyticsSummaryMeta {
   transactions: number;
+  transactions_source: string;
   raw_palmer_rows: number;
   subscriptions: number;
   traffic_rows: number;
@@ -66,18 +66,20 @@ function trafficMetricsFromPayload(payload: unknown): TrafficMetric[] {
 }
 
 export function computeFbAnalyticsSummary(input: {
-  palmerPayload: unknown;
+  /** Store-equivalent transactions from serverTransactionsSource (warehouse-hydrated,
+   * or snapshot transactions already backfilled — matching the browser store). */
+  transactions: Transaction[];
+  transactionsSource: string;
+  rawPalmerRows: RawPalmerRow[];
   subscriptionsPayload: unknown;
   trafficPayload: unknown;
   capsuledRows: CapsuledFacebookRow[];
   filters?: FbAnalyticsFilters;
   snapshotUpdatedAt?: FbAnalyticsSummarySnapshotTimestamps;
 }): FbAnalyticsSummaryResponse {
-  const palmer = normalizePalmerCloudPayload(input.palmerPayload);
-  const baseTxs = palmer?.transactions ?? [];
-  const rawRows: RawPalmerRow[] = palmer?.rawPalmerRows ?? [];
+  const rawRows = input.rawPalmerRows;
   const txs = enrichTransactionDeclinesFromRawRows(
-    backfillTransactionCardTypesFromRawRows(baseTxs, rawRows),
+    backfillTransactionCardTypesFromRawRows(input.transactions, rawRows),
     rawRows,
   );
 
@@ -100,7 +102,8 @@ export function computeFbAnalyticsSummary(input: {
     rows,
     summary,
     meta: {
-      transactions: baseTxs.length,
+      transactions: input.transactions.length,
+      transactions_source: input.transactionsSource,
       raw_palmer_rows: rawRows.length,
       subscriptions: subscriptions.length,
       traffic_rows: trafficMetrics.length,

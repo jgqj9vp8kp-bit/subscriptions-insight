@@ -118,6 +118,23 @@ const palmerPayload = { payload_version: 1, transactions, rawPalmerRows };
 const subscriptionsPayload = { subscriptions: [] };
 const trafficPayload = { trafficMetrics: trafficRows };
 
+// Store-equivalent transactions, as resolveServerTransactions produces them from the
+// palmer snapshot fallback (setImported applies the raw-row card-type backfill).
+const storeTransactions = backfillTransactionCardTypesFromRawRows(transactions, rawPalmerRows);
+
+function summaryInput(overrides: Partial<Parameters<typeof computeFbAnalyticsSummary>[0]> = {}) {
+  return {
+    transactions: storeTransactions,
+    transactionsSource: "palmer_snapshot",
+    rawPalmerRows,
+    subscriptionsPayload,
+    trafficPayload,
+    capsuledRows,
+    filters: {},
+    ...overrides,
+  };
+}
+
 describe("snapshot envelope", () => {
   it("passes plain payloads through and unwraps compressed envelopes", () => {
     expect(resolveSnapshotEnvelope<typeof trafficPayload>(trafficPayload, decompressFromEncodedURIComponent)).toEqual(trafficPayload);
@@ -158,13 +175,7 @@ describe("computeFbAnalyticsSummary", () => {
       filters: {},
     });
 
-    const actual = computeFbAnalyticsSummary({
-      palmerPayload,
-      subscriptionsPayload,
-      trafficPayload,
-      capsuledRows,
-      filters: {},
-    });
+    const actual = computeFbAnalyticsSummary(summaryInput());
 
     expect(actual.rows).toEqual(expected.rows);
     expect(actual.summary).toEqual(expected.summary);
@@ -174,21 +185,16 @@ describe("computeFbAnalyticsSummary", () => {
   });
 
   it("survives a JSON serialization round-trip (what the Edge Function actually returns)", () => {
-    const direct = computeFbAnalyticsSummary({ palmerPayload, subscriptionsPayload, trafficPayload, capsuledRows, filters: {} });
+    const direct = computeFbAnalyticsSummary(summaryInput());
     const roundTripped = JSON.parse(JSON.stringify(direct)) as typeof direct;
     expect(reconcileFbAnalyticsSummaries(roundTripped.summary, direct.summary)).toEqual([]);
     expect(roundTripped.rows).toEqual(direct.rows);
   });
 
   it("reports input fingerprints and tolerates missing snapshots", () => {
-    const full = computeFbAnalyticsSummary({
-      palmerPayload,
-      subscriptionsPayload,
-      trafficPayload,
-      capsuledRows,
-      filters: {},
-      snapshotUpdatedAt: { palmer: "2026-05-02T00:00:00Z", subscriptions: null, traffic: "2026-05-02T01:00:00Z" },
-    });
+    const full = computeFbAnalyticsSummary(
+      summaryInput({ snapshotUpdatedAt: { palmer: "2026-05-02T00:00:00Z", subscriptions: null, traffic: "2026-05-02T01:00:00Z" } }),
+    );
     expect(full.meta).toMatchObject({
       transactions: transactions.length,
       raw_palmer_rows: 2,
@@ -200,7 +206,9 @@ describe("computeFbAnalyticsSummary", () => {
     });
 
     const empty = computeFbAnalyticsSummary({
-      palmerPayload: null,
+      transactions: [],
+      transactionsSource: "empty",
+      rawPalmerRows: [],
       subscriptionsPayload: null,
       trafficPayload: null,
       capsuledRows: [],
@@ -212,20 +220,14 @@ describe("computeFbAnalyticsSummary", () => {
   });
 
   it("applies filters through to the compute", () => {
-    const filtered = computeFbAnalyticsSummary({
-      palmerPayload,
-      subscriptionsPayload,
-      trafficPayload,
-      capsuledRows,
-      filters: { campaignPathFilter: "path-b" },
-    });
+    const filtered = computeFbAnalyticsSummary(summaryInput({ filters: { campaignPathFilter: "path-b" } }));
     expect(filtered.rows.every((row) => row.campaign_id !== "120001" || row.trial_users === 0)).toBe(true);
   });
 });
 
 describe("reconcileFbAnalyticsSummaries", () => {
   it("accepts identical summaries and flags drifted metrics", () => {
-    const { summary } = computeFbAnalyticsSummary({ palmerPayload, subscriptionsPayload, trafficPayload, capsuledRows, filters: {} });
+    const { summary } = computeFbAnalyticsSummary(summaryInput());
     expect(reconcileFbAnalyticsSummaries(summary, summary)).toEqual([]);
 
     const drifted = { ...summary, netRevenue: summary.netRevenue + 1 };
@@ -235,7 +237,7 @@ describe("reconcileFbAnalyticsSummaries", () => {
   });
 
   it("treats null-vs-number as a mismatch and null-vs-null as equal", () => {
-    const { summary } = computeFbAnalyticsSummary({ palmerPayload, subscriptionsPayload, trafficPayload, capsuledRows, filters: {} });
+    const { summary } = computeFbAnalyticsSummary(summaryInput());
     const withNullSpend = { ...summary, spend: null, cac: null, roas: null, profit: null };
     expect(reconcileFbAnalyticsSummaries(withNullSpend, withNullSpend)).toEqual([]);
     const mismatches = reconcileFbAnalyticsSummaries(withNullSpend, summary);

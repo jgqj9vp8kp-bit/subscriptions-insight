@@ -10,6 +10,7 @@
 import { decompressFromEncodedURIComponent } from "https://esm.sh/lz-string@1.5.0";
 import { jsonResponse, methodNotAllowed, optionsResponse, parseJsonBody, requireSupabaseUser } from "../_shared/clickhouse/http.ts";
 import { resolveSnapshotEnvelope } from "../_shared/clickhouse/snapshotEnvelope.ts";
+import { resolveServerTransactions } from "../_shared/clickhouse/serverTransactionsSource.ts";
 import {
   computeFbAnalyticsSummary,
   type FbAnalyticsSummaryRequest,
@@ -80,8 +81,15 @@ Deno.serve(async (req: Request) => {
     const subscriptions = snapshots.get("funnelfox_subscriptions");
     const traffic = snapshots.get("facebook_traffic");
 
-    const response = computeFbAnalyticsSummary({
+    const source = await resolveServerTransactions({
+      supabase: auth.supabase,
+      authUserId: auth.id,
       palmerPayload: resolvePayload(palmer),
+    });
+    const response = computeFbAnalyticsSummary({
+      transactions: source.transactions,
+      transactionsSource: source.source,
+      rawPalmerRows: source.rawPalmerRows,
       subscriptionsPayload: resolvePayload(subscriptions),
       trafficPayload: resolvePayload(traffic),
       capsuledRows,
