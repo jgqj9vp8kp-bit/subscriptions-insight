@@ -1,130 +1,129 @@
 # Architecture
 
+Updated 2026-07-23. Companion docs: `FB_WAREHOUSE_V2_DESIGN.md` (warehouse redesign),
+`FB_COHORT_AUTHORITATIVE_AUDIT.md` (allocation architecture), `PERF_SERVER_AGGREGATION_PLAN.md`
+(server aggregation), `DEVELOPER_NOTES.md` (operational rules).
+
 ## Overview
 
-This project is a Vite + React + TypeScript subscription analytics dashboard.
-It is organized into four main layers:
+Vite + React + TypeScript subscription analytics dashboard backed by Supabase
+(Auth, Postgres, Edge Functions) and a ClickHouse analytics warehouse.
 
-- Auth/access layer: Supabase Auth email/password login, session persistence, and protected routes for analytics pages.
-- UI layer (React): pages and components for Dashboard, Transactions, Users, Cohorts, Forecasting, Subscriptions, and Import Data.
-- Data transformation layer: import parsing, Palmer normalization, transaction classification, and cohort assignment.
-- Analytics layer: KPI, revenue, user, funnel, and cohort aggregation functions used by the UI.
-- Subscription monitoring layer: FunnelFox subscription sync, cancellation normalization, and subscription status UI.
+- **Auth/access**: Supabase email/password, protected routes, no public signup.
+- **UI (React)**: Dashboard, Cohorts, FB Analytics, Forecasting, Transactions, Users,
+  Subscriptions, Support, Import Data. Presentation-focused; business rules live in services.
+- **Compute core (`supabase/functions/_shared/clickhouse/`)**: ALL pure business logic —
+  cohort computation, classification, FB analytics, dashboard math, currency/FX,
+  mapping/resolution, reconciliation. The browser imports these exact modules through
+  one-line re-export stubs in `src/services/`, and Edge Functions import them directly:
+  **one definition of every formula, shared verbatim by client and server.**
+- **Edge Functions (Deno)**: thin HTTP wrappers over the compute core plus the only
+  holders of secrets (ClickHouse credentials, Capsuled token, FunnelFox secret).
+- **Warehouses**: Supabase Postgres `transactions` (transaction warehouse, the
+  production store source) and ClickHouse (`analytics_transactions`,
+  `fact_user_cohorts`, `fact_facebook_stats`, Warehouse V2 tables).
 
-The UI should stay presentation-focused. Business rules belong in `src/services`, especially in `palmerTransform.ts` and `analytics.ts`.
-
-The Import Data page is the single source connection center. Palmer upload, Facebook traffic import, FunnelFox connection testing/sync, and local IndexedDB cache load/clear controls live there. Analytics pages should only render already-loaded data, filters, tables, and summaries.
-
-Forecasting is a read-only scenario layer over existing cohort data. It uses Cohorts as the factual base, calculates absolute retention from original trial users, and lets the user edit forecast assumptions without mutating Palmer, FunnelFox, traffic, or cohort calculations.
-
-Small page UI state is persisted in localStorage via `src/hooks/usePersistedPageState.ts`. Cohorts table settings additionally sync to Supabase `data_snapshots` as `cohorts_ui_settings` so column order, widths, visibility, active preset, and filters can follow the authenticated user across devices. Large data remains outside localStorage: Palmer, FunnelFox, and Facebook traffic datasets use IndexedDB for local reloads and Supabase `data_snapshots` for cross-device restore. API keys/secrets are never persisted.
-
-All analytics routes are protected by Supabase Auth. `/login` is public; Dashboard, Cohorts, Forecasting, Transactions, Users, Subscriptions, and Import Data require an authenticated session. Supabase signup should be disabled in production, and allowed users should be created in Supabase Auth.
-
-## Data Flow
-
-Raw Palmer export
--> `normalizePalmerRows`
--> `classifyUserTransactions`
--> `transactions_clean`
--> cohort aggregation by campaign_path + cohort_date
--> UI
-
-The import page can still accept a clean template CSV. In that mode, `applyMapping` maps user-provided columns into the shared `Transaction` shape. In Palmer mode, raw rows are preserved and transformed through the Palmer pipeline before they enter analytics.
-
-Imported datasets are saved in two layers:
+## Data flow
 
 ```text
-Import/sync success
--> IndexedDB local cache
--> Supabase data_snapshots row scoped by auth.uid()
--> app startup restores IndexedDB first, then latest Supabase snapshot if local cache is missing
+Palmer CSV / FunnelFox sync / Capsuled FB sync
+  -> import + normalization (palmerTransform, subscriptionTransform)
+  -> IndexedDB cache + Supabase data_snapshots (cross-device restore)
+  -> Supabase transactions warehouse (authoritative store source in production;
+     MIT recurring payments arrive HERE via sync and never enter the palmer snapshot)
+  -> ClickHouse analytics_transactions / fact_user_cohorts (cohort snapshot, CAS-guarded builds)
+  -> readers: pages (client compute) and summary Edge Functions (server compute)
 ```
 
-`data_snapshots` stores the latest snapshot per authenticated user and dataset type: `palmer`, `funnelfox_subscriptions`, `facebook_traffic`, `forecasting_settings`, and `cohorts_ui_settings`. Row-level security keeps snapshots private to the owning Supabase Auth user.
+The browser store policy — warehouse rows when available, palmer snapshot otherwise —
+is mirrored server-side by `serverTransactionsSource.ts`, so summary functions see the
+same inputs as the page (`meta.transactions_source` in every response tells which).
 
-FunnelFox subscription monitoring is imported separately from Palmer transactions, then joined into cohort reporting by normalized email for subscription-health metrics:
+## Server aggregation (parity-first, flag-gated)
 
-```text
-FunnelFox subscriptions API
--> backend/serverless proxy
--> optional subscription details enrichment
--> `normalizeSubscription`
--> `subscriptions`
--> Subscriptions UI
--> Cohorts/Dashboard active and cancellation metrics
-```
+Heavy page computes move server-side only as *faster producers of identical numbers*:
+the Edge Function reuses the in-app modules verbatim, ships behind a flag defaulting to
+the client path, and DEV reconciles both sides before any flag flips.
 
-The browser must never call FunnelFox directly with `Fox-Secret` or `https://api.funnelfox.io`. Backend endpoints read `process.env.FUNNELFOX_SECRET`, call FunnelFox server-side, and return JSON to the frontend. Frontend proxy URLs are restricted to same-origin `/api/funnelfox/...` paths unless external proxy use is explicitly enabled.
+| Function | Mirrors | Flag |
+|---|---|---|
+| `clickhouse-cohorts` | Cohorts read path (materialized snapshot + FB user-cost allocation) | `VITE_COHORTS_DATA_SOURCE` (default `clickhouse`) |
+| `fb-analytics-summary` | `buildFbAnalytics` over the exact page enrichment chain | `VITE_FB_ANALYTICS_SOURCE` (default `client`) |
+| `dashboard-summary` | The full Dashboard chain (KPIs, cash revenue, trends, daily series, FX) | `VITE_DASHBOARD_SOURCE` (default `client`) |
 
-## Key Concepts
+## Facebook analytics: two spend models, two mapping layers
 
-### transaction_type
+**Model 1 — user-attributed spend** (validated, the Cohorts engine):
+`user_cpp = Campaign CPP (spend / fb_purchases)` for the user's Campaign ID + FB
+reporting date; `Cohort Spend = SUM(user_cpp)`. No proportional distribution, exact
+campaign_id matching only, IANA-timezone reporting dates, snapshot-uniqueness gate.
+Campaigns with zero matched users contribute nothing here — by design.
 
-`transaction_type` describes the business role of a payment:
+**Model 2 — full funnel spend** (`fbCampaignResolution.ts`): source campaign spend
+resolved to funnels through mapping Layer B. Zero-user campaigns are INCLUDED by
+construction; every figure carries `match_kind` provenance (confirmed vs suggested);
+`source_spend == funnel_resolved_spend + unknown_funnel_spend` holds by identity.
+**The two models are never forced to agree — divergence is signal.**
 
-- `trial`: first successful non-upsell payment for a user.
-- `upsell`: successful upsell payment detected by `ff_billing_reason`, or a known upsell amount within 60 minutes after trial.
-- `first_subscription`: next successful non-upsell payment after trial.
-- `renewal_2`: next successful non-upsell payment after first_subscription.
-- `renewal_3`: next successful non-upsell payment after renewal_2.
-- `renewal`: all later successful non-upsell payments.
-- `failed_payment`, `refund`, `chargeback`, `unknown`: non-standard or non-success states.
+Mapping is data, not code (Postgres, owner-editable, retire-only):
 
-Revenue analytics use net revenue. When `net_amount_usd` is present, it is authoritative; otherwise revenue falls back to `amount_usd - refund_amount_usd`, then to `amount_usd`.
+- **Layer A** `facebook_campaign_mapping`: observed utm_campaign → actual source
+  campaign id (seeded from the audited 22-pair hardcode; classification-only, never
+  allocation math).
+- **Layer B** `facebook_campaign_funnel_map`: source campaign id → funnel. Evidence
+  ladder: destination URL > stable funnel across authoritative users (`campaign_path`,
+  auto-confirmed at ≥3 users) > copy relation > manual > name token (`name_rule`,
+  suggested ONLY — enforced by CHECK) > unknown.
 
-### cohort_date
+## Facebook Warehouse V2 (migration in progress)
 
-`cohort_date` is the calendar date of the user's successful trial. Cohorts are based on the trial timestamp, not the later transaction timestamp.
+V1 (`fact_facebook_stats`, mixed `level` column, silent restates) is being replaced
+without stopping production. Both pipelines run until cutover; every phase rolls back
+by flag.
 
-### cohort_id
+- **Phase 0 — schema** (`fbWarehouseV2Schema.ts`, created by `clickhouse-init`):
+  per-grain daily facts (no stored ratios, full lineage), verbatim raw API response
+  layer (no TTL), SCD2 dims, `facebook_batch_registry` mirror, DQ results,
+  `facebook_recon_snapshots`; `v_*_current` views resolve the latest PUBLISHED batch;
+  `v_channel_campaign_daily` is the cross-channel contract seed (`traffic_channel`
+  dimension — TikTok/Google later UNION their own facts into it).
+- **Phase 1 — dual-write** (`fbWarehouseV2Writer.ts`): the existing sync writes V2
+  beside V1, fail-safe (absent V2 schema leaves the sync byte-identical). Shared
+  batch/run lineage with the append-only Postgres history
+  (`facebook_sync_runs` / `facebook_import_batches` / `facebook_raw_payloads` /
+  `facebook_batch_dq`, UPDATE/DELETE rejected by triggers). The `day` level is spend
+  ground truth, never a fact; merged multi-day rows withhold the batch with a
+  `grain_single_day` DQ failure.
+- **Phase 2 — probe/backfill**: `source_probe` action (read-only day scan, defaults
+  to the audited 2026-05-08..06-14 gap) → data ⇒ `runFbBackfillWindow` (full sync
+  with explicit dates, lands in both warehouses) · empty ⇒ `recordFacebookKnownGap`
+  (append-only, refuses to record when data exists).
+- **Recon (Wave 4)** (`fbReconSnapshot.ts`): stored snapshots partition source spend
+  by campaign state (allocated / no_user / unknown_funnel / unknown_campaign) with
+  Model 1 reported beside (uncapped — overallocation stays visible), coverage against
+  a known-gap-adjusted denominator, and green/yellow/red health. Degradation is
+  caught by the next snapshot, not a retrospective audit.
+- **Cutover (pending)**: readers switch to `v_*_current` behind `FB_WAREHOUSE_V2_READS`
+  after a ≤$0.01 parity harness holds for 7 days; cohorts switch last.
 
-`cohort_id` combines exact campaign path and cohort date. It does not use the broad funnel because multiple landing paths can belong to the same funnel.
+## Key concepts
 
-```text
-{campaign_path}_{cohort_date}
-```
+- `transaction_type`: `trial` (first successful non-upsell), `upsell`,
+  `first_subscription`, `renewal_2`, `renewal_3`, `renewal`, `token_purchase`
+  (web-app add-on packs), plus `failed_payment` / `refund` / `chargeback` / `unknown`.
+  Revenue analytics use net USD (FX-normalized; unconvertible rows keep flowing with
+  zeroed money and are surfaced in FX diagnostics — rows are never dropped).
+- `cohort_date`: calendar date of the user's successful trial.
+- `cohort_id`: `{funnel}_{campaign_path}_{cohort_date}`; campaign_path is the exact
+  normalized landing path, funnel is verbatim from the payload (never derived).
+- `campaign_id` **is** `utm_campaign` verbatim — forensically proven (0 exceptions,
+  95.1% of spend); `utm_term`/`utm_content` are structurally similar Meta ids but
+  never campaign ids.
 
-Example:
+## Persistence rules
 
-```text
-soulmate-marriage_2026-01-01
-```
-
-### campaign_path
-
-`campaign_path` is the exact landing path from `ff_campaign_path`, normalized for grouping.
-Examples:
-
-- `/soulmate-marriage` -> `soulmate-marriage`
-- `/soulmate-reading` -> `soulmate-reading`
-
-If no path is available, `campaign_path` is `unknown`.
-
-### transaction_day
-
-`transaction_day` is the whole number of days since the user's trial timestamp.
-It is used for interpreting customer lifecycle timing and cohort windows.
-
-### FunnelFox subscriptions
-
-FunnelFox data answers subscription-state questions that Palmer transaction exports do not answer reliably, especially cancellation state and cancellation timing.
-
-`SubscriptionClean` is normalized in `src/services/subscriptionTransform.ts`.
-
-- `is_cancelled` is true when FunnelFox status includes `cancel` or `renews === false`.
-- `cancelled_at` uses FunnelFox `cancelled_at`, or falls back to `updated_at` when the subscription is cancelled.
-- `is_active_now` can remain true after cancellation when the paid period has not ended.
-- The Subscriptions page uses FunnelFox-normalized cancellation labels such as `cancelled_unknown_reason` and `auto_payment_related`.
-- Cohorts and Dashboard use a cross-source cancellation classification based on FunnelFox subscription timing plus Palmer failed transactions near cancellation.
-- FunnelFox subscriptions are cached in IndexedDB, not localStorage.
-- Temporary FunnelFox key input is development-only and is shown only on Import Data. Production sync must use server-side `FUNNELFOX_SECRET`.
-- Raw subscription debug output is development-only unless explicitly enabled with `VITE_ENABLE_FUNNELFOX_DEBUG=true`.
-
-Planned webhook endpoint:
-
-```text
-POST /api/webhooks/funnelfox
-```
-
-The webhook handler should verify `Fox-Secret-Key` server-side and handle `subscription.cancelled`, `subscription.activated`, and `subscription.renewed`. This Vite frontend does not implement production webhooks.
+- IndexedDB: fast local cache for large datasets (palmer, subscriptions, traffic).
+- Supabase `data_snapshots`: latest cross-device snapshot per dataset type, RLS-scoped,
+  lz-string envelope over 256KB (`snapshotEnvelope.ts` — one definition, decompressor
+  injected: npm in the browser, esm.sh in Deno).
+- localStorage: small UI state only. Secrets never persist anywhere client-side.

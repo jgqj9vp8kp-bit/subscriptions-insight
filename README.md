@@ -59,6 +59,22 @@ Production defaults must stay locked down:
 - The temporary FunnelFox key input is hidden in production by default.
 - Raw FunnelFox debug output is hidden in production by default.
 
+### Analytics Edge Functions (ClickHouse warehouse + server summaries)
+
+Apply migrations first, then deploy the analytics functions:
+
+```text
+supabase db push
+supabase functions deploy clickhouse-cohorts clickhouse-facebook clickhouse-init fb-analytics-summary dashboard-summary
+```
+
+After deploying `clickhouse-init`, run ClickHouse Init once from the Integrations UI —
+it idempotently creates/extends the warehouse schema (including Warehouse V2 tables).
+
+Server-summary flags stay off in production until real-data parity is confirmed
+(see `.env.example`): `VITE_FB_ANALYTICS_SOURCE` and `VITE_DASHBOARD_SOURCE`
+default to `client`; `VITE_COHORTS_DATA_SOURCE` defaults to `clickhouse`.
+
 ### Supabase Edge Function secret
 
 ```text
