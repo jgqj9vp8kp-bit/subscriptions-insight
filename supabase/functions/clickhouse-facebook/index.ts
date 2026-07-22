@@ -10,14 +10,27 @@
 // (report = summary+list+charts+filters+diagnostics in ONE atomic response —
 // the FB Analytics page consumes only this, so its numbers can never mix
 // warehouse states).
+//
+// Warehouse V2 Phase 1 read-only history actions (Supabase tables only, no
+// ClickHouse): history_runs | history_batches | history_versions |
+// history_raw_payloads | history_dq. Pure observability — Cohorts, allocation,
+// reconciliation and mapping never read them.
 
 import { createClickHouseClient } from "../_shared/clickhouse/client.ts";
 import { jsonResponse, methodNotAllowed, optionsResponse, parseJsonBody, requireSupabaseUser } from "../_shared/clickhouse/http.ts";
 import { ensureFactFacebookStatsSchema } from "../_shared/clickhouse/schema.ts";
 import {
+  getFbBatchDq,
+  listFbImportBatches,
+  listFbRawPayloads,
+  listFbSyncRuns,
+  listFbWarehouseVersions,
+} from "../_shared/clickhouse/fbSyncHistory.ts";
+import {
   buildFbDiagnostics,
   createCapsuledFetcher,
   FacebookStatsRequestError,
+  FacebookStatsValidationError,
   getFbSyncState,
   normalizeFbFilters,
   normalizeFbLevel,
@@ -54,6 +67,22 @@ Deno.serve(async (req: Request) => {
     return jsonResponse({ ok: false, error: "Invalid JSON request body." }, 400);
   }
   const action = typeof body.action === "string" ? body.action : "report";
+
+  // Warehouse V2 Phase 1: append-only history reads. They only SELECT from the
+  // facebook_* history tables, so they run before any ClickHouse client exists.
+  if (action.startsWith("history_")) {
+    try {
+      if (action === "history_runs") return jsonResponse({ ok: true, action, runs: await listFbSyncRuns(auth.supabase, auth.id, body) });
+      if (action === "history_batches") return jsonResponse({ ok: true, action, batches: await listFbImportBatches(auth.supabase, auth.id, body) });
+      if (action === "history_versions") return jsonResponse({ ok: true, action, versions: await listFbWarehouseVersions(auth.supabase, auth.id, body) });
+      if (action === "history_raw_payloads") return jsonResponse({ ok: true, action, payloads: await listFbRawPayloads(auth.supabase, auth.id, body) });
+      if (action === "history_dq") return jsonResponse({ ok: true, action, dq: await getFbBatchDq(auth.supabase, auth.id, body) });
+      return jsonResponse({ ok: false, action, error: `Unsupported action: ${action}` }, 400);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Facebook history read failed.";
+      return jsonResponse({ ok: false, action, error: message }, /required/i.test(message) ? 400 : 502);
+    }
+  }
 
   let client: ReturnType<typeof createClickHouseClient> | null = null;
   try {
@@ -131,9 +160,15 @@ Deno.serve(async (req: Request) => {
 
     return jsonResponse({ ok: false, error: `Unsupported action: ${action}` }, 400);
   } catch (error) {
-    const status = error instanceof FacebookStatsRequestError ? 400 : 502;
+    const status = error instanceof FacebookStatsRequestError ? 400 : error instanceof FacebookStatsValidationError ? 422 : 502;
+    const errorCode = error instanceof FacebookStatsValidationError ? error.code : undefined;
+    const safeError = error instanceof FacebookStatsValidationError
+      ? error.safeMessage
+      : error instanceof FacebookStatsRequestError
+        ? error.message
+        : "Facebook warehouse action failed.";
     return jsonResponse(
-      { ok: false, action, source: "clickhouse", error: error instanceof Error ? error.message : "Facebook warehouse action failed." },
+      { ok: false, action, source: "clickhouse", ...(errorCode ? { error_code: errorCode } : {}), error: safeError },
       status,
     );
   } finally {

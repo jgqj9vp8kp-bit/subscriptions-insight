@@ -25,6 +25,12 @@
 
 import type { ClickHouseClientLike, SupabaseLikeClient } from "./types.ts";
 import { ANALYTICS_TRANSACTIONS_TABLE, FACT_FACEBOOK_STATS_TABLE, ensureFactFacebookStatsSchema } from "./schema.ts";
+import {
+  computeFbBatchChecksum,
+  computeFbBatchDq,
+  createFbSyncHistoryRecorder,
+  type FbSyncTrigger,
+} from "./fbSyncHistory.ts";
 
 export const FB_SYNC_NAME = "fact_facebook_stats_sync";
 export const FB_LEVELS = ["account", "campaign", "adset", "ad", "day"] as const;
@@ -44,6 +50,16 @@ const FB = FACT_FACEBOOK_STATS_TABLE;
 const MAX_IN = 200;
 
 export class FacebookStatsRequestError extends Error {}
+
+export class FacebookStatsValidationError extends Error {
+  readonly code = "FB_SPEND_MISMATCH";
+  readonly safeMessage = "Facebook export validation failed: entity-level Spend does not match the day-level source of truth. Previous warehouse data remains active.";
+
+  constructor(readonly validationDiagnostics: Record<string, unknown>) {
+    super("Facebook export validation failed: Spend mismatch between entity and day levels.");
+    this.name = "FacebookStatsValidationError";
+  }
+}
 
 const n = (v: unknown): number => {
   const p = Number(v ?? 0);
@@ -347,6 +363,8 @@ export interface FbSyncRequest {
   date_from?: string | null;
   date_to?: string | null;
   levels?: string[];
+  /** History-only annotation (facebook_sync_runs.trigger_source). Does not affect the sync itself. */
+  trigger_source?: FbSyncTrigger;
 }
 
 export interface FbSyncResult {
@@ -370,6 +388,10 @@ export interface FbSyncResult {
   range_splits: number;
   duration_ms: number;
   error?: string;
+  /** Append-only history lineage (Facebook Warehouse V2 Phase 1). Absent only if the history layer is unavailable. */
+  history_run_id?: string;
+  history_batch_id?: string;
+  history_errors?: number;
 }
 
 export function resolveSyncRange(input: {
@@ -416,6 +438,18 @@ export async function runFacebookStatsSync(input: {
     ? input.request.levels.map((l) => normalizeFbLevel(l))
     : [...FB_LEVELS]) as FbLevel[];
 
+  // Append-only history sidecar (Warehouse V2 Phase 1). Fail-safe by contract:
+  // every history write swallows its own errors, so the sync below behaves
+  // byte-for-byte identically whether the history tables exist or not.
+  const history = createFbSyncHistoryRecorder({
+    supabase: input.supabase,
+    authUserId: input.authUserId,
+    warehouseVersion,
+    mode,
+    trigger: input.request.trigger_source,
+    startedAtIso: syncedAtIso,
+  });
+
   await ensureFactFacebookStatsSchema(input.clickhouse);
   const previousState = await getFbSyncState(input.supabase, input.authUserId).catch(() => null);
   const cursorDate = s(previousState?.cursor_transaction_id) || null;
@@ -438,6 +472,11 @@ export async function runFacebookStatsSync(input: {
     finished_at: null,
     last_error: null,
   });
+
+  await history.stageBatch();
+  // Every Capsuled response (and failure) is recorded verbatim; the wrapper is
+  // pass-through for the pipeline itself.
+  const fetcher = history.wrapFetcher(input.fetcher);
 
   const stats: CapsuledFetchStats = { requests: 0, payload_bytes: 0, api_latency_ms: 0, splits: 0, failed_attempts: [] };
   try {
@@ -470,7 +509,7 @@ export async function runFacebookStatsSync(input: {
     // 1) Day-level scan over the whole range. The `day` level returns exactly
     //    one row per active date (no entity dimensions to merge), so it is both
     //    the list of days that need entity fetches and the spend ground truth.
-    const dayScan = await fetchLevelRows({ fetcher: input.fetcher, level: "day", dateFrom, dateTo, stats });
+    const dayScan = await fetchLevelRows({ fetcher, level: "day", dateFrom, dateTo, stats });
     if (levels.includes("day")) addMapped(dayScan.rows, "day", dayScan.envelope);
     const activeDays = Array.from(
       new Set(
@@ -492,7 +531,7 @@ export async function runFacebookStatsSync(input: {
       const batch = tasks.slice(i, i + FB_DAY_FETCH_CONCURRENCY);
       const settled = await Promise.all(
         batch.map(async (task) => {
-          const { envelope, bytes, latencyMs } = await input.fetcher(task.day, task.day, task.level);
+          const { envelope, bytes, latencyMs } = await fetcher(task.day, task.day, task.level);
           stats.requests += 1;
           stats.payload_bytes += bytes;
           stats.api_latency_ms += latencyMs;
@@ -509,6 +548,27 @@ export async function runFacebookStatsSync(input: {
       .filter((level) => Math.abs((spendByLevel[level] ?? 0) - daySpend) > 0.05)
       .map((level) => ({ level, level_spend: round2(spendByLevel[level] ?? 0), day_spend: round2(daySpend) }));
 
+    // The day level is the source-of-truth total. Never write a partial entity
+    // export: fact_facebook_stats is a ReplacingMergeTree, so even a failed sync
+    // would otherwise make its newer row_version visible through FINAL.
+    if (spendMismatch.length > 0) {
+      throw new FacebookStatsValidationError({
+        mode,
+        date_from: dateFrom,
+        date_to: dateTo,
+        levels,
+        strategy: "per_day_entity_fetch",
+        active_days: activeDays.length,
+        merged_rows_detected: mergedRowsDetected,
+        spend_by_level: Object.fromEntries(Object.entries(spendByLevel).map(([key, value]) => [key, round2(value)])),
+        day_spend_total: round2(daySpend),
+        spend_mismatch: spendMismatch,
+      });
+    }
+
+    // Validation gate passed → the batch is coherent (staged → validated).
+    await history.markValidated(computeFbBatchChecksum(mapped));
+
     if (mapped.length) {
       await input.clickhouse.insert({ table: FB, values: mapped as unknown as Record<string, unknown>[], format: "JSONEachRow" });
     }
@@ -516,6 +576,11 @@ export async function runFacebookStatsSync(input: {
     const inserted = Math.max(0, after - before);
     const updated = Math.max(0, mapped.length - inserted);
     const durationMs = Date.now() - started;
+
+    // Warehouse write succeeded → the batch is live (validated → published),
+    // and its automatic DQ report is stored alongside.
+    await history.recordDq(computeFbBatchDq({ rows: mapped, activeDays, daySpendTotal: daySpend }));
+    await history.markPublished();
 
     await upsertFbSyncState(input.supabase, {
       auth_user_id: input.authUserId,
@@ -557,6 +622,32 @@ export async function runFacebookStatsSync(input: {
       },
     });
 
+    await history.recordRun({
+      status: "completed",
+      windowFrom: dateFrom,
+      windowTo: dateTo,
+      levels,
+      apiRequests: stats.requests,
+      rowsReceived: apiRows,
+      rowsInserted: inserted,
+      rowsUpdated: updated,
+      rowsSkipped: skipped,
+      durationMs: Date.now() - started,
+      errorMessage: null,
+      rawResponseMetadata: {
+        api_payload_bytes: stats.payload_bytes,
+        api_latency_ms: stats.api_latency_ms,
+        range_splits: stats.splits,
+        fb_stats_to: fbStatsTo,
+        api_last_import_at: apiLastImportAt,
+        merged_rows_detected: mergedRowsDetected,
+        day_spend_total: round2(daySpend),
+        active_days: activeDays.length,
+        strategy: "per_day_entity_fetch",
+      },
+      finishedAtIso: new Date().toISOString(),
+    });
+
     return {
       status: "completed", mode, date_from: dateFrom, date_to: dateTo, levels,
       api_rows: apiRows, rows_inserted: inserted, rows_updated: updated, rows_skipped: skipped,
@@ -564,9 +655,11 @@ export async function runFacebookStatsSync(input: {
       warehouse_version: warehouseVersion, fb_stats_to: fbStatsTo, api_last_import_at: apiLastImportAt,
       api_requests: stats.requests, api_latency_ms: stats.api_latency_ms, api_payload_bytes: stats.payload_bytes,
       range_splits: stats.splits, duration_ms: Date.now() - started,
+      history_run_id: history.runId, history_batch_id: history.batchId, history_errors: history.errors.length,
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : "Facebook stats sync failed.";
+    const validationError = error instanceof FacebookStatsValidationError ? error : null;
     await upsertFbSyncState(input.supabase, {
       auth_user_id: input.authUserId,
       status: "failed",
@@ -575,7 +668,40 @@ export async function runFacebookStatsSync(input: {
       finished_at: new Date().toISOString(),
       duration_ms: Date.now() - started,
       last_error: message,
+      ...(validationError ? {
+        diagnostics: {
+          ...validationError.validationDiagnostics,
+          validation_status: "FAILED",
+          error_code: validationError.code,
+          error_message_safe: validationError.safeMessage,
+        },
+      } : {}),
     }).catch(() => undefined);
+
+    // History: nothing was activated, so the staged batch rolls back (status
+    // change only — its raw payloads stay for post-mortem), and the failed run
+    // becomes a permanent record. Both calls are fail-safe.
+    await history.markRolledBack(message);
+    await history.recordRun({
+      status: "failed",
+      windowFrom: dateFrom,
+      windowTo: dateTo,
+      levels,
+      apiRequests: stats.requests,
+      rowsReceived: 0,
+      rowsInserted: 0,
+      rowsUpdated: 0,
+      rowsSkipped: 0,
+      durationMs: Date.now() - started,
+      errorMessage: message,
+      rawResponseMetadata: {
+        api_payload_bytes: stats.payload_bytes,
+        api_latency_ms: stats.api_latency_ms,
+        range_splits: stats.splits,
+        ...(validationError ? { error_code: validationError.code, validation_diagnostics: validationError.validationDiagnostics } : {}),
+      },
+      finishedAtIso: new Date().toISOString(),
+    });
     throw error;
   }
 }

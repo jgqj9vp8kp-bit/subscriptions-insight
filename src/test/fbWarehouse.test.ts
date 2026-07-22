@@ -16,6 +16,7 @@ import {
   resolveSyncRange,
   runFacebookStatsSync,
   runFbList,
+  FacebookStatsValidationError,
   type CapsuledFetcher,
   type CapsuledFetchStats,
 } from "../../supabase/functions/_shared/clickhouse/facebookStats.ts";
@@ -257,7 +258,7 @@ describe("runFacebookStatsSync (per-day entity fetch — merge-proof)", () => {
     expect(finalPatch).toContain('"strategy":"per_day_entity_fetch"');
   });
 
-  it("reports a spend mismatch when an entity level disagrees with the day-level ground truth", async () => {
+  it("fails validation and does not write or activate a partial entity export", async () => {
     const calls: Array<{ from: string; to: string; level: string }> = [];
     const lossyFetcher: CapsuledFetcher = async (from, to, level) => {
       const base = await mergingFetcher(calls)(from, to, level);
@@ -265,16 +266,22 @@ describe("runFacebookStatsSync (per-day entity fetch — merge-proof)", () => {
       return base;
     };
     const upserts: unknown[] = [];
-    await runFacebookStatsSync({
+    const inserts: unknown[] = [];
+    await expect(runFacebookStatsSync({
       authUserId: "user-1",
       supabase: fakeSupabase(null, upserts),
-      clickhouse: fakeFbClickHouse({ countSequence: [0, 3] }),
+      clickhouse: fakeFbClickHouse({ countSequence: [0, 3], inserts }),
       fetcher: lossyFetcher,
       request: { mode: "incremental", last_days: 2, levels: ["campaign", "day"] },
       now: new Date("2026-07-15T10:00:00.000Z"),
-    });
+    })).rejects.toBeInstanceOf(FacebookStatsValidationError);
+    expect(inserts).toHaveLength(0);
     const finalPatch = JSON.stringify(upserts.at(-1));
+    expect(finalPatch).toContain('"status":"failed"');
+    expect(finalPatch).toContain('"validation_status":"FAILED"');
+    expect(finalPatch).toContain('"error_code":"FB_SPEND_MISMATCH"');
     expect(finalPatch).toContain('"spend_mismatch":[{"level":"campaign"');
+    expect(finalPatch).not.toContain('"status":"completed"');
   });
 
   it("completed sync records cursor, counters and constraint-safe vocabulary", async () => {

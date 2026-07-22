@@ -41,10 +41,14 @@ export interface SupabaseQueryBuilder extends PromiseLike<SupabaseQueryResult> {
   lte(column: string, value: unknown): SupabaseQueryBuilder;
   maybeSingle(): Promise<SupabaseQueryResult>;
   upsert(values: unknown, options?: Record<string, unknown>): Promise<SupabaseQueryResult>;
+  /** Append-only history writes (Facebook Warehouse V2 Phase 1). Optional: fakes without them stay valid — the history layer is fail-safe. */
+  insert?(values: unknown, options?: Record<string, unknown>): PromiseLike<SupabaseQueryResult>;
+  update?(values: unknown): SupabaseQueryBuilder;
 }
 
 export interface SupabaseLikeClient {
   from(table: string): SupabaseQueryBuilder;
+  rpc?(functionName: string, params?: Record<string, unknown>): Promise<SupabaseQueryResult>;
 }
 
 export interface SupabaseAuthClient extends SupabaseLikeClient {
