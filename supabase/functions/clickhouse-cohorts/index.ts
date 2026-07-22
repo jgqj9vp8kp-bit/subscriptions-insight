@@ -19,6 +19,7 @@ import {
   runMaterializedCohortOptions,
 } from "../_shared/clickhouse/cohortMembership.ts";
 import type { CohortRequest } from "../_shared/clickhouse/cohortContract.ts";
+import { fbAllocationDiagnosticsFeatureEnabled } from "../_shared/clickhouse/fbAllocationDiagnostics.ts";
 
 const QUERY_TIMEOUT_MS = 25_000;
 
@@ -68,7 +69,15 @@ Deno.serve(async (req: Request) => {
       return jsonResponse(result);
     }
     const materialized = await withTimeout(
-      runMaterializedCohortList({ authUserId: auth.id, supabase: auth.supabase, clickhouse: ch, request }),
+      runMaterializedCohortList({
+        authUserId: auth.id,
+        supabase: auth.supabase,
+        clickhouse: ch,
+        request,
+        allocationDiagnosticsEnabled: fbAllocationDiagnosticsFeatureEnabled(
+          Deno.env.get("FB_COHORT_ALLOCATION_DIAGNOSTICS_ENABLED"),
+        ),
+      }),
       QUERY_TIMEOUT_MS,
     );
     if (materialized) return jsonResponse(materialized);

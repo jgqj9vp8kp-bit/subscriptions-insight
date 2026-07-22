@@ -3,6 +3,7 @@
 // analyticsCache.ts and are re-exported here for existing importers.
 
 import type { CohortRequest, CohortRefundStatus, CohortSort } from "../../supabase/functions/_shared/clickhouse/cohortContract";
+import { normalizeFbAllocationDiagnosticsRequest, type NormalizedFbAllocationDiagnosticsRequest } from "../../supabase/functions/_shared/clickhouse/fbAllocationDiagnostics";
 import { ANALYTICS_CACHE_SCHEMA_VERSION, sortUniq } from "@/services/analyticsCache";
 
 export {
@@ -35,6 +36,7 @@ export interface NormalizedCohortRequest {
   card_type: string[];
   currency: string[];
   transaction_type: string[];
+  fb_allocation_diagnostics: NormalizedFbAllocationDiagnosticsRequest | null;
 }
 
 // Canonicalize a CohortRequest so logically-identical filters are byte-identical.
@@ -59,6 +61,9 @@ export function normalizeCohortRequest(req: CohortRequest, opts: { includeSort?:
     card_type: sortUniq(f.card_type),
     currency: sortUniq(f.currency),
     transaction_type: sortUniq(f.transaction_type),
+    fb_allocation_diagnostics: req.fb_allocation_diagnostics
+      ? normalizeFbAllocationDiagnosticsRequest(req.fb_allocation_diagnostics)
+      : null,
   };
 }
 

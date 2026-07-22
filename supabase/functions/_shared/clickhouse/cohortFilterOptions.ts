@@ -29,6 +29,7 @@ import type {
   CohortFilters,
   CohortOptionDimension,
 } from "./cohortContract.ts";
+import { MAPPED_UTM_SOURCES, splitMediaBuyerSelections } from "./mediaBuyerSelection.ts";
 
 function n(value: unknown): number {
   const parsed = Number(value ?? 0);
@@ -79,18 +80,57 @@ export function optionFiltersIgnored(filters: CohortFilters): string[] {
 /**
  * SELECT list for the `members` CTE: one UInt8 pass flag per dimension. Values are
  * bound as numbered {o_<dim>_<i>:String} params — never string-interpolated.
+ *
+ * `trialUtmColumn` names the per-user authoritative first-trial utm_source
+ * column of the caller's CTE. The media_buyer dimension may carry "utm:<value>"
+ * selections; its pass flag then becomes
+ * (media_buyer IN names) OR (trialUtmColumn IN utms) — the same union the list
+ * queries apply — so a UTM selection scopes every OTHER dropdown correctly.
  */
-export function optionFlagColumns(filters: CohortFilters, params: Record<string, unknown>): string {
+export function optionFlagColumns(filters: CohortFilters, params: Record<string, unknown>, trialUtmColumn = "trial_utm"): string {
   return OPTION_DIMENSIONS.map((spec) => {
-    const values = spec.values(filters);
-    if (!values.length) return `1 AS m_${spec.dim}`;
-    const placeholders = values.map((value, index) => {
-      const key = `o_${spec.dim}_${index}`;
+    const bind = (values: string[], prefix: string) => values.map((value, index) => {
+      const key = `o_${prefix}_${index}`;
       params[key] = value;
       return `{${key}:String}`;
     });
-    return `(${spec.column} IN (${placeholders.join(", ")})) AS m_${spec.dim}`;
+    if (spec.dim === "media_buyer") {
+      const { buyers, utms } = splitMediaBuyerSelections(spec.values(filters));
+      if (!buyers.length && !utms.length) return `1 AS m_${spec.dim}`;
+      const parts: string[] = [];
+      if (buyers.length) parts.push(`${spec.column} IN (${bind(buyers, spec.dim).join(", ")})`);
+      if (utms.length) parts.push(`${trialUtmColumn} IN (${bind(utms, "media_buyer_utm").join(", ")})`);
+      return `(${parts.join(" OR ")}) AS m_${spec.dim}`;
+    }
+    const values = spec.values(filters);
+    if (!values.length) return `1 AS m_${spec.dim}`;
+    return `(${spec.column} IN (${bind(values, spec.dim).join(", ")})) AS m_${spec.dim}`;
   }).join(",\n    ");
+}
+
+/**
+ * Extra UNION branch for the UTM entries of the Media Buyer dropdown: distinct
+ * unmapped first-trial utm_source values with distinct-user counts. Scoped like
+ * the media_buyer list itself (all active filters EXCEPT media_buyer). Mapped
+ * utm values ("4", "19", "22") are excluded — they are already represented by a
+ * media buyer name.
+ */
+export function utmSourceOptionBranch(
+  filters: CohortFilters,
+  params: Record<string, unknown>,
+  trialUtmColumn = "trial_utm",
+  membersCte = "members",
+): string {
+  const mappedPlaceholders = MAPPED_UTM_SOURCES.map((value, index) => {
+    const key = `o_utm_mapped_${index}`;
+    params[key] = value;
+    return `{${key}:String}`;
+  });
+  const scope = optionWhereExcept(filters, "media_buyer");
+  const own = `${trialUtmColumn} != ''${mappedPlaceholders.length ? ` AND ${trialUtmColumn} NOT IN (${mappedPlaceholders.join(", ")})` : ""}`;
+  const where = scope ? `${scope} AND ${own}` : `WHERE ${own}`;
+  return `SELECT 'utm_source' dim, ${trialUtmColumn} value, uniqExact(canonical_user_id) cnt ` +
+    `FROM ${membersCte} ${where} GROUP BY ${trialUtmColumn}`;
 }
 
 /** WHERE over the pass flags requiring every ACTIVE dimension except `self`. */
@@ -131,6 +171,7 @@ export function emptyFilterOptions(): CohortFilterOptions {
     country: [],
     card_type: [],
     media_buyer: [],
+    utm_source: [],
   };
 }
 
@@ -165,6 +206,7 @@ export function filterOptionsFromRows(
     else if (dim === "country") opts.country.push({ country_code: value, user_count: cnt });
     else if (dim === "card_type") opts.card_type.push({ card_type: value, trial_count: cnt });
     else if (dim === "media_buyer") opts.media_buyer.push({ media_buyer: value, trial_count: cnt });
+    else if (dim === "utm_source") opts.utm_source.push({ utm_source: value, trial_count: cnt });
   }
 
   opts.funnel.sort();
@@ -176,6 +218,7 @@ export function filterOptionsFromRows(
   opts.country.sort((a, b) => a.country_code.localeCompare(b.country_code));
   opts.card_type.sort((a, b) => b.trial_count - a.trial_count);
   opts.media_buyer.sort((a, b) => b.trial_count - a.trial_count);
+  opts.utm_source.sort((a, b) => b.trial_count - a.trial_count || a.utm_source.localeCompare(b.utm_source));
 
   const dimensions: CohortFilterOptionDimensionDiagnostic[] = OPTION_DIMENSIONS.map((spec) => ({
     dimension: spec.dim,

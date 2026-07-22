@@ -1,6 +1,7 @@
 /* global Deno */
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { verifyEdgeBearerSession } from "./auth.ts";
 
 export const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -46,10 +47,6 @@ export function methodNotAllowed(allowed: string): Response {
   });
 }
 
-function bearerToken(req: Request): string {
-  return (req.headers.get("Authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
-}
-
 export async function requireSupabaseUser(req: Request): Promise<AuthenticatedEdgeUser | EdgeResult> {
   const supabaseUrl = Deno.env.get("SUPABASE_URL")?.trim();
   const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")?.trim();
@@ -57,19 +54,19 @@ export async function requireSupabaseUser(req: Request): Promise<AuthenticatedEd
     return { status: 503, body: { error: "Supabase Edge authentication is not configured." } };
   }
 
-  const token = bearerToken(req);
-  if (!token) return { status: 401, body: { error: "Authentication required." } };
-
   const supabase = createClient(supabaseUrl, serviceRoleKey, {
     auth: { persistSession: false, autoRefreshToken: false },
   });
-  const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data.user?.id) return { status: 401, body: { error: "Invalid or expired session." } };
+  const decision = await verifyEdgeBearerSession({
+    authorization: req.headers.get("Authorization"),
+    getUser: (token) => supabase.auth.getUser(token),
+  });
+  if ("status" in decision) return decision;
 
   return {
-    id: data.user.id,
-    email: data.user.email ?? null,
-    token,
+    id: decision.id,
+    email: decision.email,
+    token: decision.token,
     supabase,
   };
 }

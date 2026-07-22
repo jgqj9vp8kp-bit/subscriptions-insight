@@ -10,6 +10,7 @@ import { declineDetailsForTransaction } from "@/services/paymentFailures";
 import { buildCohortId } from "@/services/cohortIdentity";
 import { isTokenPurchaseTransaction } from "@/services/monetization";
 import { APP_ADDON_WINDOW_HOURS } from "@/services/monetizationProductMap";
+import { normalizeTrafficSource } from "../../supabase/functions/_shared/clickhouse/fbSourceClassification.ts";
 
 export type RawPalmerRow = Record<string, unknown>;
 
@@ -264,11 +265,13 @@ function detectCampaignPath(metadata: PalmerMetadata): string {
 }
 
 function detectTrafficSource(row: RawPalmerRow, metadata: PalmerMetadata): TrafficSource {
-  const raw = `${valueFrom(row, FIELD_ALIASES.traffic_source)} ${metadata.utm_source ?? ""}`.toLowerCase();
-  if (raw.includes("facebook") || raw === "fb" || raw.includes("meta")) return "facebook";
-  if (raw.includes("tiktok") || raw.includes("tik_tok")) return "tiktok";
-  if (raw.includes("google") || raw.includes("adwords")) return "google";
-  return "unknown";
+  const normalized = normalizeTrafficSource([
+    valueFrom(row, FIELD_ALIASES.traffic_source),
+    metadata.utm_source,
+  ]);
+  // "other" is a diagnostics-only bucket. The normalized transaction schema
+  // intentionally keeps unsupported sources as unknown.
+  return normalized === "other" ? "unknown" : normalized;
 }
 
 function transactionIdFrom(row: RawPalmerRow, index: number): string {

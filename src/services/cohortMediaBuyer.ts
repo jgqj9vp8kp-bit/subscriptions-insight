@@ -8,6 +8,7 @@ import {
 import { CARD_TYPE_VALUES, cardTypeForUserTransactions } from "@/services/userCardType";
 import { countryCodeForUserTransactions, normalizeCountryCode } from "@/services/userCountry";
 import { MEDIA_BUYER_VALUES, mediaBuyerForUserTransactions } from "@/services/userMediaBuyer";
+import { MAPPED_UTM_SOURCES } from "@/services/mediaBuyerSelection";
 import type { SubscriptionClean } from "@/types/subscriptions";
 import type { CardType, MediaBuyer, Transaction } from "@/services/types";
 
@@ -119,4 +120,63 @@ export function buildMediaBuyerOptions({
       trial_count: counts.get(media_buyer) ?? 0,
     }))
     .filter((option) => option.trial_count > 0);
+}
+
+export interface UtmSourceOption {
+  utm_source: string;
+  trial_count: number;
+}
+
+/**
+ * UTM entries of the Media Buyer dropdown (legacy client compute): distinct
+ * attributed utm_source values NOT already represented by a media buyer name,
+ * with authoritative-trial user counts. Same scope rules as
+ * buildMediaBuyerOptions (all active filters except the dropdown's own).
+ */
+export function buildUtmSourceOptions(input: MediaBuyerOptionInput): UtmSourceOption[] {
+  const {
+    txs,
+    subscriptions = [],
+    filters = {},
+    trafficSourceFilter = "all",
+    selectedCampaignIds = [],
+    selectedCountries = [],
+    selectedCardTypes = [],
+    maxRenewalDepth,
+  } = input;
+  const attributionTxs = filterTransactionsByTrialAttribution(txs, { trafficSourceFilter, selectedCampaignIds }) as Transaction[];
+  const contextCohorts = filterCohortsWithDiagnostics(
+    computeCohorts(attributionTxs, subscriptions, {
+      maxRenewalDepth,
+      selectedCountries: [...selectedCountries],
+      selectedCardTypes: [...selectedCardTypes],
+    }),
+    filters,
+  ).cohorts;
+  const contextCohortIds = new Set(contextCohorts.map((cohort) => cohort.cohort_id));
+  if (!contextCohortIds.size) return [];
+
+  const countries = normalizeCountryFilter(selectedCountries);
+  const cardTypes = normalizeCardTypeFilter(selectedCardTypes);
+  const byUser = transactionsByUser(attributionTxs);
+  const trialByUser = firstSuccessfulTrialByUser(attributionTxs);
+  const counts = new Map<string, number>();
+
+  trialByUser.forEach((trial, userId) => {
+    const list = byUser.get(userId) ?? [];
+    if (!userMatchesFilters(list, countries, cardTypes)) return;
+
+    const cohortDate = trial.cohort_date ?? trial.event_time.slice(0, 10);
+    const campaignPath = trial.campaign_path || "unknown";
+    const cohortId = buildCohortId(trial.funnel, campaignPath, cohortDate);
+    if (!contextCohortIds.has(cohortId)) return;
+
+    const utm = mediaBuyerForUserTransactions(list).utm_source;
+    if (!utm || MAPPED_UTM_SOURCES.includes(utm)) return;
+    counts.set(utm, (counts.get(utm) ?? 0) + 1);
+  });
+
+  return [...counts.entries()]
+    .map(([utm_source, trial_count]) => ({ utm_source, trial_count }))
+    .sort((a, b) => b.trial_count - a.trial_count || a.utm_source.localeCompare(b.utm_source));
 }

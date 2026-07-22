@@ -17,7 +17,7 @@ export type TransactionType =
 export type TransactionStatus = "success" | "failed" | "refunded" | "chargeback";
 
 export type Funnel = "past_life" | "soulmate" | "starseed" | "unknown";
-export type TrafficSource = "facebook" | "tiktok" | "google" | "unknown";
+export type TrafficSource = "facebook" | "tiktok" | "google" | "organic" | "direct" | "unknown";
 export type CardType = "prepaid" | "debit" | "credit" | "other" | "unknown";
 export type MediaBuyer = "Ivan" | "Artem A" | "Artem D" | "Unknown";
 export type DeclineReason =
@@ -205,25 +205,35 @@ export interface CohortCurrencyBreakdownRow {
   avg_trial_price_usd: number | null;
 }
 
-// FB Analytics metrics joined server-side by (campaign_id, cohort_date).
+// FB Analytics metrics assigned server-side per authoritative user through
+// selected-period Campaign CPP at campaign_id grain.
 // All optional: absent on legacy-engine rows and pre-FB cached bundles — the
 // UI renders "—" for absent values, never NaN/Infinity.
 export interface CohortFbFields {
-  fb_spend?: number;
+  fb_spend?: number | null;
   fb_currency?: string | null;
-  fb_purchases?: number;
+  fb_purchases?: number | null;
   fb_cpp?: number | null;
-  fb_impressions?: number;
-  fb_reach?: number;
-  fb_clicks?: number;
-  fb_link_clicks?: number;
+  fb_impressions?: number | null;
+  fb_reach?: number | null;
+  fb_clicks?: number | null;
+  fb_link_clicks?: number | null;
   fb_ctr?: number | null;
   fb_cpc?: number | null;
   fb_cpm?: number | null;
-  fb_purchase_value?: number;
+  fb_purchase_value?: number | null;
   fb_roas?: number | null;
   fb_campaigns_matched?: number;
   fb_match_status?: string;
+  fb_reporting_date?: string | null;
+  fb_campaign_cpp?: number | null;
+  fb_user_cpp?: number | null;
+  fb_matched_users?: number;
+  fb_unmatched_users?: number;
+  fb_campaign_coverage?: number | null;
+  fb_cpp_source?: string;
+  fb_timezone?: string | null;
+  coverage_rate?: number | null;
   /** Cohort-side business ratios derived from server row values (null when denominator is 0). */
   fb_cac?: number | null;
   fb_cost_per_trial?: number | null;

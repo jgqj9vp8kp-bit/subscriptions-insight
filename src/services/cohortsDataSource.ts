@@ -20,7 +20,7 @@ import type { FxNormalizationDiagnostics } from "@/services/currencyNormalizatio
 import type { CampaignIdOption } from "@/services/cohortCampaignIds";
 import type { CountryUserCount } from "@/services/userCountry";
 import type { CohortCardTypeOption } from "@/services/cohortCardTypes";
-import type { MediaBuyerOption } from "@/services/cohortMediaBuyer";
+import type { MediaBuyerOption, UtmSourceOption } from "@/services/cohortMediaBuyer";
 import type { SubscriptionClean } from "@/types/subscriptions";
 import type {
   CohortAggregateRow,
@@ -44,6 +44,8 @@ export interface CohortFilterOptionsView {
   country: CountryUserCount[];
   card_type: CohortCardTypeOption[];
   media_buyer: MediaBuyerOption[];
+  /** UTM entries of the Media Buyer dropdown (unmapped first-trial utm_source values). */
+  utm_source: UtmSourceOption[];
 }
 
 export type CohortsDataSourceMode = "legacy" | "clickhouse";
@@ -69,9 +71,10 @@ export interface CohortsSourceResult {
   /** Dataset-level FX/token diagnostics for the panels (clickhouse source only). */
   fxDiagnostics?: FxNormalizationDiagnostics;
   tokenDiagnostics?: MonetizationDiagnostics;
-  /** FB Analytics totals (deduplicated campaign/day pairs) + join health (clickhouse source only). */
+  /** FB Analytics totals aggregated from per-user CPP assignments (ClickHouse source only). */
   fbTotals?: CohortResponse["fb_totals"];
   fbDiagnostics?: CohortResponse["fb_diagnostics"];
+  fbAllocationDiagnostics?: CohortResponse["fb_allocation_diagnostics"];
 }
 
 // Non-reversible synthetic ids sized to a count. Because each user belongs to
@@ -195,8 +198,8 @@ export function mapAggregateToCohortRow(agg: CohortAggregateRow): CohortRow {
     ltv_d7: trial ? round2(agg.revenue_d7 / trial) : 0,
     ltv_d14: trial ? round2(agg.revenue_d14 / trial) : 0,
     ltv_d30: trial ? round2(agg.revenue_d30 / trial) : 0,
-    // FB Analytics metrics: server-joined by (campaign_id, cohort_date). Copied
-    // verbatim; business ratios derive from this row's own server values.
+    // FB Analytics metrics: Campaign CPP assigned per authoritative user and
+    // aggregated through users. Copied verbatim from the server bundle.
     fb_spend: agg.fb_spend,
     fb_currency: agg.fb_currency,
     fb_purchases: agg.fb_purchases,
@@ -212,6 +215,15 @@ export function mapAggregateToCohortRow(agg: CohortAggregateRow): CohortRow {
     fb_roas: agg.fb_roas,
     fb_campaigns_matched: agg.fb_campaigns_matched,
     fb_match_status: agg.fb_match_status,
+    fb_reporting_date: agg.fb_reporting_date,
+    fb_campaign_cpp: agg.fb_campaign_cpp,
+    fb_user_cpp: agg.fb_user_cpp,
+    fb_matched_users: agg.fb_matched_users,
+    fb_unmatched_users: agg.fb_unmatched_users,
+    fb_campaign_coverage: agg.fb_campaign_coverage,
+    fb_cpp_source: agg.fb_cpp_source,
+    fb_timezone: agg.fb_timezone,
+    coverage_rate: agg.coverage_rate,
     ...deriveFbBusinessMetrics({
       fb_spend: agg.fb_spend,
       fb_match_status: agg.fb_match_status,
@@ -238,6 +250,7 @@ export function mapFilterOptions(fo: CohortResponse["filter_options"]): CohortFi
     country: fo.country ?? [],
     card_type: (fo.card_type ?? []).map((o) => ({ card_type: o.card_type as CardType, trial_count: o.trial_count })),
     media_buyer: (fo.media_buyer ?? []).map((o) => ({ media_buyer: o.media_buyer as MediaBuyer, trial_count: o.trial_count })),
+    utm_source: (fo.utm_source ?? []).map((o) => ({ utm_source: o.utm_source, trial_count: o.trial_count })),
   };
 }
 
@@ -262,6 +275,7 @@ export async function loadCohortsFromClickHouse(request: CohortRequest): Promise
       : undefined,
     fbTotals: response.fb_totals,
     fbDiagnostics: response.fb_diagnostics,
+    fbAllocationDiagnostics: response.fb_allocation_diagnostics,
   };
 }
 

@@ -20,6 +20,7 @@
 
 import type { CohortFilterOptionsView } from "@/services/cohortsDataSource";
 import type { CardType, MediaBuyer } from "@/services/types";
+import { utmSelectionValue } from "@/services/mediaBuyerSelection";
 
 export interface CohortFilterSelection {
   funnelFilter: string;
@@ -28,7 +29,7 @@ export interface CohortFilterSelection {
   currencyFilter: string;
   selectedCountries: string[];
   selectedCardTypes: CardType[];
-  selectedMediaBuyers: MediaBuyer[];
+  selectedMediaBuyers: Array<MediaBuyer | string>;
   selectedCampaignIds: string[];
 }
 
@@ -39,7 +40,7 @@ export interface CohortFilterSelectionPatch {
   currencyFilter?: string;
   selectedCountries?: string[];
   selectedCardTypes?: CardType[];
-  selectedMediaBuyers?: MediaBuyer[];
+  selectedMediaBuyers?: Array<MediaBuyer | string>;
   selectedCampaignIds?: string[];
   /** Legacy single-select mirror, reset whenever the multi-select is pruned. */
   campaignIdFilter?: string;
@@ -83,7 +84,15 @@ export function pruneInvalidCohortSelections(
   if (countries) patch.selectedCountries = countries;
   const cardTypes = pruneMulti(selection.selectedCardTypes, new Set(options.card_type.map((o) => o.card_type)));
   if (cardTypes) patch.selectedCardTypes = cardTypes;
-  const mediaBuyers = pruneMulti(selection.selectedMediaBuyers, new Set(options.media_buyer.map((o) => o.media_buyer)));
+  // The Media Buyer dropdown carries buyer names AND "utm:<value>" entries;
+  // both lists together define what is currently selectable.
+  const mediaBuyers = pruneMulti(
+    selection.selectedMediaBuyers as string[],
+    new Set([
+      ...options.media_buyer.map((o) => o.media_buyer),
+      ...(options.utm_source ?? []).map((o) => utmSelectionValue(o.utm_source)),
+    ]),
+  );
   if (mediaBuyers) patch.selectedMediaBuyers = mediaBuyers;
   const campaignIds = pruneMulti(selection.selectedCampaignIds, new Set(options.campaign_id.map((o) => o.campaign_id)));
   if (campaignIds) {

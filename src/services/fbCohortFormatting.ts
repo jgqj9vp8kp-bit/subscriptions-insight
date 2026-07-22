@@ -42,7 +42,7 @@ export function formatFbSpend(row: Pick<CohortRow, "fb_spend" | "fb_match_status
  * cohort's OWN user counts. Null when the denominator or spend is missing.
  */
 export function deriveFbBusinessMetrics(row: {
-  fb_spend?: number;
+  fb_spend?: number | null;
   fb_match_status?: string;
   trial_users: number;
   first_subscription_users: number;
@@ -50,7 +50,7 @@ export function deriveFbBusinessMetrics(row: {
   gross_revenue: number;
   net_revenue: number;
 }): Pick<CohortFbFields, "fb_cac" | "fb_cost_per_trial" | "fb_cost_per_upsell" | "fb_gross_roas" | "fb_net_roas" | "fb_profit" | "fb_margin"> {
-  const spend = row.fb_match_status === "mixed_currency" ? null : row.fb_spend;
+  const spend = row.fb_match_status === "matched" || row.fb_match_status === "partial_coverage" ? row.fb_spend : null;
   if (spend == null) {
     return { fb_cac: null, fb_cost_per_trial: null, fb_cost_per_upsell: null, fb_gross_roas: null, fb_net_roas: null, fb_profit: null, fb_margin: null };
   }
@@ -64,6 +64,20 @@ export function deriveFbBusinessMetrics(row: {
     fb_profit: profit,
     fb_margin: row.net_revenue > 0 ? round2((profit / row.net_revenue) * 100) : null,
   };
+}
+
+export function fbUnavailableReason(status: string | null | undefined): string | null {
+  if (status === "timezone_unverified") {
+    return "Legacy cache status: timezone no longer participates in Campaign-level Cohorts allocation. Refresh the data.";
+  }
+  if (status === "overallocated") return "Authoritative users exceed Facebook Purchases for at least one Campaign. Spend is still calculated as Campaign CPP × users; diagnostics show the excess.";
+  if (status === "partial_coverage") return "Частичное покрытие: Spend включает только пользователей с Campaign ID, для которой вычислен CPP за выбранный период.";
+  if (status === "mixed_currency") return "Недоступно: строка содержит несколько валют FB.";
+  if (status === "invalid_campaign_metric") return "Недоступно: Campaign содержит конфликтующие ad account/currency или повреждённые метрики за выбранный период.";
+  if (status === "no_fb_campaign") return "Недоступно: для authoritative Campaign ID нет Facebook Metrics за выбранный период.";
+  if (status === "no_fb_purchases") return "Недоступно: Campaign Metrics содержит нулевое количество Facebook Purchases, CPP не вычисляется.";
+  if (status === "missing_cohort_campaign_id") return "Недоступно: у пользователей cohort отсутствует authoritative Campaign ID.";
+  return null;
 }
 
 /** Column ids of every FB metric on the Cohorts table, in display order. */

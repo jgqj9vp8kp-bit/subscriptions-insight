@@ -308,6 +308,7 @@ describe("clickhouse-support architecture", () => {
         status: "completed",
         active_warehouse_version: "wh_active",
         active_classification_version: "cohort_v1",
+        duplicate_users: 0,
         diagnostics: { validation: { status: "PASS" } },
       }),
       clickhouse,
@@ -341,6 +342,7 @@ describe("clickhouse-support architecture", () => {
       status: "completed",
       active_warehouse_version: "wh_active",
       active_classification_version: "cohort_v1",
+      duplicate_users: 0,
       diagnostics: { validation: { status: "PASS" } },
     });
     const first = await enrichSupportAttribution({ authUserId: "owner-1", supabase, clickhouse });

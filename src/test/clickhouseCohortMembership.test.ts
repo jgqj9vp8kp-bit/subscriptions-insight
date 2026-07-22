@@ -1,9 +1,11 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   activeCohortMemberWhere,
   buildCohortMembershipInsertSql,
   buildMaterializedFilterOptionsQuery,
   buildMaterializedCohortListQuery,
+  COHORT_CLASSIFICATION_VERSION,
   rebuildCohortMembership,
   runMaterializedCohortList,
 } from "../../supabase/functions/_shared/clickhouse/cohortMembership.ts";
@@ -11,19 +13,29 @@ import { normalizeCohortRequest } from "../../supabase/functions/_shared/clickho
 import type { ClickHouseClientLike, SupabaseLikeClient } from "../../supabase/functions/_shared/clickhouse/types.ts";
 import type { CohortFilters, CohortRequest } from "../../supabase/functions/_shared/clickhouse/cohortContract.ts";
 
-function fakeSupabase(state: Record<string, unknown> | null, upserts: unknown[] = []): SupabaseLikeClient {
+interface SnapshotRpcCall {
+  functionName: string;
+  params: Record<string, unknown>;
+}
+
+function fakeSupabase(
+  state: Record<string, unknown> | null,
+  rpcCalls: SnapshotRpcCall[] = [],
+  rpcResult: Partial<Record<string, boolean>> = {},
+): SupabaseLikeClient {
   return {
     from() {
       const builder = {
         select: () => builder,
         eq: () => builder,
         maybeSingle: async () => ({ data: state, error: null }),
-        upsert: async (value: unknown) => {
-          upserts.push(value);
-          return { data: value, error: null };
-        },
+        upsert: async (value: unknown) => ({ data: value, error: null }),
       };
       return builder as never;
+    },
+    rpc: async (functionName, params = {}) => {
+      rpcCalls.push({ functionName, params });
+      return { data: rpcResult[functionName] ?? true, error: null };
     },
   };
 }
@@ -107,11 +119,13 @@ describe("ClickHouse cohort membership materialization", () => {
     expect(sql).toContain("GROUP BY uid");
     expect(sql).toContain("argMin(et, (ets, tprio, tid)) trial_event_time");
     expect(sql).toContain("argMin(tid, (ets, tprio, tid)) trial_transaction_id");
-    expect(sql).toContain("any(c_campaign_id) campaign_id");
-    expect(sql).toContain("any(c_traffic_source) traffic_source");
-    expect(sql).toContain("any(u_media_buyer) media_buyer");
-    expect(sql).toContain("any(u_country) country");
-    expect(sql).toContain("any(u_card_type) card_type");
+    expect(sql).toContain("c_campaign_id campaign_id");
+    expect(sql).toContain("c_traffic_source traffic_source");
+    expect(sql).toContain("u_media_buyer media_buyer");
+    expect(sql).toContain("u_country country");
+    expect(sql).toContain("u_card_type card_type");
+    expect(sql).not.toContain("any(c_campaign_id)");
+    expect(sql).toContain("GROUP BY uid, c_date");
     expect(sql).not.toContain("raw_payload");
   });
 
@@ -139,14 +153,28 @@ describe("ClickHouse cohort membership materialization", () => {
     expect(params.p_mmb_0).toBe("Ivan");
   });
 
-  it("builds filter options from fact_user_cohorts without scanning transactions", () => {
+  // Intentional contract update (UTM filter): every cohort dimension still
+  // comes from fact_user_cohorts, but the Media Buyer dropdown's UTM entries
+  // need the authoritative first-trial utm_source, which only exists in
+  // analytics_transactions. The options query therefore adds ONE narrow lookup
+  // CTE (transaction_id -> utm_source, scoped to the auth user) joined by the
+  // snapshot's trial_transaction_id — it never re-derives cohort dimensions
+  // from raw history.
+  it("builds filter options from fact_user_cohorts plus only the narrow trial-utm lookup", () => {
     const params: Record<string, unknown> = { auth_user_id: "user-1" };
     const nreq = normalizeCohortRequest({ action: "options" } as CohortRequest);
     const sql = buildMaterializedFilterOptionsQuery(nreq, { warehouse_version: "wh_1", classification_version: "cv_1" }, params);
     expect(sql).toContain("FROM fact_user_cohorts FINAL");
     expect(sql).toContain("'price_plan' dim");
     expect(sql).toContain("'traffic_source' dim");
-    expect(sql).not.toContain("analytics_transactions");
+    expect(sql).toContain("'utm_source' dim");
+    // The ONLY analytics_transactions access is the trial-utm lookup CTE.
+    const scans = sql.match(/FROM analytics_transactions[^\n]*/g) ?? [];
+    expect(scans).toHaveLength(1);
+    expect(sql).toContain("SELECT transaction_id, utm_source");
+    expect(sql).toContain("tutm.transaction_id = fcm.trial_transaction_id");
+    // FINAL scans stay in standalone CTEs — never FINAL directly in a join list.
+    expect(sql).not.toMatch(/FINAL\s+(AS\s+\w+\s+)?(LEFT|INNER|JOIN)/);
     expect(params.warehouse_version).toBe("wh_1");
   });
 
@@ -166,44 +194,47 @@ describe("ClickHouse cohort membership materialization", () => {
   });
 
   it("skips a rebuild when the active snapshot already matches the warehouse version", async () => {
-    const upserts: unknown[] = [];
+    const rpcCalls: SnapshotRpcCall[] = [];
     const result = await rebuildCohortMembership({
       authUserId: "user-1",
       supabase: fakeSupabase({
         status: "completed",
         active_warehouse_version: "wh_abc123",
-        active_classification_version: "cohort_classifier_v1_dynamic_sql",
+        active_classification_version: COHORT_CLASSIFICATION_VERSION,
         active_generated_at: "2026-07-12T00:00:00Z",
         users_classified: 4,
         duplicate_users: 0,
         diagnostics: { validation: { status: "PASS" } },
-      }, upserts),
+      }, rpcCalls),
       clickhouse: fakeClickHouse(),
     });
     expect(result.rows_inserted).toBe(0);
     expect(result.unchanged_users).toBe(4);
-    expect(upserts).toHaveLength(0);
+    expect(rpcCalls).toHaveLength(0);
   });
 
   it("activates a completed snapshot only after rows are inserted", async () => {
-    const upserts: unknown[] = [];
+    const rpcCalls: SnapshotRpcCall[] = [];
     const commands: string[] = [];
     const result = await rebuildCohortMembership({
       authUserId: "user-1",
-      supabase: fakeSupabase(null, upserts),
+      supabase: fakeSupabase(null, rpcCalls),
       clickhouse: fakeClickHouse({ count: 4, commands }),
       force: true,
     });
     expect(commands.some((query) => query.includes("INSERT INTO fact_user_cohorts"))).toBe(true);
     expect(result.status).toBe("completed");
     expect(result.users_classified).toBe(4);
-    expect(JSON.stringify(upserts.at(-1))).toContain('"status":"completed"');
-    expect(JSON.stringify(upserts.at(-1))).toContain('"active_warehouse_version":"wh_abc123"');
-    expect(JSON.stringify(upserts.at(-1))).toContain('"validation":{"status":"PASS"');
+    expect(rpcCalls.map((call) => call.functionName)).toEqual([
+      "claim_clickhouse_cohort_snapshot_build",
+      "complete_clickhouse_cohort_snapshot_build",
+    ]);
+    expect(JSON.stringify(rpcCalls.at(-1)?.params)).toContain('"p_warehouse_version":"wh_abc123"');
+    expect(JSON.stringify(rpcCalls.at(-1)?.params)).toContain('"validation":{"status":"PASS"');
   });
 
   it("does not activate a built snapshot when membership validation fails", async () => {
-    const upserts: unknown[] = [];
+    const rpcCalls: SnapshotRpcCall[] = [];
     await expect(rebuildCohortMembership({
       authUserId: "user-1",
       supabase: fakeSupabase({
@@ -211,12 +242,12 @@ describe("ClickHouse cohort membership materialization", () => {
         active_warehouse_version: "wh_old",
         active_classification_version: "cohort_classifier_v1_dynamic_sql",
         diagnostics: { validation: { status: "PASS" } },
-      }, upserts),
+      }, rpcCalls),
       clickhouse: fakeClickHouse({ count: 4, validationFails: true }),
       force: true,
     })).rejects.toThrow("validation failed");
-    const failedPatch = JSON.stringify(upserts.at(-1));
-    expect(failedPatch).toContain('"status":"failed"');
+    expect(rpcCalls.at(-1)?.functionName).toBe("fail_clickhouse_cohort_snapshot_build");
+    const failedPatch = JSON.stringify(rpcCalls.at(-1)?.params);
     expect(failedPatch).toContain('"validation":{"status":"FAIL"');
     expect(failedPatch).not.toContain('"active_warehouse_version":"wh_abc123"');
   });
@@ -344,19 +375,54 @@ describe("ClickHouse cohort membership materialization", () => {
   });
 
   it("failed rebuild records failure without replacing the active snapshot", async () => {
-    const upserts: unknown[] = [];
+    const rpcCalls: SnapshotRpcCall[] = [];
     await expect(rebuildCohortMembership({
       authUserId: "user-1",
       supabase: fakeSupabase({
         status: "completed",
         active_warehouse_version: "wh_old",
         active_classification_version: "cohort_classifier_v1_dynamic_sql",
-      }, upserts),
+      }, rpcCalls),
       clickhouse: fakeClickHouse({ insertFails: true }),
       force: true,
     })).rejects.toThrow("insert failed");
-    const failedPatch = JSON.stringify(upserts.at(-1));
-    expect(failedPatch).toContain('"status":"failed"');
+    expect(rpcCalls.at(-1)?.functionName).toBe("fail_clickhouse_cohort_snapshot_build");
+    const failedPatch = JSON.stringify(rpcCalls.at(-1)?.params);
     expect(failedPatch).not.toContain("active_warehouse_version");
+  });
+
+  it("refuses to activate a rebuild whose CAS token was superseded", async () => {
+    const rpcCalls: SnapshotRpcCall[] = [];
+    await expect(rebuildCohortMembership({
+      authUserId: "user-1",
+      supabase: fakeSupabase(null, rpcCalls, { complete_clickhouse_cohort_snapshot_build: false }),
+      clickhouse: fakeClickHouse({ count: 4 }),
+      force: true,
+    })).rejects.toThrow("superseded");
+    const claimToken = rpcCalls.find((call) => call.functionName === "claim_clickhouse_cohort_snapshot_build")?.params.p_build_token;
+    const completeToken = rpcCalls.find((call) => call.functionName === "complete_clickhouse_cohort_snapshot_build")?.params.p_build_token;
+    expect(claimToken).toBeTruthy();
+    expect(completeToken).toBe(claimToken);
+    expect(rpcCalls.at(-1)?.functionName).toBe("fail_clickhouse_cohort_snapshot_build");
+  });
+
+  it("does not start a second rebuild while the snapshot lease is active", async () => {
+    const rpcCalls: SnapshotRpcCall[] = [];
+    const commands: string[] = [];
+    await expect(rebuildCohortMembership({
+      authUserId: "user-1",
+      supabase: fakeSupabase(null, rpcCalls, { claim_clickhouse_cohort_snapshot_build: false }),
+      clickhouse: fakeClickHouse({ commands }),
+      force: true,
+    })).rejects.toThrow("already in progress");
+    expect(commands.some((query) => query.includes("INSERT INTO fact_user_cohorts"))).toBe(false);
+  });
+
+  it("uses lease claim and build-token CAS predicates in the database migration", () => {
+    const sql = readFileSync("supabase/migrations/202607180001_add_cohort_snapshot_build_cas.sql", "utf8");
+    expect(sql).toContain("lease_expires_at <= now()");
+    expect(sql).toContain("and build_token = p_build_token");
+    expect(sql).toContain("and building_warehouse_version = p_warehouse_version");
+    expect(sql).toContain("grant execute on function public.complete_clickhouse_cohort_snapshot_build");
   });
 });

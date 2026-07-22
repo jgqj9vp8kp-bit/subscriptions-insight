@@ -24,8 +24,10 @@ import {
   optionFiltersApplied,
   optionFlagColumns,
   optionsDiagnostics,
+  utmSourceOptionBranch,
   type FilterOptionsResult,
 } from "./cohortFilterOptions.ts";
+import { splitMediaBuyerSelections } from "./mediaBuyerSelection.ts";
 import type {
   CohortAction,
   CohortAggregateRow,
@@ -342,6 +344,20 @@ ${memberWhere}
 GROUP BY c_date, c_funnel, c_camp`;
 }
 
+// Per-user authoritative first-trial utm_source as an IN-subquery over user ids.
+// argMin picks the utm_source OF the first successful trial (not the first
+// non-empty utm), matching the snapshot engine's trial_transaction_id lookup.
+function firstTrialUtmUserSubquery(utms: string[], prefix: string, params: Record<string, unknown>): string {
+  const placeholders = utms.map((value, index) => {
+    const key = `p_${prefix}_${index}`;
+    params[key] = value;
+    return `{${key}:String}`;
+  });
+  return `(SELECT user_id FROM (SELECT user_id, argMin(utm_source, (event_time, transaction_id)) first_trial_utm ` +
+    `FROM ${CH} FINAL WHERE auth_user_id = {auth_user_id:String} AND is_success = 1 AND transaction_type = 'trial' ` +
+    `GROUP BY user_id) WHERE first_trial_utm IN (${placeholders.join(", ")}))`;
+}
+
 // Member-level filters: every row in `fin` carries the same attributed
 // campaign/traffic and user-level dimensions for its user, so this keeps full
 // lifecycle/revenue rows for matching users and excludes whole non-matching users.
@@ -355,8 +371,15 @@ function memberFilterWhere(filters: CohortFilters, params: Record<string, unknow
   if (country) conds.push(country);
   const card = inClause("u_card_type", filters.card_type, "card", params);
   if (card) conds.push(card);
-  const media = inClause("u_media_buyer", filters.media_buyer, "mb", params);
-  if (media) conds.push(media);
+  // Media Buyer dropdown: names filter u_media_buyer exactly as before;
+  // "utm:<value>" selections admit users by first-trial utm_source (union).
+  const { buyers, utms } = splitMediaBuyerSelections(filters.media_buyer);
+  const mediaParts: string[] = [];
+  const media = inClause("u_media_buyer", buyers, "mb", params);
+  if (media) mediaParts.push(media);
+  if (utms.length) mediaParts.push(`uid IN ${firstTrialUtmUserSubquery(utms, "mbutm", params)}`);
+  if (mediaParts.length === 1) conds.push(mediaParts[0]);
+  else if (mediaParts.length > 1) conds.push(`(${mediaParts.join(" OR ")})`);
   return conds.length ? `WHERE ${conds.join(" AND ")}` : "";
 }
 
@@ -564,7 +587,15 @@ async function scanDiagnostics(client: ClickHouseClientLike, authUserId: string)
 
 export async function fxDiagnostics(client: ClickHouseClientLike, authUserId: string, mediaBuyer: string[]): Promise<CohortFxDiagnostics> {
   const params: Record<string, unknown> = { auth_user_id: authUserId };
-  const mb = mediaBuyer.length ? ` AND ${inClause("media_buyer", mediaBuyer, "fxmb", params)}` : "";
+  // Same union semantics as the cohort member filter: buyer names scope by the
+  // transaction-level media_buyer, "utm:<value>" selections scope by the user's
+  // authoritative first-trial utm_source.
+  const { buyers, utms } = splitMediaBuyerSelections(mediaBuyer);
+  const mbParts: string[] = [];
+  const buyerClause = inClause("media_buyer", buyers, "fxmb", params);
+  if (buyerClause) mbParts.push(buyerClause);
+  if (utms.length) mbParts.push(`user_id IN ${firstTrialUtmUserSubquery(utms, "fxmbutm", params)}`);
+  const mb = mbParts.length ? ` AND (${mbParts.join(" OR ")})` : "";
   const rs = await client.query({
     query: `SELECT
       count() AS transactions_total,
@@ -697,10 +728,10 @@ export function buildFilterOptionsQuery(nreq: NormalizedCohortRequest, params: R
   return `WITH
 ${classifierSQL(`a.auth_user_id = {auth_user_id:String}`, "")}
 , trialrow AS (
-  SELECT uid canonical_user_id, any(c_date) cohort_date,
-    any(c_funnel) funnel, any(c_camp) campaign_path,
-    any(c_campaign_id) campaign_id, any(c_traffic_source) traffic_source,
-    any(u_country) country, any(u_card_type) card_type, any(u_media_buyer) media_buyer,
+  SELECT uid canonical_user_id, c_date cohort_date,
+    c_funnel funnel, c_camp campaign_path,
+    c_campaign_id campaign_id, c_traffic_source traffic_source,
+    u_country country, u_card_type card_type, u_media_buyer media_buyer,
     argMin(cur, (ets, tprio, tid)) currency,
     if(
       countIf(is_success = 1 AND lt NOT IN ('upsell','token_purchase')) = 0,
@@ -708,15 +739,26 @@ ${classifierSQL(`a.auth_user_id = {auth_user_id:String}`, "")}
       concat('$', toString(argMinIf(round(g, 2), (ets, tprio, tid), is_success = 1 AND lt NOT IN ('upsell','token_purchase'))))
     ) price_plan
   FROM fin
-  GROUP BY uid
+  GROUP BY uid, c_date, c_funnel, c_camp, c_campaign_id, c_traffic_source,
+    u_country, u_card_type, u_media_buyer
+),
+futm AS (
+  SELECT user_id, argMin(utm_source, (event_time, transaction_id)) trial_utm
+  FROM ${CH} FINAL
+  WHERE auth_user_id = {auth_user_id:String} AND is_success = 1 AND transaction_type = 'trial'
+  GROUP BY user_id
 ),
 members AS (
-  SELECT canonical_user_id, funnel, campaign_path, campaign_id, traffic_source,
-    media_buyer, country, card_type, currency, price_plan,
-    ${optionFlagColumns(filters, params)}
-  FROM trialrow${dateConds.length ? `\n  WHERE ${dateConds.join(" AND ")}` : ""}
+  SELECT trialrow.canonical_user_id canonical_user_id, trialrow.funnel funnel, trialrow.campaign_path campaign_path,
+    trialrow.campaign_id campaign_id, trialrow.traffic_source traffic_source,
+    trialrow.media_buyer media_buyer, trialrow.country country, trialrow.card_type card_type,
+    trialrow.currency currency, trialrow.price_plan price_plan,
+    ifNull(futm.trial_utm, '') trial_utm,
+    ${optionFlagColumns(filters, params, "ifNull(futm.trial_utm, '')")}
+  FROM trialrow LEFT JOIN futm ON futm.user_id = trialrow.canonical_user_id${dateConds.length ? `\n  WHERE ${dateConds.join(" AND ")}` : ""}
 )
 ${optionBranches(filters)}
+UNION ALL ${utmSourceOptionBranch(filters, params, "trial_utm")}
 FORMAT JSONEachRow`;
 }
 

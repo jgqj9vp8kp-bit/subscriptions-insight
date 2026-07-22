@@ -3,7 +3,8 @@ import type { SubscriptionClean } from "@/types/subscriptions";
 import { isSubscriptionActiveNow } from "@/services/subscriptionTransform";
 import { countryCodeForUserTransactions, normalizeCountryCode } from "@/services/userCountry";
 import { CARD_TYPE_VALUES, cardTypeForUserTransactions } from "@/services/userCardType";
-import { MEDIA_BUYER_VALUES, mediaBuyerForUserTransactions } from "@/services/userMediaBuyer";
+import { mediaBuyerForUserTransactions } from "@/services/userMediaBuyer";
+import { splitMediaBuyerSelections, userMatchesMediaBuyerSelection, type MediaBuyerSelectionSplit } from "@/services/mediaBuyerSelection";
 import { failedPaymentStateForUserTransactions } from "@/services/paymentFailures";
 import { buildCohortId } from "@/services/cohortIdentity";
 import {
@@ -222,7 +223,8 @@ export interface ComputeCohortsOptions {
   maxRenewalDepth?: number;
   selectedCountries?: string[];
   selectedCardTypes?: CardType[];
-  selectedMediaBuyers?: MediaBuyer[];
+  /** Media buyer names and/or "utm:<value>" selections (one dropdown, union). */
+  selectedMediaBuyers?: Array<MediaBuyer | string>;
   /** Filter users by the ORIGINAL currency of their trial charge (e.g. ["MXN"]). */
   selectedCurrencies?: string[];
   /** Reference "now" (ms) for currently-active subscription metrics. Defaults to Date.now() once per call. */
@@ -279,9 +281,9 @@ function normalizeCardTypeFilter(cardTypes: unknown): Set<CardType> {
   return new Set(cardTypes.filter((value): value is CardType => CARD_TYPE_VALUES.includes(value as CardType)));
 }
 
-function normalizeMediaBuyerFilter(mediaBuyers: unknown): Set<MediaBuyer> {
-  if (!Array.isArray(mediaBuyers)) return new Set();
-  return new Set(mediaBuyers.filter((value): value is MediaBuyer => MEDIA_BUYER_VALUES.includes(value as MediaBuyer)));
+function normalizeMediaBuyerFilter(mediaBuyers: unknown): MediaBuyerSelectionSplit {
+  if (!Array.isArray(mediaBuyers)) return { buyers: [], utms: [] };
+  return splitMediaBuyerSelections(mediaBuyers);
 }
 
 export function computeKpis(txs: Transaction[]): Kpis {
@@ -706,7 +708,7 @@ export function computeCohortsWithDiagnostics(
   const userFilteredIds = new Set<string>();
   const txsByUserForFilters = new Map<string, Transaction[]>();
   const hasUserFilters =
-    selectedCountries.size > 0 || selectedCardTypes.size > 0 || selectedMediaBuyers.size > 0 || selectedCurrencies.size > 0;
+    selectedCountries.size > 0 || selectedCardTypes.size > 0 || selectedMediaBuyers.buyers.length > 0 || selectedMediaBuyers.utms.length > 0 || selectedCurrencies.size > 0;
   if (hasUserFilters) {
     for (const tx of analyticsTxs) {
       const list = txsByUserForFilters.get(tx.user_id) ?? [];
@@ -717,7 +719,7 @@ export function computeCohortsWithDiagnostics(
       const country = countryCodeForUserTransactions(list);
       if (selectedCountries.size > 0 && (!country || !selectedCountries.has(country))) return;
       if (selectedCardTypes.size > 0 && !selectedCardTypes.has(cardTypeForUserTransactions(list))) return;
-      if (selectedMediaBuyers.size > 0 && !selectedMediaBuyers.has(mediaBuyerForUserTransactions(list).media_buyer)) return;
+      if (!userMatchesMediaBuyerSelection(list, selectedMediaBuyers)) return;
       if (selectedCurrencies.size > 0) {
         const currency = currencyForUserTransactions(list);
         if (!currency || !selectedCurrencies.has(currency)) return;

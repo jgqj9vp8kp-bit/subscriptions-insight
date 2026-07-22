@@ -124,7 +124,7 @@ const VALID_TYPES: TransactionType[] = [
 ];
 const VALID_STATUSES: TransactionStatus[] = ["success", "failed", "refunded", "chargeback"];
 const VALID_FUNNELS: Funnel[] = ["past_life", "soulmate", "starseed", "unknown"];
-const VALID_SOURCES: TrafficSource[] = ["facebook", "tiktok", "google", "unknown"];
+const VALID_SOURCES: TrafficSource[] = ["facebook", "tiktok", "google", "organic", "direct", "unknown"];
 
 function coerceType(raw: string): TransactionType {
   const v = raw.toLowerCase().trim().replace(/[\s-]+/g, "_");

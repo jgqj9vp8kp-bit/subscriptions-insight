@@ -76,6 +76,8 @@ export interface CohortRequest {
   now?: string;
   /** For action=details: the exact cohort to expand. */
   cohort_key?: { cohort_date: string; funnel: string; campaign_path: string };
+  /** Authenticated, server-flagged runtime allocation diagnostics controls. */
+  fb_allocation_diagnostics?: import("./fbAllocationDiagnostics.ts").FbAllocationDiagnosticsRequest | null;
 }
 
 // One aggregated cohort. Mirrors the transaction-derived subset of the client
@@ -140,24 +142,32 @@ export interface CohortAggregateRow {
   fx_missing_transactions: number;
   fx_missing_amount: number;
 
-  // FB Analytics metrics joined by (campaign_id, cohort_date) from
-  // fact_facebook_stats (see fbCohortStats.ts). Optional: absent on responses
-  // from the dynamic fallback path or pre-FB cached bundles.
-  fb_spend?: number;
+  // FB Analytics user-cost metrics. Selected-period Campaign CPP is assigned
+  // per authoritative user by campaign_id; Cohort membership is unchanged.
+  fb_spend?: number | null;
   fb_currency?: string | null;
-  fb_purchases?: number;
+  fb_purchases?: number | null;
   fb_cpp?: number | null;
-  fb_impressions?: number;
-  fb_reach?: number;
-  fb_clicks?: number;
-  fb_link_clicks?: number;
+  fb_impressions?: number | null;
+  fb_reach?: number | null;
+  fb_clicks?: number | null;
+  fb_link_clicks?: number | null;
   fb_ctr?: number | null;
   fb_cpc?: number | null;
   fb_cpm?: number | null;
-  fb_purchase_value?: number;
+  fb_purchase_value?: number | null;
   fb_roas?: number | null;
   fb_campaigns_matched?: number;
   fb_match_status?: string;
+  fb_reporting_date?: string | null;
+  fb_campaign_cpp?: number | null;
+  fb_user_cpp?: number | null;
+  fb_matched_users?: number;
+  fb_unmatched_users?: number;
+  fb_campaign_coverage?: number | null;
+  fb_cpp_source?: string;
+  fb_timezone?: string | null;
+  coverage_rate?: number | null;
 
   // Non-reversible id-hash sets for cross-cohort dedup of the totals row only.
   dedup: {
@@ -219,6 +229,10 @@ export interface CohortFilterOptions {
   country: Array<{ country_code: string; user_count: number }>;
   card_type: Array<{ card_type: string; trial_count: number }>;
   media_buyer: Array<{ media_buyer: string; trial_count: number }>;
+  /** Authoritative first-trial utm_source values NOT already represented by a
+   * media buyer name. Rendered inside the Media Buyer dropdown as "UTM: <value>"
+   * and selected via the "utm:<value>" sentinel in filters.media_buyer. */
+  utm_source: Array<{ utm_source: string; trial_count: number }>;
 }
 
 /** The dimensions that get a cascading, self-excluded option list. */
@@ -328,10 +342,12 @@ export interface CohortResponse {
   filter_options_diagnostics?: CohortFilterOptionsDiagnostics;
   fx_diagnostics?: CohortFxDiagnostics;
   token_diagnostics?: CohortTokenDiagnostics;
-  /** FB Analytics totals over deduplicated (campaign_id, date) pairs of the visible rows. */
+  /** FB Analytics totals aggregated from per-user CPP assignments. */
   fb_totals?: import("./fbCohortStats.ts").FbCohortTotals;
   /** FB join health for this bundle (source rows, match rate, freshness, warehouse version). */
   fb_diagnostics?: import("./fbCohortStats.ts").FbCohortDiagnostics;
+  /** Feature-flagged Campaign/reporting-date allocation diagnostics page. */
+  fb_allocation_diagnostics?: import("./fbAllocationDiagnostics.ts").FbAllocationDiagnosticsPage;
   diagnostics: CohortDiagnostics;
   error?: string;
 }

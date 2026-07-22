@@ -42,6 +42,9 @@ interface MemberRow {
   card_type: string;
   currency: string;
   price_plan: string;
+  /** Authoritative first-trial utm_source (the value the trial-utm lookup CTE
+   * would join in); "" when the trial carried none. */
+  trial_utm?: string;
 }
 
 function member(id: string, over: Partial<MemberRow> = {}): MemberRow {
@@ -64,12 +67,12 @@ function member(id: string, over: Partial<MemberRow> = {}): MemberRow {
 // soulmate/soulmate-sketch users are US+CA only. The other funnel/path carries the
 // GEOs that must NOT appear once soulmate-sketch is selected.
 const MEMBERS: MemberRow[] = [
-  member("u1", { country: "US", card_type: "visa", media_buyer: "Alex" }),
-  member("u2", { country: "US", card_type: "mastercard", media_buyer: "Alex" }),
-  member("u3", { country: "CA", card_type: "visa", media_buyer: "Jamie", currency: "CAD" }),
+  member("u1", { country: "US", card_type: "visa", media_buyer: "Alex", trial_utm: "int1" }),
+  member("u2", { country: "US", card_type: "mastercard", media_buyer: "Alex", trial_utm: "int2" }),
+  member("u3", { country: "CA", card_type: "visa", media_buyer: "Jamie", currency: "CAD", trial_utm: "int1" }),
   member("u4", { funnel: "soulmate", campaign_path: "soulmate-quiz", country: "DE", currency: "EUR" }),
   member("u5", { funnel: "soulmate", campaign_path: "soulmate-quiz", country: "BR" }),
-  member("u6", { funnel: "astro", campaign_path: "astro-natal", country: "AE", campaign_id: "cid_9", media_buyer: "Sam" }),
+  member("u6", { funnel: "astro", campaign_path: "astro-natal", country: "AE", campaign_id: "cid_9", media_buyer: "Sam", trial_utm: "4" }),
   member("u7", { funnel: "astro", campaign_path: "astro-natal", country: "AR", campaign_id: "cid_9" }),
   member("u8", { funnel: "astro", campaign_path: "astro-natal", country: "AU", campaign_id: "cid_9" }),
   // Same user id must never be double-counted across its own row (uniqExact).
@@ -103,10 +106,23 @@ function evaluateOptionsSql(sql: string, params: Record<string, unknown>, rows: 
   })();
 
   // 1. Pass flags: `(<col> IN (<params>)) AS m_<dim>` or `1 AS m_<dim>`.
+  // media_buyer may also carry the UTM union:
+  //   `(media_buyer IN (…) OR ifNull(<utm col>, '') IN (…)) AS m_media_buyer`
+  // or, with only UTM selections, `(ifNull(<utm col>, '') IN (…)) AS m_media_buyer`.
   const flags = new Map<string, (row: MemberRow) => boolean>();
+  const trialUtm = (row: MemberRow) => String(row.trial_utm ?? "");
   for (const [, column, values, dim] of cteBlock.matchAll(/\((\w+) IN \(([^)]*)\)\) AS m_(\w+)/g)) {
     const allowed = new Set(resolveParams(values, params));
     flags.set(dim, (row) => allowed.has(String(row[column as keyof MemberRow] ?? "")));
+  }
+  for (const [, values, dim] of cteBlock.matchAll(/\(ifNull\([^)]+\) IN \(([^)]*)\)\) AS m_(\w+)/g)) {
+    const allowed = new Set(resolveParams(values, params));
+    flags.set(dim, (row) => allowed.has(trialUtm(row)));
+  }
+  for (const [, column, buyerValues, utmValues] of cteBlock.matchAll(/\((\w+) IN \(([^)]*)\) OR ifNull\([^)]+\) IN \(([^)]*)\)\) AS m_media_buyer/g)) {
+    const buyers = new Set(resolveParams(buyerValues, params));
+    const utms = new Set(resolveParams(utmValues, params));
+    flags.set("media_buyer", (row) => buyers.has(String(row[column as keyof MemberRow] ?? "")) || utms.has(trialUtm(row)));
   }
   for (const [, dim] of cteBlock.matchAll(/\s1 AS m_(\w+)/g)) {
     if (!flags.has(dim)) flags.set(dim, () => true);
@@ -114,9 +130,11 @@ function evaluateOptionsSql(sql: string, params: Record<string, unknown>, rows: 
   const missing = DIMENSIONS.filter((dim) => !flags.has(dim));
   if (missing.length) throw new Error(`members CTE is missing pass flags: ${missing.join(", ")}`);
 
-  // 2. Base WHERE date range (applies to every dimension).
-  const from = cteBlock.match(/(?:toString\()?cohort_date\)? >= \{(\w+):String\}/);
-  const to = cteBlock.match(/(?:toString\()?cohort_date\)? <= \{(\w+):String\}/);
+  // 2. Base WHERE date range (applies to every dimension). The materialized
+  // builder binds it in the fcm CTE (before the trial-utm join), the dynamic
+  // fallback in the members CTE — search the whole statement.
+  const from = sql.match(/(?:toString\()?cohort_date\)? >= \{(\w+):String\}/);
+  const to = sql.match(/(?:toString\()?cohort_date\)? <= \{(\w+):String\}/);
   const inDateRange = (row: MemberRow) =>
     (!from || row.cohort_date >= String(params[from[1]])) && (!to || row.cohort_date <= String(params[to[1]]));
   const base = rows.filter(inDateRange);
@@ -129,7 +147,15 @@ function evaluateOptionsSql(sql: string, params: Record<string, unknown>, rows: 
     const dim = head[1];
     const column = head[2];
     const required = [...chunk.matchAll(/m_(\w+) = 1/g)].map(([, d]) => d);
-    const scoped = base.filter((row) => required.every((d) => flags.get(d)!(row)));
+    let scoped = base.filter((row) => required.every((d) => flags.get(d)!(row)));
+    // The utm_source branch carries its own value conditions: non-empty and
+    // not one of the buyer-mapped utm values.
+    if (/trial_utm != ''/.test(chunk)) scoped = scoped.filter((row) => trialUtm(row) !== "");
+    const notIn = chunk.match(/trial_utm NOT IN \(([^)]*)\)/);
+    if (notIn) {
+      const excluded = new Set(resolveParams(notIn[1], params));
+      scoped = scoped.filter((row) => !excluded.has(trialUtm(row)));
+    }
 
     if (dim === "_scope") {
       out.push({ dim, value: "_scope", cnt: new Set(scoped.map((r) => r.canonical_user_id)).size });
@@ -137,7 +163,7 @@ function evaluateOptionsSql(sql: string, params: Record<string, unknown>, rows: 
     }
     const groups = new Map<string, Set<string>>();
     for (const row of scoped) {
-      const value = String(row[column as keyof MemberRow] ?? "");
+      const value = column === "trial_utm" ? trialUtm(row) : String(row[column as keyof MemberRow] ?? "");
       if (!groups.has(value)) groups.set(value, new Set());
       groups.get(value)!.add(row.canonical_user_id);
     }
@@ -285,6 +311,52 @@ describe("cohort filter options — cascading scope", () => {
     const result = filterOptionsFromRows(evaluateOptionsSql(sql, params, MEMBERS));
     expect(result.options.country.map((c) => c.country_code)).toEqual(["CA", "US"]);
   });
+
+  // ---- UTM entries of the Media Buyer dropdown ------------------------------
+
+  it("lists unmapped first-trial utm values with distinct-user counts; mapped utms never appear", () => {
+    const result = optionsFor();
+    // u1+u3 -> int1 (2), u2 -> int2 (1); u6's "4" is mapped to Ivan and excluded.
+    expect(result.options.utm_source).toEqual([
+      { utm_source: "int1", trial_count: 2 },
+      { utm_source: "int2", trial_count: 1 },
+    ]);
+  });
+
+  it("scopes the UTM list by the other filters but NOT by media_buyer itself", () => {
+    const scoped = optionsFor({ campaign_path: ["soulmate-quiz"] });
+    expect(scoped.options.utm_source).toEqual([]);
+    // media_buyer's own filter must not narrow the UTM list (same dropdown).
+    const selfExcluded = optionsFor({ media_buyer: ["Jamie"] });
+    expect(selfExcluded.options.utm_source).toEqual([
+      { utm_source: "int1", trial_count: 2 },
+      { utm_source: "int2", trial_count: 1 },
+    ]);
+  });
+
+  it("a utm selection scopes every OTHER dropdown through the media_buyer flag", () => {
+    // utm:int1 -> u1 (US) + u3 (CA) only.
+    const result = optionsFor({ media_buyer: ["utm:int1"] });
+    expect(geo(result)).toEqual(["CA", "US"]);
+    expect(result.options.card_type.map((o) => o.card_type)).toEqual(["visa"]);
+  });
+
+  it("a mixed buyers+utm selection scopes other dropdowns as a union", () => {
+    // Jamie -> u3 (CA); utm:int2 -> u2 (US).
+    const result = optionsFor({ media_buyer: ["Jamie", "utm:int2"] });
+    expect(geo(result)).toEqual(["CA", "US"]);
+  });
+
+  it("the fallback engine lists the SAME utm options", () => {
+    const nreq = normalizeCohortRequest({ filters: {} } as CohortRequest);
+    const params: Record<string, unknown> = { auth_user_id: "auth_1" };
+    const sql = buildFilterOptionsQuery(nreq, params);
+    const result = filterOptionsFromRows(evaluateOptionsSql(sql, params, MEMBERS));
+    expect(result.options.utm_source).toEqual([
+      { utm_source: "int1", trial_count: 2 },
+      { utm_source: "int2", trial_count: 1 },
+    ]);
+  });
 });
 
 // ---- The Edge entrypoint carries the filters end to end --------------------
@@ -298,6 +370,7 @@ describe("runMaterializedCohortOptions", () => {
     active_classification_version: "cv_1",
     active_generated_at: "2026-07-01T00:00:00.000Z",
     users_classified: MEMBERS.length,
+    duplicate_users: 0,
     source_transactions: 100,
     source_unique_users: MEMBERS.length,
     diagnostics: { validation: { status: "PASS" } },

@@ -8,9 +8,22 @@
 import type { ClickHouseSummary } from "@/services/clickhouse";
 
 // v3: CohortRow grew renewal_3_to_renewal_4_cr / 4→5 / 5→6.
-// v4: CohortRow grew the FB Analytics block (fb_spend…fb_match_status) and the
-// bundle carries fb_totals/fb_diagnostics — pre-FB bundles must be discarded.
-export const ANALYTICS_CACHE_SCHEMA_VERSION = 4;
+// v4: CohortRow grew the FB Analytics block (fb_spend…fb_match_status).
+// v5: FB Cohorts moved to the authoritative user → unique campaign/date
+// architecture and added spend reconciliation diagnostics; discard v4 bundles
+// so incorrect/stale row spend can never survive the rollout.
+// v6: shared campaign/date rows and unverified timezone joins now carry null
+// metrics; diagnostics split authoritative-unmatched from unrelated FB spend.
+// v7: FB Cohorts uses Campaign CPP assigned per authoritative user at the Meta
+// reporting date; discard every row-spend cache from the previous architecture.
+// v8: authenticated allocation diagnostics add full-scope summary, filters and
+// pagination; discard v7 Cohorts bundles that only contained a sliced row list.
+// v9: Cohorts adds source-scoped FB reconciliation. Discard v8 bundles so the
+// UI never renders missing source counts or the former all-user coverage label.
+// v10: Cohorts filter options add the utm_source list (UTM entries of the Media
+// Buyer dropdown). Discard v9 bundles so selection pruning never runs against a
+// response that predates the list and silently drops a "utm:<value>" selection.
+export const ANALYTICS_CACHE_SCHEMA_VERSION = 10;
 
 export const WAREHOUSE_VERSION_KEY = ["clickhouse", "warehouse-version"] as const;
 export const SUPPORT_WAREHOUSE_VERSION_KEY = ["clickhouse", "support-warehouse-version"] as const;

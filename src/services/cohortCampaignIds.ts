@@ -10,7 +10,7 @@ import {
 } from "@/services/cohortFiltering";
 import { CARD_TYPE_VALUES, cardTypeForUserTransactions } from "@/services/userCardType";
 import { countryCodeForUserTransactions, normalizeCountryCode } from "@/services/userCountry";
-import { MEDIA_BUYER_VALUES, mediaBuyerForUserTransactions } from "@/services/userMediaBuyer";
+import { splitMediaBuyerSelections, userMatchesMediaBuyerSelection, type MediaBuyerSelectionSplit } from "@/services/mediaBuyerSelection";
 import type { SubscriptionClean } from "@/types/subscriptions";
 import type { CardType, MediaBuyer, Transaction } from "@/services/types";
 
@@ -27,7 +27,7 @@ export interface CampaignIdOptionInput {
   trafficSourceFilter?: string;
   selectedCountries?: readonly string[];
   selectedCardTypes?: readonly CardType[];
-  selectedMediaBuyers?: readonly MediaBuyer[];
+  selectedMediaBuyers?: readonly (MediaBuyer | string)[];
   maxRenewalDepth?: number;
 }
 
@@ -42,22 +42,22 @@ function normalizeCardTypeFilter(cardTypes: readonly CardType[] = []): Set<CardT
   return new Set(cardTypes.filter((value): value is CardType => CARD_TYPE_VALUES.includes(value)));
 }
 
-function normalizeMediaBuyerFilter(mediaBuyers: readonly MediaBuyer[] = []): Set<MediaBuyer> {
-  return new Set(mediaBuyers.filter((value): value is MediaBuyer => MEDIA_BUYER_VALUES.includes(value)));
+function normalizeMediaBuyerFilter(mediaBuyers: readonly (MediaBuyer | string)[] = []): MediaBuyerSelectionSplit {
+  return splitMediaBuyerSelections(mediaBuyers);
 }
 
 function userMatchesFilters(
   list: Transaction[],
   countries: Set<string>,
   cardTypes: Set<CardType>,
-  mediaBuyers: Set<MediaBuyer>,
+  mediaBuyers: MediaBuyerSelectionSplit,
 ): boolean {
   if (countries.size > 0) {
     const country = countryCodeForUserTransactions(list);
     if (!country || !countries.has(country)) return false;
   }
   if (cardTypes.size > 0 && !cardTypes.has(cardTypeForUserTransactions(list))) return false;
-  if (mediaBuyers.size > 0 && !mediaBuyers.has(mediaBuyerForUserTransactions(list).media_buyer)) return false;
+  if (!userMatchesMediaBuyerSelection(list, mediaBuyers)) return false;
   return true;
 }
 

@@ -26,9 +26,11 @@ import {
   optionFiltersApplied,
   optionFlagColumns,
   optionsDiagnostics as buildOptionsDiagnostics,
+  utmSourceOptionBranch,
   type FilterOptionsResult,
 } from "./cohortFilterOptions.ts";
-import { computeFbCohortStats, fbCohortRowKey } from "./fbCohortStats.ts";
+import { splitMediaBuyerSelections } from "./mediaBuyerSelection.ts";
+import { computeFbCohortStats, fbCohortRowKey, unavailableFbCohortStats } from "./fbCohortStats.ts";
 import type {
   CohortFilters,
   CohortRequest,
@@ -36,7 +38,10 @@ import type {
 } from "./cohortContract.ts";
 
 export const COHORT_SNAPSHOT_NAME = "fact_user_cohorts";
-export const COHORT_CLASSIFICATION_VERSION = "cohort_classifier_v1_dynamic_sql";
+// v2 makes the authoritative attribution columns explicit members of the
+// per-user grain (no any(campaign_id) copy step). Bumping forces a validated
+// snapshot rebuild on rollout instead of silently reusing the v1 materialization.
+export const COHORT_CLASSIFICATION_VERSION = "cohort_classifier_v2_authoritative_attribution";
 
 export type CohortSnapshotStatus = "never_started" | "building" | "completed" | "failed";
 
@@ -49,6 +54,8 @@ export interface CohortSnapshotState {
   active_generated_at: string | null;
   building_warehouse_version: string | null;
   building_classification_version: string | null;
+  build_token?: string | null;
+  lease_expires_at?: string | null;
   started_at: string | null;
   finished_at: string | null;
   duration_ms: number | null;
@@ -112,7 +119,13 @@ function s(value: unknown): string {
 }
 
 function validationPassed(value: unknown): boolean {
-  return Boolean(value && typeof value === "object" && (value as { status?: unknown }).status === "PASS");
+  if (!value || typeof value !== "object") return false;
+  const validation = value as { status?: unknown; duplicate_users?: unknown; dynamic_users?: unknown; materialized_users?: unknown };
+  if (validation.status !== "PASS") return false;
+  if (validation.duplicate_users != null && n(validation.duplicate_users) !== 0) return false;
+  if (validation.dynamic_users != null && validation.materialized_users != null
+    && n(validation.dynamic_users) !== n(validation.materialized_users)) return false;
+  return true;
 }
 
 export function isCompleteValidatedCohortSnapshot(state: CohortSnapshotState | null | undefined): state is CohortSnapshotState {
@@ -121,6 +134,7 @@ export function isCompleteValidatedCohortSnapshot(state: CohortSnapshotState | n
       state.status === "completed" &&
       state.active_warehouse_version &&
       state.active_classification_version &&
+      state.duplicate_users === 0 &&
       validationPassed(state.diagnostics?.validation),
   );
 }
@@ -188,21 +202,20 @@ export async function getCohortSnapshotState(supabase: SupabaseLikeClient, authU
   return (data as CohortSnapshotState | null) ?? null;
 }
 
-async function upsertSnapshotState(
+async function snapshotBuildCas(
   supabase: SupabaseLikeClient,
-  patch: Partial<CohortSnapshotState> & { auth_user_id: string },
-): Promise<void> {
-  const { error } = await supabase
-    .from("clickhouse_cohort_snapshot_state")
-    .upsert(
-      {
-        snapshot_name: COHORT_SNAPSHOT_NAME,
-        ...patch,
-        updated_at: new Date().toISOString(),
-      },
-      { onConflict: "auth_user_id,snapshot_name" },
-    );
-  if (error) throw new Error(`Could not persist ClickHouse cohort snapshot state: ${error.message}`);
+  functionName:
+    | "claim_clickhouse_cohort_snapshot_build"
+    | "complete_clickhouse_cohort_snapshot_build"
+    | "fail_clickhouse_cohort_snapshot_build",
+  params: Record<string, unknown>,
+): Promise<boolean> {
+  if (!supabase.rpc) {
+    throw new Error("Snapshot rebuild CAS functions are unavailable; apply the snapshot build CAS migration before rebuilding.");
+  }
+  const { data, error } = await supabase.rpc(functionName, params);
+  if (error) throw new Error(`Could not update ClickHouse cohort snapshot lease: ${error.message}`);
+  return data === true;
 }
 
 export function buildCohortMembershipInsertSql(): string {
@@ -213,24 +226,25 @@ ${classifierSQL(`a.auth_user_id = {auth_user_id:String}`, "")}
 , membership AS (
   SELECT
     uid canonical_user_id,
-    any(c_date) cohort_date,
+    c_date cohort_date,
     argMin(et, (ets, tprio, tid)) trial_event_time,
     argMin(tid, (ets, tprio, tid)) trial_transaction_id,
-    any(u_normalized_email) normalized_email,
-    any(c_funnel) funnel,
-    any(c_camp) campaign_path,
-    any(c_campaign_id) campaign_id,
-    any(c_traffic_source) traffic_source,
-    any(u_media_buyer) media_buyer,
-    any(u_country) country,
-    any(u_card_type) card_type,
+    u_normalized_email normalized_email,
+    c_funnel funnel,
+    c_camp campaign_path,
+    c_campaign_id campaign_id,
+    c_traffic_source traffic_source,
+    u_media_buyer media_buyer,
+    u_country country,
+    u_card_type card_type,
     argMin(cur, (ets, tprio, tid)) currency,
     argMin(g, (ets, tprio, tid)) trial_amount_usd,
     max(u_source_updated_at) source_updated_at,
     countIf(is_success = 1 AND lt NOT IN ('upsell','token_purchase')) plan_candidates,
     argMinIf(round(g, 2), (ets, tprio, tid), is_success = 1 AND lt NOT IN ('upsell','token_purchase')) plan_price
   FROM fin
-  GROUP BY uid
+  GROUP BY uid, c_date, u_normalized_email, c_funnel, c_camp,
+    c_campaign_id, c_traffic_source, u_media_buyer, u_country, u_card_type
 )
 SELECT
   {auth_user_id:String} auth_user_id,
@@ -381,13 +395,13 @@ export async function rebuildCohortMembership(input: {
   const fingerprint = await getWarehouseFingerprint(input.clickhouse, input.authUserId);
   const classificationVersion = COHORT_CLASSIFICATION_VERSION;
   const generatedAt = new Date().toISOString();
+  const buildToken = crypto.randomUUID();
 
   if (
     !input.force &&
-    previousState?.status === "completed" &&
+    isCompleteValidatedCohortSnapshot(previousState) &&
     previousState.active_warehouse_version === fingerprint.warehouse_version &&
-    previousState.active_classification_version === classificationVersion &&
-    validationPassed(previousState.diagnostics?.validation)
+    previousState.active_classification_version === classificationVersion
   ) {
     return {
       status: "completed",
@@ -408,18 +422,20 @@ export async function rebuildCohortMembership(input: {
     };
   }
 
-  await upsertSnapshotState(input.supabase, {
-    auth_user_id: input.authUserId,
-    status: "building",
-    building_warehouse_version: fingerprint.warehouse_version,
-    building_classification_version: classificationVersion,
-    started_at: generatedAt,
-    finished_at: null,
-    last_error: null,
-    source_transactions: fingerprint.transaction_count,
-    source_unique_users: fingerprint.unique_users,
-    diagnostics: { warehouse: fingerprint },
+  const claimed = await snapshotBuildCas(input.supabase, "claim_clickhouse_cohort_snapshot_build", {
+    p_auth_user_id: input.authUserId,
+    p_build_token: buildToken,
+    p_warehouse_version: fingerprint.warehouse_version,
+    p_classification_version: classificationVersion,
+    p_started_at: generatedAt,
+    p_lease_seconds: 300,
+    p_source_transactions: fingerprint.transaction_count,
+    p_source_unique_users: fingerprint.unique_users,
+    p_diagnostics: { warehouse: fingerprint },
   });
+  if (!claimed) {
+    throw new Error("A cohort snapshot rebuild is already in progress for this account.");
+  }
 
   let failedDiagnostics: Record<string, unknown> | null = null;
   try {
@@ -469,25 +485,25 @@ export async function rebuildCohortMembership(input: {
       removed_or_invalidated: versionDiff.removed_or_invalidated,
       validation,
     };
-    await upsertSnapshotState(input.supabase, {
-      auth_user_id: input.authUserId,
-      status: "completed",
-      active_warehouse_version: fingerprint.warehouse_version,
-      active_classification_version: classificationVersion,
-      active_generated_at: generatedAt,
-      building_warehouse_version: null,
-      building_classification_version: null,
-      finished_at: new Date().toISOString(),
-      duration_ms: durationMs,
-      users_classified: rowsInserted,
-      rows_inserted: rowsInserted,
-      duplicate_users: duplicateUsers,
-      removed_or_invalidated: versionDiff.removed_or_invalidated,
-      source_transactions: fingerprint.transaction_count,
-      source_unique_users: fingerprint.unique_users,
-      diagnostics,
-      last_error: null,
+    const completed = await snapshotBuildCas(input.supabase, "complete_clickhouse_cohort_snapshot_build", {
+      p_auth_user_id: input.authUserId,
+      p_build_token: buildToken,
+      p_warehouse_version: fingerprint.warehouse_version,
+      p_classification_version: classificationVersion,
+      p_generated_at: generatedAt,
+      p_finished_at: new Date().toISOString(),
+      p_duration_ms: durationMs,
+      p_users_classified: rowsInserted,
+      p_rows_inserted: rowsInserted,
+      p_duplicate_users: duplicateUsers,
+      p_removed_or_invalidated: versionDiff.removed_or_invalidated,
+      p_source_transactions: fingerprint.transaction_count,
+      p_source_unique_users: fingerprint.unique_users,
+      p_diagnostics: diagnostics,
     });
+    if (!completed) {
+      throw new Error("Cohort snapshot rebuild was superseded; its result was not activated.");
+    }
     const nextState = await getCohortSnapshotState(input.supabase, input.authUserId).catch(() => null);
     return {
       status: "completed",
@@ -505,16 +521,14 @@ export async function rebuildCohortMembership(input: {
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown cohort membership rebuild error.";
-    await upsertSnapshotState(input.supabase, {
-      auth_user_id: input.authUserId,
-      status: "failed",
-      building_warehouse_version: fingerprint.warehouse_version,
-      building_classification_version: classificationVersion,
-      finished_at: new Date().toISOString(),
-      duration_ms: Date.now() - started,
-      last_error: message,
-      diagnostics: failedDiagnostics ? { ...failedDiagnostics, error: message } : { warehouse: fingerprint, error: message },
-    }).catch(() => undefined);
+    await snapshotBuildCas(input.supabase, "fail_clickhouse_cohort_snapshot_build", {
+      p_auth_user_id: input.authUserId,
+      p_build_token: buildToken,
+      p_finished_at: new Date().toISOString(),
+      p_duration_ms: Date.now() - started,
+      p_error: message,
+      p_diagnostics: failedDiagnostics ? { ...failedDiagnostics, error: message } : { warehouse: fingerprint, error: message },
+    }).catch(() => false);
     throw error;
   }
 }
@@ -530,11 +544,32 @@ export function activeCohortMemberWhere(filters: CohortFilters, params: Record<s
     });
     clauses.push(`${column} IN (${placeholders.join(", ")})`);
   };
+  const bindList = (values: string[], prefix: string) => values.map((value, index) => {
+    const key = `p_${prefix}_${index}`;
+    params[key] = value;
+    return `{${key}:String}`;
+  });
   addIn("fc.funnel", filters.funnel, "mfn");
   addIn("fc.campaign_path", filters.campaign_path, "mcp");
   addIn("fc.campaign_id", filters.campaign_id, "mcid");
   addIn("fc.traffic_source", filters.traffic_source, "mtsrc");
-  addIn("fc.media_buyer", filters.media_buyer, "mmb");
+  // Media Buyer dropdown: buyer names filter fc.media_buyer exactly as before;
+  // "utm:<value>" selections additionally admit users whose authoritative
+  // first-trial transaction carries that utm_source. Mixed selections are a
+  // union — multi-select semantics of one dropdown.
+  {
+    const { buyers, utms } = splitMediaBuyerSelections(filters.media_buyer);
+    const parts: string[] = [];
+    if (buyers.length) parts.push(`fc.media_buyer IN (${bindList(buyers, "mmb").join(", ")})`);
+    if (utms.length) {
+      parts.push(
+        `fc.trial_transaction_id IN (SELECT transaction_id FROM ${ANALYTICS_TRANSACTIONS_TABLE} FINAL ` +
+        `WHERE auth_user_id = {auth_user_id:String} AND utm_source IN (${bindList(utms, "mmbutm").join(", ")}))`,
+      );
+    }
+    if (parts.length === 1) clauses.push(parts[0]);
+    else if (parts.length > 1) clauses.push(`(${parts.join(" OR ")})`);
+  }
   addIn("fc.country", filters.country, "mcountry");
   addIn("fc.card_type", filters.card_type, "mcard");
   addIn("fc.currency", filters.currency, "mcur");
@@ -642,16 +677,34 @@ export function buildMaterializedFilterOptionsQuery(
     dateConds.push(`toString(cohort_date) <= {o_date_to:String}`);
   }
 
-  return `WITH members AS (
+  // The FINAL scans live in their own CTEs and are joined by CTE name — the
+  // production ClickHouse build rejects FINAL modifiers inside a join list.
+  // trial_utm is the authoritative first-trial utm_source (the utm_source of
+  // the snapshot's trial_transaction_id row); it feeds the media_buyer pass
+  // flag for "utm:<value>" selections and the extra utm_source option branch.
+  return `WITH fcm AS (
   SELECT canonical_user_id, funnel, campaign_path, campaign_id, traffic_source,
-    media_buyer, country, card_type, currency, price_plan,
-    ${optionFlagColumns(filters, params)}
+    media_buyer, country, card_type, currency, price_plan, trial_transaction_id
   FROM ${FACT_USER_COHORTS_TABLE} FINAL
   WHERE auth_user_id = {auth_user_id:String}
     AND warehouse_version = {warehouse_version:String}
     AND classification_version = {classification_version:String}${dateConds.length ? `\n    AND ${dateConds.join(" AND ")}` : ""}
+),
+tutm AS (
+  SELECT transaction_id, utm_source
+  FROM ${ANALYTICS_TRANSACTIONS_TABLE} FINAL
+  WHERE auth_user_id = {auth_user_id:String} AND utm_source != ''
+),
+members AS (
+  SELECT fcm.canonical_user_id canonical_user_id, fcm.funnel funnel, fcm.campaign_path campaign_path,
+    fcm.campaign_id campaign_id, fcm.traffic_source traffic_source, fcm.media_buyer media_buyer,
+    fcm.country country, fcm.card_type card_type, fcm.currency currency, fcm.price_plan price_plan,
+    ifNull(tutm.utm_source, '') trial_utm,
+    ${optionFlagColumns(filters, params, "ifNull(tutm.utm_source, '')")}
+  FROM fcm LEFT JOIN tutm ON tutm.transaction_id = fcm.trial_transaction_id
 )
 ${optionBranches(filters)}
+UNION ALL ${utmSourceOptionBranch(filters, params, "trial_utm")}
 FORMAT JSONEachRow`;
 }
 
@@ -720,6 +773,7 @@ export async function runMaterializedCohortList(input: {
   supabase: SupabaseLikeClient;
   clickhouse: ClickHouseClientLike;
   request: CohortRequest;
+  allocationDiagnosticsEnabled?: boolean;
 }): Promise<CohortResponse | null> {
   const state = await getCohortSnapshotState(input.supabase, input.authUserId).catch(() => null);
   const active = activeCohortSnapshotVersion(state);
@@ -752,11 +806,15 @@ export async function runMaterializedCohortList(input: {
   const totals = computeTotals(rows);
   const options = filterOptionsFromRows(optionRows, optionFiltersApplied(nreq.filters, nreq.dateFrom, nreq.dateTo));
 
-  // FB Analytics join (campaign_id + cohort_date): computed AFTER the cohort
-  // report so totals deduplicate campaign/day pairs over the rows that actually
-  // survived post-filters. A failure here never degrades the cohort report —
-  // FB fields are simply absent and the page renders "—".
+  // FB user-cost attribution is computed AFTER the cohort report so only users
+  // belonging to rows that survived post-filters receive Campaign CPP. Campaign
+  // Spend is never joined directly to a Cohorts row.
   const visibleKeys = new Set(rows.map((r) => fbCohortRowKey(r.cohort_date, r.funnel, r.campaign_path)));
+  const visibleRows = rows.map((row) => ({
+    cohort_date: row.cohort_date,
+    funnel: row.funnel,
+    campaign_path: row.campaign_path,
+  }));
   const fbStats = await computeFbCohortStats({
     clickhouse: input.clickhouse,
     supabase: input.supabase,
@@ -766,13 +824,14 @@ export async function runMaterializedCohortList(input: {
     dateFrom: nreq.dateFrom,
     dateTo: nreq.dateTo,
     visibleKeys,
-  }).catch(() => null);
-  if (fbStats) {
-    for (const row of rows) {
-      const fb = fbStats.perRow[fbCohortRowKey(row.cohort_date, row.funnel, row.campaign_path)];
-      if (fb) Object.assign(row, fb);
-      else Object.assign(row, { fb_spend: 0, fb_purchases: 0, fb_impressions: 0, fb_reach: 0, fb_clicks: 0, fb_link_clicks: 0, fb_purchase_value: 0, fb_cpp: null, fb_cpc: null, fb_cpm: null, fb_ctr: null, fb_roas: null, fb_currency: null, fb_campaigns_matched: 0, fb_match_status: "missing_cohort_campaign_id" });
-    }
+    visibleRows,
+    allocationDiagnosticsEnabled: Boolean(input.allocationDiagnosticsEnabled),
+    allocationDiagnosticsRequest: input.request.fb_allocation_diagnostics,
+  }).catch((error) => unavailableFbCohortStats(error, Boolean(input.allocationDiagnosticsEnabled)));
+  for (const row of rows) {
+    const fb = fbStats.perRow[fbCohortRowKey(row.cohort_date, row.funnel, row.campaign_path)];
+    if (fb) Object.assign(row, fb);
+    else Object.assign(row, { fb_spend: null, fb_purchases: null, fb_impressions: null, fb_reach: null, fb_clicks: null, fb_link_clicks: null, fb_purchase_value: null, fb_cpp: null, fb_cpc: null, fb_cpm: null, fb_ctr: null, fb_roas: null, fb_currency: null, fb_campaigns_matched: 0, fb_match_status: "missing_cohort_campaign_id", fb_reporting_date: null, fb_campaign_cpp: null, fb_user_cpp: null, fb_matched_users: 0, fb_unmatched_users: 0, fb_campaign_coverage: null, fb_cpp_source: "campaign_spend_div_fb_purchases", fb_timezone: null, coverage_rate: null });
   }
 
   return {
@@ -786,7 +845,11 @@ export async function runMaterializedCohortList(input: {
     filter_options_diagnostics: optionsDiagnostics(nreq, options, optionsDurationMs),
     fx_diagnostics: fx,
     token_diagnostics: tokenDiagnosticsFromRows(rows),
-    ...(fbStats ? { fb_totals: fbStats.totals, fb_diagnostics: fbStats.diagnostics } : {}),
+    ...({
+      fb_totals: fbStats.totals,
+      fb_diagnostics: fbStats.diagnostics,
+      ...(fbStats.allocationDiagnostics ? { fb_allocation_diagnostics: fbStats.allocationDiagnostics } : {}),
+    }),
     diagnostics: snapshotDiagnostics(state, nreq, subStatus, support, totals.support_users, currentWarehouse),
   };
 }
@@ -863,23 +926,25 @@ ${classifierSQL(`a.auth_user_id = {auth_user_id:String}`, "")}
 , dynamic AS (
   SELECT
     uid canonical_user_id,
-    any(c_date) cohort_date,
+    c_date cohort_date,
     argMin(et, (ets, tprio, tid)) trial_event_time,
     argMin(tid, (ets, tprio, tid)) trial_transaction_id,
-    any(c_funnel) funnel,
-    any(c_camp) campaign_path,
-    any(c_campaign_id) campaign_id,
-    any(c_traffic_source) traffic_source,
-    any(u_media_buyer) media_buyer,
-    any(u_country) country,
-    any(u_card_type) card_type,
+    c_funnel funnel,
+    c_camp campaign_path,
+    c_campaign_id campaign_id,
+    c_traffic_source traffic_source,
+    u_media_buyer media_buyer,
+    u_country country,
+    u_card_type card_type,
     argMin(cur, (ets, tprio, tid)) currency,
     if(
       countIf(is_success = 1 AND lt NOT IN ('upsell','token_purchase')) = 0,
       'Unknown',
       concat('$', toString(argMinIf(round(g, 2), (ets, tprio, tid), is_success = 1 AND lt NOT IN ('upsell','token_purchase'))))
     ) price_plan
-  FROM fin GROUP BY uid
+  FROM fin
+  GROUP BY uid, c_date, c_funnel, c_camp, c_campaign_id, c_traffic_source,
+    u_media_buyer, u_country, u_card_type
 ),
 materialized AS (
   SELECT canonical_user_id, toString(cohort_date) cohort_date, trial_event_time, trial_transaction_id,

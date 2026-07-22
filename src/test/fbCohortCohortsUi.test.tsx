@@ -8,11 +8,10 @@ import { render, screen, act, renderHook } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createElement, type ReactNode } from "react";
 import {
-  buildFbCohortJoinSql,
+  assembleFbUserCosts,
   computeFbCohortStats,
-  fbCohortMembersSql,
+  fbAuthoritativeUsersSql,
   fbCohortRowKey,
-  assembleFbCohortStats,
 } from "../../supabase/functions/_shared/clickhouse/fbCohortStats.ts";
 import { runMaterializedCohortList } from "../../supabase/functions/_shared/clickhouse/cohortMembership.ts";
 import type { ClickHouseClientLike, SupabaseLikeClient } from "../../supabase/functions/_shared/clickhouse/types.ts";
@@ -107,8 +106,10 @@ const FB_SYNC_STATE = {
 
 function fakeWarehouse(options: {
   listRows?: Array<Record<string, unknown>>;
-  fbPairs?: Array<Record<string, unknown>>;
+  fbUsers?: Array<Record<string, unknown>>;
+  fbMetrics?: Array<Record<string, unknown>>;
   fbSourceStats?: Record<string, unknown>;
+  fbSourceScoped?: Record<string, unknown>;
   fbJoinFails?: boolean;
 } = {}): ClickHouseClientLike {
   const listRows = options.listRows ?? [{
@@ -121,19 +122,49 @@ function fakeWarehouse(options: {
     insert: async () => undefined,
     query: async ({ query }) => ({
       json: async () => {
-        if (query.includes("LEFT JOIN fb f")) {
+        if (query.includes("authoritative_users") && query.includes("utc_date_from")) {
           if (options.fbJoinFails) throw new Error("fb join unavailable");
-          return options.fbPairs ?? [{
+          const users = options.fbUsers ?? Array.from({ length: 6 }, (_, index) => ({
+            canonical_user_id: `fb-user-${index}`, campaign_id: CAMPAIGN_A,
+          }));
+          return users.length ? [{ campaign_id: CAMPAIGN_A, authoritative_users: users.length, utc_date_from: "2026-07-14", utc_date_to: "2026-07-14" }] : [];
+        }
+        if (query.includes("authoritative_user_count")) {
+          if (options.fbJoinFails) throw new Error("fb user aggregation unavailable");
+          const users = options.fbUsers ?? Array.from({ length: 6 }, (_, index) => ({ canonical_user_id: `fb-user-${index}` }));
+          return users.length ? [{
             cohort_date: "2026-07-14", funnel: "soulmate", campaign_path: "soulmate-sketch",
-            campaign_id: CAMPAIGN_A, currency: "USD", matched: 1,
-            spend: 249.27, purchases: 6, impressions: 2823, reach: 0, clicks: 318, link_clicks: 0, purchase_value: 0,
+            campaign_id: CAMPAIGN_A, authoritative_user_count: users.length,
+          }] : [];
+        }
+        if (query.includes("GROUP BY campaign_id")) {
+          if (options.fbJoinFails) throw new Error("fb metrics unavailable");
+          return options.fbMetrics ?? [{
+            period_date_from: "2026-07-14", period_date_to: "2026-07-14", campaign_id: CAMPAIGN_A, ad_account_id: "act-1",
+            currency: "USD", reporting_timezones: "UTC", spend: 249.27, purchases: 6,
+            impressions: 2823, reach: 0, clicks: 318, link_clicks: 0, purchase_value: 0,
           }];
         }
         if (query.includes("raw_rows")) {
           if (options.fbJoinFails) throw new Error("fb stats unavailable");
           const yesterday = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
-          return [options.fbSourceStats ?? { raw_rows: 1065, campaign_day_rows: 1065, currencies: 1, last_stat_date: yesterday }];
+          return [options.fbSourceStats ?? { raw_rows: 1065, campaign_day_rows: 1065, last_stat_date: yesterday }];
         }
+        if (query.includes("facebook_qualified_users")) {
+          if (options.fbJoinFails) throw new Error("fb source diagnostics unavailable");
+          const users = options.fbUsers ?? Array.from({ length: 6 }, (_, index) => ({ canonical_user_id: `fb-user-${index}` }));
+          return [options.fbSourceScoped ?? {
+            all_cohorts_users: users.length,
+            facebook_qualified_users: users.length,
+            tiktok_users: 0,
+            google_users: 0,
+            organic_users: 0,
+            direct_users: 0,
+            unknown_source_users: 0,
+            other_source_users: 0,
+          }];
+        }
+        if (query.includes("snapshot_duplicate_users")) return [{ snapshot_rows: 10, snapshot_unique_users: 10, snapshot_duplicate_users: 0 }];
         if (query.includes("warehouse_hash")) {
           return [{ transaction_count: 100, unique_users: 10, max_row_version: "9", max_source_updated_at: "2026-07-16 00:00:00", warehouse_hash: "live" }];
         }
@@ -151,7 +182,11 @@ function fakeWarehouse(options: {
   };
 }
 
-async function runList(options: Parameters<typeof fakeWarehouse>[0] = {}, request: CohortRequest = { action: "list" }) {
+async function runList(
+  options: Parameters<typeof fakeWarehouse>[0] = {},
+  request: CohortRequest = { action: "list" },
+  allocationDiagnosticsEnabled = true,
+) {
   const response = await runMaterializedCohortList({
     authUserId: "user-1",
     supabase: fakeSupabaseTables({
@@ -160,6 +195,7 @@ async function runList(options: Parameters<typeof fakeWarehouse>[0] = {}, reques
     }),
     clickhouse: fakeWarehouse(options),
     request,
+    allocationDiagnosticsEnabled,
   });
   if (!response) throw new Error("materialized path unexpectedly unavailable");
   return response;
@@ -171,51 +207,51 @@ async function runList(options: Parameters<typeof fakeWarehouse>[0] = {}, reques
 describe("H. Filters and sorting", () => {
   it("H71: cohort date filter bounds the FB member scan with bound parameters", () => {
     const params: Record<string, unknown> = {};
-    const sql = fbCohortMembersSql({ filters: NO_FILTERS, dateFrom: "2026-07-01", dateTo: "2026-07-14", params });
-    expect(sql).toContain("cohort_date) >= {fbj_date_from:String}");
-    expect(sql).toContain("cohort_date) <= {fbj_date_to:String}");
-    expect(params.fbj_date_from).toBe("2026-07-01");
+    const sql = fbAuthoritativeUsersSql({ filters: NO_FILTERS, dateFrom: "2026-07-01", dateTo: "2026-07-14", params });
+    expect(sql).toContain("cohort_date) >= {fbu_date_from:String}");
+    expect(sql).toContain("cohort_date) <= {fbu_date_to:String}");
+    expect(params.fbu_date_from).toBe("2026-07-01");
   });
 
   it("H72: funnel filter scopes matched campaigns via bound parameters", () => {
     const params: Record<string, unknown> = {};
-    const sql = fbCohortMembersSql({ filters: { ...NO_FILTERS, funnel: ["soulmate"] }, dateFrom: null, dateTo: null, params });
-    expect(sql).toContain("funnel IN ({p_fbj_fn_0:String})");
-    expect(params.p_fbj_fn_0).toBe("soulmate");
+    const sql = fbAuthoritativeUsersSql({ filters: { ...NO_FILTERS, funnel: ["soulmate"] }, dateFrom: null, dateTo: null, params });
+    expect(sql).toContain("funnel IN ({p_fbu_fn_0:String})");
+    expect(params.p_fbu_fn_0).toBe("soulmate");
   });
 
   it("H73: campaign path filter scopes matched campaigns", () => {
     const params: Record<string, unknown> = {};
-    const sql = fbCohortMembersSql({ filters: { ...NO_FILTERS, campaign_path: ["soulmate-sketch"] }, dateFrom: null, dateTo: null, params });
-    expect(sql).toContain("campaign_path IN ({p_fbj_cp_0:String})");
-    expect(params.p_fbj_cp_0).toBe("soulmate-sketch");
+    const sql = fbAuthoritativeUsersSql({ filters: { ...NO_FILTERS, campaign_path: ["soulmate-sketch"] }, dateFrom: null, dateTo: null, params });
+    expect(sql).toContain("campaign_path IN ({p_fbu_cp_0:String})");
+    expect(params.p_fbu_cp_0).toBe("soulmate-sketch");
   });
 
   it("H74: campaign id filter scopes FB metrics to the selected campaigns", () => {
     const params: Record<string, unknown> = {};
-    const sql = fbCohortMembersSql({ filters: { ...NO_FILTERS, campaign_id: [CAMPAIGN_A] }, dateFrom: null, dateTo: null, params });
-    expect(sql).toContain("campaign_id IN ({p_fbj_cid_0:String})");
-    expect(params.p_fbj_cid_0).toBe(CAMPAIGN_A);
+    const sql = fbAuthoritativeUsersSql({ filters: { ...NO_FILTERS, campaign_id: [CAMPAIGN_A] }, dateFrom: null, dateTo: null, params });
+    expect(sql).toContain("IN (unhex(");
+    expect(sql).not.toContain(CAMPAIGN_A);
+    expect(Object.keys(params).some((key) => key.includes("cid"))).toBe(false);
   });
 
   it("H75: media buyer filter preserves member-attribution semantics (user-level scope, bound param)", () => {
     const params: Record<string, unknown> = {};
-    const sql = fbCohortMembersSql({ filters: { ...NO_FILTERS, media_buyer: ["Ivan"] }, dateFrom: null, dateTo: null, params });
-    expect(sql).toContain("media_buyer IN ({p_fbj_mb_0:String})");
-    expect(params.p_fbj_mb_0).toBe("Ivan");
+    const sql = fbAuthoritativeUsersSql({ filters: { ...NO_FILTERS, media_buyer: ["Ivan"] }, dateFrom: null, dateTo: null, params });
+    expect(sql).toContain("media_buyer IN ({p_fbu_mb_0:String})");
+    expect(params.p_fbu_mb_0).toBe("Ivan");
   });
 
   it("H76: a split filter (GEO) narrows members without duplicating spend — the pair still counts once", () => {
     const params: Record<string, unknown> = {};
-    const sql = fbCohortMembersSql({ filters: { ...NO_FILTERS, country: ["US"] }, dateFrom: null, dateTo: null, params });
-    expect(sql).toContain("country IN ({p_fbj_geo_0:String})");
+    const sql = fbAuthoritativeUsersSql({ filters: { ...NO_FILTERS, country: ["US"] }, dateFrom: null, dateTo: null, params });
+    expect(sql).toContain("country IN ({p_fbu_geo_0:String})");
     const KEY = fbCohortRowKey("2026-07-14", "soulmate", "soulmate-sketch");
-    const { totals } = assembleFbCohortStats(
-      [
-        { cohort_date: "2026-07-14", funnel: "soulmate", campaign_path: "soulmate-sketch", campaign_id: CAMPAIGN_A, currency: "USD", matched: 1, spend: 100, purchases: 1, impressions: 10, clicks: 1, link_clicks: 0, reach: 0, purchase_value: 0 },
-        { cohort_date: "2026-07-14", funnel: "soulmate", campaign_path: "soulmate-sketch", campaign_id: CAMPAIGN_A, currency: "USD", matched: 1, spend: 100, purchases: 1, impressions: 10, clicks: 1, link_clicks: 0, reach: 0, purchase_value: 0 },
-      ],
+    const { totals } = assembleFbUserCosts(
+      [{ canonical_user_id: "u1", cohort_date: "2026-07-14", trial_timestamp_utc: "2026-07-14T12:00:00Z", funnel: "soulmate", campaign_path: "soulmate-sketch", campaign_id: CAMPAIGN_A }],
+      [{ fb_reporting_date: "2026-07-14", campaign_id: CAMPAIGN_A, ad_account_id: "act-1", currency: "USD", spend: 100, purchases: 1 }],
       new Set([KEY]),
+      { defaultTimezone: "UTC" },
     );
     expect(totals.fb_spend).toBe(100);
   });
@@ -366,19 +402,25 @@ describe("J. Diagnostics and regression", () => {
 
   it("J92: fb_data_status is empty_source when the FB warehouse has zero rows", async () => {
     const response = await runList({
-      fbPairs: [],
+      fbUsers: [],
+      fbMetrics: [],
       fbSourceStats: { raw_rows: 0, campaign_day_rows: 0, currencies: 0, last_stat_date: "1970-01-01" },
     });
     expect(response.fb_diagnostics?.fb_data_status).toBe("empty_source");
   });
 
-  it("J93: FB backend failure never degrades the cohort report (rows survive, fb block absent)", async () => {
+  it("J93: FB backend failure keeps cohort rows and returns a safe structured unavailable status", async () => {
     const response = await runList({ fbJoinFails: true });
     expect(response.ok).toBe(true);
     expect(response.rows).toHaveLength(1);
     expect(response.rows[0].trial_users).toBe(10);
-    expect(response.fb_totals).toBeUndefined();
-    expect(response.fb_diagnostics).toBeUndefined();
+    expect(response.fb_totals?.fb_spend).toBeNull();
+    expect(response.fb_diagnostics).toMatchObject({
+      fb_data_status: "unavailable",
+      fb_error_code: "FB_ALLOCATION_UNAVAILABLE",
+      fb_error_message_safe: "FB allocation is temporarily unavailable. Cohorts data is still available; retry after checking the Facebook warehouse.",
+    });
+    expect(JSON.stringify(response.fb_diagnostics)).not.toContain("fb join unavailable");
   });
 
   it("J94: fb_data_status is sync_pending while an FB sync is running", async () => {
@@ -397,8 +439,28 @@ describe("J. Diagnostics and regression", () => {
   it("J95: match diagnostics reconcile — matched + unmatched equals visible rows", async () => {
     const response = await runList();
     const d = response.fb_diagnostics!;
-    expect(d.fb_matched_cohort_rows + d.fb_unmatched_cohort_rows).toBe(response.rows.length);
-    expect(d.fb_join_key).toBe("campaign_id+cohort_date");
+    expect(d.fb_matched_users + d.fb_unmatched_users).toBe(d.fb_users_in_cohorts);
+    expect(d.fb_join_key).toBe("campaign_id");
+    expect(d.fb_users_in_cohorts).toBe(6);
+    expect(d.fb_matched_users).toBe(6);
+    expect(d.fb_allocated_spend).toBe(249.27);
+    expect(d.coverage_rate).toBe(100);
+    expect(response.fb_allocation_diagnostics?.rows).toHaveLength(1);
+    expect(response.fb_allocation_diagnostics?.summary.sum_visible_cohort_spend).toBe(249.27);
+  });
+
+  it("J95b: the server feature flag removes detailed allocation diagnostics", async () => {
+    const response = await runList({}, { action: "list", fb_allocation_diagnostics: { page: 1 } }, false);
+    expect(response.fb_allocation_diagnostics).toBeUndefined();
+    expect(response.fb_diagnostics?.fb_allocation_diagnostics_enabled).toBe(false);
+    expect(response.fb_diagnostics).toMatchObject({
+      fb_all_cohorts_users: 6,
+      fb_facebook_qualified_users: 6,
+      fb_analytics_purchases: 6,
+      fb_allocated_purchases: 6,
+      fb_allocation_gap_purchases: 0,
+      fb_allocation_coverage: 100,
+    });
   });
 
   it("J96: existing Trial metric is byte-identical with and without the FB join", async () => {
@@ -456,16 +518,18 @@ describe("computeFbCohortStats contract", () => {
       dateFrom: null,
       dateTo: null,
       visibleKeys: new Set([KEY]),
+      visibleRows: [{ cohort_date: "2026-07-14", funnel: "soulmate", campaign_path: "soulmate-sketch" }],
       today: "2026-07-16",
+      timezoneConfig: { defaultTimezone: "UTC" },
     });
-    expect(bundle.perRow[KEY].fb_spend).toBe(249.27);
+    expect(bundle.perRow[KEY].fb_spend).toBeCloseTo(249.27, 10);
     expect(bundle.totals.fb_campaign_day_pairs).toBe(1);
     expect(bundle.diagnostics.fb_data_status).toBe("ready");
   });
 
   it("binds the snapshot version so FB members always match the active cohort snapshot", () => {
     const params: Record<string, unknown> = {};
-    const sql = buildFbCohortJoinSql({ filters: NO_FILTERS, dateFrom: null, dateTo: null, params });
+    const sql = fbAuthoritativeUsersSql({ filters: NO_FILTERS, dateFrom: null, dateTo: null, params });
     expect(sql).toContain("warehouse_version = {warehouse_version:String}");
     expect(sql).toContain("classification_version = {classification_version:String}");
   });

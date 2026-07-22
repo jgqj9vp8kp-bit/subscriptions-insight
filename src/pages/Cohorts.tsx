@@ -45,6 +45,7 @@ import {
   FB_COHORT_DEFAULT_COLUMNS,
   FB_COHORT_OPTIONAL_COLUMNS,
   fbCohortCellText,
+  fbUnavailableReason,
   formatFbInt,
   formatFbPct,
   formatFbRoas,
@@ -54,6 +55,7 @@ import { useFbWarehouseStatus } from "@/hooks/useFbWarehouse";
 import { buildCohortsExportTable, cohortsTableToCsv } from "@/services/cohortsExport";
 import { pruneInvalidCohortSelections } from "@/services/cohortFilterSelection";
 import type { CohortRequest } from "../../supabase/functions/_shared/clickhouse/cohortContract";
+import type { FbAllocationStatus, FbTimezoneSource } from "../../supabase/functions/_shared/clickhouse/fbCohortStats";
 import { useAuth } from "@/hooks/useAuth";
 import { hashUserScope } from "@/services/cohortsCache";
 import { useCohortsListQuery, useWarehouseVersion } from "@/hooks/useCohortsCache";
@@ -99,10 +101,24 @@ import { filterCohortsWithDiagnostics, filterTransactionsByTrialAttribution, nor
 import { buildCohortGeoOptions } from "@/services/cohortGeo";
 import { buildCampaignIdOptions, formatCampaignIdOptionLabel } from "@/services/cohortCampaignIds";
 import { buildCohortCardTypeOptions } from "@/services/cohortCardTypes";
-import { buildMediaBuyerOptions, formatMediaBuyerOptionLabel } from "@/services/cohortMediaBuyer";
+import { buildMediaBuyerOptions, buildUtmSourceOptions, formatMediaBuyerOptionLabel } from "@/services/cohortMediaBuyer";
+import {
+  UTM_OPTION_LABEL_PREFIX,
+  formatUtmSourceOptionLabel,
+  isMediaBuyerSelectionValue,
+  isUtmMediaBuyerSelection,
+  utmSelectionValue,
+  utmValueFromSelection,
+} from "@/services/mediaBuyerSelection";
 import { normalizeCountryCode } from "@/services/userCountry";
 import { CARD_TYPE_VALUES, cardTypeLabel } from "@/services/userCardType";
 import { MEDIA_BUYER_VALUES, mediaBuyerLabel } from "@/services/userMediaBuyer";
+
+/** Dropdown/summary label for one Media Buyer selection value. */
+function mediaBuyerSelectionLabel(value: MediaBuyer | string): string {
+  const utm = utmValueFromSelection(value);
+  return utm ? `${UTM_OPTION_LABEL_PREFIX}${utm}` : mediaBuyerLabel(value as MediaBuyer);
+}
 import { backfillTransactionCardTypesFromRawRows } from "@/services/palmerTransform";
 import { traceEvent, traceMark, traceMeasure } from "@/services/performanceTrace";
 import {
@@ -113,9 +129,9 @@ import {
 
 // Visual-only helpers — no data/logic impact.
 const HEAD_BASE =
-  "sticky top-0 z-40 bg-card h-8 px-2 whitespace-nowrap border-b border-border shadow-[0_1px_0_0_hsl(var(--border))] text-xs font-semibold text-muted-foreground select-none";
+  "sticky top-0 z-40 bg-card min-h-8 px-2 whitespace-nowrap border-b border-border shadow-[0_1px_0_0_hsl(var(--border))] text-xs font-semibold text-muted-foreground select-none";
 const HEAD_NUM = `${HEAD_BASE} text-right`;
-const CELL_BASE = "py-1 px-2 align-middle";
+const CELL_BASE = "py-1 px-2 align-middle overflow-hidden text-ellipsis";
 const CELL_NUM = `${CELL_BASE} text-right tabular-nums whitespace-nowrap text-sm`;
 const CELL_TXT = `${CELL_BASE} text-xs text-muted-foreground whitespace-nowrap`;
 // Left border marks the start of a logical section.
@@ -134,7 +150,7 @@ const DEFAULT_COHORTS_UI_STATE = {
   refundFilter: "all",
   selectedCountries: [] as string[],
   selectedCardTypes: [] as CardType[],
-  selectedMediaBuyers: [] as MediaBuyer[],
+  selectedMediaBuyers: [] as Array<MediaBuyer | string>,
   cohortDateFrom: "",
   cohortDateTo: "",
   dateSort: "desc" as "desc" | "asc",
@@ -147,8 +163,8 @@ const COLUMN_ORDER_BEFORE_RENEWALS = [
   "cohort_date",
   "campaign_path",
   "funnel",
-  // FB Analytics (campaign_id + cohort_date join): Spend / FB Purchases / CPP
-  // lead the row per spec; the remaining FB columns live at the end, hidden.
+  // FB Analytics user-cost metrics: selected-period Campaign CPP is assigned by
+  // campaign_id; Spend / matched FB Purchases / CPP lead the row.
   ...FB_COHORT_DEFAULT_COLUMNS,
   "trial_users",
   "support_users",
@@ -333,7 +349,7 @@ const STATIC_COLUMN_LABELS: Record<string, string> = {
   roas_d7: "ROAS D7",
   roas_1m: "ROAS 1M",
   roas_2m: "ROAS 2M",
-  // FB Analytics columns (server-joined by campaign_id + cohort_date).
+  // FB Analytics columns (aggregated from per-user Campaign CPP assignments).
   ...FB_COHORT_COLUMN_LABELS,
 };
 
@@ -1014,6 +1030,19 @@ function CohortMonetizationDetails({ cohort, nowMs }: { cohort: CohortRow; nowMs
 // Wait this long after the last multi-select change before re-running the cohort computations.
 const COHORT_FILTER_DEBOUNCE_MS = 300;
 
+const FB_ALLOCATION_STATUSES: FbAllocationStatus[] = [
+  "fully_allocated",
+  "underallocated",
+  "overallocated",
+  "no_fb_purchases",
+  "no_matched_users",
+  "campaign_unmatched",
+  "timezone_unverified",
+  "invalid_timezone",
+  "invalid_metrics",
+];
+const FB_TIMEZONE_SOURCES: FbTimezoneSource[] = ["payload", "account_config", "default_config", "unverified"];
+
 export default function CohortsPage() {
   const txs = useTransactions();
   const mountedRef = useRef(false);
@@ -1040,6 +1069,16 @@ export default function CohortsPage() {
   const rawPalmerRows = useDataStore((s) => s.rawPalmerRows);
   const dataStoreSource = useDataStore((s) => s.meta.source);
   const [legacyWarehouseLoadState, setLegacyWarehouseLoadState] = useState<"idle" | "loading" | "settled">("idle");
+  const [fbAllocationDiagnosticsUi, setFbAllocationDiagnosticsUi] = useState({
+    page: 1,
+    dateFrom: "",
+    dateTo: "",
+    campaignId: "",
+    campaignName: "",
+    adAccountId: "",
+    allocationStatus: "all" as FbAllocationStatus | "all",
+    timezoneSource: "all" as FbTimezoneSource | "all",
+  });
   const [legacyWarehouseProgress, setLegacyWarehouseProgress] = useState(getLegacyWarehouseLoadProgress);
   useEffect(
     () => subscribeLegacyWarehouseLoadProgress(() => setLegacyWarehouseProgress(getLegacyWarehouseLoadProgress())),
@@ -1098,7 +1137,7 @@ export default function CohortsPage() {
   const selectedMediaBuyers = useMemo(
     () =>
       Array.isArray(rawSelectedMediaBuyers)
-        ? rawSelectedMediaBuyers.filter((value): value is MediaBuyer => MEDIA_BUYER_VALUES.includes(value as MediaBuyer))
+        ? rawSelectedMediaBuyers.filter(isMediaBuyerSelectionValue)
         : [],
     [rawSelectedMediaBuyers],
   );
@@ -1142,10 +1181,10 @@ export default function CohortsPage() {
     () => (appliedSelectedCardTypes.length === CARD_TYPE_VALUES.length ? [] : appliedSelectedCardTypes),
     [appliedSelectedCardTypes],
   );
-  const effectiveSelectedMediaBuyers = useMemo(
-    () => (appliedSelectedMediaBuyers.length === MEDIA_BUYER_VALUES.length ? [] : appliedSelectedMediaBuyers),
-    [appliedSelectedMediaBuyers],
-  );
+  const effectiveSelectedMediaBuyers = useMemo(() => {
+    const hasUtmSelection = appliedSelectedMediaBuyers.some((value) => isUtmMediaBuyerSelection(value));
+    return !hasUtmSelection && appliedSelectedMediaBuyers.length === MEDIA_BUYER_VALUES.length ? [] : appliedSelectedMediaBuyers;
+  }, [appliedSelectedMediaBuyers]);
   const expandedCohortIds = useMemo(() => new Set(expandedCohortIdList), [expandedCohortIdList]);
   const updateUiState = (patch: Partial<typeof DEFAULT_COHORTS_UI_STATE>) => {
     markCohortsUiSettingsUpdated();
@@ -1450,8 +1489,21 @@ export default function CohortsPage() {
         refund_status: refundFilter === "has" ? "has" : refundFilter === "none" ? "none" : "all",
       },
       max_renewal_depth: maxRenewalColumns,
+      fb_allocation_diagnostics: {
+        page: fbAllocationDiagnosticsUi.page,
+        page_size: 100,
+        filters: {
+          date_from: fbAllocationDiagnosticsUi.dateFrom || null,
+          date_to: fbAllocationDiagnosticsUi.dateTo || null,
+          campaign_id: fbAllocationDiagnosticsUi.campaignId.trim() || null,
+          campaign_name: fbAllocationDiagnosticsUi.campaignName.trim() || null,
+          ad_account_id: fbAllocationDiagnosticsUi.adAccountId.trim() || null,
+          allocation_status: fbAllocationDiagnosticsUi.allocationStatus,
+          timezone_source: fbAllocationDiagnosticsUi.timezoneSource,
+        },
+      },
     }),
-    [cohortDateFrom, cohortDateTo, funnelFilter, campaignPathFilter, appliedSelectedCampaignIds, appliedTrafficSourceFilter, effectiveSelectedMediaBuyers, appliedSelectedCountries, effectiveSelectedCardTypes, selectedCurrencies, refundFilter, maxRenewalColumns],
+    [cohortDateFrom, cohortDateTo, funnelFilter, campaignPathFilter, appliedSelectedCampaignIds, appliedTrafficSourceFilter, effectiveSelectedMediaBuyers, appliedSelectedCountries, effectiveSelectedCardTypes, selectedCurrencies, refundFilter, maxRenewalColumns, fbAllocationDiagnosticsUi],
   );
   const {
     chResult,
@@ -1565,6 +1617,7 @@ export default function CohortsPage() {
   // True when ClickHouse aggregates drive the table, options and diagnostics
   // (so the legacy client compute below runs on an empty list).
   const clickHouseDriving = cohortsSource === "clickhouse" && chResult != null && !legacyRowsReady;
+  const fbAllocationDiagnostics = clickHouseDriving ? chResult?.fbAllocationDiagnostics : undefined;
   // In ClickHouse mode with ClickHouse driving, feed an EMPTY list to the legacy
   // compute + option builders so the browser performs NO transaction scan.
   const analyticsTxs = useMemo(
@@ -1745,7 +1798,33 @@ export default function CohortsPage() {
           }),
     [clickHouseDriving, chResult, analyticsTxs, subscriptions, cohortRowFilters, appliedTrafficSourceFilter, appliedSelectedCampaignIds, appliedSelectedCountries, effectiveSelectedCardTypes, maxRenewalColumns],
   );
-  const mediaBuyerOptionIds = useMemo(() => new Set(mediaBuyerOptions.map((option) => option.media_buyer)), [mediaBuyerOptions]);
+  const utmSourceOptions = useMemo(
+    () =>
+      clickHouseDriving && chResult?.filterOptions
+        ? chResult.filterOptions.utm_source
+        : buildUtmSourceOptions({
+            txs: analyticsTxs,
+            subscriptions,
+            filters: cohortRowFilters,
+            trafficSourceFilter: appliedTrafficSourceFilter,
+            selectedCampaignIds: appliedSelectedCampaignIds,
+            selectedCountries: appliedSelectedCountries,
+            selectedCardTypes: effectiveSelectedCardTypes,
+            maxRenewalDepth: maxRenewalColumns,
+          }),
+    [clickHouseDriving, chResult, analyticsTxs, subscriptions, cohortRowFilters, appliedTrafficSourceFilter, appliedSelectedCampaignIds, appliedSelectedCountries, effectiveSelectedCardTypes, maxRenewalColumns],
+  );
+  // ONE dropdown, three groups: media buyer names (existing order), then the
+  // UTM entries, then Unknown pinned last. UTM entries are an additional filter
+  // category (their users are a slice of Unknown), never a replacement.
+  const mediaBuyerFilterItems = useMemo(() => {
+    const buyers = mediaBuyerOptions.map((option) => ({ value: option.media_buyer as string, label: formatMediaBuyerOptionLabel(option) }));
+    const utm = utmSourceOptions.map((option) => ({ value: utmSelectionValue(option.utm_source), label: formatUtmSourceOptionLabel(option) }));
+    const named = buyers.filter((item) => item.value !== "Unknown");
+    const unknown = buyers.filter((item) => item.value === "Unknown");
+    return [...named, ...utm, ...unknown];
+  }, [mediaBuyerOptions, utmSourceOptions]);
+  const mediaBuyerOptionIds = useMemo(() => new Set(mediaBuyerFilterItems.map((item) => item.value)), [mediaBuyerFilterItems]);
   useEffect(() => {
     if (!analyticsTxs.length || !selectedMediaBuyers.length) return;
     const next = selectedMediaBuyers.filter((mediaBuyer) => mediaBuyerOptionIds.has(mediaBuyer));
@@ -1996,6 +2075,16 @@ export default function CohortsPage() {
     () => columnOrder.filter((id) => columnVisibility[id] !== false),
     [columnOrder, columnVisibility],
   );
+  // table-layout:fixed needs an explicit total width — with table-layout:auto (the
+  // default), the browser ignores a column's requested width whenever it's narrower
+  // than the header/cell content, which silently breaks shrinking columns via drag.
+  const tableTotalWidth = useMemo(() => {
+    const firstColWidth = columnWidths[COHORT_FIRST_COL_KEY] ?? defaultColumnWidths[COHORT_FIRST_COL_KEY] ?? 150;
+    return visibleColumnOrder.reduce(
+      (sum, id) => sum + (columnWidths[id] ?? defaultColumnWidths[id] ?? MIN_COLUMN_WIDTH),
+      firstColWidth,
+    );
+  }, [columnWidths, defaultColumnWidths, visibleColumnOrder]);
 
   const maxUpsellCR = Math.max(0, ...cohorts.map((c) => c.trial_to_upsell_cr));
   const maxSubCR = Math.max(0, ...cohorts.map((c) => c.trial_to_first_subscription_cr));
@@ -2121,8 +2210,8 @@ export default function CohortsPage() {
   const cellClassFor = (id: CohortColumnId, child = false) => {
     const base = child
       ? TEXT_COLUMNS.has(id)
-        ? "py-1.5 px-3 text-xs text-muted-foreground/60 whitespace-nowrap"
-        : "py-1.5 px-3 text-right text-xs text-muted-foreground tabular-nums whitespace-nowrap"
+        ? "py-1.5 px-3 text-xs text-muted-foreground/60 whitespace-nowrap overflow-hidden text-ellipsis"
+        : "py-1.5 px-3 text-right text-xs text-muted-foreground tabular-nums whitespace-nowrap overflow-hidden text-ellipsis"
       : TEXT_COLUMNS.has(id)
         ? CELL_TXT
         : CELL_NUM;
@@ -2140,7 +2229,7 @@ export default function CohortsPage() {
   };
   const countrySummary = selectedCountries.length ? selectedCountries.join(", ") : "All countries";
   const cardTypeSummary = selectedCardTypes.length ? selectedCardTypes.map(cardTypeLabel).join(", ") : "All card types";
-  const mediaBuyerSummary = selectedMediaBuyers.length ? selectedMediaBuyers.map(mediaBuyerLabel).join(", ") : "All media buyers";
+  const mediaBuyerSummary = selectedMediaBuyers.length ? selectedMediaBuyers.map(mediaBuyerSelectionLabel).join(", ") : "All media buyers";
   const toggleCountry = (country: string) => {
     const normalized = normalizeCountryCode(country);
     if (!normalized) return;
@@ -2157,10 +2246,10 @@ export default function CohortsPage() {
     updateUiState({ selectedCardTypes: next });
   };
   const clearCardTypes = () => updateUiState({ selectedCardTypes: [] });
-  const toggleMediaBuyer = (mediaBuyer: MediaBuyer) => {
-    const next = selectedMediaBuyers.includes(mediaBuyer)
-      ? selectedMediaBuyers.filter((value) => value !== mediaBuyer)
-      : [...selectedMediaBuyers, mediaBuyer];
+  const toggleMediaBuyer = (selectionValue: MediaBuyer | string) => {
+    const next = selectedMediaBuyers.includes(selectionValue)
+      ? selectedMediaBuyers.filter((value) => value !== selectionValue)
+      : [...selectedMediaBuyers, selectionValue];
     updateUiState({ selectedMediaBuyers: next });
   };
   const clearMediaBuyers = () => updateUiState({ selectedMediaBuyers: [] });
@@ -2215,8 +2304,8 @@ export default function CohortsPage() {
         aria-label={`Sort by ${columnLabel(id)}`}
       >
         <GripVertical className="h-3 w-3 shrink-0 cursor-grab opacity-40 active:cursor-grabbing" />
-        <span className="truncate">{columnLabel(id)}</span>
-        {sortIcon(id)}
+        <span className="line-clamp-2 min-w-0 whitespace-normal break-words leading-tight">{columnLabel(id)}</span>
+        <span className="shrink-0">{sortIcon(id)}</span>
       </button>
       <div
         role="separator"
@@ -2299,7 +2388,8 @@ export default function CohortsPage() {
       case "fb_profit":
       case "fb_margin": {
         const text = fbCohortCellText(c, id);
-        return <TableCell key={id} className={className}>{text === "—" ? dash : text}</TableCell>;
+        const unavailableReason = fbUnavailableReason(c.fb_match_status);
+        return <TableCell key={id} className={className} title={unavailableReason ?? undefined}>{text === "—" ? dash : text}</TableCell>;
       }
       case "renewal_2_to_renewal_3_cr":
         return <TableCell key={id} className={`${className} font-medium`} style={heatStyle(c.renewal_2_to_renewal_3_cr, maxRenewal3CR)}>{formatPct(c.renewal_2_to_renewal_3_cr)}</TableCell>;
@@ -2601,19 +2691,19 @@ export default function CohortsPage() {
       case "fb_roas":
         return <TableCell key={id} className={className}>{fbT?.fb_roas != null ? formatFbRoas(fbT.fb_roas) : dash}</TableCell>;
       case "fb_cac":
-        return <TableCell key={id} className={className}>{fbT && totals.totalFirstSubscriptionUsers > 0 ? formatFbUsd(fbT.fb_spend / totals.totalFirstSubscriptionUsers) : dash}</TableCell>;
+        return <TableCell key={id} className={className}>{fbT?.fb_spend != null && totals.totalFirstSubscriptionUsers > 0 ? formatFbUsd(fbT.fb_spend / totals.totalFirstSubscriptionUsers) : dash}</TableCell>;
       case "fb_cost_per_trial":
-        return <TableCell key={id} className={className}>{fbT && totals.totalTrialUsers > 0 ? formatFbUsd(fbT.fb_spend / totals.totalTrialUsers) : dash}</TableCell>;
+        return <TableCell key={id} className={className}>{fbT?.fb_spend != null && totals.totalTrialUsers > 0 ? formatFbUsd(fbT.fb_spend / totals.totalTrialUsers) : dash}</TableCell>;
       case "fb_cost_per_upsell":
-        return <TableCell key={id} className={className}>{fbT && totals.totalUpsellUsers > 0 ? formatFbUsd(fbT.fb_spend / totals.totalUpsellUsers) : dash}</TableCell>;
+        return <TableCell key={id} className={className}>{fbT?.fb_spend != null && totals.totalUpsellUsers > 0 ? formatFbUsd(fbT.fb_spend / totals.totalUpsellUsers) : dash}</TableCell>;
       case "fb_gross_roas":
-        return <TableCell key={id} className={className}>{fbT && fbT.fb_spend > 0 ? formatFbRoas(totals.grossRevenue / fbT.fb_spend) : dash}</TableCell>;
+        return <TableCell key={id} className={className}>{fbT?.fb_spend != null && fbT.fb_spend > 0 ? formatFbRoas(totals.grossRevenue / fbT.fb_spend) : dash}</TableCell>;
       case "fb_net_roas":
-        return <TableCell key={id} className={className}>{fbT && fbT.fb_spend > 0 ? formatFbRoas(totals.netRevenue / fbT.fb_spend) : dash}</TableCell>;
+        return <TableCell key={id} className={className}>{fbT?.fb_spend != null && fbT.fb_spend > 0 ? formatFbRoas(totals.netRevenue / fbT.fb_spend) : dash}</TableCell>;
       case "fb_profit":
-        return <TableCell key={id} className={className}>{fbT ? formatFbUsd(totals.netRevenue - fbT.fb_spend) : dash}</TableCell>;
+        return <TableCell key={id} className={className}>{fbT?.fb_spend != null ? formatFbUsd(totals.netRevenue - fbT.fb_spend) : dash}</TableCell>;
       case "fb_margin":
-        return <TableCell key={id} className={className}>{fbT && totals.netRevenue > 0 ? formatFbPct(((totals.netRevenue - fbT.fb_spend) / totals.netRevenue) * 100) : dash}</TableCell>;
+        return <TableCell key={id} className={className}>{fbT?.fb_spend != null && totals.netRevenue > 0 ? formatFbPct(((totals.netRevenue - fbT.fb_spend) / totals.netRevenue) * 100) : dash}</TableCell>;
       case "cohort_date":
       case "campaign_path":
       case "funnel":
@@ -2955,16 +3045,16 @@ export default function CohortsPage() {
                 </Button>
               </div>
               <div className="max-h-72 overflow-auto py-1">
-                {mediaBuyerOptions.length === 0 && (
+                {mediaBuyerFilterItems.length === 0 && (
                   <div className="px-3 py-3 text-sm text-muted-foreground">No media buyer data</div>
                 )}
-                {mediaBuyerOptions.map((option) => (
-                  <label key={option.media_buyer} className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted/50">
+                {mediaBuyerFilterItems.map((item) => (
+                  <label key={item.value} className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted/50">
                     <Checkbox
-                      checked={selectedMediaBuyers.includes(option.media_buyer)}
-                      onCheckedChange={() => toggleMediaBuyer(option.media_buyer)}
+                      checked={selectedMediaBuyers.includes(item.value)}
+                      onCheckedChange={() => toggleMediaBuyer(item.value)}
                     />
-                    <span>{formatMediaBuyerOptionLabel(option)}</span>
+                    <span>{item.label}</span>
                   </label>
                 ))}
               </div>
@@ -3250,17 +3340,234 @@ export default function CohortsPage() {
                 </span>
               )}
               {clickHouseDriving && chResult?.fbDiagnostics && (
-                <span>
-                  fb: <span className={chResult.fbDiagnostics.fb_data_status === "ready" ? "font-mono text-foreground" : "font-mono text-warning"}>{chResult.fbDiagnostics.fb_data_status}</span>
-                  {" · rows "}{formatRowsCount(chResult.fbDiagnostics.fb_source_rows)}
-                  {" · matched "}{formatRowsCount(chResult.fbDiagnostics.fb_matched_cohort_rows)}/{formatRowsCount(chResult.fbDiagnostics.fb_matched_cohort_rows + chResult.fbDiagnostics.fb_unmatched_cohort_rows)}
-                  {chResult.fbDiagnostics.fb_last_sync_at && (
-                    <> · sync {formatUpdatedAgo(Date.parse(chResult.fbDiagnostics.fb_last_sync_at))}</>
+                <>
+                  <span>
+                    fb: <span className={chResult.fbDiagnostics.fb_data_status === "ready" ? "font-mono text-foreground" : "font-mono text-warning"}>{chResult.fbDiagnostics.fb_data_status}</span>
+                    {" · rows "}{formatRowsCount(chResult.fbDiagnostics.fb_source_rows)}
+                    {" · allocated purchases "}{formatRowsCount(chResult.fbDiagnostics.fb_allocated_purchases)}/{formatRowsCount(chResult.fbDiagnostics.fb_analytics_purchases)}
+                    {chResult.fbDiagnostics.fb_last_sync_at && (
+                      <> · sync {formatUpdatedAgo(Date.parse(chResult.fbDiagnostics.fb_last_sync_at))}</>
+                    )}
+                  </span>
+                  {chResult.fbDiagnostics.fb_error_code && (
+                    <span className="text-destructive" role="alert">
+                      {chResult.fbDiagnostics.fb_error_code}: {chResult.fbDiagnostics.fb_error_message_safe}
+                    </span>
                   )}
-                </span>
+                  {chResult.fbDiagnostics.fb_attribution_source === "fact_user_cohorts" && (
+                    <span>
+                      attribution: campaigns {formatRowsCount(chResult.fbDiagnostics.fb_campaigns_in_scope)}
+                      {" · campaign coverage "}{chResult.fbDiagnostics.fb_campaign_coverage == null ? dash : formatFbPct(chResult.fbDiagnostics.fb_campaign_coverage)}
+                      {" · allocation coverage "}{chResult.fbDiagnostics.fb_allocation_coverage == null ? dash : formatFbPct(chResult.fbDiagnostics.fb_allocation_coverage)}
+                    </span>
+                  )}
+                  {chResult.fbDiagnostics.fb_attribution_source === "fact_user_cohorts" && (
+                    <span className={chResult.fbDiagnostics.fb_overallocated_campaigns > 0 ? "text-destructive" : "text-muted-foreground"}>
+                      user cost: allocated {formatFbUsd(chResult.fbDiagnostics.fb_allocated_spend)}
+                      {" · unallocated "}{formatFbUsd(chResult.fbDiagnostics.fb_unallocated_spend)}
+                      {" · allocation gap "}{formatRowsCount(chResult.fbDiagnostics.fb_allocation_gap_purchases)}
+                      {" · gross campaign unmatched "}{formatRowsCount(chResult.fbDiagnostics.fb_gross_unmatched_purchases)}
+                      {" · campaigns without users "}{formatRowsCount(chResult.fbDiagnostics.fb_campaigns_without_cohort_users)}
+                      {" · avg user CPP "}{formatFbUsd(chResult.fbDiagnostics.fb_user_cpp)}
+                      {" · underallocated "}{formatRowsCount(chResult.fbDiagnostics.fb_underallocated_campaigns)}
+                      {" · overallocated "}{formatRowsCount(chResult.fbDiagnostics.fb_overallocated_campaigns)}
+                      {" · validation "}{formatRowsCount(chResult.fbDiagnostics.fb_validation_rows)}
+                    </span>
+                  )}
+                  {chResult.fbDiagnostics.fb_attribution_source === "fact_user_cohorts" && (
+                    <span className={chResult.fbDiagnostics.fb_timezone_unverified_users > 0 ? "text-warning" : "text-muted-foreground"}>
+                      join: {chResult.fbDiagnostics.fb_join_key}
+                      {" · FB period "}{chResult.fbDiagnostics.fb_period_date_from ?? dash}–{chResult.fbDiagnostics.fb_period_date_to ?? dash}
+                      {" · timezone informational "}{chResult.fbDiagnostics.fb_timezone ?? "unverified"}
+                      {" · snapshot "}{formatRowsCount(chResult.fbDiagnostics.fb_snapshot_rows)}/{formatRowsCount(chResult.fbDiagnostics.fb_snapshot_unique_users)} unique users
+                    </span>
+                  )}
+                </>
               )}
             </div>
           </div>
+        )}
+
+        {clickHouseDriving && chResult?.fbDiagnostics && (
+          <section
+            className="mb-2 space-y-2 rounded-md border border-border/70 bg-muted/20 px-3 py-3 text-xs"
+            aria-label="Facebook source reconciliation"
+            data-testid="fb-source-reconciliation"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h3 className="font-medium text-foreground">Facebook source reconciliation</h3>
+              <span className="text-muted-foreground">Source scope: authoritative first-trial users</span>
+            </div>
+            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-8">
+              <div title="All authoritative trial users in the currently selected Cohorts scope."><span className="text-muted-foreground">All Cohorts Users</span><div className="font-mono text-foreground">{formatRowsCount(chResult.fbDiagnostics.fb_all_cohorts_users)}</div></div>
+              <div title="Users qualified as Meta by an explicit Meta source, exact FB Campaign ID, confirmed Campaign alias, or paid Campaign plus _fbc. _fbp alone is excluded."><span className="text-muted-foreground">Facebook-qualified Users</span><div className="font-mono text-foreground">{formatRowsCount(chResult.fbDiagnostics.fb_facebook_qualified_users)}</div></div>
+              <div title="Authoritative users with explicit TikTok source evidence."><span className="text-muted-foreground">TikTok Users</span><div className="font-mono text-foreground">{formatRowsCount(chResult.fbDiagnostics.fb_tiktok_users)}</div></div>
+              <div title="Users without sufficient source evidence. They are reported separately and are not Facebook allocation failures."><span className="text-muted-foreground">Unknown Source Users</span><div className="font-mono text-foreground">{formatRowsCount(chResult.fbDiagnostics.fb_unknown_source_users)}</div></div>
+              <div title="Meta-attributed purchases reported by Facebook Analytics for the selected period."><span className="text-muted-foreground">FB Analytics Purchases</span><div className="font-mono text-foreground">{formatRowsCount(chResult.fbDiagnostics.fb_analytics_purchases)}</div></div>
+              <div title="Facebook purchases assigned through the unchanged Campaign ID allocation."><span className="text-muted-foreground">Allocated FB Purchases</span><div className="font-mono text-foreground">{formatRowsCount(chResult.fbDiagnostics.fb_allocated_purchases)}</div></div>
+              <div title="Allocation Gap shows Facebook purchases that could not be assigned to an existing Cohort campaign."><span className="text-muted-foreground">Unallocated FB Purchases</span><div className="font-mono text-foreground">{formatRowsCount(chResult.fbDiagnostics.fb_allocation_gap_purchases)}</div></div>
+              <div title="Allocated FB Purchases divided by FB Analytics Purchases. Trial Count is never used as the denominator."><span className="text-muted-foreground">Allocation Coverage</span><div className="font-mono text-foreground">{chResult.fbDiagnostics.fb_allocation_coverage == null ? dash : formatFbPct(chResult.fbDiagnostics.fb_allocation_coverage)}</div></div>
+            </div>
+            {(chResult.fbDiagnostics.fb_google_users > 0 || chResult.fbDiagnostics.fb_organic_users > 0 || chResult.fbDiagnostics.fb_direct_users > 0 || chResult.fbDiagnostics.fb_other_source_users > 0) && (
+              <div className="text-muted-foreground">
+                Other classified sources: Google {formatRowsCount(chResult.fbDiagnostics.fb_google_users)}
+                {" · Organic "}{formatRowsCount(chResult.fbDiagnostics.fb_organic_users)}
+                {" · Direct "}{formatRowsCount(chResult.fbDiagnostics.fb_direct_users)}
+                {" · Other "}{formatRowsCount(chResult.fbDiagnostics.fb_other_source_users)}
+              </div>
+            )}
+            <div className="grid gap-2 sm:grid-cols-3">
+              <div title="This is a traffic-source mix difference, not an allocation error." className="rounded border border-border/60 bg-background p-2"><span className="text-muted-foreground">A · All Cohorts − FB Analytics</span><div className="font-mono text-foreground">{formatRowsCount(chResult.fbDiagnostics.fb_source_mix_difference)}</div><div className="text-muted-foreground">Source-mix difference</div></div>
+              <div title="Difference between Meta-qualified authoritative users and Meta-reported purchases." className="rounded border border-border/60 bg-background p-2"><span className="text-muted-foreground">B · Facebook-qualified − FB Analytics</span><div className="font-mono text-foreground">{formatRowsCount(chResult.fbDiagnostics.fb_meta_authoritative_difference)}</div><div className="text-muted-foreground">Meta vs authoritative users</div></div>
+              <div title="Allocation Gap shows Facebook purchases that could not be assigned to an existing Cohort campaign." className="rounded border border-border/60 bg-background p-2"><span className="text-muted-foreground">C · FB Analytics − Allocated</span><div className="font-mono text-foreground">{formatRowsCount(chResult.fbDiagnostics.fb_allocation_gap_purchases)}</div><div className="text-muted-foreground">Real allocation gap</div></div>
+            </div>
+            <div className="space-y-1 rounded border border-border/60 bg-background p-2 text-muted-foreground">
+              <p>Trial Count includes users from all traffic sources. Facebook Purchases includes only Meta-attributed purchases. Therefore these values are not expected to match.</p>
+              <p>Allocation Gap shows Facebook purchases that could not be assigned to an existing Cohort campaign.</p>
+            </div>
+          </section>
+        )}
+
+        {fbAllocationDiagnostics && (
+          <details className="mb-2 rounded-md border border-border/70 bg-muted/20 px-3 py-2 text-xs">
+            <summary className="cursor-pointer font-medium text-foreground">
+              FB runtime allocation diagnostics ({fbAllocationDiagnostics.total_rows} Campaign rows)
+            </summary>
+            <div className="mt-3 space-y-3">
+              <div className="rounded border border-border/60 bg-background p-2 text-muted-foreground">
+                Authenticated debug view · CPP is calculated per Campaign over the selected Cohorts period. Date filters below only filter Campaign activity-period rows; they do not recompute allocation.
+              </div>
+              <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-7">
+                <Label className="space-y-1 text-[11px]">
+                  <span>Campaign active from</span>
+                  <Input type="date" value={fbAllocationDiagnosticsUi.dateFrom} onChange={(event) => setFbAllocationDiagnosticsUi((current) => ({ ...current, page: 1, dateFrom: event.target.value }))} className="h-8" />
+                </Label>
+                <Label className="space-y-1 text-[11px]">
+                  <span>Campaign active to</span>
+                  <Input type="date" value={fbAllocationDiagnosticsUi.dateTo} onChange={(event) => setFbAllocationDiagnosticsUi((current) => ({ ...current, page: 1, dateTo: event.target.value }))} className="h-8" />
+                </Label>
+                <Label className="space-y-1 text-[11px]">
+                  <span>Campaign ID</span>
+                  <Input value={fbAllocationDiagnosticsUi.campaignId} onChange={(event) => setFbAllocationDiagnosticsUi((current) => ({ ...current, page: 1, campaignId: event.target.value }))} className="h-8" placeholder="Exact ID" />
+                </Label>
+                <Label className="space-y-1 text-[11px]">
+                  <span>Campaign name</span>
+                  <Input value={fbAllocationDiagnosticsUi.campaignName} onChange={(event) => setFbAllocationDiagnosticsUi((current) => ({ ...current, page: 1, campaignName: event.target.value }))} className="h-8" placeholder="Contains" />
+                </Label>
+                <Label className="space-y-1 text-[11px]">
+                  <span>Ad account ID</span>
+                  <Input value={fbAllocationDiagnosticsUi.adAccountId} onChange={(event) => setFbAllocationDiagnosticsUi((current) => ({ ...current, page: 1, adAccountId: event.target.value }))} className="h-8" placeholder="Exact ID" />
+                </Label>
+                <Label className="space-y-1 text-[11px]">
+                  <span>Allocation status</span>
+                  <Select value={fbAllocationDiagnosticsUi.allocationStatus} onValueChange={(value) => setFbAllocationDiagnosticsUi((current) => ({ ...current, page: 1, allocationStatus: value as FbAllocationStatus | "all" }))}>
+                    <SelectTrigger className="h-8"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">All statuses</SelectItem>
+                      {FB_ALLOCATION_STATUSES.map((status) => <SelectItem key={status} value={status}>{status}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
+                </Label>
+                <Label className="space-y-1 text-[11px]">
+                  <span>Timezone source</span>
+                  <Select value={fbAllocationDiagnosticsUi.timezoneSource} onValueChange={(value) => setFbAllocationDiagnosticsUi((current) => ({ ...current, page: 1, timezoneSource: value as FbTimezoneSource | "all" }))}>
+                    <SelectTrigger className="h-8"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">All sources</SelectItem>
+                      {FB_TIMEZONE_SOURCES.map((source) => <SelectItem key={source} value={source}>{source}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
+                </Label>
+              </div>
+              <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-6">
+                <div><span className="text-muted-foreground">Total FB Spend</span><div className="font-mono">{formatFbUsd(fbAllocationDiagnostics.summary.total_fb_spend)}</div></div>
+                <div><span className="text-muted-foreground">Allocated</span><div className="font-mono">{formatFbUsd(fbAllocationDiagnostics.summary.total_allocated_spend)}</div></div>
+                <div><span className="text-muted-foreground">Unallocated</span><div className="font-mono">{formatFbUsd(fbAllocationDiagnostics.summary.total_unallocated_spend)}</div></div>
+                <div title="Gross unmatched purchases summed Campaign by Campaign; this is not the net Allocation Gap."><span className="text-muted-foreground">Gross campaign unmatched</span><div className="font-mono">{formatRowsCount(fbAllocationDiagnostics.summary.total_unallocated_purchases)}</div></div>
+                <div><span className="text-muted-foreground">Allocation difference</span><div className="font-mono">{formatFbUsd(fbAllocationDiagnostics.summary.total_allocation_difference)}</div></div>
+                <div><span className="text-muted-foreground">FB Purchases / matched</span><div className="font-mono">{formatRowsCount(fbAllocationDiagnostics.summary.total_fb_purchases)} / {formatRowsCount(fbAllocationDiagnostics.summary.total_matched_users)}</div></div>
+                <div><span className="text-muted-foreground">Allocation coverage</span><div className="font-mono">{fbAllocationDiagnostics.summary.overall_coverage_rate == null ? dash : formatFbPct(fbAllocationDiagnostics.summary.overall_coverage_rate)}</div></div>
+                <div><span className="text-muted-foreground">Fully / under / over</span><div className="font-mono">{fbAllocationDiagnostics.summary.fully_allocated_campaign_dates} / {fbAllocationDiagnostics.summary.underallocated_campaign_dates} / {fbAllocationDiagnostics.summary.overallocated_campaign_dates}</div></div>
+                <div><span className="text-muted-foreground">Timezone unverified</span><div className="font-mono">{fbAllocationDiagnostics.summary.timezone_unverified_campaign_dates}</div></div>
+                <div><span className="text-muted-foreground">Campaign IDs without users</span><div className="font-mono">{fbAllocationDiagnostics.summary.campaign_ids_without_cohort_users}</div></div>
+                <div title="Only authoritative users that carry a Campaign ID are included; Unknown Source users without Campaign ID are not treated as Facebook failures."><span className="text-muted-foreground">Campaign users without FB metrics</span><div className="font-mono">{fbAllocationDiagnostics.summary.users_without_matching_fb_metrics}</div></div>
+                <div><span className="text-muted-foreground">Visible Cohort Spend</span><div className="font-mono">{formatFbUsd(fbAllocationDiagnostics.summary.sum_visible_cohort_spend)}</div></div>
+                <div><span className="text-muted-foreground">Visible − allocated</span><div className="font-mono">{formatFbUsd(fbAllocationDiagnostics.summary.visible_allocated_difference)}</div></div>
+              </div>
+              {(!fbAllocationDiagnostics.summary.reconciliation_ok || !fbAllocationDiagnostics.summary.visible_spend_reconciles) && (
+                <div className="rounded border border-destructive/40 bg-destructive/5 p-2 text-destructive">
+                  Allocation invariant failed beyond ±{formatFbUsd(fbAllocationDiagnostics.summary.money_tolerance)} tolerance. Do not proceed with rollout.
+                </div>
+              )}
+              {fbAllocationDiagnostics.display_message && <div className="font-medium text-warning">{fbAllocationDiagnostics.display_message}</div>}
+            <div className="max-h-[32rem] overflow-auto rounded border border-border/60 bg-background">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Campaign ID</TableHead>
+                    <TableHead>Campaign Name</TableHead>
+                    <TableHead>Ad Account</TableHead>
+                    <TableHead>FB Activity Period</TableHead>
+                    <TableHead>Meta Timezone</TableHead>
+                    <TableHead>Timezone Source</TableHead>
+                    <TableHead>FB Spend</TableHead>
+                    <TableHead>FB Purchases</TableHead>
+                    <TableHead>Matched Users</TableHead>
+                    <TableHead>Unmatched Purchases</TableHead>
+                    <TableHead>Excess Users</TableHead>
+                    <TableHead>Coverage</TableHead>
+                    <TableHead>CPP</TableHead>
+                    <TableHead>Allocated</TableHead>
+                    <TableHead>Unallocated</TableHead>
+                    <TableHead>Difference</TableHead>
+                    <TableHead>Difference %</TableHead>
+                    <TableHead>Status</TableHead>
+                    <TableHead>Cohort Rows</TableHead>
+                    <TableHead>Funnels</TableHead>
+                    <TableHead>Campaign Paths</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {fbAllocationDiagnostics.rows.map((row) => (
+                    <TableRow key={`${row.campaign_id}|${row.ad_account_id ?? ""}`}>
+                      <TableCell className="font-mono">{row.campaign_id}</TableCell>
+                      <TableCell>{row.campaign_name ?? dash}</TableCell>
+                      <TableCell className="font-mono">{row.ad_account_id ?? dash}</TableCell>
+                      <TableCell className="whitespace-nowrap font-mono">{row.period_date_from ?? dash}–{row.period_date_to ?? dash}</TableCell>
+                      <TableCell className="font-mono">{row.meta_timezone ?? dash}</TableCell>
+                      <TableCell>{row.timezone_source}</TableCell>
+                      <TableCell>{formatFbUsd(row.fb_spend)}</TableCell>
+                      <TableCell>{formatRowsCount(row.fb_purchases)}</TableCell>
+                      <TableCell>{formatRowsCount(row.matched_authoritative_users)}</TableCell>
+                      <TableCell>{formatRowsCount(row.unmatched_fb_purchases)}</TableCell>
+                      <TableCell>{formatRowsCount(row.excess_authoritative_users)}</TableCell>
+                      <TableCell>{row.coverage_rate == null ? dash : formatFbPct(row.coverage_rate)}</TableCell>
+                      <TableCell>{formatFbUsd(row.campaign_cpp)}</TableCell>
+                      <TableCell>{formatFbUsd(row.allocated_spend)}</TableCell>
+                      <TableCell>{formatFbUsd(row.unallocated_spend)}</TableCell>
+                      <TableCell>{formatFbUsd(row.allocation_difference)}</TableCell>
+                      <TableCell>{row.allocation_difference_percent == null ? dash : formatFbPct(row.allocation_difference_percent)}</TableCell>
+                      <TableCell className={row.allocation_status === "overallocated" ? "text-destructive" : row.allocation_status === "underallocated" ? "text-warning" : ""}>{row.allocation_status}</TableCell>
+                      <TableCell>{row.affected_cohort_rows}</TableCell>
+                      <TableCell>{row.affected_funnels.join(", ") || dash}</TableCell>
+                      <TableCell>{row.affected_campaign_paths.join(", ") || dash}</TableCell>
+                    </TableRow>
+                  ))}
+                  {fbAllocationDiagnostics.rows.length === 0 && (
+                    <TableRow><TableCell colSpan={21} className="py-6 text-center text-muted-foreground">No Campaign rows match the diagnostics filters.</TableCell></TableRow>
+                  )}
+                </TableBody>
+              </Table>
+            </div>
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-muted-foreground">Page {fbAllocationDiagnostics.page}{fbAllocationDiagnostics.total_pages ? ` of ${fbAllocationDiagnostics.total_pages}` : ""} · summary is computed before pagination</span>
+                <div className="flex gap-2">
+                  <Button size="sm" variant="outline" disabled={!fbAllocationDiagnostics.has_previous_page} onClick={() => setFbAllocationDiagnosticsUi((current) => ({ ...current, page: Math.max(1, current.page - 1) }))}>Previous</Button>
+                  <Button size="sm" variant="outline" disabled={!fbAllocationDiagnostics.has_next_page} onClick={() => setFbAllocationDiagnosticsUi((current) => ({ ...current, page: current.page + 1 }))}>Next</Button>
+                </div>
+              </div>
+            </div>
+          </details>
         )}
 
         {(fxDiagnostics.transactions_converted > 0 || fxDiagnostics.excluded_transactions > 0) && (
@@ -3362,7 +3669,10 @@ export default function CohortsPage() {
           </div>
         )}
         <div className="rounded-lg border border-border [&>div]:max-h-[calc(100vh-220px)] [&>div]:overflow-auto [&>div]:rounded-lg [&>div]:scroll-smooth">
-          <Table className="border-separate border-spacing-0 w-auto">
+          <Table
+            className="border-separate border-spacing-0 w-auto"
+            style={{ tableLayout: "fixed", width: tableTotalWidth }}
+          >
             <TableHeader>
               <TableRow className="hover:bg-transparent">
                 <TableHead
@@ -3375,8 +3685,8 @@ export default function CohortsPage() {
                     className="inline-flex max-w-full items-center gap-1 hover:text-foreground"
                     aria-label="Sort by Cohort"
                   >
-                    <span className="truncate">Cohort</span>
-                    {sortIcon(COHORT_FIRST_COL_KEY)}
+                    <span className="line-clamp-2 min-w-0 whitespace-normal break-words leading-tight">Cohort</span>
+                    <span className="shrink-0">{sortIcon(COHORT_FIRST_COL_KEY)}</span>
                   </button>
                   <div
                     role="separator"
@@ -3402,15 +3712,15 @@ export default function CohortsPage() {
                       <TableCell
                         className={`${CELL_BASE} sticky left-0 bg-card z-10 font-medium text-sm whitespace-nowrap shadow-[1px_0_0_0_hsl(var(--border))]`}
                       >
-                        <div className="flex items-center gap-2">
+                        <div className="flex min-w-0 items-center gap-2">
                           <button
                             type="button"
                             onClick={() => toggleExpanded(c.cohort_id)}
-                            className="inline-flex items-center gap-1.5 hover:text-primary"
+                            className="inline-flex min-w-0 items-center gap-1.5 hover:text-primary"
                             aria-expanded={expanded}
                           >
-                            {expanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
-                            {c.cohort_id}
+                            {expanded ? <ChevronDown className="h-3.5 w-3.5 shrink-0" /> : <ChevronRight className="h-3.5 w-3.5 shrink-0" />}
+                            <span className="truncate">{c.cohort_id}</span>
                           </button>
                         </div>
                       </TableCell>
