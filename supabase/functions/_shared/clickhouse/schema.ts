@@ -1,4 +1,5 @@
 import type { ClickHouseClientLike, ClickHouseEnv } from "./types.ts";
+import { ensureFbWarehouseV2Schema } from "./fbWarehouseV2Schema.ts";
 
 export const ANALYTICS_TRANSACTIONS_TABLE = "analytics_transactions";
 export const FACT_USER_COHORTS_TABLE = "fact_user_cohorts";
@@ -325,6 +326,8 @@ export async function initializeClickHouseSchema(input: { client: ClickHouseClie
   await client.command({ query: CREATE_FACT_USER_COHORTS_SQL });
   await ensureFactSupportRequestsSchema(client);
   await ensureFactFacebookStatsSchema(client);
+  // Warehouse V2 Phase 0: additive, idempotent, zero readers until later phases.
+  await ensureFbWarehouseV2Schema(client);
   const database = input.env.database || "default";
   const table = ANALYTICS_TRANSACTIONS_TABLE;
   const [metadata] = await jsonRows<TableMetadataRow>(
