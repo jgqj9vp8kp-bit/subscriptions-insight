@@ -31,6 +31,7 @@ import {
   createFbSyncHistoryRecorder,
   type FbSyncTrigger,
 } from "./fbSyncHistory.ts";
+import { buildFbV2DqChecks, createFbWarehouseV2Writer } from "./fbWarehouseV2Writer.ts";
 
 export const FB_SYNC_NAME = "fact_facebook_stats_sync";
 export const FB_LEVELS = ["account", "campaign", "adset", "ad", "day"] as const;
@@ -392,6 +393,7 @@ export interface FbSyncResult {
   history_run_id?: string;
   history_batch_id?: string;
   history_errors?: number;
+  v2_errors?: number;
 }
 
 export function resolveSyncRange(input: {
@@ -449,6 +451,18 @@ export async function runFacebookStatsSync(input: {
     trigger: input.request.trigger_source,
     startedAtIso: syncedAtIso,
   });
+  // Warehouse V2 dual-writer (Phase 1): writes raw responses, per-grain daily
+  // facts, the batch-registry mirror and DQ results BESIDE the V1 pipeline.
+  // Same fail-safe contract as `history`; shares its batch/run lineage.
+  const v2 = createFbWarehouseV2Writer({
+    clickhouse: input.clickhouse,
+    supabase: input.supabase,
+    authUserId: input.authUserId,
+    batchId: history.batchId,
+    runId: history.runId,
+    warehouseVersion,
+    nowIso: syncedAtIso,
+  });
 
   await ensureFactFacebookStatsSchema(input.clickhouse);
   const previousState = await getFbSyncState(input.supabase, input.authUserId).catch(() => null);
@@ -474,9 +488,10 @@ export async function runFacebookStatsSync(input: {
   });
 
   await history.stageBatch();
-  // Every Capsuled response (and failure) is recorded verbatim; the wrapper is
+  await v2.mirrorBatch("staged");
+  // Every Capsuled response (and failure) is recorded verbatim; both wrappers are
   // pass-through for the pipeline itself.
-  const fetcher = history.wrapFetcher(input.fetcher);
+  const fetcher = v2.wrapFetcher(history.wrapFetcher(input.fetcher));
 
   const stats: CapsuledFetchStats = { requests: 0, payload_bytes: 0, api_latency_ms: 0, splits: 0, failed_attempts: [] };
   try {
@@ -568,6 +583,7 @@ export async function runFacebookStatsSync(input: {
 
     // Validation gate passed → the batch is coherent (staged → validated).
     await history.markValidated(computeFbBatchChecksum(mapped));
+    await v2.mirrorBatch("validated");
 
     if (mapped.length) {
       await input.clickhouse.insert({ table: FB, values: mapped as unknown as Record<string, unknown>[], format: "JSONEachRow" });
@@ -579,8 +595,19 @@ export async function runFacebookStatsSync(input: {
 
     // Warehouse write succeeded → the batch is live (validated → published),
     // and its automatic DQ report is stored alongside.
-    await history.recordDq(computeFbBatchDq({ rows: mapped, activeDays, daySpendTotal: daySpend }));
+    const dqReport = computeFbBatchDq({ rows: mapped, activeDays, daySpendTotal: daySpend });
+    await history.recordDq(dqReport);
     await history.markPublished();
+    await v2.publish({
+      rows: mapped,
+      sourceVersion: fbStatsTo,
+      dqChecks: buildFbV2DqChecks({
+        dqReport: dqReport as unknown as Record<string, unknown>,
+        mergedRowsDetected,
+        spendMismatchCount: spendMismatch.length,
+      }),
+      mergedRowsDetected,
+    });
 
     await upsertFbSyncState(input.supabase, {
       auth_user_id: input.authUserId,
@@ -647,6 +674,7 @@ export async function runFacebookStatsSync(input: {
       },
       finishedAtIso: new Date().toISOString(),
     });
+    await v2.recordRequestTelemetry();
 
     return {
       status: "completed", mode, date_from: dateFrom, date_to: dateTo, levels,
@@ -656,6 +684,7 @@ export async function runFacebookStatsSync(input: {
       api_requests: stats.requests, api_latency_ms: stats.api_latency_ms, api_payload_bytes: stats.payload_bytes,
       range_splits: stats.splits, duration_ms: Date.now() - started,
       history_run_id: history.runId, history_batch_id: history.batchId, history_errors: history.errors.length,
+      v2_errors: v2.errors.length,
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : "Facebook stats sync failed.";
@@ -702,6 +731,9 @@ export async function runFacebookStatsSync(input: {
       },
       finishedAtIso: new Date().toISOString(),
     });
+    // V2 mirror: raw evidence is kept (post-mortem), the batch mirror rolls back.
+    await v2.abort();
+    await v2.recordRequestTelemetry();
     throw error;
   }
 }

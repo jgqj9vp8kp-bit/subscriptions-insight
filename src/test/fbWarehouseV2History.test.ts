@@ -269,8 +269,9 @@ describe("append-only history: successful sync", () => {
     // No delete API exists in the recorder at all: only insert/update/upsert ops occur.
     expect(ops.every((op) => ["insert", "update", "upsert"].includes(op.op))).toBe(true);
 
-    // The pipeline itself still wrote the warehouse exactly once.
-    expect(chInserts).toHaveLength(1);
+    // The pipeline itself still wrote the V1 warehouse exactly once; the V2
+    // dual-writer adds its own side-tables (registry/raw/facts/dq) beside it.
+    expect(chInserts.filter((entry) => (entry as { table?: string }).table === "fact_facebook_stats")).toHaveLength(1);
   });
 
   it("every sync creates a NEW run and a NEW batch (no overwritten state)", async () => {
@@ -305,7 +306,7 @@ describe("append-only history: failures are permanent records, not lost state", 
       fetcher: lossy,
     }))).rejects.toBeInstanceOf(FacebookStatsValidationError);
 
-    expect(chInserts).toHaveLength(0);
+    expect(chInserts.filter((entry) => (entry as { table?: string }).table === "fact_facebook_stats")).toHaveLength(0);
     const batchOps = byTable(ops, FB_IMPORT_BATCHES_TABLE);
     expect(batchOps.map((o) => o.op)).toEqual(["insert", "update"]);
     const rolledBack = batchOps[1].values as Record<string, unknown>;
@@ -350,7 +351,7 @@ describe("append-only history: failures are permanent records, not lost state", 
 
     expect(result.status).toBe("completed");
     expect(result.rows_inserted).toBe(4);
-    expect(chInserts).toHaveLength(1);
+    expect(chInserts.filter((entry) => (entry as { table?: string }).table === "fact_facebook_stats")).toHaveLength(1);
     expect(result.history_errors).toBeGreaterThan(0);
     // The production state machine (upsert-based, pre-existing) still ran.
     const stateOps = byTable(ops, "clickhouse_transaction_sync_state");

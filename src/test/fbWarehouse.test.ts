@@ -275,7 +275,14 @@ describe("runFacebookStatsSync (per-day entity fetch — merge-proof)", () => {
       request: { mode: "incremental", last_days: 2, levels: ["campaign", "day"] },
       now: new Date("2026-07-15T10:00:00.000Z"),
     })).rejects.toBeInstanceOf(FacebookStatsValidationError);
-    expect(inserts).toHaveLength(0);
+    // Neither warehouse got fact rows: V1 wrote nothing, and the V2 dual-writer
+    // only kept raw post-mortem evidence + its rolled-back batch mirror.
+    const factInserts = (inserts as Array<{ table?: string }>).filter(
+      (entry) => entry.table === "fact_facebook_stats" || String(entry.table ?? "").endsWith("_daily"),
+    );
+    expect(factInserts).toHaveLength(0);
+    const v2Tables = (inserts as Array<{ table?: string }>).map((entry) => entry.table);
+    expect(v2Tables).toContain("raw_facebook_api_responses");
     const finalPatch = JSON.stringify(upserts.at(-1));
     expect(finalPatch).toContain('"status":"failed"');
     expect(finalPatch).toContain('"validation_status":"FAILED"');
