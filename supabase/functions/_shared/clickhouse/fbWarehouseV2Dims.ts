@@ -13,6 +13,7 @@
 import type { ClickHouseClientLike } from "./types.ts";
 import { DIM_FB_ACCOUNT_TABLE, DIM_FB_CAMPAIGN_TABLE, ensureFbWarehouseV2Schema } from "./fbWarehouseV2Schema.ts";
 import { FACT_FACEBOOK_STATS_TABLE } from "./schema.ts";
+import { clickHouseBodyStringSet } from "./fbCohortStats.ts";
 
 export interface FbDimSourceRow {
   level: string;
@@ -97,7 +98,7 @@ interface CurrentAccountVersion {
   account_name: string;
   buyer: string;
   currency: string;
-  valid_from: string;
+  latest_valid_from: string;
 }
 
 interface CurrentCampaignVersion {
@@ -105,7 +106,7 @@ interface CurrentCampaignVersion {
   ad_account_id: string;
   campaign_name: string;
   first_seen_date: string;
-  valid_from: string;
+  latest_valid_from: string;
 }
 
 async function jsonRows<T>(client: ClickHouseClientLike, query: string, params: Record<string, unknown>): Promise<T[]> {
@@ -132,12 +133,12 @@ export async function syncFbV2Dims(input: {
          argMax(account_name, valid_from) AS account_name,
          argMax(buyer, valid_from) AS buyer,
          argMax(currency, valid_from) AS currency,
-         toString(max(valid_from)) AS valid_from
+         toString(max(valid_from)) AS latest_valid_from
        FROM ${DIM_FB_ACCOUNT_TABLE} FINAL
        WHERE auth_user_id = {auth_user_id:String} AND is_current = 1
-         AND ad_account_id IN {ids:Array(String)}
+         AND ad_account_id IN (${clickHouseBodyStringSet(input.accounts.map((account) => account.ad_account_id))})
        GROUP BY ad_account_id`,
-      { auth_user_id: input.authUserId, ids: input.accounts.map((account) => account.ad_account_id) },
+      { auth_user_id: input.authUserId },
     );
     const currentById = new Map(current.map((row) => [row.ad_account_id, row]));
     const closes: Record<string, unknown>[] = [];
@@ -158,7 +159,7 @@ export async function syncFbV2Dims(input: {
           buyer: existing.buyer,
           currency: existing.currency,
           timezone: "",
-          valid_from: existing.valid_from,
+          valid_from: existing.latest_valid_from,
           valid_to: input.nowIso,
           is_current: 0,
           import_batch_id: input.importBatchId,
@@ -190,12 +191,12 @@ export async function syncFbV2Dims(input: {
          argMax(ad_account_id, valid_from) AS ad_account_id,
          argMax(campaign_name, valid_from) AS campaign_name,
          toString(argMax(first_seen_date, valid_from)) AS first_seen_date,
-         toString(max(valid_from)) AS valid_from
+         toString(max(valid_from)) AS latest_valid_from
        FROM ${DIM_FB_CAMPAIGN_TABLE} FINAL
        WHERE auth_user_id = {auth_user_id:String} AND is_current = 1
-         AND campaign_id IN {ids:Array(String)}
+         AND campaign_id IN (${clickHouseBodyStringSet(input.campaigns.map((campaign) => campaign.campaign_id))})
        GROUP BY campaign_id`,
-      { auth_user_id: input.authUserId, ids: input.campaigns.map((campaign) => campaign.campaign_id) },
+      { auth_user_id: input.authUserId },
     );
     const currentById = new Map(current.map((row) => [row.campaign_id, row]));
     const closes: Record<string, unknown>[] = [];
@@ -218,7 +219,7 @@ export async function syncFbV2Dims(input: {
           campaign_name: existing.campaign_name,
           first_seen_date: existing.first_seen_date,
           last_seen_date: candidate.last_seen_date,
-          valid_from: existing.valid_from,
+          valid_from: existing.latest_valid_from,
           valid_to: input.nowIso,
           is_current: 0,
           import_batch_id: input.importBatchId,

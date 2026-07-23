@@ -109,13 +109,20 @@ Deno.serve(async (req: Request) => {
     }
 
     if (action === "v2_dims_backfill") {
-      // One-shot SCD2 seed from the V1 warehouse; idempotent (unchanged entities skipped).
-      const result = await withTimeout(
-        backfillFbV2DimsFromV1({ clickhouse: ch, authUserId: auth.id, nowIso: new Date().toISOString() }),
-        READ_TIMEOUT_MS,
-        "V2 dims backfill",
-      );
-      return jsonResponse({ ok: true, action, ...result });
+      // One-shot SCD2 seed from the V1 warehouse; idempotent (unchanged entities
+      // skipped). Admin diagnostics: the first line of a failure is returned —
+      // ClickHouse exception headers carry no credentials.
+      try {
+        const result = await withTimeout(
+          backfillFbV2DimsFromV1({ clickhouse: ch, authUserId: auth.id, nowIso: new Date().toISOString() }),
+          READ_TIMEOUT_MS,
+          "V2 dims backfill",
+        );
+        return jsonResponse({ ok: true, action, ...result });
+      } catch (error) {
+        const message = (error instanceof Error ? error.message : String(error)).split("\n")[0].slice(0, 300);
+        return jsonResponse({ ok: false, action, error: message }, 502);
+      }
     }
 
     if (action === "v2_parity") {
