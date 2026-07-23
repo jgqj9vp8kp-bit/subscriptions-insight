@@ -937,9 +937,13 @@ FORMAT JSONEachRow`;
     FROM scoped WHERE is_success = 1 AND lt = 'token_purchase' GROUP BY pid, pname, round(amt, 2)`, p3);
 
   const p4: Record<string, unknown> = { auth_user_id: input.authUserId };
+  // sum_g/sum_nn (not "sum(g) g"): ClickHouse substitutes SELECT aliases into
+  // sibling expressions, so aliasing an aggregate back onto its source column
+  // turns the sibling argMin into argMin(round(sum(g),2)) -> ILLEGAL_AGGREGATION.
+  // This silently emptied price_breakdown via the catch below (found 2026-07-23).
   const planSql = base(`SELECT plan_price price,
-    uniqExact(uid) trial_users, sum(g) gross_revenue, sum(nn) net_revenue FROM (
-      SELECT uid, argMin(round(g, 2), (ets2, tprio2, tid2)) plan_price, sum(g) g, sum(nn) nn FROM (
+    uniqExact(uid) trial_users, sum(sum_g) gross_revenue, sum(sum_nn) net_revenue FROM (
+      SELECT uid, argMin(round(g, 2), (ets2, tprio2, tid2)) plan_price, sum(g) sum_g, sum(nn) sum_nn FROM (
         SELECT s.uid uid, s.g g, s.nn nn, p.ets ets2, p.tprio tprio2, p.tid tid2
         FROM scoped s INNER JOIN pretyped p ON p.uid = s.uid
         WHERE s.is_success = 1 AND s.lt NOT IN ('upsell','token_purchase')
