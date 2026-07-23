@@ -7,6 +7,7 @@ import { runClickHouseFacebook } from "@/services/clickhouse";
 import { sortUniq } from "@/services/analyticsCache";
 import type { FunnelSpendResult } from "../../supabase/functions/_shared/clickhouse/fbCampaignResolution.ts";
 import type { FbReconSnapshotRow } from "../../supabase/functions/_shared/clickhouse/fbReconSnapshot.ts";
+import type { FbV2ParityReport } from "../../supabase/functions/_shared/clickhouse/fbV2ParityHarness.ts";
 import type {
   FbChartPoint,
   FbDiagnostics,
@@ -195,6 +196,15 @@ export async function loadFbFunnelSuggestions(apply = false): Promise<{
   error?: string;
 }> {
   return runClickHouseFacebook({ action: "funnel_suggestions", apply });
+}
+
+/** Wave 5 cutover gate: day-by-day V1 vs V2-published parity report (read-only). */
+export async function runFbV2Parity(dateFrom?: string, dateTo?: string): Promise<FbV2ParityReport & { ok: boolean; error?: string }> {
+  return runClickHouseFacebook<FbV2ParityReport & { ok: boolean; error?: string }>({
+    action: "v2_parity",
+    ...(dateFrom ? { date_from: dateFrom } : {}),
+    ...(dateTo ? { date_to: dateTo } : {}),
+  });
 }
 
 /** Wave 4: compute AND STORE a reconciliation health snapshot (six spend buckets,

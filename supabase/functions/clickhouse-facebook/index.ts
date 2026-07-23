@@ -35,6 +35,7 @@ import {
   seedConfirmedCampaignAliases,
 } from "../_shared/clickhouse/fbCampaignResolution.ts";
 import { listFbReconSnapshots, runFbReconSnapshot } from "../_shared/clickhouse/fbReconSnapshot.ts";
+import { runFbV2Parity } from "../_shared/clickhouse/fbV2ParityHarness.ts";
 import {
   buildFbDiagnostics,
   createCapsuledFetcher,
@@ -100,6 +101,23 @@ Deno.serve(async (req: Request) => {
     const ch = client;
     // Idempotent CREATE IF NOT EXISTS so read actions work before the first sync.
     await ensureFactFacebookStatsSchema(ch);
+
+    if (action === "v2_parity") {
+      // Wave 5 cutover gate: day-by-day V1 vs V2-published comparison. Read-only.
+      const today = new Date().toISOString().slice(0, 10);
+      const defaultFrom = new Date(Date.now() - 89 * 86_400_000).toISOString().slice(0, 10);
+      const report = await withTimeout(
+        runFbV2Parity({
+          clickhouse: ch,
+          authUserId: auth.id,
+          dateFrom: typeof body.date_from === "string" ? body.date_from : defaultFrom,
+          dateTo: typeof body.date_to === "string" ? body.date_to : today,
+        }),
+        READ_TIMEOUT_MS,
+        "V2 parity",
+      );
+      return jsonResponse({ ok: true, action, ...report });
+    }
 
     if (action === "recon_snapshot") {
       // Wave 4: compute AND STORE a reconciliation health snapshot (six spend
