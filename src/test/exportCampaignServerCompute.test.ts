@@ -55,11 +55,10 @@ describe("export campaign performance — server-side compute", () => {
     const [row] = buildCampaignPerformanceRows({ txs });
     // The token purchase must not occupy a renewal/first-sub slot...
     expect(row.first_sub_users).toBe(1);
-    // ...and it is EXCLUDED from net_revenue: the export mirrors the dashboard's
-    // cash-revenue type list, which does not include token_purchase yet
-    // (TODO_MONETIZATION item 1 adds it to BOTH surfaces together). The retired
-    // port used to leak it in as a fake renewal.
-    expect(row.net_revenue).toBeCloseTo(1 + 29, 2);
+    // ...and its revenue counts as cash: token_purchase is in the shared
+    // cash-revenue type list (TODO_MONETIZATION item 1, changed for the
+    // dashboard and the export in lockstep).
+    expect(row.net_revenue).toBeCloseTo(1 + 29 + 4.99, 2);
   });
 
   it("1. computes metrics from warehouse rows alone (no frontend cache)", () => {

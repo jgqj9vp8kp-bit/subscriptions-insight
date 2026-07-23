@@ -512,6 +512,8 @@ describe("dashboard data builders", () => {
         upsell_users: 1,
         non_upsell_trial_users: 1,
         upsell_rate: 50,
+        token_buyers: 0,
+        token_revenue: 0,
       },
       {
         date: "2026-03-19",
@@ -519,6 +521,8 @@ describe("dashboard data builders", () => {
         upsell_users: 0,
         non_upsell_trial_users: 1,
         upsell_rate: 0,
+        token_buyers: 0,
+        token_revenue: 0,
       },
     ]);
   });

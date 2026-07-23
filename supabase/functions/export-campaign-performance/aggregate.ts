@@ -29,7 +29,8 @@ export interface TrafficMetricLike {
 }
 
 // Revenue is recognised only for successful sale events — mirrors the dashboard's
-// CASH_REVENUE_TRANSACTION_TYPES / isCashRevenueTransaction (src/services/dashboard.ts).
+// CASH_REVENUE_TRANSACTION_TYPES (shared dashboardCompute.ts). token_purchase
+// added 2026-07-23 in lockstep with the dashboard (TODO_MONETIZATION item 1).
 const REVENUE_TRANSACTION_TYPES = new Set([
   "trial",
   "upsell",
@@ -37,6 +38,7 @@ const REVENUE_TRANSACTION_TYPES = new Set([
   "renewal_2",
   "renewal_3",
   "renewal",
+  "token_purchase",
 ]);
 
 // Mirrors FAILED_STATUS_TOKENS in src/services/paymentFailures.ts.

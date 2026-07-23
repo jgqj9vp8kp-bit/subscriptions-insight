@@ -85,6 +85,7 @@ const DEFAULT_DASHBOARD_UI_STATE = {
 const PROJECT_KPIS = [
   "Cash Revenue",
   "Cash Net Revenue",
+  "Token / Add-on Rev",
 ];
 
 const COHORT_KPIS = [
@@ -97,6 +98,7 @@ const COHORT_KPIS = [
 const KPI_TOOLTIPS: Record<string, string> = {
   "Cash Revenue": "Cash Revenue is based on transaction dates and matches PSP/Primer reporting.",
   "Cash Net Revenue": "Transaction-date Cash Revenue minus refund amounts in the selected period.",
+  "Token / Add-on Rev": "Net revenue from web-app token/minute packs attributed to visible cohorts. Also included in Cash Revenue.",
   "Cohort Gross Rev": "Gross revenue from visible cohorts.",
   "Cohort Net Rev": "Gross revenue minus refunds from visible cohorts.",
   "Cohort Rev D7": "Cohort revenue through day 7.",
@@ -122,6 +124,7 @@ const KPI_TOOLTIPS: Record<string, string> = {
 const KPI_ICONS: Record<string, JSX.Element> = {
   "Cash Revenue": <DollarSign className="h-4 w-4" />,
   "Cash Net Revenue": <DollarSign className="h-4 w-4" />,
+  "Token / Add-on Rev": <CreditCard className="h-4 w-4" />,
   "Cohort Gross Rev": <DollarSign className="h-4 w-4" />,
   "Cohort Net Rev": <DollarSign className="h-4 w-4" />,
   "Cohort Rev D7": <DollarSign className="h-4 w-4" />,
@@ -147,6 +150,7 @@ const KPI_ICONS: Record<string, JSX.Element> = {
 const KPI_ACCENTS: Record<string, "primary" | "accent" | "warning" | "success"> = {
   "Cash Revenue": "success",
   "Cash Net Revenue": "success",
+  "Token / Add-on Rev": "accent",
   "Cohort Gross Rev": "primary",
   "Cohort Net Rev": "success",
   "Cohort Rev D7": "primary",
@@ -197,6 +201,7 @@ const healthConfig = {
 const trialsUpsellsConfig = {
   upsell_users: { label: "Upsell Users", color: "hsl(var(--chart-2))" },
   non_upsell_trial_users: { label: "Trials without Upsell", color: "hsl(var(--chart-1))" },
+  token_buyers: { label: "Token Buyers", color: "hsl(var(--chart-5))" },
 } satisfies ChartConfig;
 
 const dailyRefundsConfig = {
@@ -744,6 +749,7 @@ export default function Dashboard() {
                   <ChartLegend content={<ChartLegendContent />} />
                   <Bar dataKey="upsell_users" stackId="activity" fill="var(--color-upsell_users)" radius={[0, 0, 4, 4]} />
                   <Bar dataKey="non_upsell_trial_users" stackId="activity" fill="var(--color-non_upsell_trial_users)" radius={[4, 4, 0, 0]} />
+                  <Bar dataKey="token_buyers" fill="var(--color-token_buyers)" radius={[4, 4, 4, 4]} />
                 </BarChart>
               </ChartContainer>
             ) : <ChartEmptyState message="No daily trial or upsell events to chart." />}

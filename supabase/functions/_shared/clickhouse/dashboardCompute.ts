@@ -61,6 +61,8 @@ export interface DailyTrialsUpsellsRow {
   upsell_users: number;
   non_upsell_trial_users: number;
   upsell_rate: number;
+  token_buyers: number;
+  token_revenue: number;
 }
 
 export interface DailyRefundsRow {
@@ -123,6 +125,8 @@ type DashboardTotals = {
   roasD7: number | null;
   roas1m: number | null;
   roas2m: number | null;
+  tokenNetRevenue: number;
+  tokenBuyers: number;
 };
 
 const round2 = (value: number) => Math.round(value * 100) / 100;
@@ -184,6 +188,9 @@ function isSuccessfulTransaction(transaction: Transaction): boolean {
   return transaction.status === "success";
 }
 
+// token_purchase added 2026-07-23 (TODO_MONETIZATION item 1) — web-app token
+// packs are real cash. The Export API's REVENUE_TRANSACTION_TYPES mirrors this
+// list and MUST change in the same commit.
 const CASH_REVENUE_TRANSACTION_TYPES = new Set<Transaction["transaction_type"]>([
   "trial",
   "upsell",
@@ -191,6 +198,7 @@ const CASH_REVENUE_TRANSACTION_TYPES = new Set<Transaction["transaction_type"]>(
   "renewal_2",
   "renewal_3",
   "renewal",
+  "token_purchase",
 ]);
 
 function isCashRevenueTransaction(transaction: Transaction): boolean {
@@ -278,6 +286,8 @@ function summarizeDashboardCohorts(cohorts: DashboardCohort[]): DashboardTotals 
   const autoCancelledUsers = uniqueCount(cohorts, (cohort) => cohort.auto_cancelled_user_ids, (cohort) => cohort.auto_cancelled_users);
   const cancelledActiveUsers = uniqueCount(cohorts, (cohort) => cohort.cancelled_active_user_ids, (cohort) => cohort.cancelled_active_users);
   const amountRefunded = sum(cohorts, (cohort) => cohort.amount_refunded);
+  const tokenNetRevenue = sum(cohorts, (cohort) => cohort.token_net_revenue ?? 0);
+  const tokenBuyers = uniqueCount(cohorts, (cohort) => cohort.token_buyer_user_ids, (cohort) => cohort.token_buyers ?? 0);
 
   return {
     grossRevenue: round2(grossRevenue),
@@ -335,6 +345,9 @@ export function buildDashboardKpis(cohorts: DashboardCohort[]): DashboardKpi[] {
     { label: "User Cancelled", value: totals.userCancelledUsers, type: "number" },
     { label: "Auto Cancelled", value: totals.autoCancelledUsers, type: "number" },
     { label: "Refund Rate", value: totals.refundRate, type: "percent" },
+    // TODO_MONETIZATION item 1: token/add-on cash surfaced as its own card.
+    { label: "Token / Add-on Rev", value: totals.tokenNetRevenue, type: "currency" },
+    { label: "Token Buyers", value: totals.tokenBuyers, type: "number" },
   ];
 }
 
@@ -480,6 +493,25 @@ export function buildTrialsUpsellsByDay(transactions: Transaction[]): DailyTrial
     upsellUsersByDate.set(date, users);
   }
 
+  // Token / add-on packs by purchase date (TODO_MONETIZATION item 1). Counted on
+  // their own axis — token buyers are NOT trial users of that day.
+  const { transactions: usdTransactions } = normalizeDashboardTransactions(transactions);
+  const tokenBuyersByDate = new Map<string, Set<string>>();
+  const tokenRevenueByDate = new Map<string, number>();
+  for (const transaction of usdTransactions) {
+    if (!isSuccessfulTransaction(transaction) || transaction.transaction_type !== "token_purchase") continue;
+    const date = dateKey(transaction.event_time);
+    if (!date) continue;
+    const buyers = tokenBuyersByDate.get(date) ?? new Set<string>();
+    buyers.add(userKey(transaction));
+    tokenBuyersByDate.set(date, buyers);
+    const net = grossTransactionAmount(transaction) - refundTransactionAmount(transaction);
+    tokenRevenueByDate.set(date, (tokenRevenueByDate.get(date) ?? 0) + net);
+  }
+  for (const date of tokenBuyersByDate.keys()) {
+    if (!trialUsersByDate.has(date)) trialUsersByDate.set(date, new Set<string>());
+  }
+
   return Array.from(trialUsersByDate.entries())
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([date, trialUsers]) => {
@@ -489,6 +521,8 @@ export function buildTrialsUpsellsByDay(transactions: Transaction[]): DailyTrial
         date,
         trial_users: trialCount,
         upsell_users: upsellCount,
+        token_buyers: tokenBuyersByDate.get(date)?.size ?? 0,
+        token_revenue: Math.round((tokenRevenueByDate.get(date) ?? 0) * 100) / 100,
         non_upsell_trial_users: Math.max(0, trialCount - upsellCount),
         upsell_rate: round2(ratio(upsellCount, trialCount)),
       };
