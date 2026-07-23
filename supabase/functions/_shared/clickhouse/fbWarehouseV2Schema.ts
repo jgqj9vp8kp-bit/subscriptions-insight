@@ -267,6 +267,87 @@ SELECT
 FROM ${V_FB_CAMPAIGN_DAILY_CURRENT}
 `;
 
+export const V_FB_STATS_V2_CAMPAIGN_COMPAT = "v_fb_stats_v2_campaign_compat";
+export const V_FB_STATS_V2_ACCOUNT_COMPAT = "v_fb_stats_v2_account_compat";
+
+// Read-cutover compatibility views: expose the V1 row shape (level literal +
+// names/buyer) over V2 current facts + SCD2 dims, so the existing read SQL can
+// swap its FROM clause behind FB_WAREHOUSE_V2_READS without rewriting queries.
+// adset/ad grains keep reading V1 until their dims exist.
+const DIM_CAMPAIGN_CURRENT_SUBQUERY = `
+  SELECT auth_user_id, campaign_id, argMax(campaign_name, valid_from) AS campaign_name
+  FROM ${DIM_FB_CAMPAIGN_TABLE} FINAL
+  WHERE is_current = 1
+  GROUP BY auth_user_id, campaign_id`;
+
+const DIM_ACCOUNT_CURRENT_SUBQUERY = `
+  SELECT auth_user_id, ad_account_id,
+    argMax(account_name, valid_from) AS account_name,
+    argMax(buyer, valid_from) AS buyer
+  FROM ${DIM_FB_ACCOUNT_TABLE} FINAL
+  WHERE is_current = 1
+  GROUP BY auth_user_id, ad_account_id`;
+
+const CREATE_V_FB_STATS_V2_CAMPAIGN_COMPAT_SQL = `
+CREATE VIEW IF NOT EXISTS ${V_FB_STATS_V2_CAMPAIGN_COMPAT} AS
+SELECT
+  f.auth_user_id AS auth_user_id,
+  'campaign' AS level,
+  f.stat_date AS stat_date,
+  f.ad_account_id AS ad_account_id,
+  a.account_name AS ad_account_name,
+  a.buyer AS buyer,
+  f.campaign_id AS campaign_id,
+  c.campaign_name AS campaign_name,
+  '' AS adset_id,
+  '' AS adset_name,
+  '' AS ad_id,
+  '' AS ad_name,
+  f.spend AS spend,
+  f.impressions AS impressions,
+  f.reach AS reach,
+  f.clicks AS clicks,
+  f.link_clicks AS link_clicks,
+  f.outbound_clicks AS outbound_clicks,
+  f.fb_purchases AS fb_purchases,
+  f.purchase_value AS purchase_value,
+  f.currency AS currency
+FROM ${V_FB_CAMPAIGN_DAILY_CURRENT} AS f
+LEFT JOIN (${DIM_CAMPAIGN_CURRENT_SUBQUERY}) AS c
+  ON c.auth_user_id = f.auth_user_id AND c.campaign_id = f.campaign_id
+LEFT JOIN (${DIM_ACCOUNT_CURRENT_SUBQUERY}) AS a
+  ON a.auth_user_id = f.auth_user_id AND a.ad_account_id = f.ad_account_id
+`;
+
+const CREATE_V_FB_STATS_V2_ACCOUNT_COMPAT_SQL = `
+CREATE VIEW IF NOT EXISTS ${V_FB_STATS_V2_ACCOUNT_COMPAT} AS
+SELECT
+  f.auth_user_id AS auth_user_id,
+  'account' AS level,
+  f.stat_date AS stat_date,
+  f.ad_account_id AS ad_account_id,
+  a.account_name AS ad_account_name,
+  a.buyer AS buyer,
+  '' AS campaign_id,
+  '' AS campaign_name,
+  '' AS adset_id,
+  '' AS adset_name,
+  '' AS ad_id,
+  '' AS ad_name,
+  f.spend AS spend,
+  f.impressions AS impressions,
+  f.reach AS reach,
+  f.clicks AS clicks,
+  f.link_clicks AS link_clicks,
+  f.outbound_clicks AS outbound_clicks,
+  f.fb_purchases AS fb_purchases,
+  f.purchase_value AS purchase_value,
+  f.currency AS currency
+FROM ${V_FB_ACCOUNT_DAILY_CURRENT} AS f
+LEFT JOIN (${DIM_ACCOUNT_CURRENT_SUBQUERY}) AS a
+  ON a.auth_user_id = f.auth_user_id AND a.ad_account_id = f.ad_account_id
+`;
+
 export const FB_WAREHOUSE_V2_DDL: readonly string[] = [
   CREATE_RAW_FACEBOOK_API_RESPONSES_SQL,
   CREATE_FACT_FB_ACCOUNT_DAILY_SQL,
@@ -283,6 +364,8 @@ export const FB_WAREHOUSE_V2_DDL: readonly string[] = [
   createCurrentViewSql(V_FB_ADSET_DAILY_CURRENT, FACT_FB_ADSET_DAILY_TABLE, ["ad_account_id", "campaign_id", "adset_id"]),
   createCurrentViewSql(V_FB_AD_DAILY_CURRENT, FACT_FB_AD_DAILY_TABLE, ["ad_account_id", "campaign_id", "adset_id", "ad_id"]),
   CREATE_V_CHANNEL_CAMPAIGN_DAILY_SQL,
+  CREATE_V_FB_STATS_V2_CAMPAIGN_COMPAT_SQL,
+  CREATE_V_FB_STATS_V2_ACCOUNT_COMPAT_SQL,
 ];
 
 export async function ensureFbWarehouseV2Schema(client: ClickHouseClientLike): Promise<void> {

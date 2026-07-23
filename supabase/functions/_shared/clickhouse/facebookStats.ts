@@ -32,6 +32,7 @@ import {
   type FbSyncTrigger,
 } from "./fbSyncHistory.ts";
 import { buildFbV2DqChecks, createFbWarehouseV2Writer } from "./fbWarehouseV2Writer.ts";
+import { V_FB_STATS_V2_ACCOUNT_COMPAT, V_FB_STATS_V2_CAMPAIGN_COMPAT } from "./fbWarehouseV2Schema.ts";
 
 export const FB_SYNC_NAME = "fact_facebook_stats_sync";
 export const FB_LEVELS = ["account", "campaign", "adset", "ad", "day"] as const;
@@ -818,6 +819,9 @@ export interface FbReadRequest {
   filters?: Partial<FbReadFilters>;
   sort?: { field?: string; direction?: string };
   limit?: number;
+  /** Validation-only: force the V2 read path for THIS request without touching
+   * the global FB_WAREHOUSE_V2_READS flag (used to compare V1 vs V2 reads live). */
+  v2_preview?: boolean;
 }
 
 export function normalizeFbFilters(req: FbReadRequest): FbReadFilters {
@@ -858,6 +862,30 @@ export function fbScopeWhere(input: {
   where += inClause(`${p}ad_account_id`, filters.ad_account_id, "acct", params);
   where += inClause(`${p}campaign_id`, filters.campaign_id, "camp", params);
   return where;
+}
+
+// ---- Warehouse V2 read cutover (Wave 5, behind FB_WAREHOUSE_V2_READS) --------
+
+/** Read-cutover flag. Flip ONLY after the parity harness has been green for 7
+ * consecutive days (recon snapshots record the history). */
+export function fbV2ReadsEnabled(
+  raw: string | undefined = (globalThis as { Deno?: { env?: { get?: (k: string) => string | undefined } } }).Deno?.env?.get?.("FB_WAREHOUSE_V2_READS") ??
+    (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env?.FB_WAREHOUSE_V2_READS,
+): boolean {
+  return ["1", "true", "yes", "on"].includes(String(raw ?? "").trim().toLowerCase());
+}
+
+/** FROM-clause resolver: campaign/account grains switch to the V2 compat views
+ * (V1 row shape over published facts + SCD2 dims); adset/ad/day grains and all
+ * pipeline diagnostics keep reading V1 until their dims exist / Phase 5. */
+export function fbReadFrom(level: FbLevel, alias?: string, enabled: boolean = fbV2ReadsEnabled()): string {
+  const compat = enabled && level === "campaign"
+    ? V_FB_STATS_V2_CAMPAIGN_COMPAT
+    : enabled && level === "account"
+      ? V_FB_STATS_V2_ACCOUNT_COMPAT
+      : null;
+  if (compat) return alias ? `${compat} AS ${alias}` : compat;
+  return alias ? `${FB} AS ${alias} FINAL` : `${FB} FINAL`;
 }
 
 // Aggregate metric select shared by summary/list/charts: additive sums plus
@@ -977,6 +1005,7 @@ function blendedFromRow(r: Record<string, unknown>, spend: number): FbBlendedMet
 
 export async function runFbList(client: ClickHouseClientLike, authUserId: string, req: FbReadRequest): Promise<{ rows: FbListRow[]; level: FbLevel }> {
   const level = normalizeFbLevel(req.level);
+  const v2Reads = req.v2_preview === true || fbV2ReadsEnabled();
   const filters = normalizeFbFilters(req);
   const params: Record<string, unknown> = { auth_user_id: authUserId };
   const keys = LEVEL_KEYS[level];
@@ -1002,7 +1031,7 @@ export async function runFbList(client: ClickHouseClientLike, authUserId: string
       toString(max(stat_date)) last_date,
       uniqExact(stat_date) days,
       ${METRIC_SUMS}${blendCols}
-    FROM ${FB} AS fb FINAL
+    FROM ${fbReadFrom(level, "fb", v2Reads)}
     ${blendJoin}
     WHERE ${where}
     GROUP BY ${groupBy}
@@ -1055,7 +1084,7 @@ export async function runFbCharts(client: ClickHouseClientLike, authUserId: stri
   const where = fbScopeWhere({ level, filters, params });
   const sql = `
     SELECT toString(stat_date) date, ${METRIC_SUMS}
-    FROM ${FB} FINAL
+    FROM ${fbReadFrom(level)}
     WHERE ${where}
     GROUP BY stat_date
     ORDER BY stat_date
@@ -1091,9 +1120,9 @@ export async function runFbFilterOptions(client: ClickHouseClientLike, authUserI
   const acctQ = base("acct");
   const campQ = base("camp");
   const [buyers, accounts, campaigns, range] = await Promise.all([
-    jsonRows<Record<string, unknown>>(client, `SELECT buyer value, sum(spend) spend, count() rows FROM ${FB} FINAL WHERE ${buyerQ.where} AND buyer != '' GROUP BY buyer ORDER BY spend DESC FORMAT JSONEachRow`, buyerQ.params),
-    jsonRows<Record<string, unknown>>(client, `SELECT ad_account_id value, argMax(ad_account_name, stat_date) label, sum(spend) spend, count() rows FROM ${FB} FINAL WHERE ${acctQ.where} AND ad_account_id != '' GROUP BY ad_account_id ORDER BY spend DESC FORMAT JSONEachRow`, acctQ.params),
-    jsonRows<Record<string, unknown>>(client, `SELECT campaign_id value, argMax(campaign_name, stat_date) label, sum(spend) spend, count() rows FROM ${FB} FINAL WHERE ${campQ.where} AND campaign_id != '' GROUP BY campaign_id ORDER BY spend DESC FORMAT JSONEachRow`, campQ.params),
+    jsonRows<Record<string, unknown>>(client, `SELECT buyer value, sum(spend) spend, count() rows FROM ${fbReadFrom("campaign")} WHERE ${buyerQ.where} AND buyer != '' GROUP BY buyer ORDER BY spend DESC FORMAT JSONEachRow`, buyerQ.params),
+    jsonRows<Record<string, unknown>>(client, `SELECT ad_account_id value, argMax(ad_account_name, stat_date) label, sum(spend) spend, count() rows FROM ${fbReadFrom("campaign")} WHERE ${acctQ.where} AND ad_account_id != '' GROUP BY ad_account_id ORDER BY spend DESC FORMAT JSONEachRow`, acctQ.params),
+    jsonRows<Record<string, unknown>>(client, `SELECT campaign_id value, argMax(campaign_name, stat_date) label, sum(spend) spend, count() rows FROM ${fbReadFrom("campaign")} WHERE ${campQ.where} AND campaign_id != '' GROUP BY campaign_id ORDER BY spend DESC FORMAT JSONEachRow`, campQ.params),
     jsonRows<Record<string, unknown>>(client, `SELECT toString(min(stat_date)) date_min, toString(max(stat_date)) date_max FROM ${FB} FINAL WHERE auth_user_id = {auth_user_id:String}`, { auth_user_id: authUserId }),
   ]);
   return {
