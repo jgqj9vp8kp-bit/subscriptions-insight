@@ -296,6 +296,38 @@ describe("projected revenue", () => {
 // 8-9. Payback day
 // ---------------------------------------------------------------------------
 
+describe("token ARPU uplift (TODO_MONETIZATION item 2)", () => {
+  it("is an additive net stream: projection with uplift differs by the exact geometric series", () => {
+    const months = 6;
+    const base = projectMonthlyNetRevenue(100, baseAssumptions, months);
+    const uplifted = projectMonthlyNetRevenue(100, { ...baseAssumptions, tokenArpuPerTrial: 2, tokenArpuDecay: 0.5 }, months);
+    let expectedCumulative = 0;
+    for (let month = 0; month <= months; month += 1) {
+      expectedCumulative += 100 * 2 * Math.pow(0.5, month);
+      expect(uplifted[month].cumulativeNetRevenue - base[month].cumulativeNetRevenue).toBeCloseTo(expectedCumulative, 1);
+      // Retention math is untouched: paying users and gross are identical.
+      expect(uplifted[month].payingUsers).toBe(base[month].payingUsers);
+      expect(uplifted[month].grossRevenue).toBe(base[month].grossRevenue);
+    }
+  });
+
+  it("hold mode (decay 0) adds a flat ARPU every month; absent assumption changes nothing", () => {
+    const base = projectMonthlyNetRevenue(10, baseAssumptions, 3);
+    const hold = projectMonthlyNetRevenue(10, { ...baseAssumptions, tokenArpuPerTrial: 1, tokenArpuDecay: 0 }, 3);
+    expect(hold[3].cumulativeNetRevenue - base[3].cumulativeNetRevenue).toBeCloseTo(10 * 1 * 4, 2);
+    const none = projectMonthlyNetRevenue(10, { ...baseAssumptions, tokenArpuPerTrial: 0 }, 3);
+    expect(none.map((point) => point.cumulativeNetRevenue)).toEqual(base.map((point) => point.cumulativeNetRevenue));
+  });
+
+  it("derives the auto ARPU from cohort token net revenue per trial user", () => {
+    const auto = deriveAssumptionsFromCohorts([
+      { trial_users: 40, token_net_revenue: 100 } as never,
+      { trial_users: 10, token_net_revenue: 25 } as never,
+    ]);
+    expect(auto.tokenArpuPerTrial).toBeCloseTo(2.5, 2);
+  });
+});
+
 describe("payback day", () => {
   it("finds the first day cumulative net revenue >= spend", () => {
     const cohortId = buildCohortId("soulmate", "reading", COHORT_DATE);

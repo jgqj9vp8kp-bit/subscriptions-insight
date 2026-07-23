@@ -54,6 +54,11 @@ export interface ForecastAssumptions {
   fixedProcessingFee: number; // USD per successful charge
   cac: number | null;
   marginTarget?: number; // desired profit margin for Max Profitable CAC (fraction)
+  /** TODO_MONETIZATION item 2: additive token/add-on uplift, kept SEPARATE from
+   * the retention math. Average token NET revenue per trial user in month 0. */
+  tokenArpuPerTrial?: number;
+  /** Month-over-month decay of the token ARPU (fraction 0..1; 0 = hold flat). */
+  tokenArpuDecay?: number;
 }
 
 export interface RevenueByDayResult {
@@ -284,6 +289,12 @@ export function projectMonthlyNetRevenue(
   const points: MonthlyProjectionPoint[] = [];
   let cumulativeGross = 0;
   let cumulativeCharges = 0;
+  // Token/add-on uplift is an INDEPENDENT additive net stream: the ARPU is
+  // derived from token NET revenue, so it never runs through gross/fee math
+  // (that would double-count processing fees) and never touches retention.
+  const tokenArpu = Math.max(0, a.tokenArpuPerTrial ?? 0);
+  const tokenHold = 1 - clamp01(a.tokenArpuDecay ?? 0);
+  let cumulativeTokenNet = 0;
   for (let month = 0; month <= months; month += 1) {
     let grossThisMonth: number;
     let payingUsers: number;
@@ -300,13 +311,14 @@ export function projectMonthlyNetRevenue(
     }
     cumulativeGross += grossThisMonth;
     cumulativeCharges += chargesThisMonth;
+    cumulativeTokenNet += trialUsers * tokenArpu * Math.pow(tokenHold, month);
     points.push({
       month,
       day: month * MONTH_DAYS,
       payingUsers,
       grossRevenue: round2(grossThisMonth),
       cumulativeGrossRevenue: round2(cumulativeGross),
-      cumulativeNetRevenue: round2(netFromGross(cumulativeGross, cumulativeCharges, a)),
+      cumulativeNetRevenue: round2(netFromGross(cumulativeGross, cumulativeCharges, a) + cumulativeTokenNet),
     });
   }
   return points;
@@ -457,6 +469,7 @@ export function facebookSpendForCohorts(
 // ---------------------------------------------------------------------------
 
 export interface AutoAssumptionValues {
+  tokenArpuPerTrial: number;
   trialPrice: number;
   subscriptionPrice: number;
   upsellValue: number;
@@ -482,7 +495,10 @@ export function deriveAssumptionsFromCohorts(cohorts: CohortRow[]): AutoAssumpti
   const grossRevenue = sumBy(cohorts, (c) => c.gross_revenue);
   const amountRefunded = sumBy(cohorts, (c) => c.amount_refunded);
 
+  const tokenNetRevenue = sumBy(cohorts, (c) => c.token_net_revenue ?? 0);
+
   return {
+    tokenArpuPerTrial: trialUsers > 0 ? round2(tokenNetRevenue / trialUsers) : 0,
     trialPrice: trialUsers > 0 ? round2(trialRevenue / trialUsers) : 0,
     subscriptionPrice: firstSubUsers > 0 ? round2(firstSubRevenue / firstSubUsers) : 0,
     upsellValue: upsellUsers > 0 ? round2(upsellRevenue / upsellUsers) : 0,

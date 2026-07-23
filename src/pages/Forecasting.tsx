@@ -63,6 +63,8 @@ const DEFAULT_FORECAST_UI_STATE = {
   firstRenewalRate: "",
   monthlyRetention: "",
   refundRate: "",
+  tokenArpu: "",
+  tokenArpuDecay: "",
   processingFeePct: String(PROCESSING_FEE_DEFAULT_PCT),
   fixedFee: String(FIXED_FEE_DEFAULT),
   manualSpend: "",
@@ -248,6 +250,8 @@ export default function ForecastingPage() {
     const margin = parseNum(deferredUi.marginTarget);
     return {
       trialPrice: dollarsOr(deferredUi.trialPrice, autoAssumptions.trialPrice),
+      tokenArpuPerTrial: dollarsOr(deferredUi.tokenArpu, autoAssumptions.tokenArpuPerTrial),
+      tokenArpuDecay: pctOr(deferredUi.tokenArpuDecay, 0),
       subscriptionPrice: dollarsOr(deferredUi.subscriptionPrice, autoAssumptions.subscriptionPrice),
       upsellValue: dollarsOr(deferredUi.upsellValue, autoAssumptions.upsellValue),
       upsellRate: pctOr(deferredUi.upsellRate, autoAssumptions.upsellRate),
@@ -501,6 +505,8 @@ export default function ForecastingPage() {
                   <CostInput label="First Renewal Rate" suffix="%" autoValue={`${(autoAssumptions.firstRenewalRate * 100).toFixed(1)}%`} value={ui.firstRenewalRate} onChange={(v) => update({ firstRenewalRate: v })} hint="Trial → first paid subscription month." />
                   <CostInput label="Monthly Retention" suffix="%" autoValue={`${(autoAssumptions.monthlyRetention * 100).toFixed(1)}%`} value={ui.monthlyRetention} onChange={(v) => update({ monthlyRetention: v })} hint="Month-over-month retention after the first paid month." />
                   <CostInput label="Refund Rate" suffix="%" autoValue={`${(autoAssumptions.refundRate * 100).toFixed(1)}%`} value={ui.refundRate} onChange={(v) => update({ refundRate: v })} />
+                  <CostInput label="Token ARPU / Trial" suffix="$" autoValue={`$${autoAssumptions.tokenArpuPerTrial.toFixed(2)}`} value={ui.tokenArpu} onChange={(v) => update({ tokenArpu: v })} />
+                  <CostInput label="Token ARPU Decay" suffix="%/mo" autoValue="0%" value={ui.tokenArpuDecay} onChange={(v) => update({ tokenArpuDecay: v })} />
                   <CostInput label="Processing Fee" suffix="%" autoValue={`${PROCESSING_FEE_DEFAULT_PCT}%`} value={ui.processingFeePct} onChange={(v) => update({ processingFeePct: v })} />
                   <CostInput label="Fixed Processing Fee" suffix="$/charge" autoValue={fmtMoney(FIXED_FEE_DEFAULT)} value={ui.fixedFee} onChange={(v) => update({ fixedFee: v })} />
                   <CostInput label="Margin Target" suffix="%" autoValue="0%" value={ui.marginTarget} onChange={(v) => update({ marginTarget: v })} hint="Desired profit margin for Max Profitable CAC." />
