@@ -33,23 +33,36 @@ and the documented plan for the pieces intentionally **not** done yet.
   totals, expanded-row upsell-funnel + token-pack breakdown, aggregated pack
   table + diagnostics line above the table.
 
-## Deliberately NOT done in this task (planned follow-ups)
+## Follow-up status (updated 2026-07-23)
 
-### 1. Dashboard token revenue (later)
+- Item 1 (Dashboard token revenue): DONE — token_purchase is in the shared
+  CASH_REVENUE_TRANSACTION_TYPES and the Export API's mirrored list (same
+  commit); "Token / Add-on Rev" KPI card + token series in the daily chart.
+- Item 2 (Forecasting token LTV): DONE — additive tokenArpuPerTrial (+ optional
+  monthly decay) net stream in projectMonthlyNetRevenue, kept separate from
+  retention math; auto-derived from cohort token net revenue per trial.
+- Item 4 (Export API parity): DONE — the duplicated classifier port was retired;
+  the export reuses the shared hydration/classification (token_purchase aware).
+- Item 3 (token revenue in cohort net_ltv / revenue_dN): STILL OPEN — changes
+  historical cohort metrics, requires an explicit sign-off before implementing.
+
+## Original follow-up plans (kept for context)
+
+### 1. Dashboard token revenue (DONE)
 - `CASH_REVENUE_TRANSACTION_TYPES` in `src/services/dashboard.ts` does not
   include `token_purchase`, so Dashboard cash revenue ignores token purchases.
 - Plan: add a "Token / Add-on Revenue" KPI card and include `token_purchase`
   in cash revenue behind the existing filters; extend `buildUpsellsByDay`-style
   daily series with a token series.
 
-### 2. Forecasting token LTV component (later)
+### 2. Forecasting token LTV component (DONE)
 - Forecasting reads subscription-lifecycle types only; token revenue is
   invisible to it today.
 - Plan: add an additive "token ARPU uplift" component — per-cohort
   `avg_token_revenue_per_trial` decaying/holding per forecast month — kept
   separate from renewal retention math so scenario editing stays independent.
 
-### 3. Token LTV in cohort LTV columns (later)
+### 3. Token LTV in cohort LTV columns (OPEN — needs sign-off)
 - `net_ltv` / `revenue_dN` include token purchases only when the token purchase
   arrives under the same `user_id` as the funnel purchase (existing revenue
   definitions were intentionally left untouched). Email-matched token revenue
@@ -58,7 +71,7 @@ and the documented plan for the pieces intentionally **not** done yet.
   `gross_revenue`/`net_revenue`/`revenue_dN` (that changes existing metric
   values, so it needs an explicit sign-off).
 
-### 4. Export API / edge function parity (later)
+### 4. Export API / edge function parity (DONE)
 - `supabase/functions/export-campaign-performance/classify.ts` duplicates the
   client classifier and does NOT know `token_purchase`; the export still
   counts token-like rows as renewals. Port the token detection there when the

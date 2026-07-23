@@ -60,6 +60,7 @@ import {
   type FbAnalyticsSortKey,
 } from "@/services/fbAnalytics";
 import { fbAnalyticsSource, fetchFbAnalyticsSummary } from "@/services/fbAnalyticsSummaryClient";
+import { FbWarehouseHealth } from "@/components/FbWarehouseHealth";
 import { reconcileFbAnalyticsSummaries } from "../../supabase/functions/_shared/clickhouse/fbAnalyticsSummary.ts";
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -1207,6 +1208,7 @@ export default function FBAnalyticsPage() {
 
           {/* Server-driven FB warehouse analytics — no browser calculations. */}
           <TabsContent value="warehouse" className="space-y-4">
+            <FbWarehouseHealth />
             <FbWarehouseAnalytics />
           </TabsContent>
 
