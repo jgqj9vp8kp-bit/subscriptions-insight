@@ -11,7 +11,7 @@
 //    same philosophy as the facts.
 
 import type { ClickHouseClientLike } from "./types.ts";
-import { DIM_FB_ACCOUNT_TABLE, DIM_FB_CAMPAIGN_TABLE, ensureFbWarehouseV2Schema } from "./fbWarehouseV2Schema.ts";
+import { DIM_FB_ACCOUNT_TABLE, DIM_FB_AD_TABLE, DIM_FB_ADSET_TABLE, DIM_FB_CAMPAIGN_TABLE, ensureFbWarehouseV2Schema } from "./fbWarehouseV2Schema.ts";
 import { FACT_FACEBOOK_STATS_TABLE } from "./schema.ts";
 import { clickHouseBodyStringSet } from "./fbCohortStats.ts";
 
@@ -24,6 +24,10 @@ export interface FbDimSourceRow {
   currency: string;
   campaign_id: string;
   campaign_name: string;
+  adset_id?: string;
+  adset_name?: string;
+  ad_id?: string;
+  ad_name?: string;
 }
 
 export interface FbAccountDimCandidate {
@@ -41,13 +45,32 @@ export interface FbCampaignDimCandidate {
   last_seen_date: string;
 }
 
+export interface FbAdsetDimCandidate {
+  adset_id: string;
+  campaign_id: string;
+  ad_account_id: string;
+  adset_name: string;
+}
+
+export interface FbAdDimCandidate {
+  ad_id: string;
+  adset_id: string;
+  campaign_id: string;
+  ad_account_id: string;
+  ad_name: string;
+}
+
 /** Latest attributes per entity out of a batch's mapped rows (argmax by stat_date). */
 export function deriveDimCandidatesFromRows(rows: readonly FbDimSourceRow[]): {
   accounts: FbAccountDimCandidate[];
   campaigns: FbCampaignDimCandidate[];
+  adsets: FbAdsetDimCandidate[];
+  ads: FbAdDimCandidate[];
 } {
   const accounts = new Map<string, { stat_date: string } & FbAccountDimCandidate>();
   const campaigns = new Map<string, { stat_date: string } & FbCampaignDimCandidate>();
+  const adsets = new Map<string, { stat_date: string } & FbAdsetDimCandidate>();
+  const ads = new Map<string, { stat_date: string } & FbAdDimCandidate>();
 
   for (const row of rows) {
     const accountId = row.ad_account_id?.trim();
@@ -85,11 +108,40 @@ export function deriveDimCandidatesFromRows(rows: readonly FbDimSourceRow[]): {
         if (row.stat_date > current.last_seen_date) current.last_seen_date = row.stat_date;
       }
     }
+    const adsetId = row.level === "adset" ? row.adset_id?.trim() : "";
+    if (adsetId) {
+      const current = adsets.get(adsetId);
+      if (!current || row.stat_date >= current.stat_date) {
+        adsets.set(adsetId, {
+          stat_date: row.stat_date,
+          adset_id: adsetId,
+          campaign_id: row.campaign_id ?? "",
+          ad_account_id: row.ad_account_id ?? "",
+          adset_name: row.adset_name ?? "",
+        });
+      }
+    }
+    const adId = row.level === "ad" ? row.ad_id?.trim() : "";
+    if (adId) {
+      const current = ads.get(adId);
+      if (!current || row.stat_date >= current.stat_date) {
+        ads.set(adId, {
+          stat_date: row.stat_date,
+          ad_id: adId,
+          adset_id: row.adset_id ?? "",
+          campaign_id: row.campaign_id ?? "",
+          ad_account_id: row.ad_account_id ?? "",
+          ad_name: row.ad_name ?? "",
+        });
+      }
+    }
   }
 
   return {
     accounts: [...accounts.values()].map(({ stat_date: _s, ...rest }) => rest),
     campaigns: [...campaigns.values()].map(({ stat_date: _s, ...rest }) => rest),
+    adsets: [...adsets.values()].map(({ stat_date: _s, ...rest }) => rest),
+    ads: [...ads.values()].map(({ stat_date: _s, ...rest }) => rest),
   };
 }
 
@@ -122,8 +174,12 @@ export async function syncFbV2Dims(input: {
   nowIso: string;
   accounts: readonly FbAccountDimCandidate[];
   campaigns: readonly FbCampaignDimCandidate[];
-}): Promise<{ accounts_opened: number; accounts_closed: number; campaigns_opened: number; campaigns_closed: number }> {
-  const counters = { accounts_opened: 0, accounts_closed: 0, campaigns_opened: 0, campaigns_closed: 0 };
+  adsets?: readonly FbAdsetDimCandidate[];
+  ads?: readonly FbAdDimCandidate[];
+}): Promise<{ accounts_opened: number; accounts_closed: number; campaigns_opened: number; campaigns_closed: number; adsets_opened: number; adsets_closed: number; ads_opened: number; ads_closed: number }> {
+  const counters = { accounts_opened: 0, accounts_closed: 0, campaigns_opened: 0, campaigns_closed: 0, adsets_opened: 0, adsets_closed: 0, ads_opened: 0, ads_closed: 0 };
+  const adsets = input.adsets ?? [];
+  const ads = input.ads ?? [];
   const ch = input.clickhouse;
 
   if (input.accounts.length) {
@@ -244,6 +300,123 @@ export async function syncFbV2Dims(input: {
     counters.campaigns_opened = opens.length;
   }
 
+
+  if (adsets.length) {
+    const current = await jsonRows<{ adset_id: string; campaign_id: string; ad_account_id: string; adset_name: string; latest_valid_from: string }>(
+      ch,
+      `SELECT adset_id,
+         argMax(campaign_id, valid_from) AS campaign_id,
+         argMax(ad_account_id, valid_from) AS ad_account_id,
+         argMax(adset_name, valid_from) AS adset_name,
+         toString(max(valid_from)) AS latest_valid_from
+       FROM ${DIM_FB_ADSET_TABLE} FINAL
+       WHERE auth_user_id = {auth_user_id:String} AND is_current = 1
+         AND adset_id IN (${clickHouseBodyStringSet(adsets.map((adset) => adset.adset_id))})
+       GROUP BY adset_id`,
+      { auth_user_id: input.authUserId },
+    );
+    const currentById = new Map(current.map((row) => [row.adset_id, row]));
+    const closes: Record<string, unknown>[] = [];
+    const opens: Record<string, unknown>[] = [];
+    for (const candidate of adsets) {
+      const existing = currentById.get(candidate.adset_id);
+      const changed =
+        !existing ||
+        existing.adset_name !== candidate.adset_name ||
+        existing.campaign_id !== candidate.campaign_id ||
+        existing.ad_account_id !== candidate.ad_account_id;
+      if (!changed) continue;
+      if (existing) {
+        closes.push({
+          auth_user_id: input.authUserId,
+          adset_id: candidate.adset_id,
+          campaign_id: existing.campaign_id,
+          ad_account_id: existing.ad_account_id,
+          adset_name: existing.adset_name,
+          valid_from: existing.latest_valid_from,
+          valid_to: input.nowIso,
+          is_current: 0,
+          import_batch_id: input.importBatchId,
+        });
+      }
+      opens.push({
+        auth_user_id: input.authUserId,
+        adset_id: candidate.adset_id,
+        campaign_id: candidate.campaign_id,
+        ad_account_id: candidate.ad_account_id,
+        adset_name: candidate.adset_name,
+        valid_from: input.nowIso,
+        valid_to: null,
+        is_current: 1,
+        import_batch_id: input.importBatchId,
+      });
+    }
+    if (closes.length) await ch.insert({ table: DIM_FB_ADSET_TABLE, values: closes, format: "JSONEachRow" });
+    if (opens.length) await ch.insert({ table: DIM_FB_ADSET_TABLE, values: opens, format: "JSONEachRow" });
+    counters.adsets_closed = closes.length;
+    counters.adsets_opened = opens.length;
+  }
+
+  if (ads.length) {
+    const current = await jsonRows<{ ad_id: string; adset_id: string; campaign_id: string; ad_account_id: string; ad_name: string; latest_valid_from: string }>(
+      ch,
+      `SELECT ad_id,
+         argMax(adset_id, valid_from) AS adset_id,
+         argMax(campaign_id, valid_from) AS campaign_id,
+         argMax(ad_account_id, valid_from) AS ad_account_id,
+         argMax(ad_name, valid_from) AS ad_name,
+         toString(max(valid_from)) AS latest_valid_from
+       FROM ${DIM_FB_AD_TABLE} FINAL
+       WHERE auth_user_id = {auth_user_id:String} AND is_current = 1
+         AND ad_id IN (${clickHouseBodyStringSet(ads.map((ad) => ad.ad_id))})
+       GROUP BY ad_id`,
+      { auth_user_id: input.authUserId },
+    );
+    const currentById = new Map(current.map((row) => [row.ad_id, row]));
+    const closes: Record<string, unknown>[] = [];
+    const opens: Record<string, unknown>[] = [];
+    for (const candidate of ads) {
+      const existing = currentById.get(candidate.ad_id);
+      const changed =
+        !existing ||
+        existing.ad_name !== candidate.ad_name ||
+        existing.adset_id !== candidate.adset_id ||
+        existing.campaign_id !== candidate.campaign_id ||
+        existing.ad_account_id !== candidate.ad_account_id;
+      if (!changed) continue;
+      if (existing) {
+        closes.push({
+          auth_user_id: input.authUserId,
+          ad_id: candidate.ad_id,
+          adset_id: existing.adset_id,
+          campaign_id: existing.campaign_id,
+          ad_account_id: existing.ad_account_id,
+          ad_name: existing.ad_name,
+          valid_from: existing.latest_valid_from,
+          valid_to: input.nowIso,
+          is_current: 0,
+          import_batch_id: input.importBatchId,
+        });
+      }
+      opens.push({
+        auth_user_id: input.authUserId,
+        ad_id: candidate.ad_id,
+        adset_id: candidate.adset_id,
+        campaign_id: candidate.campaign_id,
+        ad_account_id: candidate.ad_account_id,
+        ad_name: candidate.ad_name,
+        valid_from: input.nowIso,
+        valid_to: null,
+        is_current: 1,
+        import_batch_id: input.importBatchId,
+      });
+    }
+    if (closes.length) await ch.insert({ table: DIM_FB_AD_TABLE, values: closes, format: "JSONEachRow" });
+    if (opens.length) await ch.insert({ table: DIM_FB_AD_TABLE, values: opens, format: "JSONEachRow" });
+    counters.ads_closed = closes.length;
+    counters.ads_opened = opens.length;
+  }
+
   return counters;
 }
 
@@ -257,7 +430,7 @@ export async function backfillFbV2DimsFromV1(input: {
 }): Promise<{ accounts_opened: number; accounts_closed: number; campaigns_opened: number; campaigns_closed: number }> {
   await ensureFbWarehouseV2Schema(input.clickhouse);
   const params = { auth_user_id: input.authUserId };
-  const [accounts, campaigns] = await Promise.all([
+  const [accounts, campaigns, adsets, ads] = await Promise.all([
     jsonRows<FbAccountDimCandidate>(
       input.clickhouse,
       `SELECT ad_account_id,
@@ -281,6 +454,29 @@ export async function backfillFbV2DimsFromV1(input: {
        GROUP BY campaign_id`,
       params,
     ),
+    jsonRows<FbAdsetDimCandidate>(
+      input.clickhouse,
+      `SELECT adset_id,
+         argMax(campaign_id, stat_date) AS campaign_id,
+         argMax(ad_account_id, stat_date) AS ad_account_id,
+         argMax(adset_name, stat_date) AS adset_name
+       FROM ${FACT_FACEBOOK_STATS_TABLE} FINAL
+       WHERE auth_user_id = {auth_user_id:String} AND level = 'adset' AND adset_id != ''
+       GROUP BY adset_id`,
+      params,
+    ),
+    jsonRows<FbAdDimCandidate>(
+      input.clickhouse,
+      `SELECT ad_id,
+         argMax(adset_id, stat_date) AS adset_id,
+         argMax(campaign_id, stat_date) AS campaign_id,
+         argMax(ad_account_id, stat_date) AS ad_account_id,
+         argMax(ad_name, stat_date) AS ad_name
+       FROM ${FACT_FACEBOOK_STATS_TABLE} FINAL
+       WHERE auth_user_id = {auth_user_id:String} AND level = 'ad' AND ad_id != ''
+       GROUP BY ad_id`,
+      params,
+    ),
   ]);
   return syncFbV2Dims({
     clickhouse: input.clickhouse,
@@ -289,23 +485,31 @@ export async function backfillFbV2DimsFromV1(input: {
     nowIso: input.nowIso,
     accounts,
     campaigns,
+    adsets,
+    ads,
   });
 }
 
 export async function fbV2DimsStatus(clickhouse: ClickHouseClientLike, authUserId: string): Promise<{
   current_accounts: number;
   current_campaigns: number;
+  current_adsets: number;
+  current_ads: number;
   campaign_versions: number;
 }> {
   const params = { auth_user_id: authUserId };
-  const [accounts, campaigns, versions] = await Promise.all([
+  const [accounts, campaigns, adsets, ads, versions] = await Promise.all([
     jsonRows<{ c: number }>(clickhouse, `SELECT count() c FROM ${DIM_FB_ACCOUNT_TABLE} FINAL WHERE auth_user_id = {auth_user_id:String} AND is_current = 1`, params),
     jsonRows<{ c: number }>(clickhouse, `SELECT count() c FROM ${DIM_FB_CAMPAIGN_TABLE} FINAL WHERE auth_user_id = {auth_user_id:String} AND is_current = 1`, params),
+    jsonRows<{ c: number }>(clickhouse, `SELECT count() c FROM ${DIM_FB_ADSET_TABLE} FINAL WHERE auth_user_id = {auth_user_id:String} AND is_current = 1`, params),
+    jsonRows<{ c: number }>(clickhouse, `SELECT count() c FROM ${DIM_FB_AD_TABLE} FINAL WHERE auth_user_id = {auth_user_id:String} AND is_current = 1`, params),
     jsonRows<{ c: number }>(clickhouse, `SELECT count() c FROM ${DIM_FB_CAMPAIGN_TABLE} FINAL WHERE auth_user_id = {auth_user_id:String}`, params),
   ]);
   return {
     current_accounts: Number(accounts[0]?.c) || 0,
     current_campaigns: Number(campaigns[0]?.c) || 0,
+    current_adsets: Number(adsets[0]?.c) || 0,
+    current_ads: Number(ads[0]?.c) || 0,
     campaign_versions: Number(versions[0]?.c) || 0,
   };
 }

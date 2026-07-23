@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import { fbReadFrom, fbV2ReadsEnabled, runFbList } from "../../supabase/functions/_shared/clickhouse/facebookStats.ts";
 import {
   V_FB_STATS_V2_ACCOUNT_COMPAT,
+  V_FB_STATS_V2_AD_COMPAT,
+  V_FB_STATS_V2_ADSET_COMPAT,
   V_FB_STATS_V2_CAMPAIGN_COMPAT,
   FB_WAREHOUSE_V2_DDL,
 } from "../../supabase/functions/_shared/clickhouse/fbWarehouseV2Schema.ts";
@@ -19,25 +21,29 @@ describe("fbV2ReadsEnabled", () => {
 });
 
 describe("fbReadFrom", () => {
-  it("keeps V1 (with FINAL) by default and for grains without dims", () => {
+  it("keeps V1 (with FINAL) by default and for the day grain", () => {
     expect(fbReadFrom("campaign", "fb", false)).toBe("fact_facebook_stats AS fb FINAL");
     expect(fbReadFrom("campaign", undefined, false)).toBe("fact_facebook_stats FINAL");
-    expect(fbReadFrom("adset", undefined, true)).toBe("fact_facebook_stats FINAL");
-    expect(fbReadFrom("ad", undefined, true)).toBe("fact_facebook_stats FINAL");
     expect(fbReadFrom("day", undefined, true)).toBe("fact_facebook_stats FINAL");
   });
 
-  it("switches campaign/account grains to the compat views when enabled (no FINAL on views)", () => {
+  it("switches every entity grain to its compat view when enabled (no FINAL on views)", () => {
     expect(fbReadFrom("campaign", "fb", true)).toBe(`${V_FB_STATS_V2_CAMPAIGN_COMPAT} AS fb`);
     expect(fbReadFrom("account", undefined, true)).toBe(V_FB_STATS_V2_ACCOUNT_COMPAT);
+    expect(fbReadFrom("adset", undefined, true)).toBe(V_FB_STATS_V2_ADSET_COMPAT);
+    expect(fbReadFrom("ad", "fb", true)).toBe(`${V_FB_STATS_V2_AD_COMPAT} AS fb`);
   });
 });
 
 describe("compat views DDL", () => {
   it("exposes the full V1 row shape with names joined from SCD2 dims", () => {
     const ddl = FB_WAREHOUSE_V2_DDL.join("\n");
-    for (const view of [V_FB_STATS_V2_CAMPAIGN_COMPAT, V_FB_STATS_V2_ACCOUNT_COMPAT]) {
+    for (const view of [V_FB_STATS_V2_CAMPAIGN_COMPAT, V_FB_STATS_V2_ACCOUNT_COMPAT, V_FB_STATS_V2_ADSET_COMPAT, V_FB_STATS_V2_AD_COMPAT]) {
       expect(ddl).toContain(`CREATE VIEW IF NOT EXISTS ${view}`);
+    }
+    const adCompat = FB_WAREHOUSE_V2_DDL.find((query) => query.includes(V_FB_STATS_V2_AD_COMPAT))!;
+    for (const dim of ["dim_facebook_ad FINAL", "dim_facebook_adset FINAL", "dim_facebook_campaign FINAL", "dim_facebook_account FINAL"]) {
+      expect(adCompat).toContain(dim);
     }
     const campaignCompat = FB_WAREHOUSE_V2_DDL.find((query) => query.includes(V_FB_STATS_V2_CAMPAIGN_COMPAT))!;
     for (const column of ["'campaign' AS level", "ad_account_name", "buyer", "campaign_name", "adset_name", "ad_name", "purchase_value", "link_clicks"]) {

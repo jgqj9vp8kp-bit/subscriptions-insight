@@ -1,5 +1,20 @@
 # Developer Notes
 
+## ClickHouse SQL gotchas (caught live, do not relearn)
+
+- The project's custom ClickHouse HTTP client does NOT serialize `Array(String)`
+  query params. Never write `IN {ids:Array(String)}` — build IN lists with
+  `clickHouseBodyStringSet(...)` from `fbCohortStats.ts`.
+- ClickHouse substitutes SELECT aliases into sibling expressions. An output alias
+  that shadows a column used in ANOTHER aggregate fails with ILLEGAL_AGGREGATION
+  (`max(valid_from) AS valid_from` + `argMax(x, valid_from)` elsewhere). Rename
+  such aliases (`latest_valid_from`). Self-reference (`argMax(spend, t) AS spend`)
+  is safe. The same rule applies inside CREATE VIEW: a WHERE on a column that a
+  SELECT alias shadows must live in an inner subquery.
+- Table alias goes BEFORE `FINAL`: `FROM t AS x FINAL`, never `FROM t FINAL AS x`.
+- Views never take `FINAL`; ReplacingMergeTree tables read through views must
+  apply `FINAL` inside the view definition (or use argMax-per-key views).
+
 ## Known Limitations
 
 - Palmer column names can vary by export. `palmerTransform.ts` supports common aliases, but new exports may require additional aliases.

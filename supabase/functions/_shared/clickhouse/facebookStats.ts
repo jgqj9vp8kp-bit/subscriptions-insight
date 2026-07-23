@@ -32,7 +32,7 @@ import {
   type FbSyncTrigger,
 } from "./fbSyncHistory.ts";
 import { buildFbV2DqChecks, createFbWarehouseV2Writer } from "./fbWarehouseV2Writer.ts";
-import { V_FB_STATS_V2_ACCOUNT_COMPAT, V_FB_STATS_V2_CAMPAIGN_COMPAT } from "./fbWarehouseV2Schema.ts";
+import { V_FB_STATS_V2_ACCOUNT_COMPAT, V_FB_STATS_V2_AD_COMPAT, V_FB_STATS_V2_ADSET_COMPAT, V_FB_STATS_V2_CAMPAIGN_COMPAT } from "./fbWarehouseV2Schema.ts";
 
 export const FB_SYNC_NAME = "fact_facebook_stats_sync";
 export const FB_LEVELS = ["account", "campaign", "adset", "ad", "day"] as const;
@@ -875,15 +875,18 @@ export function fbV2ReadsEnabled(
   return ["1", "true", "yes", "on"].includes(String(raw ?? "").trim().toLowerCase());
 }
 
-/** FROM-clause resolver: campaign/account grains switch to the V2 compat views
- * (V1 row shape over published facts + SCD2 dims); adset/ad/day grains and all
- * pipeline diagnostics keep reading V1 until their dims exist / Phase 5. */
+const V2_COMPAT_BY_LEVEL: Partial<Record<FbLevel, string>> = {
+  campaign: V_FB_STATS_V2_CAMPAIGN_COMPAT,
+  account: V_FB_STATS_V2_ACCOUNT_COMPAT,
+  adset: V_FB_STATS_V2_ADSET_COMPAT,
+  ad: V_FB_STATS_V2_AD_COMPAT,
+};
+
+/** FROM-clause resolver: entity grains switch to the V2 compat views (V1 row
+ * shape over published facts + SCD2 dims); the `day` grain and all pipeline
+ * diagnostics keep reading V1 until Phase 5. */
 export function fbReadFrom(level: FbLevel, alias?: string, enabled: boolean = fbV2ReadsEnabled()): string {
-  const compat = enabled && level === "campaign"
-    ? V_FB_STATS_V2_CAMPAIGN_COMPAT
-    : enabled && level === "account"
-      ? V_FB_STATS_V2_ACCOUNT_COMPAT
-      : null;
+  const compat = enabled ? V2_COMPAT_BY_LEVEL[level] ?? null : null;
   if (compat) return alias ? `${compat} AS ${alias}` : compat;
   return alias ? `${FB} AS ${alias} FINAL` : `${FB} FINAL`;
 }

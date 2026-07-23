@@ -25,6 +25,8 @@ export const FACT_FB_ADSET_DAILY_TABLE = "fact_facebook_adset_daily";
 export const FACT_FB_AD_DAILY_TABLE = "fact_facebook_ad_daily";
 export const DIM_FB_ACCOUNT_TABLE = "dim_facebook_account";
 export const DIM_FB_CAMPAIGN_TABLE = "dim_facebook_campaign";
+export const DIM_FB_ADSET_TABLE = "dim_facebook_adset";
+export const DIM_FB_AD_TABLE = "dim_facebook_ad";
 export const FB_BATCH_REGISTRY_TABLE = "facebook_batch_registry";
 export const FB_DQ_RESULTS_TABLE = "facebook_dq_results";
 export const FB_RECON_SNAPSHOTS_TABLE = "facebook_recon_snapshots";
@@ -142,6 +144,39 @@ ORDER BY (auth_user_id, campaign_id, valid_from)
 // The design doc keeps a parsed funnel on dim_facebook_campaign; rev.2 moved funnel
 // resolution into the dedicated campaign->funnel mapping layer (Postgres,
 // facebook_campaign_funnel_map), so the dim intentionally has no funnel column.
+
+const CREATE_DIM_FB_ADSET_SQL = `
+CREATE TABLE IF NOT EXISTS ${DIM_FB_ADSET_TABLE} (
+  auth_user_id String,
+  adset_id String,
+  campaign_id String,
+  ad_account_id String,
+  adset_name String,
+  valid_from DateTime64(3, 'UTC'),
+  valid_to Nullable(DateTime64(3, 'UTC')),
+  is_current UInt8,
+  import_batch_id UUID
+)
+ENGINE = ReplacingMergeTree
+ORDER BY (auth_user_id, adset_id, valid_from)
+`;
+
+const CREATE_DIM_FB_AD_SQL = `
+CREATE TABLE IF NOT EXISTS ${DIM_FB_AD_TABLE} (
+  auth_user_id String,
+  ad_id String,
+  adset_id String,
+  campaign_id String,
+  ad_account_id String,
+  ad_name String,
+  valid_from DateTime64(3, 'UTC'),
+  valid_to Nullable(DateTime64(3, 'UTC')),
+  is_current UInt8,
+  import_batch_id UUID
+)
+ENGINE = ReplacingMergeTree
+ORDER BY (auth_user_id, ad_id, valid_from)
+`;
 
 // Small mirror of Postgres facebook_import_batches, so the *_current views can
 // filter published batches without a federated query.
@@ -348,6 +383,89 @@ LEFT JOIN (${DIM_ACCOUNT_CURRENT_SUBQUERY}) AS a
   ON a.auth_user_id = f.auth_user_id AND a.ad_account_id = f.ad_account_id
 `;
 
+export const V_FB_STATS_V2_ADSET_COMPAT = "v_fb_stats_v2_adset_compat";
+export const V_FB_STATS_V2_AD_COMPAT = "v_fb_stats_v2_ad_compat";
+
+const DIM_ADSET_CURRENT_SUBQUERY = `
+  SELECT auth_user_id, adset_id, argMax(adset_name, valid_from) AS adset_name
+  FROM ${DIM_FB_ADSET_TABLE} FINAL
+  WHERE is_current = 1
+  GROUP BY auth_user_id, adset_id`;
+
+const DIM_AD_CURRENT_SUBQUERY = `
+  SELECT auth_user_id, ad_id, argMax(ad_name, valid_from) AS ad_name
+  FROM ${DIM_FB_AD_TABLE} FINAL
+  WHERE is_current = 1
+  GROUP BY auth_user_id, ad_id`;
+
+const CREATE_V_FB_STATS_V2_ADSET_COMPAT_SQL = `
+CREATE VIEW IF NOT EXISTS ${V_FB_STATS_V2_ADSET_COMPAT} AS
+SELECT
+  f.auth_user_id AS auth_user_id,
+  'adset' AS level,
+  f.stat_date AS stat_date,
+  f.ad_account_id AS ad_account_id,
+  a.account_name AS ad_account_name,
+  a.buyer AS buyer,
+  f.campaign_id AS campaign_id,
+  c.campaign_name AS campaign_name,
+  f.adset_id AS adset_id,
+  s.adset_name AS adset_name,
+  '' AS ad_id,
+  '' AS ad_name,
+  f.spend AS spend,
+  f.impressions AS impressions,
+  f.reach AS reach,
+  f.clicks AS clicks,
+  f.link_clicks AS link_clicks,
+  f.outbound_clicks AS outbound_clicks,
+  f.fb_purchases AS fb_purchases,
+  f.purchase_value AS purchase_value,
+  f.currency AS currency
+FROM ${V_FB_ADSET_DAILY_CURRENT} AS f
+LEFT JOIN (${DIM_ADSET_CURRENT_SUBQUERY}) AS s
+  ON s.auth_user_id = f.auth_user_id AND s.adset_id = f.adset_id
+LEFT JOIN (${DIM_CAMPAIGN_CURRENT_SUBQUERY}) AS c
+  ON c.auth_user_id = f.auth_user_id AND c.campaign_id = f.campaign_id
+LEFT JOIN (${DIM_ACCOUNT_CURRENT_SUBQUERY}) AS a
+  ON a.auth_user_id = f.auth_user_id AND a.ad_account_id = f.ad_account_id
+`;
+
+const CREATE_V_FB_STATS_V2_AD_COMPAT_SQL = `
+CREATE VIEW IF NOT EXISTS ${V_FB_STATS_V2_AD_COMPAT} AS
+SELECT
+  f.auth_user_id AS auth_user_id,
+  'ad' AS level,
+  f.stat_date AS stat_date,
+  f.ad_account_id AS ad_account_id,
+  a.account_name AS ad_account_name,
+  a.buyer AS buyer,
+  f.campaign_id AS campaign_id,
+  c.campaign_name AS campaign_name,
+  f.adset_id AS adset_id,
+  s.adset_name AS adset_name,
+  f.ad_id AS ad_id,
+  d.ad_name AS ad_name,
+  f.spend AS spend,
+  f.impressions AS impressions,
+  f.reach AS reach,
+  f.clicks AS clicks,
+  f.link_clicks AS link_clicks,
+  f.outbound_clicks AS outbound_clicks,
+  f.fb_purchases AS fb_purchases,
+  f.purchase_value AS purchase_value,
+  f.currency AS currency
+FROM ${V_FB_AD_DAILY_CURRENT} AS f
+LEFT JOIN (${DIM_AD_CURRENT_SUBQUERY}) AS d
+  ON d.auth_user_id = f.auth_user_id AND d.ad_id = f.ad_id
+LEFT JOIN (${DIM_ADSET_CURRENT_SUBQUERY}) AS s
+  ON s.auth_user_id = f.auth_user_id AND s.adset_id = f.adset_id
+LEFT JOIN (${DIM_CAMPAIGN_CURRENT_SUBQUERY}) AS c
+  ON c.auth_user_id = f.auth_user_id AND c.campaign_id = f.campaign_id
+LEFT JOIN (${DIM_ACCOUNT_CURRENT_SUBQUERY}) AS a
+  ON a.auth_user_id = f.auth_user_id AND a.ad_account_id = f.ad_account_id
+`;
+
 export const FB_WAREHOUSE_V2_DDL: readonly string[] = [
   CREATE_RAW_FACEBOOK_API_RESPONSES_SQL,
   CREATE_FACT_FB_ACCOUNT_DAILY_SQL,
@@ -356,6 +474,8 @@ export const FB_WAREHOUSE_V2_DDL: readonly string[] = [
   CREATE_FACT_FB_AD_DAILY_SQL,
   CREATE_DIM_FB_ACCOUNT_SQL,
   CREATE_DIM_FB_CAMPAIGN_SQL,
+  CREATE_DIM_FB_ADSET_SQL,
+  CREATE_DIM_FB_AD_SQL,
   CREATE_FB_BATCH_REGISTRY_SQL,
   CREATE_FB_DQ_RESULTS_SQL,
   CREATE_FB_RECON_SNAPSHOTS_SQL,
@@ -366,6 +486,8 @@ export const FB_WAREHOUSE_V2_DDL: readonly string[] = [
   CREATE_V_CHANNEL_CAMPAIGN_DAILY_SQL,
   CREATE_V_FB_STATS_V2_CAMPAIGN_COMPAT_SQL,
   CREATE_V_FB_STATS_V2_ACCOUNT_COMPAT_SQL,
+  CREATE_V_FB_STATS_V2_ADSET_COMPAT_SQL,
+  CREATE_V_FB_STATS_V2_AD_COMPAT_SQL,
 ];
 
 export async function ensureFbWarehouseV2Schema(client: ClickHouseClientLike): Promise<void> {

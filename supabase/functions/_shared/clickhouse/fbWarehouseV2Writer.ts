@@ -14,9 +14,8 @@
 // is wider than one day is a grain violation: it is counted, reported through DQ
 // and NOT written — V2 never stores interval rows.
 //
-// Deferred to a later slice: SCD2 dim_facebook_account / dim_facebook_campaign
-// population (honest SCD2 needs a read-modify-write of current versions; names
-// remain available in V1 rows and the raw layer meanwhile).
+// SCD2 dims (account/campaign/adset/ad) are synced on every publish — see
+// fbWarehouseV2Dims.ts for the versioning rules.
 
 import type { ClickHouseClientLike, SupabaseLikeClient } from "./types.ts";
 import { ensureFbWarehouseV2Schema, FB_BATCH_REGISTRY_TABLE, FB_DQ_RESULTS_TABLE, FACT_FB_ACCOUNT_DAILY_TABLE, FACT_FB_AD_DAILY_TABLE, FACT_FB_ADSET_DAILY_TABLE, FACT_FB_CAMPAIGN_DAILY_TABLE, RAW_FACEBOOK_API_RESPONSES_TABLE } from "./fbWarehouseV2Schema.ts";
@@ -69,6 +68,8 @@ interface FbV2FactSourceRow {
   ad_account_name?: string;
   buyer?: string;
   campaign_name?: string;
+  adset_name?: string;
+  ad_name?: string;
 }
 
 const FACT_TABLE_BY_LEVEL: Record<string, string> = {
@@ -305,7 +306,7 @@ export class FbWarehouseV2Writer {
     await this.guard("dims", async () => {
       if (inputRows.mergedRowsDetected > 0) return; // suspect batches feed no dims either
       await this.ensureSchema();
-      const { accounts, campaigns } = deriveDimCandidatesFromRows(inputRows.rows as readonly FbDimSourceRow[]);
+      const { accounts, campaigns, adsets, ads } = deriveDimCandidatesFromRows(inputRows.rows as readonly FbDimSourceRow[]);
       await syncFbV2Dims({
         clickhouse: this.input.clickhouse,
         authUserId: this.input.authUserId,
@@ -313,6 +314,8 @@ export class FbWarehouseV2Writer {
         nowIso: this.input.nowIso,
         accounts,
         campaigns,
+        adsets,
+        ads,
       });
     });
     await this.guard("dq", async () => {

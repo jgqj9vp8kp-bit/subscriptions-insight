@@ -19,11 +19,12 @@ const row = (overrides: Partial<Parameters<typeof deriveDimCandidatesFromRows>[0
 
 describe("deriveDimCandidatesFromRows", () => {
   it("takes the latest attributes per entity and tracks first/last seen", () => {
-    const { accounts, campaigns } = deriveDimCandidatesFromRows([
+    const { accounts, campaigns, adsets, ads } = deriveDimCandidatesFromRows([
       row({ stat_date: "2026-07-01", campaign_name: "Alpha (old)" }),
       row({ stat_date: "2026-07-05", campaign_name: "Alpha (new)" }),
       row({ stat_date: "2026-07-03", level: "day", ad_account_id: "", campaign_id: "" }),
-      row({ stat_date: "2026-07-02", level: "adset", campaign_id: "ignored-for-campaign-dim" }),
+      row({ stat_date: "2026-07-02", level: "adset", campaign_id: "ignored-for-campaign-dim", adset_id: "s1", adset_name: "Set One" }),
+      row({ stat_date: "2026-07-04", level: "ad", campaign_id: "c1", adset_id: "s1", ad_id: "a1", ad_name: "Creative One" }),
     ]);
     expect(accounts).toEqual([
       { ad_account_id: "act_1", account_name: "Acc One", buyer: "Ivan", currency: "USD" },
@@ -36,6 +37,12 @@ describe("deriveDimCandidatesFromRows", () => {
         first_seen_date: "2026-07-01",
         last_seen_date: "2026-07-05",
       },
+    ]);
+    expect(adsets).toEqual([
+      { adset_id: "s1", campaign_id: "ignored-for-campaign-dim", ad_account_id: "act_1", adset_name: "Set One" },
+    ]);
+    expect(ads).toEqual([
+      { ad_id: "a1", adset_id: "s1", campaign_id: "c1", ad_account_id: "act_1", ad_name: "Creative One" },
     ]);
   });
 });
@@ -66,7 +73,7 @@ describe("syncFbV2Dims (SCD2)", () => {
       accounts: [account],
       campaigns: [campaign],
     });
-    expect(result).toEqual({ accounts_opened: 1, accounts_closed: 0, campaigns_opened: 1, campaigns_closed: 0 });
+    expect(result).toEqual({ accounts_opened: 1, accounts_closed: 0, campaigns_opened: 1, campaigns_closed: 0, adsets_opened: 0, adsets_closed: 0, ads_opened: 0, ads_closed: 0 });
     const opened = inserts.flatMap((entry) => entry.values);
     expect(opened.every((version) => version.is_current === 1 && version.valid_to === null)).toBe(true);
   });
@@ -87,7 +94,7 @@ describe("syncFbV2Dims (SCD2)", () => {
       accounts: [account], // unchanged -> no writes
       campaigns: [campaign], // name differs from current -> close + open
     });
-    expect(result).toEqual({ accounts_opened: 0, accounts_closed: 0, campaigns_opened: 1, campaigns_closed: 1 });
+    expect(result).toEqual({ accounts_opened: 0, accounts_closed: 0, campaigns_opened: 1, campaigns_closed: 1, adsets_opened: 0, adsets_closed: 0, ads_opened: 0, ads_closed: 0 });
     const campaignWrites = inserts.filter((entry) => entry.table === "dim_facebook_campaign").flatMap((entry) => entry.values);
     const closed = campaignWrites.find((version) => version.is_current === 0)!;
     const opened = campaignWrites.find((version) => version.is_current === 1)!;
