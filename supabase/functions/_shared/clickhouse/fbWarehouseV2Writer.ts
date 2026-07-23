@@ -20,6 +20,7 @@
 
 import type { ClickHouseClientLike, SupabaseLikeClient } from "./types.ts";
 import { ensureFbWarehouseV2Schema, FB_BATCH_REGISTRY_TABLE, FB_DQ_RESULTS_TABLE, FACT_FB_ACCOUNT_DAILY_TABLE, FACT_FB_AD_DAILY_TABLE, FACT_FB_ADSET_DAILY_TABLE, FACT_FB_CAMPAIGN_DAILY_TABLE, RAW_FACEBOOK_API_RESPONSES_TABLE } from "./fbWarehouseV2Schema.ts";
+import { deriveDimCandidatesFromRows, syncFbV2Dims, type FbDimSourceRow } from "./fbWarehouseV2Dims.ts";
 
 export const FB_SYNC_RUN_REQUESTS_TABLE = "facebook_sync_run_requests";
 
@@ -64,6 +65,10 @@ interface FbV2FactSourceRow {
   outbound_clicks: number;
   fb_purchases: number;
   purchase_value: number;
+  /** Name attributes feed the SCD2 dims, never the facts. */
+  ad_account_name?: string;
+  buyer?: string;
+  campaign_name?: string;
 }
 
 const FACT_TABLE_BY_LEVEL: Record<string, string> = {
@@ -296,6 +301,19 @@ export class FbWarehouseV2Writer {
       for (const [table, values] of byTable) {
         await this.input.clickhouse.insert({ table, values, format: "JSONEachRow" });
       }
+    });
+    await this.guard("dims", async () => {
+      if (inputRows.mergedRowsDetected > 0) return; // suspect batches feed no dims either
+      await this.ensureSchema();
+      const { accounts, campaigns } = deriveDimCandidatesFromRows(inputRows.rows as readonly FbDimSourceRow[]);
+      await syncFbV2Dims({
+        clickhouse: this.input.clickhouse,
+        authUserId: this.input.authUserId,
+        importBatchId: this.input.batchId,
+        nowIso: this.input.nowIso,
+        accounts,
+        campaigns,
+      });
     });
     await this.guard("dq", async () => {
       await this.ensureSchema();

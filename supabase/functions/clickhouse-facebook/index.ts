@@ -36,6 +36,7 @@ import {
 } from "../_shared/clickhouse/fbCampaignResolution.ts";
 import { listFbReconSnapshots, runFbReconSnapshot } from "../_shared/clickhouse/fbReconSnapshot.ts";
 import { runFbV2Parity } from "../_shared/clickhouse/fbV2ParityHarness.ts";
+import { backfillFbV2DimsFromV1, fbV2DimsStatus } from "../_shared/clickhouse/fbWarehouseV2Dims.ts";
 import {
   buildFbDiagnostics,
   createCapsuledFetcher,
@@ -101,6 +102,21 @@ Deno.serve(async (req: Request) => {
     const ch = client;
     // Idempotent CREATE IF NOT EXISTS so read actions work before the first sync.
     await ensureFactFacebookStatsSchema(ch);
+
+    if (action === "v2_dims_status") {
+      const status = await withTimeout(fbV2DimsStatus(ch, auth.id), READ_TIMEOUT_MS, "V2 dims status");
+      return jsonResponse({ ok: true, action, ...status });
+    }
+
+    if (action === "v2_dims_backfill") {
+      // One-shot SCD2 seed from the V1 warehouse; idempotent (unchanged entities skipped).
+      const result = await withTimeout(
+        backfillFbV2DimsFromV1({ clickhouse: ch, authUserId: auth.id, nowIso: new Date().toISOString() }),
+        READ_TIMEOUT_MS,
+        "V2 dims backfill",
+      );
+      return jsonResponse({ ok: true, action, ...result });
+    }
 
     if (action === "v2_parity") {
       // Wave 5 cutover gate: day-by-day V1 vs V2-published comparison. Read-only.
