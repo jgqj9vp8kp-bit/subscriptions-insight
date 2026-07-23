@@ -215,6 +215,10 @@ function createCurrentViewSql(view: string, table: string, keyColumns: string[])
   const keys = ["auth_user_id", ...keyColumns, "stat_date"];
   const metricNames = ["spend", "impressions", "reach", "clicks", "link_clicks", "outbound_clicks", "fb_purchases", "purchase_value", "currency"];
   const metrics = metricNames.map((name) => `  argMax(${name}, ingested_at) AS ${name}`).join(",\n");
+  // The published filter lives in an inner subquery: ClickHouse substitutes
+  // SELECT aliases into WHERE, so filtering on import_batch_id at the outer
+  // level would reference the argMax alias and fail with ILLEGAL_AGGREGATION
+  // (caught live on 26.2).
   return `
 CREATE VIEW IF NOT EXISTS ${view} AS
 SELECT
@@ -222,8 +226,10 @@ ${keys.map((key) => `  ${key}`).join(",\n")},
 ${metrics},
   argMax(import_batch_id, ingested_at) AS import_batch_id,
   argMax(source_version, ingested_at) AS source_version
-FROM ${table}
-WHERE import_batch_id IN (${PUBLISHED_BATCHES_SUBQUERY})
+FROM (
+  SELECT * FROM ${table}
+  WHERE import_batch_id IN (${PUBLISHED_BATCHES_SUBQUERY})
+)
 GROUP BY ${keys.join(", ")}
 `;
 }
