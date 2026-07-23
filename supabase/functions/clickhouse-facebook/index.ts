@@ -17,7 +17,7 @@
 // reconciliation and mapping never read them.
 
 import { createClickHouseClient } from "../_shared/clickhouse/client.ts";
-import { jsonResponse, methodNotAllowed, optionsResponse, parseJsonBody, requireSupabaseUser } from "../_shared/clickhouse/http.ts";
+import { jsonResponse, methodNotAllowed, optionsResponse, parseJsonBody, requireCronSecret, requireSupabaseUser } from "../_shared/clickhouse/http.ts";
 import { ensureFactFacebookStatsSchema } from "../_shared/clickhouse/schema.ts";
 import {
   getFbBatchDq,
@@ -68,6 +68,70 @@ function withTimeout<T>(work: Promise<T>, ms: number, label: string): Promise<T>
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return optionsResponse();
   if (req.method !== "POST") return methodNotAllowed("POST");
+
+  // Daily cron tick (design §8): incremental sync + a stored recon snapshot
+  // (the V2 parity verdict rides along), authenticated by FB_CRON_SECRET —
+  // pg_cron cannot mint user JWTs. Keeps the 7-green-days gate accruing even
+  // on days nobody opens the app.
+  if (req.headers.get("x-cron-secret")) {
+    let cronBody: Record<string, unknown>;
+    try {
+      cronBody = await parseJsonBody<Record<string, unknown>>(req);
+    } catch {
+      return jsonResponse({ ok: false, error: "Invalid JSON request body." }, 400);
+    }
+    const cronAuth = requireCronSecret(req, cronBody);
+    if ("status" in cronAuth) return jsonResponse(cronAuth.body, cronAuth.status);
+    const token = Deno.env.get("CAPSULED_API_TOKEN");
+    const baseUrl = Deno.env.get("CAPSULED_API_BASE_URL") || "https://capsuled.space";
+    if (!token) return jsonResponse({ ok: false, error: "CAPSULED_API_TOKEN is not configured." }, 500);
+    let cronClient: ReturnType<typeof createClickHouseClient> | null = null;
+    try {
+      cronClient = createClickHouseClient();
+      // A failed sync (fail-safe: source export inconsistent, batch withheld)
+      // must NOT skip the recon snapshot — recon measures the last PUBLISHED
+      // warehouse state, and the 7-green-days cutover gate has to keep
+      // accruing even on days Capsuled's overnight export is mid-refresh.
+      let syncSummary: Record<string, unknown>;
+      let syncError: string | null = null;
+      try {
+        const sync = await withTimeout(
+          runFacebookStatsSync({
+            authUserId: cronAuth.id,
+            supabase: cronAuth.supabase,
+            clickhouse: cronClient,
+            fetcher: createCapsuledFetcher({ token, baseUrl }),
+            request: { mode: "incremental", trigger_source: "cron" } as FbSyncRequest,
+          }),
+          SYNC_TIMEOUT_MS,
+          "Cron Facebook sync",
+        );
+        syncSummary = { status: sync.status, rows_inserted: sync.rows_inserted, rows_updated: sync.rows_updated, v2_errors: sync.v2_errors ?? 0 };
+      } catch (error) {
+        syncError = error instanceof Error ? error.message : "Cron Facebook sync failed.";
+        syncSummary = { status: "failed", error: syncError };
+      }
+      const today = new Date().toISOString().slice(0, 10);
+      const from = new Date(Date.now() - 89 * 86_400_000).toISOString().slice(0, 10);
+      const snapshot = await withTimeout(
+        runFbReconSnapshot({ clickhouse: cronClient, supabase: cronAuth.supabase, authUserId: cronAuth.id, dateFrom: from, dateTo: today }),
+        READ_TIMEOUT_MS,
+        "Cron recon snapshot",
+      );
+      return jsonResponse({
+        ok: syncError == null,
+        action: "cron_daily",
+        sync: syncSummary,
+        health: snapshot.health,
+        v2_parity: snapshot.details.v2_parity,
+        ...(syncError ? { error: syncError } : {}),
+      }, syncError ? 502 : 200);
+    } catch (error) {
+      return jsonResponse({ ok: false, action: "cron_daily", error: error instanceof Error ? error.message : "Cron tick failed." }, 502);
+    } finally {
+      await cronClient?.close?.().catch(() => undefined);
+    }
+  }
 
   const auth = await requireSupabaseUser(req);
   if ("status" in auth) return jsonResponse(auth.body, auth.status);
