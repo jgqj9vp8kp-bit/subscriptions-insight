@@ -311,6 +311,8 @@ function summarizeDashboardCohorts(cohorts: DashboardCohort[]): DashboardTotals 
     roasD7: roas(revenueD7, spend),
     roas1m: roas(revenueD30, spend),
     roas2m: roas(revenueD60, spend),
+    tokenNetRevenue: round2(tokenNetRevenue),
+    tokenBuyers,
   };
 }
 

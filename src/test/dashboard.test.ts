@@ -213,6 +213,18 @@ describe("dashboard data builders", () => {
     expect(kpiValue(kpis, "First Sub")).toBe(75);
   });
 
+  it("surfaces token/add-on revenue as a real number, not a missing KPI", () => {
+    // Regression: summarizeDashboardCohorts computed tokenNetRevenue/tokenBuyers
+    // but omitted them from the returned totals, so the card rendered "—" even
+    // with real token revenue (TODO_MONETIZATION item 1).
+    const kpis = buildDashboardKpis([
+      cohort({ token_net_revenue: 40, token_buyers: 3 }),
+      cohort({ token_net_revenue: 9.99, token_buyers: 1 }),
+    ]);
+    expect(kpiValue(kpis, "Token / Add-on Rev")).toBe(49.99);
+    expect(kpiValue(kpis, "Token Buyers")).toBe(4);
+  });
+
   it("builds revenue and spend trend rows", () => {
     const kpis = buildDashboardKpis(cohorts);
     const trend = buildRevenueTrend(cohorts);

@@ -23,7 +23,11 @@ import type { ClickHouseSummary } from "@/services/clickhouse";
 // v10: Cohorts filter options add the utm_source list (UTM entries of the Media
 // Buyer dropdown). Discard v9 bundles so selection pruning never runs against a
 // response that predates the list and silently drops a "utm:<value>" selection.
-export const ANALYTICS_CACHE_SCHEMA_VERSION = 10;
+// v11: monetization rollout (Dashboard Token/Add-on KPI + token daily series,
+// item 3 email-matched token revenue in cohort gross/net/revenue_dN). Discard
+// v10 bundles: their KPI arrays lack the token entries (the card renders "—")
+// and their cohort revenue predates the item 3 definition.
+export const ANALYTICS_CACHE_SCHEMA_VERSION = 11;
 
 export const WAREHOUSE_VERSION_KEY = ["clickhouse", "warehouse-version"] as const;
 export const SUPPORT_WAREHOUSE_VERSION_KEY = ["clickhouse", "support-warehouse-version"] as const;
