@@ -92,6 +92,9 @@ function hydrateTransaction(record: Record<string, unknown>): ComputeTxn | null 
     utm_source: normalize(payload.utm_source) || null,
     classification_reason: normalize(payload.classification_reason),
     billing_reason: normalize(payload.billing_reason) || undefined,
+    // Token-pack detection signals for the shared classifier.
+    product: normalize(payload.product) || undefined,
+    currency: normalize(payload.currency ?? record.currency) || undefined,
     source: normalize(record.source) || null,
     import_batch_id: normalize(record.import_batch_id) || null,
     metadata: objectFrom(payload.metadata) ?? undefined,

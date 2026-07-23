@@ -38,6 +38,30 @@ function userRows(userId: string, opts: { upsell?: boolean; sub?: boolean; campa
 }
 
 describe("export campaign performance — server-side compute", () => {
+  it("token packs classify as token_purchase via the SHARED classifier — never renewals (drift fix)", () => {
+    // $4.99 "500 tokens" purchase inside the 72h add-on window after the first
+    // subscription: the retired local port counted it as a renewal.
+    const txs: ComputeTxn[] = [
+      ...userRows("u1", { sub: true }),
+      wtx({
+        user_id: "u1",
+        transaction_id: "u1-token",
+        event_time: "2026-05-09T10:00:00Z",
+        gross_amount_usd: 4.99,
+        product: "500 tokens pack",
+        currency: "USD",
+      }),
+    ];
+    const [row] = buildCampaignPerformanceRows({ txs });
+    // The token purchase must not occupy a renewal/first-sub slot...
+    expect(row.first_sub_users).toBe(1);
+    // ...and it is EXCLUDED from net_revenue: the export mirrors the dashboard's
+    // cash-revenue type list, which does not include token_purchase yet
+    // (TODO_MONETIZATION item 1 adds it to BOTH surfaces together). The retired
+    // port used to leak it in as a fake renewal.
+    expect(row.net_revenue).toBeCloseTo(1 + 29, 2);
+  });
+
   it("1. computes metrics from warehouse rows alone (no frontend cache)", () => {
     const txs = [...userRows("u1", { upsell: true, sub: true }), ...userRows("u2")];
     const [row] = buildCampaignPerformanceRows({ txs });
