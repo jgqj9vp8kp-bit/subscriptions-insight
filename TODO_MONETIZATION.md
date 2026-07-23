@@ -43,8 +43,19 @@ and the documented plan for the pieces intentionally **not** done yet.
   retention math; auto-derived from cohort token net revenue per trial.
 - Item 4 (Export API parity): DONE — the duplicated classifier port was retired;
   the export reuses the shared hydration/classification (token_purchase aware).
-- Item 3 (token revenue in cohort net_ltv / revenue_dN): STILL OPEN — changes
-  historical cohort metrics, requires an explicit sign-off before implementing.
+- Item 3 (token revenue in cohort net_ltv / revenue_dN): DONE (signed off
+  2026-07-23) — email-matched token purchases now join gross/net/revenue_dN in
+  ALL THREE engines: the client/shared compute (`cohortAnalytics.ts` merges
+  them into the member's transaction stream re-keyed to the cohort uid), the
+  dynamic ClickHouse engine (`cohorts.ts` `emailTokenSQL`: cemail/etok/finx
+  union) and the materialized snapshot engine (`cohortMembership.ts`, same
+  union built from `fact_user_cohorts`; the snapshot INSERT itself is
+  untouched). Retention/renewal metrics can't shift: token rows never enter the
+  subscription sequence or upsell slots (lvl = slot = 0 server-side, type gate
+  client-side). `token_diagnostics.matched_by_email` is now reported by the
+  server too. Known documented divergence: under user-level filters
+  (country/card/media buyer/currency) the client admits an email-matched row by
+  the BUYER's dims, the server by the receiving member's dims.
 
 ## Original follow-up plans (kept for context)
 

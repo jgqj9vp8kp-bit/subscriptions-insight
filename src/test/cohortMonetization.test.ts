@@ -269,6 +269,30 @@ describe("token purchase attribution", () => {
     expect(tokenDiagnostics.token_purchases_unmatched).toBe(0);
   });
 
+  it("email-matched token revenue joins gross/net/revenue_dN (item 3, signed off 2026-07-23)", () => {
+    const base = computeCohortsWithDiagnostics([
+      tx("u1", "trial", "2026-06-01T00:00:00Z", { email: "shared@example.com", amount_usd: 1 }),
+    ]).cohorts[0];
+    const withToken = computeCohortsWithDiagnostics([
+      tx("u1", "trial", "2026-06-01T00:00:00Z", { email: "shared@example.com", amount_usd: 1 }),
+      tx("web_9", "token_purchase", "2026-06-02T00:00:00Z", {
+        email: "shared@example.com",
+        product: "300 Tokens",
+        amount_usd: 9.99,
+      }),
+    ]).cohorts[0];
+
+    // The email-matched token behaves exactly like a uid-matched one: it joins
+    // the cohort's revenue definitions, day-offset from the cohort date (day 1).
+    expect(withToken.gross_revenue - base.gross_revenue).toBeCloseTo(9.99, 2);
+    expect(withToken.net_revenue - base.net_revenue).toBeCloseTo(9.99, 2);
+    expect(withToken.revenue_d7 - base.revenue_d7).toBeCloseTo(9.99, 2);
+    expect(withToken.revenue_d0 - base.revenue_d0).toBeCloseTo(0, 2); // day 1, not day 0
+    // Retention/renewal metrics stay untouched.
+    expect(withToken.first_subscription_users).toBe(base.first_subscription_users);
+    expect(withToken.renewal_2_users).toBe(base.renewal_2_users);
+  });
+
   it("reports unmatched token purchases and excludes them from cohort metrics", () => {
     const { cohorts, tokenDiagnostics } = computeCohortsWithDiagnostics([
       tx("u1", "trial", "2026-06-01T00:00:00Z"),

@@ -8,6 +8,7 @@ import {
   aggregateSelect,
   classifierSQL,
   computeTotals,
+  emailMatchedTokenPurchases,
   filtersApplied,
   fxDiagnostics,
   normalizeCohortRequest,
@@ -645,6 +646,76 @@ fin AS (
     multiIf(p.pretype != 'lifecycle', p.pretype, li.lvl = 1, 'first_subscription', li.lvl = 2, 'renewal_2', li.lvl = 3, 'renewal_3', 'renewal') lt
   FROM pretyped p LEFT JOIN lifeidx li USING(uid, tid) LEFT JOIN upsidx ui USING(uid, tid)
 ),
+-- TODO_MONETIZATION item 3 (signed off 2026-07-23): email-matched token rows,
+-- mirrored from the dynamic engine's emailTokenSQL (cohorts.ts) onto the
+-- snapshot. fcm = filter-passing members (email map source), fcall = ALL
+-- snapshot members (exclusion set — a member's own rows are never re-attributed
+-- by email, matching the client's cohortByUser.has() check even when filters
+-- hide that member). etok re-keys non-member token transactions to the email's
+-- member (earliest trial wins) with lvl = slot = 0, so lifecycle/upsell
+-- sequences and the snapshot INSERT (which reads fin) are untouched.
+fcall AS (
+  SELECT canonical_user_id FROM ${FACT_USER_COHORTS_TABLE} FINAL
+  WHERE auth_user_id = {auth_user_id:String}
+    AND warehouse_version = {warehouse_version:String}
+    AND classification_version = {classification_version:String}
+),
+fcm AS (
+  SELECT fc.canonical_user_id canonical_user_id, fc.cohort_date cohort_date,
+    fc.trial_event_time trial_event_time, fc.funnel funnel, fc.campaign_path campaign_path,
+    fc.normalized_email normalized_email
+  FROM ${FACT_USER_COHORTS_TABLE} AS fc FINAL
+  WHERE fc.auth_user_id = {auth_user_id:String}
+    AND fc.warehouse_version = {warehouse_version:String}
+    AND fc.classification_version = {classification_version:String}
+    ${memberWhere}
+),
+cemail AS (
+  SELECT normalized_email, argMin(cuid, (tts, cuid)) euid
+  FROM (
+    SELECT DISTINCT fcm.canonical_user_id cuid, a.normalized_email normalized_email,
+      toUnixTimestamp64Milli(fcm.trial_event_time) tts
+    FROM ${ANALYTICS_TRANSACTIONS_TABLE} AS a FINAL
+    INNER JOIN fcm ON fcm.canonical_user_id = a.user_id
+    WHERE a.auth_user_id = {auth_user_id:String} AND a.normalized_email != ''
+  )
+  GROUP BY normalized_email
+),
+etok AS (
+  SELECT ce.euid uid, a.transaction_id tid, a.event_time et, toUnixTimestamp64Milli(a.event_time) ets,
+    4 tprio, toUnixTimestamp64Milli(fcm.trial_event_time) trial_ts,
+    a.is_success is_success, a.gross_amount_usd g,
+    floor(a.net_amount_usd * 100 + 0.5) / 100 nn, floor(a.refund_amount_usd * 100 + 0.5) / 100 rr,
+    floor((toUnixTimestamp64Milli(a.event_time) - toUnixTimestamp64Milli(fcm.trial_event_time)) / 86400000) d,
+    multiIf(a.status = 'failed', 'failed_payment', a.status = 'refunded', 'refund', a.status = 'chargeback', 'chargeback', '') statusType,
+    ((a.currency = 'USD' AND (abs(toFloat64(a.original_amount) - 4.99) < 0.005 OR abs(toFloat64(a.original_amount) - 9.99) < 0.005 OR abs(toFloat64(a.original_amount) - 24.99) < 0.005))
+      OR (a.currency = 'EUR' AND abs(toFloat64(a.original_amount) - 4.99) < 0.005)
+      OR (a.currency = 'COP' AND abs(toFloat64(a.original_amount) - 17199) < 0.005)) tokenAmt,
+    a.currency cur, toFloat64(a.original_amount) amt, a.product_id pid, a.product_name pname,
+    toString(fcm.cohort_date) c_date, fcm.funnel c_funnel, fcm.campaign_path c_camp,
+    fcm.normalized_email u_normalized_email,
+    0 lvl, 0 slot,
+    multiIf(a.status = 'failed', 'failed_payment', a.status = 'refunded', 'refund', a.status = 'chargeback', 'chargeback', 'token_purchase') lt
+  FROM ${ANALYTICS_TRANSACTIONS_TABLE} AS a FINAL
+  INNER JOIN cemail ce ON ce.normalized_email = a.normalized_email
+  INNER JOIN fcm ON fcm.canonical_user_id = ce.euid
+  WHERE a.auth_user_id = {auth_user_id:String}
+    AND a.user_id NOT IN (SELECT canonical_user_id FROM fcall)
+    AND (a.transaction_type = 'token_purchase' OR (a.status IN ('refunded','chargeback') AND (
+      (a.currency = 'USD' AND (abs(toFloat64(a.original_amount) - 4.99) < 0.005 OR abs(toFloat64(a.original_amount) - 9.99) < 0.005 OR abs(toFloat64(a.original_amount) - 24.99) < 0.005))
+      OR (a.currency = 'EUR' AND abs(toFloat64(a.original_amount) - 4.99) < 0.005)
+      OR (a.currency = 'COP' AND abs(toFloat64(a.original_amount) - 17199) < 0.005))))
+    AND floor((toUnixTimestamp64Milli(a.event_time) - toUnixTimestamp64Milli(fcm.trial_event_time)) / 86400000) >= 0
+),
+finx AS (
+  SELECT uid, tid, et, ets, tprio, trial_ts, is_success, g, nn, rr, d, statusType, tokenAmt,
+    cur, amt, pid, pname, c_date, c_funnel, c_camp, u_normalized_email, lvl, slot, lt, 0 via_email
+  FROM fin
+  UNION ALL
+  SELECT uid, tid, et, ets, tprio, trial_ts, is_success, g, nn, rr, d, statusType, tokenAmt,
+    cur, amt, pid, pname, c_date, c_funnel, c_camp, u_normalized_email, lvl, slot, lt, 1 via_email
+  FROM etok
+),
 agg AS (${aggregateSelect()})
 SELECT * FROM agg ${postSql}
 FORMAT JSONEachRow`;
@@ -844,7 +915,7 @@ export async function runMaterializedCohortList(input: {
     filter_options: options.options,
     filter_options_diagnostics: optionsDiagnostics(nreq, options, optionsDurationMs),
     fx_diagnostics: fx,
-    token_diagnostics: tokenDiagnosticsFromRows(rows),
+    token_diagnostics: tokenDiagnosticsFromRows(rows, emailMatchedTokenPurchases(rawRows)),
     ...({
       fb_totals: fbStats.totals,
       fb_diagnostics: fbStats.diagnostics,

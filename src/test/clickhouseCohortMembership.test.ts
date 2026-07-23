@@ -426,3 +426,29 @@ describe("ClickHouse cohort membership materialization", () => {
     expect(sql).toContain("grant execute on function public.complete_clickhouse_cohort_snapshot_build");
   });
 });
+
+describe("email-matched token revenue on the snapshot path (TODO_MONETIZATION item 3)", () => {
+  it("keeps the snapshot INSERT free of email-token rows (uid-keyed identity)", () => {
+    const sql = buildCohortMembershipInsertSql();
+    expect(sql).not.toContain("etok");
+    expect(sql).not.toContain("via_email");
+    expect(sql).toContain("FROM membership");
+  });
+
+  it("unions email-matched token rows into the materialized aggregate", () => {
+    const params: Record<string, unknown> = { auth_user_id: "user-1" };
+    const sql = buildMaterializedCohortListQuery(request, { warehouse_version: "wh_1", classification_version: "cv_1" }, params);
+    expect(sql).toContain("cemail AS");
+    expect(sql).toContain("etok AS");
+    expect(sql).toContain("FROM finx");
+    // Exclusion covers ALL snapshot members (fcall) — a member hidden by
+    // filters still never has their own rows re-attributed by email. The email
+    // map itself (fcm) only covers filter-passing members, like the client.
+    expect(sql).toContain("a.user_id NOT IN (SELECT canonical_user_id FROM fcall)");
+    expect(sql).toContain("a.transaction_type = 'token_purchase'");
+    // Email rows carry the member's cohort key and cannot enter sequences.
+    expect(sql).toContain("0 lvl, 0 slot");
+    // The member filters bind into the email-map CTE too.
+    expect(sql).toContain("fc.campaign_id IN ({p_mcid_0:String})");
+  });
+});

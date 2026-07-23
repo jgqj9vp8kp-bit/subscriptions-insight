@@ -872,7 +872,18 @@ export function computeCohortsWithDiagnostics(
     let fx_missing_transactions = 0;
 
     for (const uid of userIds) {
-      const list = userTxs.get(uid) ?? [];
+      const baseList = userTxs.get(uid) ?? [];
+      // TODO_MONETIZATION item 3 (signed off 2026-07-23): email-matched token
+      // purchases join the user's transaction stream re-keyed to the cohort
+      // uid, so they flow through the SAME accumulation as uid-matched tokens —
+      // gross/net/revenue_dN, plan, currency mix, refunds AND the token
+      // columns. They can never enter the subscription sequence
+      // (isSubscriptionSequencePayment matches subscription types only) or
+      // upsell slots (type gate), so retention/renewal metrics are untouched.
+      const extraTokens = extraTokenTxsByUid.get(uid);
+      const list = extraTokens?.length
+        ? [...baseList, ...extraTokens.map((t) => ({ ...t, user_id: uid }))]
+        : baseList;
       const initialPlanTransaction = initialPlanTransactionForUser(list);
       const userEmail = normalizeEmailKey(list.find((t) => t.email)?.email);
       const subFlags = userEmail ? subscriptionFlags.get(userEmail) : undefined;
@@ -1006,20 +1017,6 @@ export function computeCohortsWithDiagnostics(
           renewal_revenue += net;
         }
         if (t.transaction_type === "upsell" && t.status === "success") hasUpsell = true;
-      }
-      // Token purchases matched by email (different customer id, same person).
-      // They count toward token/add-on metrics only — existing cohort revenue
-      // definitions (gross/net/revenue_dN) intentionally stay unchanged.
-      for (const t of extraTokenTxsByUid.get(uid) ?? []) {
-        const dt = (new Date(t.event_time).getTime() - userCohort.ts) / DAY;
-        if (dt < 0) continue;
-        token_refund_amount += refundAmount(t);
-        if (t.status !== "success" || t.transaction_type !== "token_purchase") continue;
-        const gross = grossAmount(t);
-        token_purchases += 1;
-        token_gross_revenue += gross;
-        tokenBuyerIds.add(uid);
-        addTokenPurchaseToPacks(tokenPacks, { product: t.product, user_id: uid }, gross);
       }
       const hasRenewal = renewalLevelsThrough(maxRenewalDepth).some((level) => subscriptionLevels.has(level));
       if (hasUpsell) upsell_users += 1;

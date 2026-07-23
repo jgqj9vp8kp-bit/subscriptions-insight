@@ -216,7 +216,7 @@ base AS (
     a.country_code country_code, a.card_type card_type, a.media_buyer media_buyer,
     multiIf(a.transaction_type = 'trial', 0, a.transaction_type = 'upsell', 1, a.transaction_type = 'first_subscription', 2,
       a.transaction_type IN ('renewal_2','renewal_3','renewal'), 3, 4) tprio,
-    a.status status, a.is_success is_success,
+    a.status status, a.is_success is_success, a.transaction_type ttype,
     positionCaseInsensitive(a.billing_reason, 'upsell') > 0 upmark,
     ((a.currency = 'USD' AND (abs(toFloat64(a.original_amount) - 4.99) < 0.005 OR abs(toFloat64(a.original_amount) - 9.99) < 0.005 OR abs(toFloat64(a.original_amount) - 24.99) < 0.005))
       OR (a.currency = 'EUR' AND abs(toFloat64(a.original_amount) - 4.99) < 0.005)
@@ -288,6 +288,72 @@ fin AS (
 )`;
 }
 
+// TODO_MONETIZATION item 3 (signed off 2026-07-23): web-app token purchases can
+// arrive under a different customer id than the funnel purchase. The client
+// engine attributes them to the buyer's cohort by normalized email and merges
+// them into the SAME accumulation as uid-matched rows (gross/net/revenue_dN,
+// token columns, refunds). This mirrors that: `cemail` maps every email seen in
+// a cohort member's transaction stream to ONE member (client keeps the first in
+// data order; here argMin(trial_ts, uid) — deterministic, diverges only when
+// two members share an email), `etok` re-keys matching non-member token rows to
+// that member (same day filter d >= 0 as the client's `dt < 0 → skip`), and
+// `finx` unions them under a via_email flag. Token rows can never enter the
+// lifecycle/upsell sequences (lvl = slot = 0), so retention metrics are
+// untouched. The membership INSERT and filter options keep reading `fin` —
+// snapshot identity is uid-based and must not change.
+// Known divergence (documented): when user-level filters (country/card/media/
+// currency) are active, the client admits an email-matched row only if the
+// BUYER's own dims pass; here the row follows the cohort member it lands on.
+export function emailTokenSQL(memberWhere = ""): string {
+  return `
+cemail AS (
+  SELECT normalized_email, argMin(uid, (trial_ts, uid)) euid
+  FROM (
+    SELECT DISTINCT b.uid uid, b.normalized_email normalized_email, tr.trial_ts trial_ts,
+      tr.c_campaign_id c_campaign_id, tr.c_traffic_source c_traffic_source,
+      ud.u_country u_country, ud.u_card_type u_card_type, ud.u_media_buyer u_media_buyer
+    FROM base b
+    INNER JOIN tr ON tr.uid = b.uid
+    INNER JOIN userdim ud ON ud.uid = b.uid
+    WHERE b.normalized_email != ''
+  ) ${memberWhere}
+  GROUP BY normalized_email
+),
+etok AS (
+  SELECT ce.euid uid, b.tid tid, b.et et, b.ets ets, b.tprio tprio, tr.trial_ts trial_ts,
+    b.is_success is_success, b.g g, b.nn nn, b.rr rr,
+    floor((b.ets - tr.trial_ts) / 86400000) d,
+    b.statusType statusType, b.tokenAmt tokenAmt,
+    b.cur cur, b.amt amt, b.pid pid, b.pname pname,
+    tr.c_date c_date, tr.c_funnel c_funnel, tr.c_camp c_camp,
+    tr.c_campaign_id c_campaign_id, tr.c_traffic_source c_traffic_source,
+    ud.u_country u_country, ud.u_card_type u_card_type, ud.u_media_buyer u_media_buyer,
+    ud.u_normalized_email u_normalized_email, ud.u_source_updated_at u_source_updated_at,
+    0 lvl, 0 slot,
+    if(b.statusType != '', b.statusType, 'token_purchase') lt
+  FROM base b
+  INNER JOIN cemail ce ON ce.normalized_email = b.normalized_email
+  INNER JOIN tr ON tr.uid = ce.euid
+  INNER JOIN userdim ud ON ud.uid = ce.euid
+  WHERE b.uid NOT IN (SELECT uid FROM tr)
+    AND (b.ttype = 'token_purchase' OR (b.statusType IN ('refund','chargeback') AND b.tokenAmt))
+    AND floor((b.ets - tr.trial_ts) / 86400000) >= 0
+),
+finx AS (
+  SELECT uid, tid, et, ets, tprio, trial_ts, is_success, g, nn, rr, d, statusType, tokenAmt,
+    cur, amt, pid, pname, c_date, c_funnel, c_camp, c_campaign_id, c_traffic_source,
+    u_country, u_card_type, u_media_buyer, u_normalized_email, u_source_updated_at,
+    lvl, slot, lt, 0 via_email
+  FROM fin
+  UNION ALL
+  SELECT uid, tid, et, ets, tprio, trial_ts, is_success, g, nn, rr, d, statusType, tokenAmt,
+    cur, amt, pid, pname, c_date, c_funnel, c_camp, c_campaign_id, c_traffic_source,
+    u_country, u_card_type, u_media_buyer, u_normalized_email, u_source_updated_at,
+    lvl, slot, lt, 1 via_email
+  FROM etok
+)`;
+}
+
 // Raw per-cohort aggregate row from ClickHouse (money as raw sums; TS rounds).
 export interface RawCohortRow {
   cohort_date: string; funnel: string; campaign_path: string;
@@ -301,6 +367,7 @@ export interface RawCohortRow {
   upsell_1_users: number; upsell_2_users: number; upsell_3_users: number; upsell_extra_users: number;
   u1_raw: number; u2_raw: number; u3_raw: number; uextra_raw: number;
   token_purchases: number; token_buyers: number; token_gross_raw: number; token_refund_raw: number;
+  token_email_purchases: number;
   refund_users: number;
   support_users: number;
 }
@@ -333,13 +400,14 @@ SELECT c_date cohort_date, c_funnel funnel, c_camp campaign_path, uniqExact(uid)
   sumIf(g, slot = 1) u1_raw, sumIf(g, slot = 2) u2_raw, sumIf(g, slot = 3) u3_raw, sumIf(g, slot >= 4) uextra_raw,
   countIf(is_success = 1 AND lt = 'token_purchase') token_purchases, uniqExactIf(uid, is_success = 1 AND lt = 'token_purchase') token_buyers,
   sumIf(g, is_success = 1 AND lt = 'token_purchase') token_gross_raw,
-  sumIf(rr, lt = 'token_purchase' OR (statusType IN ('refund','chargeback') AND tokenAmt)) token_refund_raw,
+  sumIf(rr, lt = 'token_purchase' OR (statusType IN ('refund','chargeback') AND (tokenAmt OR via_email = 1))) token_refund_raw,
+  countIf(is_success = 1 AND lt = 'token_purchase' AND via_email = 1) token_email_purchases,
   uniqExactIf(
     uid,
     lowerUTF8(trim(BOTH ' ' FROM u_normalized_email)) != ''
     AND lowerUTF8(trim(BOTH ' ' FROM u_normalized_email)) IN (SELECT normalized_email FROM support_emails)
   ) support_users
-FROM fin
+FROM finx
 ${memberWhere}
 GROUP BY c_date, c_funnel, c_camp`;
 }
@@ -407,6 +475,7 @@ function buildListQuery(nreq: NormalizedCohortRequest, params: Record<string, un
 ${withKeep}
 ${supportEmailsCTE(supportStatus)},
 ${classifierSQL(baseWhere, joinKeep)}
+, ${emailTokenSQL(memberWhere)}
 , agg AS (${aggregateSelect(memberWhere)})
 SELECT * FROM agg ${post}
 FORMAT JSONEachRow`;
@@ -581,9 +650,11 @@ async function scanDiagnostics(client: ClickHouseClientLike, authUserId: string)
 
 // ---- FX + token diagnostics (Cohorts panels, Phase Task 1) ---------------
 // FX health comes straight from the mapper-populated fx_status column. Token
-// attribution total is derived from the already-classified cohort rows (in-cohort
-// token purchases) — the panel's dataset-level unmatched/email split is not
-// reproduced server-side (returned as 0 / empty), matching own-user attribution.
+// attribution totals come from the classified cohort rows: since item 3
+// (2026-07-23) email-matched token purchases are part of the cohort metrics,
+// so matched = total in-cohort and matched_by_email is the etok subset. Only
+// the dataset-level UNMATCHED split (tokens matching no cohort user at all) is
+// not reproduced server-side (returned as 0 / empty).
 
 export async function fxDiagnostics(client: ClickHouseClientLike, authUserId: string, mediaBuyer: string[]): Promise<CohortFxDiagnostics> {
   const params: Record<string, unknown> = { auth_user_id: authUserId };
@@ -625,17 +696,21 @@ export async function fxDiagnostics(client: ClickHouseClientLike, authUserId: st
   };
 }
 
-export function tokenDiagnosticsFromRows(rows: CohortAggregateRow[]): CohortTokenDiagnostics {
+export function tokenDiagnosticsFromRows(rows: CohortAggregateRow[], matchedByEmail = 0): CohortTokenDiagnostics {
   const total = rows.reduce((a, r) => a + r.token_purchases, 0);
   return {
     token_purchases_total: total,
     token_purchases_matched: total,
-    token_purchases_matched_by_email: 0,
+    token_purchases_matched_by_email: matchedByEmail,
     token_purchases_unmatched: 0,
     token_unmatched_amount: 0,
     unknown_products: [],
     unknown_addon_revenue: 0,
   };
+}
+
+export function emailMatchedTokenPurchases(rawRows: RawCohortRow[]): number {
+  return rawRows.reduce((a, r) => a + n(r.token_email_purchases), 0);
 }
 
 // ---- Public entrypoints ---------------------------------------------------
@@ -697,7 +772,7 @@ export async function runCohortList(input: {
       source: "dynamic_classifier",
     }),
     fx_diagnostics: fx,
-    token_diagnostics: tokenDiagnosticsFromRows(rows),
+    token_diagnostics: tokenDiagnosticsFromRows(rows, emailMatchedTokenPurchases(rawRows)),
     diagnostics,
   };
 }
@@ -829,9 +904,12 @@ export async function runCohortDetails(input: {
   const key = nreq.cohortKey;
   if (!key || !key.cohort_date) throw new CohortRequestError("action=details requires cohort_key {cohort_date, funnel, campaign_path}.");
 
+  // Details read finx (fin + email-matched token rows) so the expanded row's
+  // token packs / currency mix / net_revenue_1m agree with the list row.
   const base = (extra: string, params: Record<string, unknown>) => `WITH
 ${classifierSQL(`a.auth_user_id = {auth_user_id:String}`, "")}
-, scoped AS (SELECT * FROM fin WHERE ${cohortKeyWhere(key, params)})
+, ${emailTokenSQL()}
+, scoped AS (SELECT * FROM finx WHERE ${cohortKeyWhere(key, params)})
 ${extra}
 FORMAT JSONEachRow`;
 

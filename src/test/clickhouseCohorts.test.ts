@@ -7,6 +7,8 @@ import {
   toAggregateRow,
   computeTotals,
   supportDataStatus,
+  emailMatchedTokenPurchases,
+  tokenDiagnosticsFromRows,
 } from "../../supabase/functions/_shared/clickhouse/cohorts.ts";
 import type { CohortAggregateRow } from "../../supabase/functions/_shared/clickhouse/cohortContract.ts";
 
@@ -115,7 +117,9 @@ describe("clickhouse-cohorts SQL safety and scoping", () => {
     expect(sql).toContain("c_traffic_source IN ({p_tsrc_0:String})");
     expect(sql).toContain("u_country IN ({p_country_0:String})");
     expect(sql).toContain("u_card_type IN ({p_card_0:String})");
-    expect(sql).toContain("FROM fin\nWHERE");
+    // The aggregate reads finx (fin + email-matched token rows, item 3) and the
+    // member filters still apply AFTER classification, at the aggregate level.
+    expect(sql).toContain("FROM finx\nWHERE");
     expect(params.p_cid_0).toBe("cmp-1");
     expect(params.p_tsrc_0).toBe("facebook");
     expect(params.p_country_0).toBe("US");
@@ -229,5 +233,37 @@ describe("clickhouse-cohorts support data status", () => {
       .resolves.toMatchObject({ support_data_status: "sync_pending" });
     await expect(supportDataStatus({ query: async () => { throw new Error("no table"); } } as never, "u"))
       .resolves.toMatchObject({ support_data_status: "unavailable" });
+  });
+});
+
+describe("email-matched token revenue in the dynamic engine (TODO_MONETIZATION item 3)", () => {
+  it("unions email-matched token rows into the aggregate via finx", () => {
+    const nreq = normalizeCohortRequest({});
+    const params: Record<string, unknown> = { auth_user_id: "u" };
+    const sql = buildListQuery(nreq, params);
+    expect(sql).toContain("cemail AS");
+    expect(sql).toContain("etok AS");
+    expect(sql).toContain("finx AS");
+    // Only non-members are email-attributed; a member's own rows stay uid-keyed.
+    expect(sql).toContain("b.uid NOT IN (SELECT uid FROM tr)");
+    // Exact predicate — the warehouse stores the client-classified type.
+    expect(sql).toContain("b.ttype = 'token_purchase'");
+    // Email rows can never enter the lifecycle/upsell sequences.
+    expect(sql).toContain("0 lvl, 0 slot");
+    // Same pre-trial cut as the client accumulation (dt < 0 -> skip).
+    expect(sql).toContain("floor((b.ets - tr.trial_ts) / 86400000) >= 0");
+    // The aggregate reads the union and counts the email subset for diagnostics.
+    expect(sql).toContain("FROM finx");
+    expect(sql).toContain("token_email_purchases");
+    // Email-matched refund rows count as token refunds even without the price signal.
+    expect(sql).toContain("(tokenAmt OR via_email = 1)");
+  });
+
+  it("wires matched_by_email diagnostics to the aggregate email count", () => {
+    expect(emailMatchedTokenPurchases([{ token_email_purchases: 2 }, { token_email_purchases: "1" }] as never)).toBe(3);
+    const diag = tokenDiagnosticsFromRows([{ token_purchases: 5 } as never], 3);
+    expect(diag.token_purchases_total).toBe(5);
+    expect(diag.token_purchases_matched).toBe(5);
+    expect(diag.token_purchases_matched_by_email).toBe(3);
   });
 });
