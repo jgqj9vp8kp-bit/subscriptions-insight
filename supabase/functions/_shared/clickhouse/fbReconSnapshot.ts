@@ -18,6 +18,7 @@ import {
   type CampaignPeriodSpendRow,
 } from "./fbCampaignResolution.ts";
 import { ANALYTICS_TRANSACTIONS_TABLE, FACT_FACEBOOK_STATS_TABLE } from "./schema.ts";
+import { runFbV2Parity } from "./fbV2ParityHarness.ts";
 
 export const RECON_COVERAGE_RED_THRESHOLD = 0.9;
 export const RECON_UNKNOWN_CAMPAIGN_RED_SHARE = 0.25;
@@ -25,6 +26,14 @@ export const RECON_UNKNOWN_YELLOW_SHARE = 0.1;
 export const RECON_SUGGESTED_YELLOW_SHARE = 0.5;
 
 const round2 = (value: number): number => Math.round(value * 100) / 100;
+
+export interface FbReconV2ParitySummary {
+  verdict: "parity" | "mismatch" | "no_overlap";
+  overlap_days: number;
+  matched_days: number;
+  mismatched_count: number;
+  overlap_spend_diff: number;
+}
 
 export interface FbReconComputeInput {
   windowFrom: string;
@@ -41,6 +50,9 @@ export interface FbReconComputeInput {
   knownGapDays: number;
   dqWarnCount: number;
   dqFailCount: number;
+  /** Wave 5 gate: daily V1<->V2 parity result, recorded with the snapshot so the
+   * 7-consecutive-green-days cutover criterion has a stored history. */
+  v2Parity?: FbReconV2ParitySummary | null;
 }
 
 export interface FbReconSnapshotRow {
@@ -70,6 +82,7 @@ export interface FbReconSnapshotRow {
     top_unknown_funnel_campaigns: Array<{ campaign_id: string; campaign_name: string; spend: number }>;
     expected_days: number;
     covered_days: number;
+    v2_parity: FbReconV2ParitySummary | null;
   };
 }
 
@@ -131,7 +144,15 @@ export function computeFbReconSnapshot(input: FbReconComputeInput): FbReconSnaps
   const suggestedSharePct = funnelResolved > 0 ? round2((suggestedResolved / funnelResolved) * 100) : 0;
 
   let health: FbReconSnapshotRow["health"] = "green";
-  if (input.dqWarnCount > 0 || unknownShare > RECON_UNKNOWN_YELLOW_SHARE || suggestedSharePct > RECON_SUGGESTED_YELLOW_SHARE * 100 || coveragePct < 1) {
+  if (
+    input.dqWarnCount > 0 ||
+    unknownShare > RECON_UNKNOWN_YELLOW_SHARE ||
+    suggestedSharePct > RECON_SUGGESTED_YELLOW_SHARE * 100 ||
+    coveragePct < 1 ||
+    // Dual-write drift between V1 and V2 is a data-integrity warning (no_overlap
+    // is fine — V2 simply has no published batches for the window yet).
+    input.v2Parity?.verdict === "mismatch"
+  ) {
     health = "yellow";
   }
   if (input.dqFailCount > 0 || coveragePct < RECON_COVERAGE_RED_THRESHOLD || unknownCampaignShare > RECON_UNKNOWN_CAMPAIGN_RED_SHARE) {
@@ -167,6 +188,7 @@ export function computeFbReconSnapshot(input: FbReconComputeInput): FbReconSnaps
       top_unknown_funnel_campaigns: top(topUnknownFunnel),
       expected_days: expectedDays,
       covered_days: input.coveredDays,
+      v2_parity: input.v2Parity ?? null,
     },
   };
 }
@@ -187,7 +209,7 @@ export async function runFbReconSnapshot(input: {
 }): Promise<FbReconSnapshotRow> {
   const params = { auth_user_id: input.authUserId, date_from: input.dateFrom, date_to: input.dateTo };
 
-  const [spendRows, coveredRows, authoritative, funnelMap, aliasMap, gaps, dq] = await Promise.all([
+  const [spendRows, coveredRows, authoritative, funnelMap, aliasMap, gaps, dq, v2Parity] = await Promise.all([
     jsonRows<CampaignPeriodSpendRow>(input.clickhouse, campaignPeriodSpendSql({ hasFrom: true, hasTo: true }), params),
     jsonRows<{ covered_days: number }>(
       input.clickhouse,
@@ -218,6 +240,17 @@ export async function runFbReconSnapshot(input: {
          AND batch_id = (SELECT argMax(batch_id, computed_at) FROM facebook_dq_results WHERE auth_user_id = {auth_user_id:String})`,
       params,
     ).catch(() => [{ warn_count: 0, fail_count: 0 }]),
+    // Wave 5 gate: record the daily V1<->V2 parity with the snapshot. Fail-safe —
+    // a missing V2 schema must not break reconciliation.
+    runFbV2Parity({ clickhouse: input.clickhouse, authUserId: input.authUserId, dateFrom: input.dateFrom, dateTo: input.dateTo })
+      .then((report) => ({
+        verdict: report.verdict,
+        overlap_days: report.overlap_days,
+        matched_days: report.matched_days,
+        mismatched_count: report.mismatched_days.length,
+        overlap_spend_diff: report.totals.overlap_spend_diff,
+      }))
+      .catch(() => null),
   ]);
 
   const knownGapDays = gaps.reduce((total, gap) => {
@@ -243,6 +276,7 @@ export async function runFbReconSnapshot(input: {
     knownGapDays,
     dqWarnCount: Number(dq[0]?.warn_count) || 0,
     dqFailCount: Number(dq[0]?.fail_count) || 0,
+    v2Parity,
   });
 
   // Store the snapshot (append-only history — this is the whole point).

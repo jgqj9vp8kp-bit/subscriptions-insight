@@ -115,6 +115,31 @@ describe("computeFbReconSnapshot (Wave 4, six buckets)", () => {
     expect(snapshot.known_gap_days).toBe(4);
   });
 
+  it("records the V2 parity result and degrades health on dual-write drift only", () => {
+    const clean = { verdict: "parity" as const, overlap_days: 118, matched_days: 118, mismatched_count: 0, overlap_spend_diff: 0 };
+    const withParity = computeFbReconSnapshot(baseInput({
+      campaignSpend: [{ campaign_id: "fb1", campaign_name: "A", spend: 100, fb_purchases: 4 }],
+      authoritativeUsers: [{ campaign_id: "obs1", users: 3 }],
+      v2Parity: clean,
+    }));
+    expect(withParity.details.v2_parity).toEqual(clean);
+    expect(withParity.health).toBe("green");
+
+    const noOverlap = computeFbReconSnapshot(baseInput({
+      campaignSpend: [{ campaign_id: "fb1", campaign_name: "A", spend: 100, fb_purchases: 4 }],
+      authoritativeUsers: [{ campaign_id: "obs1", users: 3 }],
+      v2Parity: { ...clean, verdict: "no_overlap", overlap_days: 0, matched_days: 0 },
+    }));
+    expect(noOverlap.health).toBe("green"); // an empty V2 is not drift
+
+    const drift = computeFbReconSnapshot(baseInput({
+      campaignSpend: [{ campaign_id: "fb1", campaign_name: "A", spend: 100, fb_purchases: 4 }],
+      authoritativeUsers: [{ campaign_id: "obs1", users: 3 }],
+      v2Parity: { ...clean, verdict: "mismatch", matched_days: 117, mismatched_count: 1, overlap_spend_diff: 12.5 },
+    }));
+    expect(drift.health).toBe("yellow");
+  });
+
   it("suggested provenance share is tracked against resolved spend", () => {
     const snapshot = computeFbReconSnapshot(baseInput());
     // suggested fb2 (40) / resolved (140) ≈ 28.57%.
