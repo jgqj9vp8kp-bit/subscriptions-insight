@@ -16,13 +16,33 @@ export interface FunnelRecord {
   funnel_path: string;
   display_name: string;
   is_active: boolean;
+  funnelfox_funnel_id: string | null;
   created_by: string | null;
   created_at: string;
   updated_at: string;
   tags: TagRecord[];
 }
 
-const FUNNEL_COLUMNS = "id,funnel_path,display_name,is_active,created_by,created_at,updated_at";
+/** One funnel as FunnelFox reports it (see supabase/functions/funnelfox-funnels). */
+export interface FunnelFoxFunnel {
+  id: string;
+  title: string;
+  alias: string;
+  type: string;
+  status: string;
+  is_draft: boolean;
+  environment: string;
+  last_published_at: string;
+  tags: string[];
+}
+
+export interface FunnelFoxImportCandidate extends FunnelFoxFunnel {
+  /** Already in the registry — shown for context but not importable again. */
+  alreadyRegistered: boolean;
+}
+
+const FUNNEL_COLUMNS =
+  "id,funnel_path,display_name,is_active,funnelfox_funnel_id,created_by,created_at,updated_at";
 const TAG_COLUMNS = "id,name,created_by,created_at";
 
 function ensureSupabase() {
@@ -142,4 +162,102 @@ export async function replaceFunnelTags(funnelId: string, tagIds: string[]): Pro
   const client = ensureSupabase();
   const { error } = await client.rpc("replace_funnel_tags", { p_funnel_id: funnelId, p_tag_ids: tagIds });
   if (error) throw new Error(`Could not update funnel tags: ${error.message}`);
+}
+
+// ---- FunnelFox import ------------------------------------------------------
+// FunnelFox is the system of record for funnel identity: it knows every funnel
+// (including ones with no traffic yet) and carries the human-readable title and
+// its own tags. The warehouse only knows paths that already produced
+// transactions, and would force machine-derived display names.
+
+/** Lists FunnelFox funnels and marks which are already in the registry. */
+export async function listFunnelFoxFunnels(): Promise<FunnelFoxImportCandidate[]> {
+  const client = ensureSupabase();
+  const { data, error } = await client.functions.invoke("funnelfox-funnels", { body: {} });
+  if (error) throw new Error(`Could not reach FunnelFox: ${error.message}`);
+  const payload = (data ?? {}) as { funnels?: FunnelFoxFunnel[]; truncated?: boolean };
+  const funnels = payload.funnels ?? [];
+
+  const existing = await listFunnels();
+  // A row counts as registered if it carries the FunnelFox id OR already
+  // occupies the same path (hand-created before the import existed).
+  const registeredIds = new Set(existing.map((row) => row.funnelfox_funnel_id).filter(Boolean));
+  const registeredPaths = new Set(existing.map((row) => row.funnel_path));
+
+  return funnels
+    .filter((funnel) => funnel.id && funnel.alias)
+    .map((funnel) => ({
+      ...funnel,
+      alreadyRegistered: registeredIds.has(funnel.id) || registeredPaths.has(funnel.alias),
+    }));
+}
+
+/** Case-insensitive name -> tag id, creating any tag that does not exist yet. */
+async function ensureTags(names: string[]): Promise<Map<string, string>> {
+  const wanted = [...new Set(names.map((name) => name.trim()).filter(Boolean))];
+  const byLowerName = new Map<string, string>();
+  if (!wanted.length) return byLowerName;
+
+  for (const tag of await listTags()) byLowerName.set(tag.name.trim().toLowerCase(), tag.id);
+
+  for (const name of wanted) {
+    const key = name.toLowerCase();
+    if (byLowerName.has(key)) continue;
+    const created = await createTag(name);
+    byLowerName.set(created.name.trim().toLowerCase(), created.id);
+  }
+  return byLowerName;
+}
+
+export interface FunnelFoxImportResult {
+  importedFunnels: number;
+  createdTags: number;
+}
+
+/**
+ * Creates a registry row per selected FunnelFox funnel and mirrors its tags.
+ * is_active follows FunnelFox's publish state rather than defaulting to false:
+ * with ~59 funnels, importing everything as inactive would mean dozens of
+ * manual toggles to restore information FunnelFox already gave us. The flag
+ * stays manually editable afterwards, per the spec.
+ */
+export async function importFunnelFoxFunnels(funnels: FunnelFoxFunnel[]): Promise<FunnelFoxImportResult> {
+  const client = ensureSupabase();
+  if (!funnels.length) return { importedFunnels: 0, createdTags: 0 };
+  const userId = await currentUserId();
+
+  const tagsBefore = (await listTags()).length;
+  const tagIdByName = await ensureTags(funnels.flatMap((funnel) => funnel.tags));
+  const createdTags = tagIdByName.size - tagsBefore;
+
+  const { data, error } = await client
+    .from("funnels")
+    .insert(
+      funnels.map((funnel) => ({
+        funnel_path: funnel.alias.trim(),
+        display_name: funnel.title.trim(),
+        is_active: funnel.status === "published",
+        funnelfox_funnel_id: funnel.id,
+        created_by: userId,
+      })),
+    )
+    .select(FUNNEL_COLUMNS);
+  if (error) throw new Error(`Could not import funnels: ${error.message}`);
+
+  const inserted = (data ?? []) as Array<Omit<FunnelRecord, "tags">>;
+  const idByFunnelFoxId = new Map(inserted.map((row) => [row.funnelfox_funnel_id, row.id]));
+
+  // Tag links go through the atomic RPC, one call per funnel. Sequential on
+  // purpose: this is a one-off admin action, and a burst of ~59 concurrent
+  // RPCs buys nothing.
+  for (const funnel of funnels) {
+    const funnelId = idByFunnelFoxId.get(funnel.id);
+    if (!funnelId || !funnel.tags.length) continue;
+    const tagIds = funnel.tags
+      .map((name) => tagIdByName.get(name.trim().toLowerCase()))
+      .filter((id): id is string => Boolean(id));
+    if (tagIds.length) await replaceFunnelTags(funnelId, tagIds);
+  }
+
+  return { importedFunnels: inserted.length, createdTags: Math.max(0, createdTags) };
 }

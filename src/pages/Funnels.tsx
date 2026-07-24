@@ -3,12 +3,20 @@
 // list). Data comes from Postgres via @/services/funnels; ClickHouse is only
 // consulted by the "Import from warehouse" bootstrap action (Phase 6).
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { ArrowDown, ArrowUp, ArrowUpDown, ChevronDown, Loader2, RefreshCw, Route } from "lucide-react";
+import { ArrowDown, ArrowUp, ArrowUpDown, ChevronDown, Download, Loader2, RefreshCw, Route } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Switch } from "@/components/ui/switch";
@@ -22,9 +30,12 @@ import {
 } from "@/components/ui/table";
 import { useToast } from "@/hooks/use-toast";
 import {
+  importFunnelFoxFunnels,
+  listFunnelFoxFunnels,
   listFunnels,
   listTags,
   setFunnelActive,
+  type FunnelFoxImportCandidate,
   type FunnelRecord,
   type TagRecord,
 } from "@/services/funnels";
@@ -51,6 +62,12 @@ export default function FunnelsPage() {
   const [selectedTagIds, setSelectedTagIds] = useState<string[]>([]);
   const [sortColumn, setSortColumn] = useState<SortColumn>("created_at");
   const [sortDirection, setSortDirection] = useState<SortDirection>("desc");
+
+  const [importOpen, setImportOpen] = useState(false);
+  const [importLoading, setImportLoading] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [candidates, setCandidates] = useState<FunnelFoxImportCandidate[]>([]);
+  const [selectedImportIds, setSelectedImportIds] = useState<string[]>([]);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -96,6 +113,65 @@ export default function FunnelsPage() {
       setTogglingId(null);
     }
   }
+
+  async function onOpenImport() {
+    setImportOpen(true);
+    setImportLoading(true);
+    setCandidates([]);
+    setSelectedImportIds([]);
+    try {
+      const rows = await listFunnelFoxFunnels();
+      setCandidates(rows);
+      // Pre-select everything not yet registered — the common case is a first
+      // bootstrap where the admin wants all of them.
+      setSelectedImportIds(rows.filter((row) => !row.alreadyRegistered).map((row) => row.id));
+    } catch (error) {
+      toast({
+        title: "Could not load funnels from FunnelFox",
+        description: error instanceof Error ? error.message : "Unknown error",
+        variant: "destructive",
+      });
+      setImportOpen(false);
+    } finally {
+      setImportLoading(false);
+    }
+  }
+
+  async function onConfirmImport() {
+    const selected = candidates.filter((row) => selectedImportIds.includes(row.id) && !row.alreadyRegistered);
+    if (!selected.length) return;
+    setImporting(true);
+    try {
+      const result = await importFunnelFoxFunnels(selected);
+      toast({
+        title: `Imported ${result.importedFunnels} funnel${result.importedFunnels === 1 ? "" : "s"}`,
+        description: result.createdTags
+          ? `${result.createdTags} new tag${result.createdTags === 1 ? "" : "s"} created from FunnelFox labels.`
+          : "Tags mirrored from FunnelFox.",
+      });
+      setImportOpen(false);
+      await refresh();
+    } catch (error) {
+      toast({
+        title: "Could not import funnels",
+        description: error instanceof Error ? error.message : "Unknown error",
+        variant: "destructive",
+      });
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  const importableCount = candidates.filter((row) => !row.alreadyRegistered).length;
+  const selectedImportCount = candidates.filter(
+    (row) => selectedImportIds.includes(row.id) && !row.alreadyRegistered,
+  ).length;
+
+  const toggleImportSelection = (id: string) => {
+    setSelectedImportIds((current) =>
+      current.includes(id) ? current.filter((value) => value !== id) : [...current, id],
+    );
+  };
 
   const toggleTagFilter = (tagId: string) => {
     setSelectedTagIds((current) =>
@@ -245,6 +321,10 @@ export default function FunnelsPage() {
               {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
               Refresh
             </Button>
+            <Button type="button" size="sm" onClick={() => void onOpenImport()}>
+              <Download className="h-4 w-4" />
+              Import from FunnelFox
+            </Button>
           </div>
         </div>
 
@@ -358,6 +438,123 @@ export default function FunnelsPage() {
           </Table>
         </div>
       </Card>
+
+      <Dialog open={importOpen} onOpenChange={(open) => !importing && setImportOpen(open)}>
+        <DialogContent className="max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>Import funnels from FunnelFox</DialogTitle>
+            <DialogDescription>
+              FunnelFox is the source of funnel identity: it knows every funnel, including ones with no traffic
+              yet, and supplies the display name, path and labels. Already-registered funnels are listed but
+              cannot be imported twice. Imported funnels follow FunnelFox&apos;s publish state — you can change
+              any of them afterwards.
+            </DialogDescription>
+          </DialogHeader>
+
+          {importLoading ? (
+            <div className="flex h-40 items-center justify-center text-sm text-muted-foreground">
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              Loading funnels from FunnelFox…
+            </div>
+          ) : (
+            <>
+              <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+                <span>
+                  {candidates.length} in FunnelFox · {importableCount} not registered · {selectedImportCount} selected
+                </span>
+                <div className="flex gap-2">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 text-xs"
+                    disabled={!importableCount}
+                    onClick={() =>
+                      setSelectedImportIds(candidates.filter((row) => !row.alreadyRegistered).map((row) => row.id))
+                    }
+                  >
+                    Select all
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 text-xs"
+                    disabled={!selectedImportCount}
+                    onClick={() => setSelectedImportIds([])}
+                  >
+                    Clear
+                  </Button>
+                </div>
+              </div>
+
+              <div className="max-h-[50vh] overflow-auto rounded-md border border-border">
+                {candidates.length === 0 ? (
+                  <div className="p-6 text-center text-sm text-muted-foreground">
+                    FunnelFox returned no funnels.
+                  </div>
+                ) : (
+                  candidates.map((candidate) => (
+                    <label
+                      key={candidate.id}
+                      className={`flex items-start gap-3 border-b border-border px-3 py-2 last:border-b-0 ${
+                        candidate.alreadyRegistered ? "opacity-50" : "cursor-pointer hover:bg-muted/50"
+                      }`}
+                    >
+                      <Checkbox
+                        className="mt-0.5"
+                        checked={selectedImportIds.includes(candidate.id) && !candidate.alreadyRegistered}
+                        disabled={candidate.alreadyRegistered}
+                        onCheckedChange={() => toggleImportSelection(candidate.id)}
+                      />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="truncate text-sm font-medium">{candidate.title || "(untitled)"}</span>
+                          {candidate.alreadyRegistered && (
+                            <Badge variant="outline" className="text-xs font-normal">
+                              already registered
+                            </Badge>
+                          )}
+                          <Badge
+                            variant={candidate.status === "published" ? "secondary" : "outline"}
+                            className="text-xs font-normal"
+                          >
+                            {candidate.status || "unknown"}
+                          </Badge>
+                        </div>
+                        <div className="mt-0.5 font-mono text-xs text-muted-foreground">{candidate.alias}</div>
+                        {candidate.tags.length > 0 && (
+                          <div className="mt-1 flex flex-wrap gap-1">
+                            {candidate.tags.map((tag) => (
+                              <Badge key={tag} variant="secondary" className="text-xs font-normal">
+                                {tag}
+                              </Badge>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </label>
+                  ))
+                )}
+              </div>
+            </>
+          )}
+
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => setImportOpen(false)} disabled={importing}>
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              onClick={() => void onConfirmImport()}
+              disabled={importing || importLoading || !selectedImportCount}
+            >
+              {importing && <Loader2 className="h-4 w-4 animate-spin" />}
+              Import {selectedImportCount || ""}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </AppLayout>
   );
 }
