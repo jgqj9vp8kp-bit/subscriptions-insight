@@ -19,6 +19,7 @@ const Transactions = lazy(() => import("./pages/Transactions.tsx"));
 const UsersPage = lazy(() => import("./pages/Users.tsx"));
 const LeadsPage = lazy(() => import("./pages/Leads.tsx"));
 const Cohorts = lazy(() => import("./pages/Cohorts.tsx"));
+const FunnelsPage = lazy(() => import("./pages/Funnels.tsx"));
 const FBAnalyticsPage = lazy(() => import("./pages/FBAnalytics.tsx"));
 const ForecastingPage = lazy(() => import("./pages/Forecasting.tsx"));
 const IntegrationsPage = lazy(() => import("./pages/Integrations.tsx"));
@@ -79,6 +80,7 @@ const App = () => (
                   <Route path="/users" element={<UsersPage />} />
                   <Route path="/leads" element={<LeadsPage />} />
                   <Route path="/cohorts" element={<Cohorts />} />
+                  <Route path="/funnels" element={<FunnelsPage />} />
                   <Route path="/fb-analytics" element={<FBAnalyticsPage />} />
                   <Route path="/integrations" element={<IntegrationsPage />} />
                   <Route path="/support" element={<SupportPage />} />

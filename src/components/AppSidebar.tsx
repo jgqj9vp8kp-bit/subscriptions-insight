@@ -1,4 +1,4 @@
-import { BarChart3, Headphones, LayoutDashboard, Receipt, Users, UserPlus, Layers, Upload, Repeat, Calculator, Plug } from "lucide-react";
+import { BarChart3, Headphones, LayoutDashboard, Receipt, Users, UserPlus, Layers, Upload, Repeat, Calculator, Plug, Route } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { NavLink } from "@/components/NavLink";
 import { useAuth } from "@/hooks/useAuth";
@@ -25,6 +25,7 @@ const items = [
   { title: "Users", url: "/users", icon: Users, end: false },
   { title: "Leads", url: "/leads", icon: UserPlus, end: false },
   { title: "Cohorts", url: "/cohorts", icon: Layers, end: false },
+  { title: "Funnels", url: "/funnels", icon: Route, end: false },
   { title: "FB-Analytics", url: "/fb-analytics", icon: BarChart3, end: false },
   { title: "Integrations", url: "/integrations", icon: Plug, end: false },
   { title: "Support", url: "/support", icon: Headphones, end: false },
