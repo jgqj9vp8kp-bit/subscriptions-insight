@@ -23,8 +23,8 @@ import type { CardType, MediaBuyer } from "@/services/types";
 import { utmSelectionValue } from "@/services/mediaBuyerSelection";
 
 export interface CohortFilterSelection {
-  funnelFilter: string;
-  campaignPathFilter: string;
+  selectedFunnels: string[];
+  selectedCampaignPaths: string[];
   trafficSourceFilter: string;
   currencyFilter: string;
   selectedCountries: string[];
@@ -34,16 +34,18 @@ export interface CohortFilterSelection {
 }
 
 export interface CohortFilterSelectionPatch {
-  funnelFilter?: string;
-  campaignPathFilter?: string;
+  selectedFunnels?: string[];
+  selectedCampaignPaths?: string[];
   trafficSourceFilter?: string;
   currencyFilter?: string;
   selectedCountries?: string[];
   selectedCardTypes?: CardType[];
   selectedMediaBuyers?: Array<MediaBuyer | string>;
   selectedCampaignIds?: string[];
-  /** Legacy single-select mirror, reset whenever the multi-select is pruned. */
+  /** Legacy single-select mirrors, reset whenever their multi-select is pruned. */
   campaignIdFilter?: string;
+  funnelFilter?: string;
+  campaignPathFilter?: string;
 }
 
 const ALL = "all";
@@ -71,10 +73,16 @@ export function pruneInvalidCohortSelections(
   if (!options) return null;
   const patch: CohortFilterSelectionPatch = {};
 
-  const funnel = pruneSingle(selection.funnelFilter, options.funnel);
-  if (funnel !== null) patch.funnelFilter = funnel;
-  const campaignPath = pruneSingle(selection.campaignPathFilter, options.campaign_path);
-  if (campaignPath !== null) patch.campaignPathFilter = campaignPath;
+  const funnels = pruneMulti(selection.selectedFunnels, new Set(options.funnel));
+  if (funnels) {
+    patch.selectedFunnels = funnels;
+    patch.funnelFilter = ALL;
+  }
+  const campaignPaths = pruneMulti(selection.selectedCampaignPaths, new Set(options.campaign_path));
+  if (campaignPaths) {
+    patch.selectedCampaignPaths = campaignPaths;
+    patch.campaignPathFilter = ALL;
+  }
   const trafficSource = pruneSingle(selection.trafficSourceFilter, options.traffic_source);
   if (trafficSource !== null) patch.trafficSourceFilter = trafficSource;
   const currency = pruneSingle(selection.currencyFilter, options.currency);

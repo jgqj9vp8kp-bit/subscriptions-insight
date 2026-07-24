@@ -140,6 +140,11 @@ const MIN_COLUMN_WIDTH = 80;
 const COHORT_FIRST_COL_KEY = "__cohort__";
 
 const DEFAULT_COHORTS_UI_STATE = {
+  // Multi-select selections are the source of truth; the singular *Filter keys
+  // stay for locally/cloud-persisted single-select settings (same migration
+  // shape as selectedCampaignIds / campaignIdFilter below).
+  selectedFunnels: [] as string[],
+  selectedCampaignPaths: [] as string[],
   funnelFilter: "all",
   campaignPathFilter: "all",
   trafficSourceFilter: "all",
@@ -1102,8 +1107,10 @@ export default function CohortsPage() {
   const { version: fbWarehouseVersion } = useFbWarehouseStatus(cohortsSource === "clickhouse");
   const [uiState, setUiState, resetUiState] = usePersistedPageState("ui_state_cohorts", DEFAULT_COHORTS_UI_STATE);
   const {
-    funnelFilter,
-    campaignPathFilter,
+    selectedFunnels: rawSelectedFunnels,
+    selectedCampaignPaths: rawSelectedCampaignPaths,
+    funnelFilter: legacyFunnelFilter,
+    campaignPathFilter: legacyCampaignPathFilter,
     trafficSourceFilter,
     currencyFilter,
     selectedCampaignIds: rawSelectedCampaignIds,
@@ -1140,6 +1147,28 @@ export default function CohortsPage() {
         ? rawSelectedMediaBuyers.filter(isMediaBuyerSelectionValue)
         : [],
     [rawSelectedMediaBuyers],
+  );
+  // Multi-select selections, merged with the legacy single-select key so a
+  // persisted "funnelFilter: soulmate" keeps working after the upgrade.
+  const mergeLegacySelection = (raw: unknown, legacy: unknown): string[] => {
+    const values = new Set<string>();
+    if (Array.isArray(raw)) {
+      raw.forEach((value) => {
+        const item = String(value ?? "").trim();
+        if (item && item !== "all") values.add(item);
+      });
+    }
+    const legacyValue = String(legacy ?? "").trim();
+    if (legacyValue && legacyValue !== "all") values.add(legacyValue);
+    return Array.from(values).sort();
+  };
+  const selectedFunnels = useMemo(
+    () => mergeLegacySelection(rawSelectedFunnels, legacyFunnelFilter),
+    [rawSelectedFunnels, legacyFunnelFilter],
+  );
+  const selectedCampaignPaths = useMemo(
+    () => mergeLegacySelection(rawSelectedCampaignPaths, legacyCampaignPathFilter),
+    [rawSelectedCampaignPaths, legacyCampaignPathFilter],
   );
   const selectedCampaignIds = useMemo(() => {
     const ids = new Set<string>();
@@ -1480,8 +1509,8 @@ export default function CohortsPage() {
       date_from: cohortDateFrom || null,
       date_to: cohortDateTo || null,
       filters: {
-        funnel: funnelFilter && funnelFilter !== "all" ? [funnelFilter] : [],
-        campaign_path: campaignPathFilter && campaignPathFilter !== "all" ? [campaignPathFilter] : [],
+        funnel: selectedFunnels,
+        campaign_path: selectedCampaignPaths,
         campaign_id: appliedSelectedCampaignIds ?? [],
         traffic_source: appliedTrafficSourceFilter && appliedTrafficSourceFilter !== "all" ? [appliedTrafficSourceFilter] : [],
         price_plan: [],
@@ -1507,7 +1536,7 @@ export default function CohortsPage() {
         },
       },
     }),
-    [cohortDateFrom, cohortDateTo, funnelFilter, campaignPathFilter, appliedSelectedCampaignIds, appliedTrafficSourceFilter, effectiveSelectedMediaBuyers, appliedSelectedCountries, effectiveSelectedCardTypes, selectedCurrencies, refundFilter, maxRenewalColumns, fbAllocationDiagnosticsUi],
+    [cohortDateFrom, cohortDateTo, selectedFunnels, selectedCampaignPaths, appliedSelectedCampaignIds, appliedTrafficSourceFilter, effectiveSelectedMediaBuyers, appliedSelectedCountries, effectiveSelectedCardTypes, selectedCurrencies, refundFilter, maxRenewalColumns, fbAllocationDiagnosticsUi],
   );
   const {
     chResult,
@@ -1691,28 +1720,32 @@ export default function CohortsPage() {
   );
   const campaignPathOptions = useMemo(() => {
     if (clickHouseDriving && chResult?.filterOptions) return chResult.filterOptions.campaign_path;
-    const optionCohorts = funnelFilter !== "all" ? parentCohorts.filter((c) => c.funnel === funnelFilter) : parentCohorts;
+    const optionCohorts = selectedFunnels.length
+      ? parentCohorts.filter((c) => selectedFunnels.includes(c.funnel))
+      : parentCohorts;
     return Array.from(new Set(optionCohorts.map((c) => c.campaign_path))).sort();
-  }, [clickHouseDriving, chResult, parentCohorts, funnelFilter]);
+  }, [clickHouseDriving, chResult, parentCohorts, selectedFunnels]);
   // Legacy path only: the ClickHouse path prunes every dimension together in the
   // cascading pruner below (which additionally waits for the CURRENT scope's
   // options, so a keepPreviousData list can never clear a valid selection).
   useEffect(() => {
     if (clickHouseDriving) return;
-    if (campaignPathFilter === "all" || campaignPathOptions.includes(campaignPathFilter)) return;
+    if (!selectedCampaignPaths.length) return;
+    const next = selectedCampaignPaths.filter((path) => campaignPathOptions.includes(path));
+    if (next.length === selectedCampaignPaths.length && (!legacyCampaignPathFilter || legacyCampaignPathFilter === "all")) return;
     markCohortsUiSettingsUpdated();
-    setUiState((current) => ({ ...current, campaignPathFilter: "all" }));
-  }, [clickHouseDriving, campaignPathFilter, campaignPathOptions, setUiState]);
+    setUiState((current) => ({ ...current, selectedCampaignPaths: next, campaignPathFilter: "all" }));
+  }, [clickHouseDriving, selectedCampaignPaths, legacyCampaignPathFilter, campaignPathOptions, setUiState]);
   const filteredCohortResult = useMemo(
     () =>
       filterCohortsWithDiagnostics(allCohorts, {
-        funnelFilter,
-        campaignPathFilter,
+        funnelFilter: selectedFunnels,
+        campaignPathFilter: selectedCampaignPaths,
         refundFilter,
         cohortDateFrom,
         cohortDateTo,
       }),
-    [allCohorts, funnelFilter, campaignPathFilter, refundFilter, cohortDateFrom, cohortDateTo],
+    [allCohorts, selectedFunnels, selectedCampaignPaths, refundFilter, cohortDateFrom, cohortDateTo],
   );
   const filteredCohorts = filteredCohortResult.cohorts;
 
@@ -1725,13 +1758,13 @@ export default function CohortsPage() {
 
   const cohortRowFilters = useMemo(
     () => ({
-      funnelFilter,
-      campaignPathFilter,
+      funnelFilter: selectedFunnels,
+      campaignPathFilter: selectedCampaignPaths,
       refundFilter,
       cohortDateFrom,
       cohortDateTo,
     }),
-    [funnelFilter, campaignPathFilter, refundFilter, cohortDateFrom, cohortDateTo],
+    [selectedFunnels, selectedCampaignPaths, refundFilter, cohortDateFrom, cohortDateTo],
   );
   const campaignIdOptions = useMemo(
     () =>
@@ -1861,8 +1894,8 @@ export default function CohortsPage() {
   const scopedOptions = clickHouseDriving && isFilterScopeCurrent ? chResult?.filterOptions : undefined;
   const liveSelection = useMemo(
     () => ({
-      funnelFilter,
-      campaignPathFilter,
+      selectedFunnels,
+      selectedCampaignPaths,
       trafficSourceFilter,
       currencyFilter,
       selectedCountries,
@@ -1870,7 +1903,7 @@ export default function CohortsPage() {
       selectedMediaBuyers,
       selectedCampaignIds,
     }),
-    [funnelFilter, campaignPathFilter, trafficSourceFilter, currencyFilter, selectedCountries, selectedCardTypes, selectedMediaBuyers, selectedCampaignIds],
+    [selectedFunnels, selectedCampaignPaths, trafficSourceFilter, currencyFilter, selectedCountries, selectedCardTypes, selectedMediaBuyers, selectedCampaignIds],
   );
   useEffect(() => {
     const patch = pruneInvalidCohortSelections(liveSelection, scopedOptions);
@@ -2257,6 +2290,30 @@ export default function CohortsPage() {
     updateUiState({ selectedMediaBuyers: next });
   };
   const clearMediaBuyers = () => updateUiState({ selectedMediaBuyers: [] });
+  const toggleFunnel = (funnel: string) => {
+    const next = selectedFunnels.includes(funnel)
+      ? selectedFunnels.filter((value) => value !== funnel)
+      : [...selectedFunnels, funnel].sort();
+    updateUiState({ selectedFunnels: next, funnelFilter: "all" });
+  };
+  const clearFunnels = () => updateUiState({ selectedFunnels: [], funnelFilter: "all" });
+  const funnelSummary = selectedFunnels.length === 0
+    ? "All funnels"
+    : selectedFunnels.length === 1
+      ? selectedFunnels[0].replace("_", " ")
+      : `${selectedFunnels.length} funnels`;
+  const toggleCampaignPath = (path: string) => {
+    const next = selectedCampaignPaths.includes(path)
+      ? selectedCampaignPaths.filter((value) => value !== path)
+      : [...selectedCampaignPaths, path].sort();
+    updateUiState({ selectedCampaignPaths: next, campaignPathFilter: "all" });
+  };
+  const clearCampaignPaths = () => updateUiState({ selectedCampaignPaths: [], campaignPathFilter: "all" });
+  const campaignPathSummary = selectedCampaignPaths.length === 0
+    ? "All campaign paths"
+    : selectedCampaignPaths.length === 1
+      ? selectedCampaignPaths[0]
+      : `${selectedCampaignPaths.length} campaign paths`;
   const toggleCampaignId = (campaignId: string) => {
     const next = selectedCampaignIds.includes(campaignId)
       ? selectedCampaignIds.filter((value) => value !== campaignId)
@@ -2873,24 +2930,66 @@ export default function CohortsPage() {
               Updating results…
             </span>
           )}
-          <Select value={funnelFilter} onValueChange={(value) => updateUiState({ funnelFilter: value })}>
-            <SelectTrigger className="h-9 w-[160px]"><SelectValue placeholder="Funnel" /></SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">All funnels</SelectItem>
-              {funnelOptions.map((f) => (
-                <SelectItem key={f} value={f}>{f.replace("_", " ")}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          <Select value={campaignPathFilter} onValueChange={(value) => updateUiState({ campaignPathFilter: value })}>
-            <SelectTrigger className="h-9 w-[220px]"><SelectValue placeholder="Campaign path" /></SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">All campaign paths</SelectItem>
-              {campaignPathOptions.map((path) => (
-                <SelectItem key={path} value={path}>{path}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+          <Popover>
+            <PopoverTrigger asChild>
+              <Button type="button" variant="outline" size="sm" className="h-9 w-[170px] justify-between gap-2">
+                <span className="truncate">{funnelSummary}</span>
+                <ChevronDown className="h-3.5 w-3.5 shrink-0 opacity-60" />
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent align="start" className="w-64 p-0">
+              <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
+                <div>
+                  <div className="text-xs font-medium text-muted-foreground">Funnel</div>
+                  <div className="text-xs text-muted-foreground">All funnels by default</div>
+                </div>
+                <Button type="button" variant="ghost" size="sm" className="h-7 text-xs" onClick={clearFunnels} disabled={!selectedFunnels.length}>
+                  Clear
+                </Button>
+              </div>
+              <div className="max-h-72 overflow-auto py-1">
+                {funnelOptions.length === 0 && (
+                  <div className="px-3 py-3 text-sm text-muted-foreground">No funnel data</div>
+                )}
+                {funnelOptions.map((f) => (
+                  <label key={f} className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted/50">
+                    <Checkbox checked={selectedFunnels.includes(f)} onCheckedChange={() => toggleFunnel(f)} />
+                    <span className="truncate">{f.replace("_", " ")}</span>
+                  </label>
+                ))}
+              </div>
+            </PopoverContent>
+          </Popover>
+          <Popover>
+            <PopoverTrigger asChild>
+              <Button type="button" variant="outline" size="sm" className="h-9 w-[230px] justify-between gap-2">
+                <span className="truncate">{campaignPathSummary}</span>
+                <ChevronDown className="h-3.5 w-3.5 shrink-0 opacity-60" />
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent align="start" className="w-72 p-0">
+              <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
+                <div>
+                  <div className="text-xs font-medium text-muted-foreground">Campaign path</div>
+                  <div className="text-xs text-muted-foreground">All campaign paths by default</div>
+                </div>
+                <Button type="button" variant="ghost" size="sm" className="h-7 text-xs" onClick={clearCampaignPaths} disabled={!selectedCampaignPaths.length}>
+                  Clear
+                </Button>
+              </div>
+              <div className="max-h-72 overflow-auto py-1">
+                {campaignPathOptions.length === 0 && (
+                  <div className="px-3 py-3 text-sm text-muted-foreground">No campaign path data</div>
+                )}
+                {campaignPathOptions.map((path) => (
+                  <label key={path} className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted/50">
+                    <Checkbox checked={selectedCampaignPaths.includes(path)} onCheckedChange={() => toggleCampaignPath(path)} />
+                    <span className="truncate">{path}</span>
+                  </label>
+                ))}
+              </div>
+            </PopoverContent>
+          </Popover>
           <Select value={trafficSourceFilter} onValueChange={(value) => updateUiState({ trafficSourceFilter: value })}>
             <SelectTrigger className="h-9 w-[160px]"><SelectValue placeholder="Traffic source" /></SelectTrigger>
             <SelectContent>

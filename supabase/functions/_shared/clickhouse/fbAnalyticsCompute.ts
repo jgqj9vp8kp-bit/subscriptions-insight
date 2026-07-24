@@ -8,6 +8,7 @@ import {
   filterTransactionsByTrialAttribution,
   normalizeCampaignId,
   type CohortFilters,
+  type CohortFilterSelection,
 } from "./cohortFiltering.ts";
 import {
   computeCohortReportTotals,
@@ -37,7 +38,7 @@ export function fbSpendStatusLabel(status: FbSpendStatus): string {
 }
 
 export interface FbAnalyticsFilters extends CohortFilters {
-  campaignPathFilter?: string;
+  campaignPathFilter?: CohortFilterSelection;
   selectedCountries?: string[];
   selectedCardTypes?: CardType[];
   campaignIdSearch?: string;

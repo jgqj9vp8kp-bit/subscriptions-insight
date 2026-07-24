@@ -10,8 +10,8 @@ import type { CohortRequest } from "../../supabase/functions/_shared/clickhouse/
 
 function selection(over: Partial<CohortFilterSelection> = {}): CohortFilterSelection {
   return {
-    funnelFilter: "all",
-    campaignPathFilter: "all",
+    selectedFunnels: [],
+    selectedCampaignPaths: [],
     trafficSourceFilter: "all",
     currencyFilter: "all",
     selectedCountries: [],
@@ -41,7 +41,7 @@ describe("pruneInvalidCohortSelections", () => {
   it("clears a downstream selection that no longer exists in the new scope", () => {
     // Campaign Path switched to a path with no CA users.
     const patch = pruneInvalidCohortSelections(
-      selection({ campaignPathFilter: "soulmate-sketch", selectedCountries: ["US", "CA"] }),
+      selection({ selectedCampaignPaths: ["soulmate-sketch"], selectedCountries: ["US", "CA"] }),
       options({ country: [{ country_code: "US", user_count: 10 }] }),
     );
     expect(patch).toEqual({ selectedCountries: ["US"] });
@@ -50,7 +50,7 @@ describe("pruneInvalidCohortSelections", () => {
   it("keeps valid selections untouched (returns null at the fixed point)", () => {
     expect(
       pruneInvalidCohortSelections(
-        selection({ campaignPathFilter: "soulmate-sketch", selectedCountries: ["US"], selectedCardTypes: ["visa" as CardType] }),
+        selection({ selectedCampaignPaths: ["soulmate-sketch"], selectedCountries: ["US"], selectedCardTypes: ["visa" as CardType] }),
         options(),
       ),
     ).toBeNull();
@@ -59,8 +59,8 @@ describe("pruneInvalidCohortSelections", () => {
   it("clears ONLY the invalid dimension and leaves unrelated filters alone", () => {
     const patch = pruneInvalidCohortSelections(
       selection({
-        funnelFilter: "soulmate",
-        campaignPathFilter: "soulmate-sketch",
+        selectedFunnels: ["soulmate"],
+        selectedCampaignPaths: ["soulmate-sketch"],
         selectedCountries: ["CA"],
         selectedCardTypes: ["visa" as CardType],
         selectedMediaBuyers: ["Alex" as MediaBuyer],
@@ -68,18 +68,18 @@ describe("pruneInvalidCohortSelections", () => {
       options({ country: [{ country_code: "US", user_count: 10 }] }),
     );
     expect(patch).toEqual({ selectedCountries: [] });
-    expect(patch).not.toHaveProperty("funnelFilter");
-    expect(patch).not.toHaveProperty("campaignPathFilter");
+    expect(patch).not.toHaveProperty("selectedFunnels");
+    expect(patch).not.toHaveProperty("selectedCampaignPaths");
     expect(patch).not.toHaveProperty("selectedCardTypes");
     expect(patch).not.toHaveProperty("selectedMediaBuyers");
   });
 
-  it("resets a single-select to 'all' when its value left the scope", () => {
+  it("prunes a multi-select value that left the scope and resets its legacy mirror", () => {
     const patch = pruneInvalidCohortSelections(
-      selection({ funnelFilter: "soulmate", campaignPathFilter: "astro-natal" }),
+      selection({ selectedFunnels: ["soulmate"], selectedCampaignPaths: ["astro-natal"] }),
       options(),
     );
-    expect(patch).toEqual({ campaignPathFilter: "all" });
+    expect(patch).toEqual({ selectedCampaignPaths: [], campaignPathFilter: "all" });
   });
 
   it("prunes campaign ids and clears the legacy single-select mirror", () => {
@@ -100,8 +100,8 @@ describe("pruneInvalidCohortSelections", () => {
     expect(
       pruneInvalidCohortSelections(
         selection({
-          funnelFilter: "soulmate",
-          campaignPathFilter: "soulmate-sketch",
+          selectedFunnels: ["soulmate"],
+          selectedCampaignPaths: ["soulmate-sketch"],
           currencyFilter: "USD",
           selectedCountries: ["US"],
           selectedCardTypes: ["visa" as CardType],
@@ -117,7 +117,7 @@ describe("pruneInvalidCohortSelections", () => {
 
   it("reaches a fixed point in one pass — no infinite filter-reset loop", () => {
     const scoped = options({ country: [{ country_code: "US", user_count: 10 }], campaign_path: ["soulmate-quiz"] });
-    const initial = selection({ campaignPathFilter: "soulmate-sketch", selectedCountries: ["CA", "US"], selectedCampaignIds: ["cid_gone"] });
+    const initial = selection({ selectedCampaignPaths: ["soulmate-sketch"], selectedCountries: ["CA", "US"], selectedCampaignIds: ["cid_gone"] });
 
     const first = pruneInvalidCohortSelections(initial, scoped);
     expect(first).not.toBeNull();

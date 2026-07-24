@@ -1,9 +1,29 @@
 import type { CohortRow } from "./serviceTypes.ts";
 import type { Transaction } from "./serviceTypes.ts";
 
+/**
+ * Funnel / campaign-path selections accept either a single value (the original
+ * single-select contract, still used by persisted settings and other callers)
+ * or a list for multi-select. "all", "" and an empty list all mean "no filter",
+ * so every engine agrees on what an inactive filter looks like.
+ */
+export type CohortFilterSelection = string | readonly string[] | undefined;
+
+/** The active values of a selection; empty means the filter is off. */
+export function cohortFilterValues(selection: CohortFilterSelection): string[] {
+  const raw = Array.isArray(selection) ? selection : selection == null ? [] : [selection as string];
+  return raw.map((value) => String(value ?? "").trim()).filter((value) => value !== "" && value !== "all");
+}
+
+/** True when the selection is inactive or contains `actual`. */
+export function cohortFilterMatches(selection: CohortFilterSelection, actual: string | null | undefined): boolean {
+  const values = cohortFilterValues(selection);
+  return values.length === 0 || values.includes(String(actual ?? ""));
+}
+
 export interface CohortFilters {
-  funnelFilter?: string;
-  campaignPathFilter?: string;
+  funnelFilter?: CohortFilterSelection;
+  campaignPathFilter?: CohortFilterSelection;
   refundFilter?: string;
   cohortDateFrom?: string;
   cohortDateTo?: string;
@@ -96,14 +116,10 @@ export function filterCohortsWithDiagnostics<T extends CohortRow>(
 ): { cohorts: T[]; diagnostics: CohortFilterDiagnostics } {
   const range = normalizeDateRange(filters.cohortDateFrom, filters.cohortDateTo);
   const dateFiltered = cohorts.filter((cohort) => cohortMatchesDateRange(cohort, range));
-  const funnelFiltered =
-    filters.funnelFilter && filters.funnelFilter !== "all"
-      ? dateFiltered.filter((cohort) => cohort.funnel === filters.funnelFilter)
-      : dateFiltered;
-  const campaignFiltered =
-    filters.campaignPathFilter && filters.campaignPathFilter !== "all"
-      ? funnelFiltered.filter((cohort) => cohort.campaign_path === filters.campaignPathFilter)
-      : funnelFiltered;
+  const funnelFiltered = dateFiltered.filter((cohort) => cohortFilterMatches(filters.funnelFilter, cohort.funnel));
+  const campaignFiltered = funnelFiltered.filter((cohort) =>
+    cohortFilterMatches(filters.campaignPathFilter, cohort.campaign_path),
+  );
   const refundFiltered = campaignFiltered.filter((cohort) => {
     if (filters.refundFilter === "has") return cohort.refund_users > 0;
     if (filters.refundFilter === "none") return cohort.refund_users === 0;

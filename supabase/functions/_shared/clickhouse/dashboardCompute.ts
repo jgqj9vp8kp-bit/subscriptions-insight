@@ -5,6 +5,7 @@ import {
   type FxNormalizationDiagnostics,
   type FxNormalizationResult,
 } from "./currencyNormalization.ts";
+import { cohortFilterMatches, type CohortFilterSelection } from "./cohortFiltering.ts";
 
 export type DashboardCohort = CohortRow & {
   traffic_spend?: number | null;
@@ -81,8 +82,8 @@ export interface DailyCancellationsRow {
 export interface CashRevenueFilters {
   dateFrom?: string;
   dateTo?: string;
-  funnelFilter?: string;
-  campaignPathFilter?: string;
+  funnelFilter?: CohortFilterSelection;
+  campaignPathFilter?: CohortFilterSelection;
   sourceFilter?: string;
 }
 
@@ -210,10 +211,8 @@ function matchesCashRevenueFilters(transaction: Transaction, filters: CashRevenu
   if (!eventDate) return false;
   if (filters.dateFrom && eventDate < filters.dateFrom) return false;
   if (filters.dateTo && eventDate > filters.dateTo) return false;
-  if (filters.funnelFilter && filters.funnelFilter !== "all" && transaction.funnel !== filters.funnelFilter) return false;
-  if (filters.campaignPathFilter && filters.campaignPathFilter !== "all" && transaction.campaign_path !== filters.campaignPathFilter) {
-    return false;
-  }
+  if (!cohortFilterMatches(filters.funnelFilter, transaction.funnel)) return false;
+  if (!cohortFilterMatches(filters.campaignPathFilter, transaction.campaign_path)) return false;
   if (filters.sourceFilter && filters.sourceFilter !== "all" && transaction.traffic_source !== filters.sourceFilter) return false;
   return true;
 }

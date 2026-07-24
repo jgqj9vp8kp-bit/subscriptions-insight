@@ -7,6 +7,7 @@ import type { SubscriptionClean } from "./subscriptionTypes.ts";
 import type { TrafficMetric } from "./trafficMetric.ts";
 import type { Transaction } from "./serviceTypes.ts";
 import { computeCohorts } from "./cohortAnalytics.ts";
+import type { CohortFilterSelection } from "./cohortFiltering.ts";
 import { aggregateTrafficMetrics, trafficForCohort } from "./cohortReporting.ts";
 import {
   buildCancellationBreakdown,
@@ -36,8 +37,8 @@ import {
 export const DASHBOARD_SUMMARY_FUNCTION = "dashboard-summary";
 
 export interface DashboardSummaryFilters {
-  funnelFilter?: string;
-  campaignPathFilter?: string;
+  funnelFilter?: CohortFilterSelection;
+  campaignPathFilter?: CohortFilterSelection;
   sourceFilter?: string;
   cohortDateFrom?: string;
   cohortDateTo?: string;
