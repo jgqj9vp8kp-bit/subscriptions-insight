@@ -1196,6 +1196,10 @@ export default function CohortsPage() {
   };
   const [columnsPopoverOpen, setColumnsPopoverOpen] = useState(false);
   const [viewsPopoverOpen, setViewsPopoverOpen] = useState(false);
+  // Diagnostics (data source, FB reconciliation, FX, token attribution) are an
+  // engineering panel, not part of the report — collapsed by default so the
+  // cohort table starts near the top of the page.
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
   const [campaignIdSearch, setCampaignIdSearch] = useState("");
   const [maxRenewalColumns, setMaxRenewalColumns] = useState(loadMaxRenewalColumns);
   const defaultColumnOrder = useMemo(() => buildDefaultColumnOrder(maxRenewalColumns), [maxRenewalColumns]);
@@ -3240,6 +3244,28 @@ export default function CohortsPage() {
           </div>
         </div>
 
+        {/* Data-integrity warnings stay visible: they are actionable, not diagnostics. */}
+        {subscriptionSyncWarning && (
+          <div className="mb-3 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning">
+            {subscriptionSyncWarning}
+          </div>
+        )}
+        <div className="mb-2">
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="h-7 gap-1 px-2 text-xs"
+            aria-expanded={diagnosticsOpen}
+            aria-controls="cohorts-diagnostics"
+            onClick={() => setDiagnosticsOpen((open) => !open)}
+          >
+            {diagnosticsOpen ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+            Diagnostics
+          </Button>
+        </div>
+        {diagnosticsOpen && (
+        <div id="cohorts-diagnostics">
         {cohortsSource === "clickhouse" && (
           <div className="mb-2 rounded-md border border-border bg-muted/20 px-3 py-2 text-xs">
             <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
@@ -3596,11 +3622,6 @@ export default function CohortsPage() {
             )}
           </div>
         )}
-        {subscriptionSyncWarning && (
-          <div className="mb-3 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning">
-            {subscriptionSyncWarning}
-          </div>
-        )}
         {(tokenDiagnostics.token_purchases_total > 0 || tokenDiagnostics.unknown_products.length > 0) && (
           <div className="mb-3 space-y-1 text-xs text-muted-foreground">
             <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
@@ -3667,6 +3688,8 @@ export default function CohortsPage() {
               </details>
             )}
           </div>
+        )}
+        </div>
         )}
         <div className="rounded-lg border border-border [&>div]:max-h-[calc(100vh-220px)] [&>div]:overflow-auto [&>div]:rounded-lg [&>div]:scroll-smooth">
           <Table
