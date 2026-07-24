@@ -388,12 +388,15 @@ describe("109–118 performance and query shape", () => {
   it("does not scan analytics_transactions for FB assignment", () => expect(`${userSql}${metricSql}`).not.toContain("analytics_transactions"));
   it("does not join Campaign Spend to cohort rows", () => expect(userSql).not.toContain("spend"));
   it("queries Campaign Metrics only for selected Campaign IDs without URL parameters", () => {
-    expect(metricSql).toContain("trim(BOTH ' ' FROM campaign_id) IN (unhex(");
+    // Qualified (f.campaign_id): the SELECT aliases the trimmed value back to
+    // `campaign_id`, so a bare identifier would resolve to that alias and raise
+    // "Cyclic aliases" instead of reading the column.
+    expect(metricSql).toContain("trim(BOTH ' ' FROM f.campaign_id) IN (unhex(");
     expect(metricSql).not.toContain("p_fbu_metric_cid");
     expect(metricSql).not.toContain(CAMPAIGN_A);
   });
   it("bounds Campaign Metrics by reporting dates", () => expect(metricSql).toContain("fbu_metric_from"));
-  it("aggregates Campaign Metrics before JavaScript assembly", () => expect(metricSql).toContain("sum(spend)"));
+  it("aggregates Campaign Metrics before JavaScript assembly", () => expect(metricSql).toContain("sum(f.spend)"));
   it("does not serialize raw payload in the result", () => expect(metricSql).not.toContain("raw_payload raw_payload"));
   it("deduplicates exact metric components", () => expect(assemble([user(1)], [metric(), metric()]).validation[0].fb_spend).toBe(100));
   it("handles 10,000 users without changing the algorithmic result", () => {
@@ -498,4 +501,45 @@ describe("snapshot invariant", () => {
   it("rejects duplicate canonical_user_id", () => {
     expect(() => assertFbSnapshotUnique({ snapshot_rows: 21, snapshot_unique_users: 20, snapshot_duplicate_users: 1 })).toThrow(/not unique/);
   });
+});
+
+// Regression: every SQL builder that aliases an expression back to
+// `campaign_id` must read the source column QUALIFIED. ClickHouse substitutes a
+// SELECT alias into any bare identifier of the same name — including the one
+// inside the aliasing expression itself — and raises "Cyclic aliases". That
+// killed all six FB queries at once, so fb_data_status was permanently
+// "unavailable" and every Spend (FB) / FB Purchases cell rendered "—"
+// (found 2026-07-24 on live data).
+describe("campaign_id aliasing never shadows its own source column", () => {
+  const sqls: Array<[string, string]> = [
+    ["users", fbAuthoritativeUsersSql({ filters: NO_FILTERS, dateFrom: DATE, dateTo: DATE, params: {} })],
+    ["campaign_scope", fbAuthoritativeCampaignScopeSql({ filters: NO_FILTERS, dateFrom: DATE, dateTo: DATE, visibleRows: [], params: {} })],
+    ["groups", fbAuthoritativeUserGroupsSql({ filters: NO_FILTERS, dateFrom: DATE, dateTo: DATE, visibleRows: [], params: {} })],
+    ["metrics", fbCampaignMetricsSql({ campaignIds: null, dateFrom: DATE, dateTo: DATE, params: {} })],
+  ];
+
+  it("metrics: no aggregate is aliased onto a bare copy of its own column", () => {
+    const sql = fbCampaignMetricsSql({ campaignIds: null, dateFrom: DATE, dateTo: DATE, params: {} });
+    // The live failure: `if(uniqExact(ad_account_id) = 1, …) ad_account_id`
+    // beside `uniqExact(ad_account_id) ad_account_count` — the alias got
+    // substituted into the sibling, nesting one aggregate inside another
+    // (ILLEGAL_AGGREGATION, code 184) and blanking every FB column.
+    // Aliases themselves are bare by definition, so assert on what actually
+    // matters: every aggregate argument reads a QUALIFIED column, so no alias
+    // can be substituted into it.
+    const unqualifiedAggregateArg = /\b(?:sum|uniqExact|argMax|any|min|max|isFinite)\(\s*(?!f\.)[a-z_]+\b/g;
+    expect(sql.match(unqualifiedAggregateArg) ?? []).toEqual([]);
+  });
+
+  for (const [label, sql] of sqls) {
+    it(`${label}: aliases campaign_id only from a qualified column`, () => {
+      // No bare `campaign_id` inside an expression that is aliased to campaign_id.
+      expect(sql).not.toMatch(/trim\(BOTH ' ' FROM campaign_id\)\s+campaign_id/);
+      expect(sql).not.toMatch(/FROM campaign_id\)\)\s*IN\s*\('',\s*'unknown'/);
+      // Any table it reads is aliased, so the qualification resolves.
+      if (/\bcampaign_id\b/.test(sql)) {
+        expect(sql).toMatch(/FROM \w+ AS (fc|f) FINAL/);
+      }
+    });
+  }
 });

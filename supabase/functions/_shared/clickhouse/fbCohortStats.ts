@@ -489,7 +489,15 @@ function authoritativeScopeWhere(input: {
   return where + visibleRowsClause(input.visibleRows);
 }
 
-function authoritativeCampaignExpr(column = "campaign_id"): string {
+// The source column MUST stay qualified (fc.campaign_id / f.campaign_id).
+// Every caller aliases the result back to `campaign_id`, and ClickHouse
+// substitutes a SELECT alias into any bare identifier of the same name —
+// including the one inside this very expression — which raises
+// "Cyclic aliases" and killed the whole FB allocation bundle (found
+// 2026-07-24: fb_data_status was permanently "unavailable"). Qualifying the
+// reference resolves it to the column and breaks the cycle while keeping the
+// output column name that every consumer reads.
+function authoritativeCampaignExpr(column = "fc.campaign_id"): string {
   return `if(lowerUTF8(trim(BOTH ' ' FROM ${column})) IN ('', 'unknown', 'null', 'n/a', 'none'), '', trim(BOTH ' ' FROM ${column}))`;
 }
 
@@ -523,7 +531,7 @@ export function fbAuthoritativeUsersSql(input: {
     funnel,
     campaign_path,
     ${authoritativeCampaignExpr()} campaign_id
-  FROM ${FC} FINAL
+  FROM ${FC} AS fc FINAL
   WHERE ${where}
   FORMAT JSONEachRow`;
 }
@@ -542,7 +550,7 @@ export function fbAuthoritativeCampaignScopeSql(input: {
     count() authoritative_users,
     toString(min(toDate(trial_event_time))) utc_date_from,
     toString(max(toDate(trial_event_time))) utc_date_to
-  FROM ${FC} FINAL
+  FROM ${FC} AS fc FINAL
   WHERE ${where}
   GROUP BY ${campaign}
   FORMAT JSONEachRow`;
@@ -563,19 +571,19 @@ export function fbAuthoritativeUserGroupsSql(input: {
     campaign_path,
     ${campaign} campaign_id,
     count() authoritative_user_count
-  FROM ${FC} FINAL
+  FROM ${FC} AS fc FINAL
   WHERE ${where}
   GROUP BY cohort_date, funnel, campaign_path, campaign_id
   FORMAT JSONEachRow`;
 }
 
-function reportingTimezoneExpr(): string {
+function reportingTimezoneExpr(prefix = ""): string {
   return `coalesce(
-    nullIf(JSONExtractString(raw_payload, 'accountTimezone'), ''),
-    nullIf(JSONExtractString(raw_payload, 'account_timezone'), ''),
-    nullIf(JSONExtractString(raw_payload, 'adAccountTimezone'), ''),
-    nullIf(JSONExtractString(raw_payload, 'timezoneName'), ''),
-    nullIf(JSONExtractString(raw_payload, 'timezone'), ''),
+    nullIf(JSONExtractString(${prefix}raw_payload, 'accountTimezone'), ''),
+    nullIf(JSONExtractString(${prefix}raw_payload, 'account_timezone'), ''),
+    nullIf(JSONExtractString(${prefix}raw_payload, 'adAccountTimezone'), ''),
+    nullIf(JSONExtractString(${prefix}raw_payload, 'timezoneName'), ''),
+    nullIf(JSONExtractString(${prefix}raw_payload, 'timezone'), ''),
     ''
   )`;
 }
@@ -591,33 +599,43 @@ export function fbCampaignMetricsSql(input: {
   const campaignIds = input.campaignIds == null
     ? null
     : [...new Set(input.campaignIds.map(normalizeAuthoritativeCampaignId).filter(Boolean))].sort();
-  let where = `auth_user_id = {auth_user_id:String} AND level = 'campaign'
-    AND trim(BOTH ' ' FROM campaign_id) != ''`;
+  // f.campaign_id stays qualified everywhere: the SELECT below aliases the
+  // trimmed value back to `campaign_id`, and a bare identifier would resolve to
+  // that alias (Cyclic aliases) instead of the column.
+  let where = `f.auth_user_id = {auth_user_id:String} AND f.level = 'campaign'
+    AND trim(BOTH ' ' FROM f.campaign_id) != ''`;
   // Generated Campaign scope can contain thousands of IDs. Keep it in the POST
   // SQL body (hex literals), never as one URL query parameter per Campaign.
   if (campaignIds != null) {
-    where += campaignIds.length ? ` AND trim(BOTH ' ' FROM campaign_id) IN ${clickHouseBodyStringSet(campaignIds)}` : " AND 0";
+    where += campaignIds.length ? ` AND trim(BOTH ' ' FROM f.campaign_id) IN ${clickHouseBodyStringSet(campaignIds)}` : " AND 0";
   }
-  if (input.dateFrom) { input.params.fbu_metric_from = input.dateFrom; where += ` AND toString(stat_date) >= {fbu_metric_from:String}`; }
-  if (input.dateTo) { input.params.fbu_metric_to = input.dateTo; where += ` AND toString(stat_date) <= {fbu_metric_to:String}`; }
-  return `SELECT trim(BOTH ' ' FROM campaign_id) campaign_id,
-    argMax(campaign_name, source_updated_at) campaign_name,
-    if(uniqExact(ad_account_id) = 1, any(ad_account_id), '') ad_account_id,
-    if(uniqExact(currency) = 1, any(currency), '') currency,
-    uniqExact(ad_account_id) ad_account_count,
-    uniqExact(currency) currency_count,
-    toString(min(stat_date)) period_date_from,
-    toString(max(stat_date)) period_date_to,
-    arrayStringConcat(arraySort(groupUniqArrayIf(${reportingTimezoneExpr()}, ${reportingTimezoneExpr()} != '')), ',') reporting_timezones,
-    sum(spend) spend,
-    sum(fb_purchases) purchases,
-    sum(impressions) impressions,
-    sum(clicks) clicks,
-    sum(link_clicks) link_clicks,
-    sum(reach) reach,
-    sum(purchase_value) purchase_value,
-    countIf(NOT isFinite(spend) OR spend < 0) invalid_metric_rows
-  FROM ${FB} FINAL
+  if (input.dateFrom) { input.params.fbu_metric_from = input.dateFrom; where += ` AND toString(f.stat_date) >= {fbu_metric_from:String}`; }
+  if (input.dateTo) { input.params.fbu_metric_to = input.dateTo; where += ` AND toString(f.stat_date) <= {fbu_metric_to:String}`; }
+  // EVERY source column here stays qualified with f. Each aggregate is aliased
+  // back to its own column name (spend -> spend, ad_account_id -> ad_account_id,
+  // …) and ClickHouse substitutes a SELECT alias into sibling expressions that
+  // use the bare identifier. Unqualified, `uniqExact(ad_account_id)` became
+  // uniqExact(if(uniqExact(...))) -> "Aggregate function ... is found inside
+  // another aggregate function" (Code 184), which failed the whole FB bundle and
+  // blanked every Spend (FB) cell. Same trap as cohorts' price_breakdown.
+  return `SELECT trim(BOTH ' ' FROM f.campaign_id) campaign_id,
+    argMax(f.campaign_name, f.source_updated_at) campaign_name,
+    if(uniqExact(f.ad_account_id) = 1, any(f.ad_account_id), '') ad_account_id,
+    if(uniqExact(f.currency) = 1, any(f.currency), '') currency,
+    uniqExact(f.ad_account_id) ad_account_count,
+    uniqExact(f.currency) currency_count,
+    toString(min(f.stat_date)) period_date_from,
+    toString(max(f.stat_date)) period_date_to,
+    arrayStringConcat(arraySort(groupUniqArrayIf(${reportingTimezoneExpr("f.")}, ${reportingTimezoneExpr("f.")} != '')), ',') reporting_timezones,
+    sum(f.spend) spend,
+    sum(f.fb_purchases) purchases,
+    sum(f.impressions) impressions,
+    sum(f.clicks) clicks,
+    sum(f.link_clicks) link_clicks,
+    sum(f.reach) reach,
+    sum(f.purchase_value) purchase_value,
+    countIf(NOT isFinite(f.spend) OR f.spend < 0) invalid_metric_rows
+  FROM ${FB} AS f FINAL
   WHERE ${where}
   GROUP BY campaign_id
   FORMAT JSONEachRow`;
@@ -673,7 +691,7 @@ export function fbSourceScopedDiagnosticsSql(input: {
 }): string {
   const where = authoritativeScopeWhere({ ...input, prefix: "fbsrc" });
   let fbWhere = `auth_user_id = {auth_user_id:String} AND level = 'campaign'
-    AND trim(BOTH ' ' FROM campaign_id) != ''`;
+    AND trim(BOTH ' ' FROM f.campaign_id) != ''`;
   if (input.dateFrom) {
     input.params.fbsrc_metric_from = input.dateFrom;
     fbWhere += " AND toString(stat_date) >= {fbsrc_metric_from:String}";
@@ -716,12 +734,12 @@ members AS (
     trial_transaction_id,
     traffic_source,
     ${authoritativeCampaignExpr()} campaign_id
-  FROM ${FC} FINAL
+  FROM ${FC} AS fc FINAL
   WHERE ${where}
 ),
 fb_campaigns AS (
-  SELECT DISTINCT trim(BOTH ' ' FROM campaign_id) campaign_id
-  FROM ${FB} FINAL
+  SELECT DISTINCT trim(BOTH ' ' FROM f.campaign_id) campaign_id
+  FROM ${FB} AS f FINAL
   WHERE ${fbWhere}
 ),
 trial_signals AS (

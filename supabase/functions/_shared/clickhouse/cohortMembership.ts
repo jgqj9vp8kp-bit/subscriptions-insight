@@ -898,7 +898,14 @@ export async function runMaterializedCohortList(input: {
     visibleRows,
     allocationDiagnosticsEnabled: Boolean(input.allocationDiagnosticsEnabled),
     allocationDiagnosticsRequest: input.request.fb_allocation_diagnostics,
-  }).catch((error) => unavailableFbCohortStats(error, Boolean(input.allocationDiagnosticsEnabled)));
+  }).catch((error) => {
+    // The client only ever sees a sanitized message, which made a total FB
+    // outage look like a transient warehouse hiccup — a ClickHouse
+    // ILLEGAL_AGGREGATION went unnoticed until every Spend (FB) cell was
+    // reported empty (2026-07-24). Keep the real cause in the function logs.
+    console.error("[cohorts] FB allocation failed:", error instanceof Error ? error.message : error);
+    return unavailableFbCohortStats(error, Boolean(input.allocationDiagnosticsEnabled));
+  });
   for (const row of rows) {
     const fb = fbStats.perRow[fbCohortRowKey(row.cohort_date, row.funnel, row.campaign_path)];
     if (fb) Object.assign(row, fb);
