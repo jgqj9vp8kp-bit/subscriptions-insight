@@ -166,16 +166,32 @@ export function subscriptionRowToClean(row: FunnelFoxSubscriptionRow): Subscript
   return normalizeSubscription(merged);
 }
 
-/** Load durable synced subscriptions and re-derive SubscriptionClean[] for the store. */
+/**
+ * Load durable synced subscriptions and re-derive SubscriptionClean[] for the
+ * store. PostgREST caps a single response at ~1000 rows regardless of .limit(),
+ * so page through the whole table with .range() — this account has ~9k
+ * subscriptions and would otherwise silently return only the first 1000.
+ * Ordered by the immutable subscription_id (not updated_at) so a concurrent
+ * cron write can't shift rows across a page boundary and drop/duplicate them.
+ */
 export async function loadFunnelFoxSubscriptions(): Promise<SubscriptionClean[]> {
   const client = ensureSupabase();
-  const { data, error } = await client
-    .from("funnelfox_subscriptions")
-    .select("subscription_id, email, normalized_email, raw_list, raw_detail")
-    .order("updated_at", { ascending: false, nullsFirst: false })
-    .limit(100000);
-  if (error) throw new Error(`Could not load FunnelFox subscriptions: ${error.message}`);
-  return ((data ?? []) as FunnelFoxSubscriptionRow[]).map(subscriptionRowToClean);
+  const PAGE = 1000;
+  const MAX_PAGES = 200; // 200k-row backstop against an unexpected loop.
+  const rows: FunnelFoxSubscriptionRow[] = [];
+  for (let page = 0; page < MAX_PAGES; page += 1) {
+    const from = page * PAGE;
+    const { data, error } = await client
+      .from("funnelfox_subscriptions")
+      .select("subscription_id, email, normalized_email, raw_list, raw_detail")
+      .order("subscription_id", { ascending: true })
+      .range(from, from + PAGE - 1);
+    if (error) throw new Error(`Could not load FunnelFox subscriptions: ${error.message}`);
+    const batch = (data ?? []) as FunnelFoxSubscriptionRow[];
+    rows.push(...batch);
+    if (batch.length < PAGE) break;
+  }
+  return rows.map(subscriptionRowToClean);
 }
 
 // ---- UI status helpers (pure, tested) --------------------------------------------------------
