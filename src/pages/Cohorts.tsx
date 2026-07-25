@@ -54,7 +54,7 @@ import {
 import { useFbWarehouseStatus } from "@/hooks/useFbWarehouse";
 import { buildCohortsExportTable, cohortsTableToCsv } from "@/services/cohortsExport";
 import { pruneInvalidCohortSelections } from "@/services/cohortFilterSelection";
-import { listActiveFunnelPaths } from "@/services/funnels";
+import { listFunnels } from "@/services/funnels";
 import type { CohortRequest } from "../../supabase/functions/_shared/clickhouse/cohortContract";
 import type { FbAllocationStatus, FbTimezoneSource } from "../../supabase/functions/_shared/clickhouse/fbCohortStats";
 import { useAuth } from "@/hooks/useAuth";
@@ -1106,18 +1106,24 @@ export default function CohortsPage() {
   // FB warehouse fingerprint (separate lifecycle from the cohort snapshot): an
   // FB sync re-keys this report so cached Spend can never outlive the sync.
   const { version: fbWarehouseVersion } = useFbWarehouseStatus(cohortsSource === "clickhouse");
-  // Active funnels from the Funnels admin registry (funnel_path == campaign_path
-  // here). Used only to highlight/quick-select active campaign paths — it never
-  // filters the report on its own, so a failed load just means no highlight.
+  // Funnels admin registry (funnel_path == campaign_path here). Used only to
+  // highlight/quick-select active campaign paths and to filter the Campaign path
+  // picker by tag — it never filters the report on its own, so a failed load
+  // just drops the highlight/tag affordances.
   const [activeFunnelPaths, setActiveFunnelPaths] = useState<Set<string>>(new Set());
+  const [funnelTagsByPath, setFunnelTagsByPath] = useState<Map<string, string[]>>(new Map());
   useEffect(() => {
     let cancelled = false;
-    listActiveFunnelPaths()
-      .then((paths) => {
-        if (!cancelled) setActiveFunnelPaths(new Set(paths));
+    listFunnels()
+      .then((rows) => {
+        if (cancelled) return;
+        setActiveFunnelPaths(new Set(rows.filter((row) => row.is_active).map((row) => row.funnel_path)));
+        const byPath = new Map<string, string[]>();
+        for (const row of rows) byPath.set(row.funnel_path, row.tags.map((tag) => tag.name));
+        setFunnelTagsByPath(byPath);
       })
       .catch(() => {
-        /* highlight is best-effort; registry is optional to the report */
+        /* highlight/tags are best-effort; registry is optional to the report */
       });
     return () => {
       cancelled = true;
@@ -2332,15 +2338,37 @@ export default function CohortsPage() {
     : selectedCampaignPaths.length === 1
       ? selectedCampaignPaths[0]
       : `${selectedCampaignPaths.length} campaign paths`;
-  // Active funnels (from the Funnels registry) that are actually offered in the
-  // current cohort scope — the "Select active" affordance only makes sense for
-  // paths the user could otherwise pick by hand.
+  // Tag filter for the Campaign path picker (registry tags). Purely a view aid
+  // for the dropdown — it narrows which paths are OFFERED, never the report
+  // itself, and it is not persisted (a transient way to find funnels by tag).
+  const [pathTagFilter, setPathTagFilter] = useState<string[]>([]);
+  const togglePathTag = (name: string) =>
+    setPathTagFilter((current) => (current.includes(name) ? current.filter((tag) => tag !== name) : [...current, name]));
+  // Tags actually present among the campaign paths currently in scope, so the
+  // chip row never offers a tag that would match nothing here.
+  const campaignPathTagOptions = useMemo(() => {
+    const tags = new Set<string>();
+    for (const path of campaignPathOptions) (funnelTagsByPath.get(path) ?? []).forEach((tag) => tags.add(tag));
+    return [...tags].sort((a, b) => a.localeCompare(b));
+  }, [campaignPathOptions, funnelTagsByPath]);
+  // The path list after the tag filter (any-of). No tags selected = all paths.
+  const visibleCampaignPathOptions = useMemo(() => {
+    if (!pathTagFilter.length) return campaignPathOptions;
+    return campaignPathOptions.filter((path) => {
+      const tags = funnelTagsByPath.get(path);
+      return tags ? tags.some((tag) => pathTagFilter.includes(tag)) : false;
+    });
+  }, [campaignPathOptions, pathTagFilter, funnelTagsByPath]);
+  // "Select active" only offers the paths the user could otherwise pick by hand,
+  // i.e. active AND currently visible under the tag filter.
   const activeCampaignPathOptions = useMemo(
-    () => campaignPathOptions.filter((path) => activeFunnelPaths.has(path)),
-    [campaignPathOptions, activeFunnelPaths],
+    () => visibleCampaignPathOptions.filter((path) => activeFunnelPaths.has(path)),
+    [visibleCampaignPathOptions, activeFunnelPaths],
   );
   const selectActiveCampaignPaths = () =>
     updateUiState({ selectedCampaignPaths: [...activeCampaignPathOptions].sort(), campaignPathFilter: "all" });
+  const selectVisibleCampaignPaths = () =>
+    updateUiState({ selectedCampaignPaths: [...visibleCampaignPathOptions].sort(), campaignPathFilter: "all" });
   const toggleCampaignId = (campaignId: string) => {
     const next = selectedCampaignIds.includes(campaignId)
       ? selectedCampaignIds.filter((value) => value !== campaignId)
@@ -2994,7 +3022,7 @@ export default function CohortsPage() {
                 <ChevronDown className="h-3.5 w-3.5 shrink-0 opacity-60" />
               </Button>
             </PopoverTrigger>
-            <PopoverContent align="start" className="w-72 p-0">
+            <PopoverContent align="start" className="w-80 p-0">
               <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
                 <div>
                   <div className="text-xs font-medium text-muted-foreground">Campaign path</div>
@@ -3008,25 +3036,71 @@ export default function CohortsPage() {
                   Clear
                 </Button>
               </div>
-              {activeCampaignPathOptions.length > 0 && (
-                <div className="border-b border-border px-3 py-1.5">
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    className="h-7 w-full justify-start gap-2 text-xs text-success hover:text-success"
-                    onClick={selectActiveCampaignPaths}
-                  >
-                    <span className="inline-block h-1.5 w-1.5 rounded-full bg-success" />
-                    Select {activeCampaignPathOptions.length} active
-                  </Button>
+              {campaignPathTagOptions.length > 0 && (
+                <div className="flex flex-wrap items-center gap-1 border-b border-border px-3 py-2">
+                  <span className="mr-1 text-xs text-muted-foreground">Tags:</span>
+                  {campaignPathTagOptions.map((tag) => {
+                    const on = pathTagFilter.includes(tag);
+                    return (
+                      <button
+                        key={tag}
+                        type="button"
+                        onClick={() => togglePathTag(tag)}
+                        className={`rounded-full border px-2 py-0.5 text-xs transition-colors ${
+                          on
+                            ? "border-primary bg-primary/10 text-primary"
+                            : "border-border text-muted-foreground hover:bg-muted/50"
+                        }`}
+                      >
+                        {tag}
+                      </button>
+                    );
+                  })}
+                  {pathTagFilter.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setPathTagFilter([])}
+                      className="ml-1 text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                    >
+                      reset
+                    </button>
+                  )}
+                </div>
+              )}
+              {(activeCampaignPathOptions.length > 0 || pathTagFilter.length > 0) && (
+                <div className="flex items-center gap-1 border-b border-border px-3 py-1.5">
+                  {activeCampaignPathOptions.length > 0 && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 gap-2 text-xs text-success hover:text-success"
+                      onClick={selectActiveCampaignPaths}
+                    >
+                      <span className="inline-block h-1.5 w-1.5 rounded-full bg-success" />
+                      Select {activeCampaignPathOptions.length} active
+                    </Button>
+                  )}
+                  {pathTagFilter.length > 0 && visibleCampaignPathOptions.length > 0 && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 text-xs"
+                      onClick={selectVisibleCampaignPaths}
+                    >
+                      Select all {visibleCampaignPathOptions.length}
+                    </Button>
+                  )}
                 </div>
               )}
               <div className="max-h-72 overflow-auto py-1">
-                {campaignPathOptions.length === 0 && (
-                  <div className="px-3 py-3 text-sm text-muted-foreground">No campaign path data</div>
+                {visibleCampaignPathOptions.length === 0 && (
+                  <div className="px-3 py-3 text-sm text-muted-foreground">
+                    {pathTagFilter.length ? "No campaign paths with the selected tags" : "No campaign path data"}
+                  </div>
                 )}
-                {campaignPathOptions.map((path) => {
+                {visibleCampaignPathOptions.map((path) => {
                   const isActive = activeFunnelPaths.has(path);
                   return (
                     <label
