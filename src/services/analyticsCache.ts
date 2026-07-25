@@ -27,7 +27,11 @@ import type { ClickHouseSummary } from "@/services/clickhouse";
 // item 3 email-matched token revenue in cohort gross/net/revenue_dN). Discard
 // v10 bundles: their KPI arrays lack the token entries (the card renders "—")
 // and their cohort revenue predates the item 3 definition.
-export const ANALYTICS_CACHE_SCHEMA_VERSION = 11;
+// v12: Cohorts active-subscription overlay — the server now joins FunnelFox
+// subscriptions to the cohort snapshot and fills active_users /
+// active_subscriptions. Discard v11 bundles whose rows carry the old hardcoded
+// 0, so the Active Subscriptions column stops showing a stale 0.
+export const ANALYTICS_CACHE_SCHEMA_VERSION = 12;
 
 export const WAREHOUSE_VERSION_KEY = ["clickhouse", "warehouse-version"] as const;
 export const SUPPORT_WAREHOUSE_VERSION_KEY = ["clickhouse", "support-warehouse-version"] as const;

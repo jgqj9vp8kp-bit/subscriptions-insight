@@ -108,11 +108,13 @@ export function mapAggregateToCohortRow(agg: CohortAggregateRow): CohortRow {
     trial_users: trial,
     support_users: agg.support_users ?? 0,
     support_rate: agg.support_rate ?? 0,
-    // Subscription metrics deferred (fact_subscriptions empty) — not zero-proven.
-    active_users: 0,
-    active_rate: 0,
-    active_subscriptions: 0,
-    active_subscriptions_rate: 0,
+    // Active-subscription metrics come from the server overlay (FunnelFox
+    // subscriptions joined to the cohort snapshot by email); other subscription
+    // metrics (cancellations) are still deferred.
+    active_users: agg.active_users ?? 0,
+    active_rate: div(agg.active_users ?? 0, trial),
+    active_subscriptions: agg.active_subscriptions ?? 0,
+    active_subscriptions_rate: div(agg.active_subscriptions ?? 0, trial),
     active_subscription_user_ids: [],
     active_subscription_ids: [],
     cancelled_users: 0,

@@ -542,7 +542,10 @@ function computeTotals(rows: CohortAggregateRow[]): CohortTotals {
   return {
     trial_users: trialUsers,
     first_subscription_users: sum((r) => r.first_subscription_users),
-    active_users: 0, active_subscriptions: 0,
+    // Summed from the rows: the materialized cohort path overlays real active
+    // subscription counts (mergeActiveSubscriptions) before totals are computed;
+    // paths that don't overlay leave the rows at 0, so this stays 0 there.
+    active_users: sum((r) => r.active_users), active_subscriptions: sum((r) => r.active_subscriptions),
     renewal_users_by_level: byLevel,
     refund_users: sum((r) => r.refund_users),
     support_users: supportUsers,

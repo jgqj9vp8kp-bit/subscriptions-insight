@@ -32,6 +32,7 @@ import {
 } from "./cohortFilterOptions.ts";
 import { splitMediaBuyerSelections } from "./mediaBuyerSelection.ts";
 import { computeFbCohortStats, fbCohortRowKey, unavailableFbCohortStats } from "./fbCohortStats.ts";
+import { activeSubscriptionMetricsByCohort, mergeActiveSubscriptions } from "./cohortSubscriptions.ts";
 import type {
   CohortFilters,
   CohortRequest,
@@ -874,6 +875,18 @@ export async function runMaterializedCohortList(input: {
   ]);
   const optionsDurationMs = Date.now() - optionsStarted;
   const rows = rawRows.map((row) => toAggregateRow(row));
+  // Active-subscription overlay: FunnelFox subscriptions live in Postgres, so
+  // they're joined to the snapshot's cohort emails here (not in the aggregate
+  // SQL) and merged onto the rows BEFORE totals sum them. Best-effort — a
+  // failure leaves the rows at 0, exactly as before.
+  const activeSubs = await activeSubscriptionMetricsByCohort({
+    supabase: input.supabase,
+    clickhouse: input.clickhouse,
+    authUserId: input.authUserId,
+    warehouseVersion: active.warehouse_version,
+    classificationVersion: active.classification_version,
+  }).catch(() => new Map());
+  mergeActiveSubscriptions(rows, activeSubs);
   const totals = computeTotals(rows);
   const options = filterOptionsFromRows(optionRows, optionFiltersApplied(nreq.filters, nreq.dateFrom, nreq.dateTo));
 
