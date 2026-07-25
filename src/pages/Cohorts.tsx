@@ -148,12 +148,10 @@ const DEFAULT_COHORTS_UI_STATE = {
   selectedCampaignPaths: [] as string[],
   funnelFilter: "all",
   campaignPathFilter: "all",
-  trafficSourceFilter: "all",
   currencyFilter: "all",
   selectedCampaignIds: [] as string[],
   // Backward compatibility for locally/cloud-persisted single-select settings.
   campaignIdFilter: "all",
-  refundFilter: "all",
   selectedCountries: [] as string[],
   selectedCardTypes: [] as CardType[],
   selectedMediaBuyers: [] as Array<MediaBuyer | string>,
@@ -1135,11 +1133,9 @@ export default function CohortsPage() {
     selectedCampaignPaths: rawSelectedCampaignPaths,
     funnelFilter: legacyFunnelFilter,
     campaignPathFilter: legacyCampaignPathFilter,
-    trafficSourceFilter,
     currencyFilter,
     selectedCampaignIds: rawSelectedCampaignIds,
     campaignIdFilter: legacyCampaignIdFilter,
-    refundFilter,
     selectedCountries: rawSelectedCountries,
     selectedCardTypes: rawSelectedCardTypes,
     selectedMediaBuyers: rawSelectedMediaBuyers,
@@ -1149,6 +1145,12 @@ export default function CohortsPage() {
     sortDirection,
     expandedCohortIds: expandedCohortIdList,
   } = uiState;
+  // Traffic-source and refund filters were removed from the Cohorts UI; the
+  // report is always unfiltered on these two dimensions. Kept as `"all"`
+  // constants (typed as string to avoid literal-narrowing in the comparisons
+  // below) so the request / pruner / trial-attribution wiring stays intact.
+  const trafficSourceFilter: string = "all";
+  const refundFilter: string = "all";
   const selectedCountries = useMemo(
     () => Array.isArray(rawSelectedCountries)
       ? rawSelectedCountries.flatMap((country) => {
@@ -1684,13 +1686,6 @@ export default function CohortsPage() {
   const trialAttributionTxs = useMemo(
     () => analyticsTxs.filter((t) => t.status === "success" && t.transaction_type === "trial"),
     [analyticsTxs],
-  );
-  const trafficSourceOptions = useMemo(
-    () =>
-      clickHouseDriving && chResult?.filterOptions
-        ? chResult.filterOptions.traffic_source
-        : Array.from(new Set(trialAttributionTxs.map((t) => t.traffic_source))).sort(),
-    [clickHouseDriving, chResult, trialAttributionTxs],
   );
   const parentAttributionTxs = useMemo(
     () => filterTransactionsByTrialAttribution(analyticsTxs, { trafficSourceFilter: appliedTrafficSourceFilter }),
@@ -3122,15 +3117,6 @@ export default function CohortsPage() {
               </div>
             </PopoverContent>
           </Popover>
-          <Select value={trafficSourceFilter} onValueChange={(value) => updateUiState({ trafficSourceFilter: value })}>
-            <SelectTrigger className="h-9 w-[160px]"><SelectValue placeholder="Traffic source" /></SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">All traffic</SelectItem>
-              {trafficSourceOptions.map((source) => (
-                <SelectItem key={source} value={source}>{source}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
           <Select value={currencyFilter} onValueChange={(value) => updateUiState({ currencyFilter: value })}>
             <SelectTrigger className="h-9 w-[150px]"><SelectValue placeholder="Currency" /></SelectTrigger>
             <SelectContent>
@@ -3183,14 +3169,6 @@ export default function CohortsPage() {
               </div>
             </PopoverContent>
           </Popover>
-          <Select value={refundFilter} onValueChange={(value) => updateUiState({ refundFilter: value })}>
-            <SelectTrigger className="h-9 w-[150px]"><SelectValue placeholder="Refund" /></SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">All refunds</SelectItem>
-              <SelectItem value="has">Has refunds</SelectItem>
-              <SelectItem value="none">No refunds</SelectItem>
-            </SelectContent>
-          </Select>
           <Popover>
             <PopoverTrigger asChild>
               <Button type="button" variant="outline" size="sm" className="h-9 max-w-[220px] justify-between gap-2">
