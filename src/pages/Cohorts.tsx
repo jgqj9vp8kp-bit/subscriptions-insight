@@ -2351,12 +2351,15 @@ export default function CohortsPage() {
     for (const path of campaignPathOptions) (funnelTagsByPath.get(path) ?? []).forEach((tag) => tags.add(tag));
     return [...tags].sort((a, b) => a.localeCompare(b));
   }, [campaignPathOptions, funnelTagsByPath]);
-  // The path list after the tag filter (any-of). No tags selected = all paths.
+  // The path list after the tag filter (all-of: a path shows only if its funnel
+  // carries EVERY selected tag). No tags selected = all paths.
   const visibleCampaignPathOptions = useMemo(() => {
     if (!pathTagFilter.length) return campaignPathOptions;
     return campaignPathOptions.filter((path) => {
       const tags = funnelTagsByPath.get(path);
-      return tags ? tags.some((tag) => pathTagFilter.includes(tag)) : false;
+      if (!tags) return false;
+      const tagSet = new Set(tags);
+      return pathTagFilter.every((tag) => tagSet.has(tag));
     });
   }, [campaignPathOptions, pathTagFilter, funnelTagsByPath]);
   // "Select active" only offers the paths the user could otherwise pick by hand,
