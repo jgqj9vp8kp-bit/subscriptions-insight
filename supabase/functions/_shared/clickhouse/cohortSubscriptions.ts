@@ -12,6 +12,12 @@ import { FACT_USER_COHORTS_TABLE } from "./schema.ts";
 export interface CohortActiveSubs {
   active_users: number;
   active_subscriptions: number;
+  // Identities behind the counts, so the client's total row can dedup across
+  // cohorts (Cohorts.tsx unions active_subscription_ids / active_user_ids). The
+  // materialized path has no per-user uid here, so the cohort user's normalized
+  // email stands in as the active-user identity — distinct-count-equivalent.
+  active_subscription_ids: string[];
+  active_user_ids: string[];
 }
 
 const cohortKey = (cohortDate: string, funnel: string, campaignPath: string): string =>
@@ -77,14 +83,27 @@ export async function activeSubscriptionMetricsByCohort(input: {
     byCohort.set(key, bucket);
   }
   for (const [key, bucket] of byCohort) {
-    result.set(key, { active_users: bucket.emails.size, active_subscriptions: bucket.subs.size });
+    result.set(key, {
+      active_users: bucket.emails.size,
+      active_subscriptions: bucket.subs.size,
+      active_subscription_ids: [...bucket.subs],
+      active_user_ids: [...bucket.emails],
+    });
   }
   return result;
 }
 
 /** Overlay the computed metrics onto cohort rows in place (by cohort key). */
 export function mergeActiveSubscriptions(
-  rows: Array<{ cohort_date: string; funnel: string; campaign_path: string; active_users: number; active_subscriptions: number }>,
+  rows: Array<{
+    cohort_date: string;
+    funnel: string;
+    campaign_path: string;
+    active_users: number;
+    active_subscriptions: number;
+    active_subscription_ids?: string[];
+    active_user_ids?: string[];
+  }>,
   metrics: Map<string, CohortActiveSubs>,
 ): void {
   if (metrics.size === 0) return;
@@ -93,6 +112,8 @@ export function mergeActiveSubscriptions(
     if (metric) {
       row.active_users = metric.active_users;
       row.active_subscriptions = metric.active_subscriptions;
+      row.active_subscription_ids = metric.active_subscription_ids;
+      row.active_user_ids = metric.active_user_ids;
     }
   }
 }

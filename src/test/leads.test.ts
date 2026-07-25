@@ -36,6 +36,7 @@ function sub(overrides: Partial<SubscriptionClean> = {}): SubscriptionClean {
     profile_id: overrides.profile_id ?? "pro_1",
     status: overrides.status ?? "active",
     renews: true,
+    sandbox: overrides.sandbox ?? false,
     is_cancelled: overrides.is_cancelled ?? false,
     cancelled_at: null,
     cancellation_source: null,

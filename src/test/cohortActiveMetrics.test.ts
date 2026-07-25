@@ -43,6 +43,7 @@ function sub(overrides: Partial<SubscriptionClean> = {}): SubscriptionClean {
     profile_id: overrides.profile_id ?? "profile_1",
     status: overrides.status ?? "active",
     renews: overrides.renews ?? true,
+    sandbox: overrides.sandbox ?? false,
     is_cancelled: overrides.is_cancelled ?? false,
     cancelled_at: overrides.cancelled_at ?? null,
     cancellation_source: null,
@@ -144,6 +145,25 @@ describe("cohort active user / subscription counts", () => {
     ];
     expect(activeUsers(subs)).toBe(1);
     expect(activeSubs(subs)).toBe(1);
+  });
+
+  it("10b. sandbox/test-mode subscriptions never count as active", () => {
+    // A reused QA email carrying many sandbox subs must not inflate its cohort
+    // past its trial count (the 70-active-vs-9-trials bug).
+    const subs = [
+      sub({ subscription_id: "live", email: "u1@example.com" }),
+      ...Array.from({ length: 20 }, (_, i) =>
+        sub({ subscription_id: `sandbox-${i}`, email: "u1@example.com", sandbox: true }),
+      ),
+    ];
+    expect(activeUsers(subs)).toBe(1);
+    expect(activeSubs(subs)).toBe(1); // only the one live subscription
+  });
+
+  it("10c. a user with only sandbox subscriptions is not active at all", () => {
+    const subs = [sub({ subscription_id: "s1", email: "u1@example.com", sandbox: true })];
+    expect(activeUsers(subs)).toBe(0);
+    expect(activeSubs(subs)).toBe(0);
   });
 
   it("11. email fallback matches user by normalized email", () => {

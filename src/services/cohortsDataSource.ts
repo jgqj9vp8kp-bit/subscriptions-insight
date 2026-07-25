@@ -115,8 +115,10 @@ export function mapAggregateToCohortRow(agg: CohortAggregateRow): CohortRow {
     active_rate: div(agg.active_users ?? 0, trial),
     active_subscriptions: agg.active_subscriptions ?? 0,
     active_subscriptions_rate: div(agg.active_subscriptions ?? 0, trial),
-    active_subscription_user_ids: [],
-    active_subscription_ids: [],
+    // The server overlay ships the identities behind the counts so the total row
+    // can dedup across cohorts (otherwise it unions empty arrays and shows 0).
+    active_subscription_user_ids: agg.active_user_ids ?? [],
+    active_subscription_ids: agg.active_subscription_ids ?? [],
     cancelled_users: 0,
     cancellation_rate: 0,
     user_cancelled_users: 0,
@@ -124,7 +126,7 @@ export function mapAggregateToCohortRow(agg: CohortAggregateRow): CohortRow {
     auto_cancelled_users: 0,
     auto_cancel_rate: 0,
     cancelled_active_users: 0,
-    active_user_ids: [],
+    active_user_ids: agg.active_user_ids ?? [],
     cancelled_user_ids: [],
     user_cancelled_user_ids: [],
     auto_cancelled_user_ids: [],

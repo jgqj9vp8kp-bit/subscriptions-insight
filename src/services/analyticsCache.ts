@@ -31,7 +31,12 @@ import type { ClickHouseSummary } from "@/services/clickhouse";
 // subscriptions to the cohort snapshot and fills active_users /
 // active_subscriptions. Discard v11 bundles whose rows carry the old hardcoded
 // 0, so the Active Subscriptions column stops showing a stale 0.
-export const ANALYTICS_CACHE_SCHEMA_VERSION = 12;
+// v13: exclude FunnelFox sandbox/test-mode subscriptions from the active-
+// subscription overlay (a reused QA email carried dozens of sandbox subs, so a
+// cohort showed more Active Subscriptions than trials), and carry the per-cohort
+// subscription/user id arrays so the total row dedups instead of showing 0.
+// Discard v12 bundles whose rows carry the inflated counts and empty id arrays.
+export const ANALYTICS_CACHE_SCHEMA_VERSION = 13;
 
 export const WAREHOUSE_VERSION_KEY = ["clickhouse", "warehouse-version"] as const;
 export const SUPPORT_WAREHOUSE_VERSION_KEY = ["clickhouse", "support-warehouse-version"] as const;

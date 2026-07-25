@@ -47,8 +47,18 @@ describe("activeSubscriptionMetricsByCohort", () => {
     const map = await activeSubscriptionMetricsByCohort(metricsInput(supabase, clickhouse));
 
     // Cohort 1: users a,b (2), subs s1,s2,s3 (3). Cohort 2: user c (1), sub s4 (1).
-    expect(map.get("2026-07-01|soulmate|sketch")).toEqual({ active_users: 2, active_subscriptions: 3 });
-    expect(map.get("2026-07-02|palm|reading")).toEqual({ active_users: 1, active_subscriptions: 1 });
+    expect(map.get("2026-07-01|soulmate|sketch")).toEqual({
+      active_users: 2,
+      active_subscriptions: 3,
+      active_subscription_ids: ["s1", "s2", "s3"],
+      active_user_ids: ["a@x.com", "b@x.com"],
+    });
+    expect(map.get("2026-07-02|palm|reading")).toEqual({
+      active_users: 1,
+      active_subscriptions: 1,
+      active_subscription_ids: ["s4"],
+      active_user_ids: ["c@x.com"],
+    });
     // The email with no active subscription contributes nothing.
     expect(map.size).toBe(2);
   });
@@ -67,7 +77,12 @@ describe("activeSubscriptionMetricsByCohort", () => {
       { email: "a@x.com", cohort_date: "d", funnel: "f", campaign_path: "p" },
     ]);
     const map = await activeSubscriptionMetricsByCohort(metricsInput(supabase, clickhouse));
-    expect(map.get("d|f|p")).toEqual({ active_users: 1, active_subscriptions: 1 });
+    expect(map.get("d|f|p")).toEqual({
+      active_users: 1,
+      active_subscriptions: 1,
+      active_subscription_ids: ["s1"],
+      active_user_ids: ["a@x.com"],
+    });
   });
 });
 
@@ -79,9 +94,19 @@ describe("mergeActiveSubscriptions", () => {
     ];
     mergeActiveSubscriptions(
       rows,
-      new Map([["2026-07-01|soulmate|sketch", { active_users: 2, active_subscriptions: 3 }]]),
+      new Map([["2026-07-01|soulmate|sketch", {
+        active_users: 2,
+        active_subscriptions: 3,
+        active_subscription_ids: ["s1", "s2", "s3"],
+        active_user_ids: ["a@x.com", "b@x.com"],
+      }]]),
     );
-    expect(rows[0]).toMatchObject({ active_users: 2, active_subscriptions: 3 });
+    expect(rows[0]).toMatchObject({
+      active_users: 2,
+      active_subscriptions: 3,
+      active_subscription_ids: ["s1", "s2", "s3"],
+      active_user_ids: ["a@x.com", "b@x.com"],
+    });
     expect(rows[1]).toMatchObject({ active_users: 0, active_subscriptions: 0 });
   });
 });

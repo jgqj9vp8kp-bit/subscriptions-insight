@@ -125,6 +125,7 @@ function subscription(overrides: Partial<SubscriptionClean>): SubscriptionClean 
     profile_id: overrides.profile_id ?? "profile",
     status: overrides.status ?? "cancelled",
     renews: overrides.renews ?? false,
+    sandbox: overrides.sandbox ?? false,
     is_cancelled: overrides.is_cancelled ?? true,
     cancelled_at: overrides.cancelled_at ?? "2026-03-18T10:00:00Z",
     cancellation_source: overrides.cancellation_source ?? "api_status_cancelled",

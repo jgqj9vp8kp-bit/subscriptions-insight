@@ -290,6 +290,7 @@ export function normalizeSubscription(raw: FunnelFoxSubscriptionRaw): Subscripti
     profile_id: extractSubscriptionProfileId(raw),
     status,
     renews,
+    sandbox: raw.sandbox === true,
     is_cancelled: isCancelled,
     cancelled_at: cancelledAt,
     cancellation_source: cancelledByStatus

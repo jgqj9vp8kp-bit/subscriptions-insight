@@ -98,9 +98,13 @@ export interface CohortAggregateRow {
   support_users: number;
   support_rate: number;
 
-  // Subscription-derived (fact_subscriptions join), see Phase 4.
+  // Subscription-derived (FunnelFox active-subscription overlay). The id arrays
+  // carry the identities behind the counts so the client total row dedups active
+  // users / subscriptions across cohorts instead of showing 0.
   active_users: number;
   active_subscriptions: number;
+  active_subscription_ids?: string[];
+  active_user_ids?: string[];
   cancelled_users: number;
   user_cancelled_users: number;
   auto_cancelled_users: number;

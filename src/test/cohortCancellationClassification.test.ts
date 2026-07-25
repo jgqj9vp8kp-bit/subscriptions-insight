@@ -38,6 +38,7 @@ function sub(overrides: Partial<SubscriptionClean>): SubscriptionClean {
     profile_id: "profile",
     status: "cancelled",
     renews: false,
+    sandbox: overrides.sandbox ?? false,
     is_cancelled: true,
     cancelled_at: "2026-04-06T00:00:00Z",
     cancellation_source: "api_status_cancelled",

@@ -425,6 +425,7 @@ function mergeSubscriptionDetails(row: SubscriptionClean, detail: SubscriptionCl
     profile_id: row.profile_id || detail.profile_id,
     status: detail.status || row.status,
     renews: detail.renews ?? row.renews,
+    sandbox: detail.sandbox || row.sandbox,
     is_cancelled: detail.is_cancelled || row.is_cancelled,
     cancellation_source: detail.cancellation_source ?? row.cancellation_source,
     cancelled_at: detail.cancelled_at ?? row.cancelled_at,

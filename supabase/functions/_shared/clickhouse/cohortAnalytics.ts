@@ -245,6 +245,7 @@ function activeSubscriptionIdsByEmail(
   const byEmail = new Map<string, Set<string>>();
   const seenSubIds = new Set<string>();
   for (const sub of subscriptions) {
+    if (sub.sandbox) continue; // sandbox/test-mode subs never count as active
     if (!isSubscriptionActiveNow(sub, nowMs)) continue;
     const email = normalizeEmailKey(sub.email);
     if (!email) continue; // no email → cannot attribute to a warehouse cohort user

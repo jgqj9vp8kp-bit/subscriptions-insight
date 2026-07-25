@@ -73,6 +73,12 @@ export interface SubscriptionClean {
   profile_id: string;
   status: string;
   renews: boolean | null;
+  // FunnelFox marks test/sandbox-mode subscriptions with a top-level `sandbox`
+  // boolean. These are QA charges (a single test email can carry dozens of
+  // "active" sandbox subscriptions) and must never count toward active-user /
+  // active-subscription business metrics — otherwise a cohort shows more active
+  // subscriptions than it had trials.
+  sandbox: boolean;
   is_cancelled: boolean;
   cancelled_at: string | null;
   cancellation_source: "api_status_cancelled" | "api_renews_false" | null;
