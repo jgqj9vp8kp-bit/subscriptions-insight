@@ -2149,6 +2149,10 @@ export default function CohortsPage() {
   const maxRenewal4CR = Math.max(0, ...cohorts.map((c) => c.renewal_3_to_renewal_4_cr ?? 0));
   const maxRenewal5CR = Math.max(0, ...cohorts.map((c) => c.renewal_4_to_renewal_5_cr ?? 0));
   const maxRenewal6CR = Math.max(0, ...cohorts.map((c) => c.renewal_5_to_renewal_6_cr ?? 0));
+  const maxUpsell1CR = Math.max(0, ...cohorts.map((c) => c.upsell_1_cr ?? 0));
+  const maxUpsell2CR = Math.max(0, ...cohorts.map((c) => c.upsell_2_cr ?? 0));
+  const maxUpsell3CR = Math.max(0, ...cohorts.map((c) => c.upsell_3_cr ?? 0));
+  const maxTokenBuyerCR = Math.max(0, ...cohorts.map((c) => c.token_buyer_cr ?? 0));
   const totals = useMemo(() => {
     const sum = (pick: (c: (typeof cohorts)[number]) => number) =>
       cohorts.reduce((total, cohort) => total + pick(cohort), 0);
@@ -2542,19 +2546,19 @@ export default function CohortsPage() {
       case "upsell_1_users":
         return <TableCell key={id} className={className}>{c.upsell_1_users ?? 0}</TableCell>;
       case "upsell_1_cr":
-        return <TableCell key={id} className={className}>{formatPct(c.upsell_1_cr ?? 0)}</TableCell>;
+        return <TableCell key={id} className={`${className} font-medium`} style={heatStyle(c.upsell_1_cr ?? 0, maxUpsell1CR)}>{formatPct(c.upsell_1_cr ?? 0)}</TableCell>;
       case "upsell_1_revenue":
         return <TableCell key={id} className={className}>{formatCurrency(c.upsell_1_revenue ?? 0)}</TableCell>;
       case "upsell_2_users":
         return <TableCell key={id} className={className}>{c.upsell_2_users ?? 0}</TableCell>;
       case "upsell_2_cr":
-        return <TableCell key={id} className={className}>{formatPct(c.upsell_2_cr ?? 0)}</TableCell>;
+        return <TableCell key={id} className={`${className} font-medium`} style={heatStyle(c.upsell_2_cr ?? 0, maxUpsell2CR)}>{formatPct(c.upsell_2_cr ?? 0)}</TableCell>;
       case "upsell_2_revenue":
         return <TableCell key={id} className={className}>{formatCurrency(c.upsell_2_revenue ?? 0)}</TableCell>;
       case "upsell_3_users":
         return <TableCell key={id} className={className}>{c.upsell_3_users ?? 0}</TableCell>;
       case "upsell_3_cr":
-        return <TableCell key={id} className={className}>{formatPct(c.upsell_3_cr ?? 0)}</TableCell>;
+        return <TableCell key={id} className={`${className} font-medium`} style={heatStyle(c.upsell_3_cr ?? 0, maxUpsell3CR)}>{formatPct(c.upsell_3_cr ?? 0)}</TableCell>;
       case "upsell_3_revenue":
         return <TableCell key={id} className={className}>{formatCurrency(c.upsell_3_revenue ?? 0)}</TableCell>;
       case "upsell_extra_users":
@@ -2568,7 +2572,7 @@ export default function CohortsPage() {
       case "token_buyers":
         return <TableCell key={id} className={className}>{c.token_buyers ?? 0}</TableCell>;
       case "token_buyer_cr":
-        return <TableCell key={id} className={className}>{formatPct(c.token_buyer_cr ?? 0)}</TableCell>;
+        return <TableCell key={id} className={`${className} font-medium`} style={heatStyle(c.token_buyer_cr ?? 0, maxTokenBuyerCR)}>{formatPct(c.token_buyer_cr ?? 0)}</TableCell>;
       case "token_purchases":
         return <TableCell key={id} className={className}>{c.token_purchases ?? 0}</TableCell>;
       case "token_gross_revenue":
