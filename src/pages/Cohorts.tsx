@@ -567,7 +567,9 @@ const COLUMN_HELP: Partial<Record<CohortColumnId, string>> = {
 };
 
 function heatStyle(value: number, max: number): React.CSSProperties {
-  if (max <= 0) return {};
+  // 0% (and any non-positive) gets no fill — a plain white/default cell — so the
+  // purple heat only marks columns that actually converted.
+  if (max <= 0 || value <= 0) return { fontVariantNumeric: "tabular-nums" };
   const intensity = Math.min(1, value / max);
   return {
     background: `hsl(var(--primary) / ${0.05 + intensity * 0.25})`,
