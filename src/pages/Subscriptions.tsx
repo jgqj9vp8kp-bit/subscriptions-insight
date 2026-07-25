@@ -22,10 +22,12 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { formatCurrency, formatPct } from "@/services/analytics";
+import { computeUsers, formatCurrency, formatPct } from "@/services/analytics";
+import { useTransactions } from "@/services/sheets";
 import { useDataStore } from "@/store/dataStore";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
 import type { SubscriptionClean } from "@/types/subscriptions";
+import type { Transaction, UserAggregate } from "@/services/types";
 
 type CancellationFilter = "all" | "cancelled" | "not_cancelled";
 type ActiveFilter = "all" | "active" | "expired";
@@ -50,14 +52,14 @@ const DEFAULT_SUBSCRIPTIONS_UI_STATE = {
   cancelledTo: "",
 };
 
-type SubscriptionCohortFields = {
+type PalmerUserLookupRow = {
   cohort_id: string | null;
   cohort_date: string | null;
   campaign_path: string | null;
   entry_price: number | null;
 };
 
-type SubscriptionDisplayRow = SubscriptionClean & SubscriptionCohortFields;
+type SubscriptionDisplayRow = SubscriptionClean & PalmerUserLookupRow;
 
 function dateKey(value: string | null): string {
   return value ? value.slice(0, 10) : "";
@@ -76,25 +78,50 @@ function readableValue(value: string): string {
   return value.split("_").join(" ");
 }
 
+function normalizeEmailForMatch(value: string | null | undefined): string {
+  return String(value ?? "").trim().toLowerCase();
+}
+
 function normalizeCampaignPathLabel(path: string | undefined): string {
   const value = String(path ?? "").trim();
   return value || "unknown";
 }
 
-// Cohort / Campaign Path / Cohort Date / Entry Price all come from the
-// FunnelFox subscription itself (funnel.title / funnel.alias / created_at /
-// price_usd, surfaced on SubscriptionClean by normalizeSubscription) — the same
-// FunnelFox pull that provides the active/cancelled state. No Palmer join.
-function funnelFoxCohortFields(sub: SubscriptionClean): SubscriptionCohortFields {
-  const campaignPath = sub.funnel_alias ? normalizeCampaignPathLabel(sub.funnel_alias) : null;
-  return {
-    // The funnel is the subscription's cohort; prefer the human title, fall
-    // back to the path slug. Empty until the row is detail-enriched.
-    cohort_id: sub.funnel_title || sub.funnel_alias || null,
-    cohort_date: sub.created_at ? sub.created_at.slice(0, 10) : null,
-    campaign_path: campaignPath,
-    entry_price: Number.isFinite(sub.price_usd) ? sub.price_usd : null,
-  };
+function campaignPathFromCohortId(cohortId: string | undefined): string {
+  const match = String(cohortId ?? "").match(/^(.*)_\d{4}-\d{2}-\d{2}$/);
+  return normalizeCampaignPathLabel(match?.[1]);
+}
+
+function buildPalmerUserLookup(txs: Transaction[], users: UserAggregate[]): Map<string, PalmerUserLookupRow> {
+  const txsByUser = new Map<string, Transaction[]>();
+  for (const tx of txs) {
+    const list = txsByUser.get(tx.user_id) ?? [];
+    list.push(tx);
+    txsByUser.set(tx.user_id, list);
+  }
+
+  const lookup = new Map<string, PalmerUserLookupRow>();
+  for (const user of users) {
+    const email = normalizeEmailForMatch(user.email);
+    if (!email) continue;
+
+    const sorted = [...(txsByUser.get(user.user_id) ?? [])].sort((a, b) => (a.event_time < b.event_time ? -1 : 1));
+    const trial = sorted.find((tx) => tx.transaction_type === "trial" && tx.status === "success")
+      ?? sorted.find((tx) => tx.transaction_type === "trial")
+      ?? sorted[0];
+    const cohortId = trial?.cohort_id || null;
+    const cohortDate = trial?.cohort_date || user.first_trial_date?.slice(0, 10) || null;
+    const campaignPath = normalizeCampaignPathLabel(trial?.campaign_path || campaignPathFromCohortId(cohortId ?? undefined));
+
+    lookup.set(email, {
+      cohort_id: cohortId,
+      cohort_date: cohortDate,
+      campaign_path: campaignPath,
+      entry_price: user.plan_price,
+    });
+  }
+
+  return lookup;
 }
 
 function cancelTypeOf(sub: SubscriptionClean): SubscriptionClean["cancellation_type"] {
@@ -106,6 +133,7 @@ function cancelTimingOf(sub: SubscriptionClean): SubscriptionClean["cancellation
 }
 
 export default function SubscriptionsPage() {
+  const txs = useTransactions();
   const subscriptions = useDataStore((s) => s.subscriptions);
   const [uiState, setUiState, resetUiState] = usePersistedPageState("ui_state_subscriptions", DEFAULT_SUBSCRIPTIONS_UI_STATE);
   const {
@@ -126,9 +154,21 @@ export default function SubscriptionsPage() {
   } = uiState;
   const updateUiState = (patch: Partial<typeof DEFAULT_SUBSCRIPTIONS_UI_STATE>) => setUiState((current) => ({ ...current, ...patch }));
 
+  const palmerUsers = useMemo(() => computeUsers(txs), [txs]);
+  const palmerUserByEmail = useMemo(() => buildPalmerUserLookup(txs, palmerUsers), [txs, palmerUsers]);
   const displayRows: SubscriptionDisplayRow[] = useMemo(
-    () => subscriptions.map((sub) => ({ ...sub, ...funnelFoxCohortFields(sub) })),
-    [subscriptions]
+    () =>
+      subscriptions.map((sub) => {
+        const palmerUser = palmerUserByEmail.get(normalizeEmailForMatch(sub.email));
+        return {
+          ...sub,
+          cohort_id: palmerUser?.cohort_id ?? null,
+          cohort_date: palmerUser?.cohort_date ?? null,
+          campaign_path: palmerUser?.campaign_path ?? null,
+          entry_price: palmerUser?.entry_price ?? null,
+        };
+      }),
+    [subscriptions, palmerUserByEmail]
   );
 
   const statusOptions = useMemo(
