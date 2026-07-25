@@ -231,11 +231,14 @@ async function fetchListPage(base: string, cursor: string | undefined, limit: nu
   const pagination = readRecord(root.pagination);
   const rows = (Array.isArray(root.data) ? root.data : Array.isArray(root.subscriptions) ? root.subscriptions : [])
     .filter((r): r is JsonRecord => Boolean(r && typeof r === "object"));
+  // FunnelFox's list pagination is { cursor, has_more } (verified live on
+  // /funnels and /subscriptions). Accept next_cursor too, defensively.
+  const rawCursor = pagination.cursor ?? pagination.next_cursor;
   return {
     ok,
     rows,
     hasMore: Boolean(pagination.has_more),
-    nextCursor: typeof pagination.next_cursor === "string" ? pagination.next_cursor : null,
+    nextCursor: typeof rawCursor === "string" && rawCursor !== "" ? rawCursor : null,
     totalReported: readReportedTotal(pagination),
   };
 }
@@ -295,17 +298,42 @@ Deno.serve(async (req: Request) => {
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
   if (!supabaseUrl || !anonKey || !serviceKey) return jsonResponse({ error: "Server is not configured." }, 500);
 
-  const token = (req.headers.get("Authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
-  if (!token) return jsonResponse({ error: "Authentication required." }, 401);
-  const authClient = createClient(supabaseUrl, anonKey, { auth: { persistSession: false } });
-  const { data: userData, error: userError } = await authClient.auth.getUser(token);
-  const userId = userData?.user?.id;
-  if (userError || !userId) return jsonResponse({ error: "Invalid or expired session." }, 401);
-
   const url = new URL(req.url);
   let body: JsonRecord = {};
   if (req.method === "POST") { try { body = readRecord(await req.json()); } catch { body = {}; } }
+
+  // Two auth paths. Normal UI: a user JWT resolves the caller's id. Headless
+  // cron (the daily refresh / stage advancer): the shared FB_CRON_SECRET plus a
+  // uuid auth_user_id in the body — pg_cron cannot mint a user JWT, same pattern
+  // as the clickhouse-facebook cron tick. The Edge gateway still verifies a JWT
+  // before the body runs, so the cron caller passes the anon key as Bearer to
+  // satisfy the gateway; that anon token would fail getUser(), which is exactly
+  // why the cron branch skips getUser and trusts the validated secret instead.
+  const isUuid = (value: string) =>
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+  const cronSecret = req.headers.get("x-cron-secret");
+  let userId: string;
+  if (cronSecret) {
+    const expected = Deno.env.get("FB_CRON_SECRET");
+    if (!expected || cronSecret !== expected) return jsonResponse({ error: "Invalid cron secret." }, 401);
+    const cronUserId = str(body.auth_user_id);
+    if (!isUuid(cronUserId)) return jsonResponse({ error: "A uuid auth_user_id is required for cron calls." }, 400);
+    userId = cronUserId;
+  } else {
+    const token = (req.headers.get("Authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
+    if (!token) return jsonResponse({ error: "Authentication required." }, 401);
+    const authClient = createClient(supabaseUrl, anonKey, { auth: { persistSession: false } });
+    const { data: userData, error: userError } = await authClient.auth.getUser(token);
+    if (userError || !userData?.user?.id) return jsonResponse({ error: "Invalid or expired session." }, 401);
+    userId = userData.user.id;
+  }
+
   const intParam = (value: unknown, fallback: number, min: number, max: number) => {
+    // An absent param (undefined/null/"") must use the fallback — NOT collapse to
+    // Number(null)===0, which is finite and would clamp to `min` (1). That made
+    // every cron call (and any UI call that omits limit/max_pages) crawl a single
+    // page of a single row, which is why the sync stored only 1 of 8931.
+    if (value === null || value === undefined || value === "") return fallback;
     const n = Number(value);
     return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.floor(n))) : fallback;
   };

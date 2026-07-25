@@ -17,6 +17,7 @@ import {
   saveSubscriptionsToCache,
   type SubscriptionCachePayload,
 } from "@/services/subscriptionCache";
+import { loadFunnelFoxSubscriptions } from "@/services/funnelfoxSubscriptionsSync";
 import {
   loadLastTrafficDataFromCache,
   saveTrafficDataToCache,
@@ -166,6 +167,35 @@ export function SavedDataAutoLoader({ loadTransactions = true }: { loadTransacti
       try {
         if (useDataStore.getState().subscriptions.length > 0) {
           details.push("FunnelFox subscriptions already loaded");
+          throw new Error("__skip__");
+        }
+
+        // DB-first: the periodically cron-synced funnelfox_subscriptions table is
+        // the source of truth. The local/cloud caches are only a fallback for the
+        // window before the first sync populates the table.
+        let dbSubscriptions: SubscriptionClean[] = [];
+        try {
+          dbSubscriptions = await traceAsync("subscriptions.db_load", loadFunnelFoxSubscriptions);
+        } catch (error) {
+          console.warn("Could not load FunnelFox subscriptions from the database.", error);
+          warnings.push("FunnelFox database");
+        }
+        if (dbSubscriptions.length) {
+          if (mounted && useDataStore.getState().subscriptions.length === 0) {
+            setSubscriptions(dbSubscriptions);
+            loadedCount += 1;
+            details.push(`Loaded ${dbSubscriptions.length} FunnelFox subscriptions from the database`);
+            const metadata: SubscriptionCachePayload["metadata"] = {
+              saved_at: new Date().toISOString(),
+              count: dbSubscriptions.length,
+              source: "funnelfox",
+              email_coverage: 0,
+              last_sync_at: new Date().toISOString(),
+            };
+            void saveSubscriptionsToCache(dbSubscriptions, metadata).catch((error) =>
+              console.warn("Could not warm FunnelFox IndexedDB cache.", error),
+            );
+          }
           throw new Error("__skip__");
         }
 
