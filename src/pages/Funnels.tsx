@@ -3,7 +3,7 @@
 // list). Data comes from Postgres via @/services/funnels; ClickHouse is only
 // consulted by the "Import from warehouse" bootstrap action (Phase 6).
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { ArrowDown, ArrowUp, ArrowUpDown, ChevronDown, Download, Loader2, RefreshCw, Route } from "lucide-react";
+import { Activity, ArrowDown, ArrowUp, ArrowUpDown, ChevronDown, Download, Loader2, RefreshCw, Route } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -34,11 +34,14 @@ import {
   listFunnelFoxFunnels,
   listFunnels,
   listTags,
+  recomputeFunnelActiveStatus,
   setFunnelActive,
   type FunnelFoxImportCandidate,
   type FunnelRecord,
   type TagRecord,
 } from "@/services/funnels";
+
+const ACTIVE_WINDOW_DAYS = 30;
 
 type StatusFilter = "all" | "active" | "inactive";
 type SortColumn = "display_name" | "funnel_path" | "created_at" | "updated_at";
@@ -56,6 +59,7 @@ export default function FunnelsPage() {
   const [tags, setTags] = useState<TagRecord[]>([]);
   const [loading, setLoading] = useState(false);
   const [togglingId, setTogglingId] = useState<string | null>(null);
+  const [recomputing, setRecomputing] = useState(false);
 
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
@@ -111,6 +115,29 @@ export default function FunnelsPage() {
       });
     } finally {
       setTogglingId(null);
+    }
+  }
+
+  async function onRecomputeActive() {
+    setRecomputing(true);
+    try {
+      const result = await recomputeFunnelActiveStatus(ACTIVE_WINDOW_DAYS);
+      const changed = result.activated + result.deactivated;
+      toast({
+        title: `${result.active_total} funnel${result.active_total === 1 ? "" : "s"} active`,
+        description: changed
+          ? `${result.activated} activated, ${result.deactivated} deactivated (traffic in last ${result.window_days} days).`
+          : `No changes — active status already matches traffic in the last ${result.window_days} days.`,
+      });
+      await refresh();
+    } catch (error) {
+      toast({
+        title: "Could not recompute active status",
+        description: error instanceof Error ? error.message : "Unknown error",
+        variant: "destructive",
+      });
+    } finally {
+      setRecomputing(false);
     }
   }
 
@@ -233,7 +260,7 @@ export default function FunnelsPage() {
   const hasFilters = Boolean(search.trim()) || statusFilter !== "all" || selectedTagIds.length > 0;
 
   return (
-    <AppLayout title="Funnels" description="Manage funnel paths, status and tags">
+    <AppLayout title="Funnels" description="Active = traffic in the last 30 days. Manage funnel paths, status and tags.">
       <Card className="p-4 shadow-card">
         <div className="flex flex-wrap items-center gap-2 border-b border-border pb-3">
           <Input
@@ -320,6 +347,17 @@ export default function FunnelsPage() {
             <Button type="button" variant="outline" size="sm" onClick={() => void refresh()} disabled={loading}>
               {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
               Refresh
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => void onRecomputeActive()}
+              disabled={recomputing}
+              title={`Set Active from successful traffic in the last ${ACTIVE_WINDOW_DAYS} days`}
+            >
+              {recomputing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Activity className="h-4 w-4" />}
+              Recompute Active
             </Button>
             <Button type="button" size="sm" onClick={() => void onOpenImport()}>
               <Download className="h-4 w-4" />

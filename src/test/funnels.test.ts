@@ -226,6 +226,33 @@ describe("funnels service", () => {
 
     await expect(replaceFunnelTags("f1", ["missing"])).rejects.toThrow("Could not update funnel tags: Unknown tag id(s)");
   });
+
+  it("recomputeFunnelActiveStatus: calls the RPC with the traffic window and returns its counts", async () => {
+    rpcMock.mockResolvedValue({
+      data: { window_days: 30, activated: 3, deactivated: 42, active_total: 15 },
+      error: null,
+    });
+    const { recomputeFunnelActiveStatus } = await importFunnels();
+
+    const result = await recomputeFunnelActiveStatus(30);
+    expect(rpcMock).toHaveBeenCalledWith("recompute_funnel_active_status", { p_window_days: 30 });
+    expect(result).toEqual({ window_days: 30, activated: 3, deactivated: 42, active_total: 15 });
+  });
+
+  it("listActiveFunnelPaths: returns only the funnel_path strings of active funnels", async () => {
+    const builder = fakeBuilder({
+      data: [{ funnel_path: "soulmate-sketch" }, { funnel_path: "palm-reading" }],
+      error: null,
+    });
+    fromMock.mockReturnValue(builder);
+    const { listActiveFunnelPaths } = await importFunnels();
+
+    const paths = await listActiveFunnelPaths();
+    expect(fromMock).toHaveBeenCalledWith("funnels");
+    expect(builder.select).toHaveBeenCalledWith("funnel_path");
+    expect(builder.eq).toHaveBeenCalledWith("is_active", true);
+    expect(paths).toEqual(["soulmate-sketch", "palm-reading"]);
+  });
 });
 
 // FunnelFox is the import source because it is the system of record for funnel
@@ -290,7 +317,7 @@ describe("FunnelFox import", () => {
     await expect(listFunnelFoxFunnels()).rejects.toThrow("Could not reach FunnelFox");
   });
 
-  it("importFunnelFoxFunnels: maps title/alias/id and follows FunnelFox publish state for is_active", async () => {
+  it("importFunnelFoxFunnels: maps title/alias/id and imports inactive (traffic decides, not publish state)", async () => {
     invokeMock.mockReset();
     const tagsBuilder = fakeBuilder({ data: [{ id: "t-fb", name: "Facebook", created_by: null, created_at: "t" }], error: null });
     const insertBuilder = fakeBuilder({
@@ -307,13 +334,15 @@ describe("FunnelFox import", () => {
     rpcMock.mockResolvedValue({ data: {}, error: null });
 
     const { importFunnelFoxFunnels } = await importFunnels();
-    const result = await importFunnelFoxFunnels([funnelFoxFunnel()]);
+    // A PUBLISHED funnel still imports inactive: "active" now means recent
+    // traffic, which the recompute (button/cron) determines afterwards.
+    const result = await importFunnelFoxFunnels([funnelFoxFunnel({ status: "published" })]);
 
     expect(insertBuilder.insert).toHaveBeenCalledWith([
       {
         funnel_path: "soulmate-sketch-en",
         display_name: "Soulmate EN",
-        is_active: true,
+        is_active: false,
         funnelfox_funnel_id: "01FFID",
         created_by: "user-1",
       },
@@ -324,22 +353,6 @@ describe("FunnelFox import", () => {
       p_tag_ids: ["t-fb", "t-web"],
     });
     expect(result.importedFunnels).toBe(1);
-  });
-
-  it("importFunnelFoxFunnels: a draft funnel imports as inactive", async () => {
-    const emptyTags = fakeBuilder({ data: [], error: null });
-    const insertBuilder = fakeBuilder({
-      data: [{ id: "new-2", funnel_path: "wip", funnelfox_funnel_id: "ff-draft" }],
-      error: null,
-    });
-    // Only TWO from() calls with a tagless funnel: the listTags() baseline
-    // count, then the insert. ensureTags([]) returns early and never queries.
-    fromMock.mockReturnValueOnce(emptyTags).mockReturnValueOnce(insertBuilder);
-
-    const { importFunnelFoxFunnels } = await importFunnels();
-    await importFunnelFoxFunnels([funnelFoxFunnel({ id: "ff-draft", alias: "wip", status: "draft", tags: [] })]);
-
-    expect(insertBuilder.insert).toHaveBeenCalledWith([expect.objectContaining({ is_active: false })]);
   });
 
   it("importFunnelFoxFunnels: no-ops on an empty selection without touching Supabase", async () => {

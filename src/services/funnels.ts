@@ -110,11 +110,41 @@ export async function updateFunnelDisplayName(id: string, displayName: string): 
   return { ...(data as Omit<FunnelRecord, "tags">), tags: [] };
 }
 
-// No deleteFunnel: is_active is the sole retirement mechanism in v1.
+// No deleteFunnel: is_active is the sole retirement mechanism in v1. A manual
+// toggle still exists for one-off overrides, but the daily recompute (below)
+// re-derives is_active from traffic on the next tick.
 export async function setFunnelActive(id: string, isActive: boolean): Promise<void> {
   const client = ensureSupabase();
   const { error } = await client.from("funnels").update({ is_active: isActive }).eq("id", id);
   if (error) throw new Error(`Could not update funnel status: ${error.message}`);
+}
+
+export interface RecomputeActiveResult {
+  window_days: number;
+  activated: number;
+  deactivated: number;
+  active_total: number;
+}
+
+// "Active" means traffic is flowing: a successful transaction on the funnel's
+// path within the trailing window. This calls the same SQL the daily
+// funnels-active-from-traffic cron runs, so the button and the automatic tick
+// can never disagree.
+export async function recomputeFunnelActiveStatus(windowDays = 30): Promise<RecomputeActiveResult> {
+  const client = ensureSupabase();
+  const { data, error } = await client.rpc("recompute_funnel_active_status", { p_window_days: windowDays });
+  if (error) throw new Error(`Could not recompute active status: ${error.message}`);
+  return data as RecomputeActiveResult;
+}
+
+// The funnel_path set for the currently-active funnels. Cohorts uses this to
+// highlight active funnels in its Campaign path filter (funnel_path there is
+// the same value as campaign_path).
+export async function listActiveFunnelPaths(): Promise<string[]> {
+  const client = ensureSupabase();
+  const { data, error } = await client.from("funnels").select("funnel_path").eq("is_active", true);
+  if (error) throw new Error(`Could not load active funnels: ${error.message}`);
+  return ((data ?? []) as Array<{ funnel_path: string }>).map((row) => row.funnel_path);
 }
 
 export async function listTags(): Promise<TagRecord[]> {
@@ -216,10 +246,9 @@ export interface FunnelFoxImportResult {
 
 /**
  * Creates a registry row per selected FunnelFox funnel and mirrors its tags.
- * is_active follows FunnelFox's publish state rather than defaulting to false:
- * with ~59 funnels, importing everything as inactive would mean dozens of
- * manual toggles to restore information FunnelFox already gave us. The flag
- * stays manually editable afterwards, per the spec.
+ * is_active is NOT taken from FunnelFox's publish state: "active" means traffic
+ * is flowing, which a fresh import cannot know. New rows start inactive and the
+ * recompute (button + daily cron) flips on the ones with recent traffic.
  */
 export async function importFunnelFoxFunnels(funnels: FunnelFoxFunnel[]): Promise<FunnelFoxImportResult> {
   const client = ensureSupabase();
@@ -236,7 +265,7 @@ export async function importFunnelFoxFunnels(funnels: FunnelFoxFunnel[]): Promis
       funnels.map((funnel) => ({
         funnel_path: funnel.alias.trim(),
         display_name: funnel.title.trim(),
-        is_active: funnel.status === "published",
+        is_active: false,
         funnelfox_funnel_id: funnel.id,
         created_by: userId,
       })),

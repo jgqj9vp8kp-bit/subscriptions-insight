@@ -54,6 +54,7 @@ import {
 import { useFbWarehouseStatus } from "@/hooks/useFbWarehouse";
 import { buildCohortsExportTable, cohortsTableToCsv } from "@/services/cohortsExport";
 import { pruneInvalidCohortSelections } from "@/services/cohortFilterSelection";
+import { listActiveFunnelPaths } from "@/services/funnels";
 import type { CohortRequest } from "../../supabase/functions/_shared/clickhouse/cohortContract";
 import type { FbAllocationStatus, FbTimezoneSource } from "../../supabase/functions/_shared/clickhouse/fbCohortStats";
 import { useAuth } from "@/hooks/useAuth";
@@ -1105,6 +1106,23 @@ export default function CohortsPage() {
   // FB warehouse fingerprint (separate lifecycle from the cohort snapshot): an
   // FB sync re-keys this report so cached Spend can never outlive the sync.
   const { version: fbWarehouseVersion } = useFbWarehouseStatus(cohortsSource === "clickhouse");
+  // Active funnels from the Funnels admin registry (funnel_path == campaign_path
+  // here). Used only to highlight/quick-select active campaign paths — it never
+  // filters the report on its own, so a failed load just means no highlight.
+  const [activeFunnelPaths, setActiveFunnelPaths] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    let cancelled = false;
+    listActiveFunnelPaths()
+      .then((paths) => {
+        if (!cancelled) setActiveFunnelPaths(new Set(paths));
+      })
+      .catch(() => {
+        /* highlight is best-effort; registry is optional to the report */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   const [uiState, setUiState, resetUiState] = usePersistedPageState("ui_state_cohorts", DEFAULT_COHORTS_UI_STATE);
   const {
     selectedFunnels: rawSelectedFunnels,
@@ -2314,6 +2332,15 @@ export default function CohortsPage() {
     : selectedCampaignPaths.length === 1
       ? selectedCampaignPaths[0]
       : `${selectedCampaignPaths.length} campaign paths`;
+  // Active funnels (from the Funnels registry) that are actually offered in the
+  // current cohort scope — the "Select active" affordance only makes sense for
+  // paths the user could otherwise pick by hand.
+  const activeCampaignPathOptions = useMemo(
+    () => campaignPathOptions.filter((path) => activeFunnelPaths.has(path)),
+    [campaignPathOptions, activeFunnelPaths],
+  );
+  const selectActiveCampaignPaths = () =>
+    updateUiState({ selectedCampaignPaths: [...activeCampaignPathOptions].sort(), campaignPathFilter: "all" });
   const toggleCampaignId = (campaignId: string) => {
     const next = selectedCampaignIds.includes(campaignId)
       ? selectedCampaignIds.filter((value) => value !== campaignId)
@@ -2971,22 +2998,50 @@ export default function CohortsPage() {
               <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
                 <div>
                   <div className="text-xs font-medium text-muted-foreground">Campaign path</div>
-                  <div className="text-xs text-muted-foreground">All campaign paths by default</div>
+                  <div className="text-xs text-muted-foreground">
+                    <span className="inline-flex items-center gap-1">
+                      <span className="inline-block h-1.5 w-1.5 rounded-full bg-success" /> active = traffic in last 30d
+                    </span>
+                  </div>
                 </div>
                 <Button type="button" variant="ghost" size="sm" className="h-7 text-xs" onClick={clearCampaignPaths} disabled={!selectedCampaignPaths.length}>
                   Clear
                 </Button>
               </div>
+              {activeCampaignPathOptions.length > 0 && (
+                <div className="border-b border-border px-3 py-1.5">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 w-full justify-start gap-2 text-xs text-success hover:text-success"
+                    onClick={selectActiveCampaignPaths}
+                  >
+                    <span className="inline-block h-1.5 w-1.5 rounded-full bg-success" />
+                    Select {activeCampaignPathOptions.length} active
+                  </Button>
+                </div>
+              )}
               <div className="max-h-72 overflow-auto py-1">
                 {campaignPathOptions.length === 0 && (
                   <div className="px-3 py-3 text-sm text-muted-foreground">No campaign path data</div>
                 )}
-                {campaignPathOptions.map((path) => (
-                  <label key={path} className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted/50">
-                    <Checkbox checked={selectedCampaignPaths.includes(path)} onCheckedChange={() => toggleCampaignPath(path)} />
-                    <span className="truncate">{path}</span>
-                  </label>
-                ))}
+                {campaignPathOptions.map((path) => {
+                  const isActive = activeFunnelPaths.has(path);
+                  return (
+                    <label
+                      key={path}
+                      className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted/50"
+                    >
+                      <Checkbox checked={selectedCampaignPaths.includes(path)} onCheckedChange={() => toggleCampaignPath(path)} />
+                      <span
+                        className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${isActive ? "bg-success" : "bg-transparent"}`}
+                        aria-hidden
+                      />
+                      <span className={`truncate ${isActive ? "font-medium text-success" : ""}`}>{path}</span>
+                    </label>
+                  );
+                })}
               </div>
             </PopoverContent>
           </Popover>
