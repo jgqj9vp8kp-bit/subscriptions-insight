@@ -312,7 +312,7 @@ const STATIC_COLUMN_LABELS: Record<string, string> = {
   revenue_d7: "Rev D7",
   revenue_d30: "Rev 1M",
   revenue_d60: "Rev 2M",
-  ltv_1m_per_user: "LTV 1M / User",
+  ltv_1m_per_user: "Gross LTV 1M",
   trial_revenue: "Trial Revenue",
   upsell_1_users: "Upsell 1 Users",
   upsell_1_cr: "Upsell 1 CR",
@@ -916,7 +916,7 @@ function CohortLtv1mDetails({ cohort, nowMs }: { cohort: CohortRow; nowMs: numbe
         <span className="text-right">{cohort.trial_users}</span>
         <span className="text-muted-foreground">Net Revenue 1M USD</span>
         <span className="text-right">{formatCurrency(netRevenue1m)}</span>
-        <span className="text-muted-foreground">LTV 1M / User</span>
+        <span className="text-muted-foreground">Gross LTV 1M</span>
         <span className="text-right font-medium">{formatCurrency(ltv)}</span>
         <span className="text-muted-foreground">Cohort Age Days</span>
         <span className="text-right">{maturity.age_days}</span>
