@@ -28,6 +28,27 @@ describe("FunnelFox subscription normalization", () => {
     vi.useRealTimers();
   });
 
+  it("flags sandbox subs and never treats them as active", () => {
+    vi.setSystemTime(new Date("2026-05-01T12:00:00Z"));
+
+    const row = normalizeSubscription({
+      id: "sub_sandbox",
+      psp_id: "psp_1",
+      status: "active",
+      renews: true,
+      sandbox: true,
+      period_ends_at: "2026-05-10T00:00:00Z", // future — would be active if not sandbox
+      currency: "USD",
+      profile: { id: "profile_1", email: "qa@example.com" },
+      product: { name: "Monthly" },
+    });
+
+    expect(row.sandbox).toBe(true);
+    expect(row.is_active_now).toBe(false);
+
+    vi.useRealTimers();
+  });
+
   it("detects cancellation from renews false and marks expired periods inactive", () => {
     vi.setSystemTime(new Date("2026-05-01T12:00:00Z"));
 
