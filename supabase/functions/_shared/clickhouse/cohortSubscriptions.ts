@@ -23,8 +23,12 @@ export interface CohortActiveSubs {
 const cohortKey = (cohortDate: string, funnel: string, campaignPath: string): string =>
   `${cohortDate}|${funnel}|${campaignPath}`;
 
-/** Active subscription ids grouped by normalized email (RLS-scoped to the caller). */
-async function activeSubscriptionsByEmail(supabase: SupabaseLikeClient): Promise<Map<string, string[]>> {
+/**
+ * Active subscription ids grouped by normalized email (RLS-scoped to the caller).
+ * The RPC already excludes FunnelFox sandbox/test subscriptions, so the returned
+ * ids are live subscriptions only.
+ */
+export async function activeSubscriptionsByEmail(supabase: SupabaseLikeClient): Promise<Map<string, string[]>> {
   const map = new Map<string, string[]>();
   if (!supabase.rpc) return map;
   const { data, error } = await supabase.rpc("active_funnelfox_subscription_emails");
@@ -34,6 +38,48 @@ async function activeSubscriptionsByEmail(supabase: SupabaseLikeClient): Promise
     if (Array.isArray(ids)) map.set(email.trim().toLowerCase(), ids.map((value) => String(value)));
   }
   return map;
+}
+
+/** Cohort user with the email used to attribute active subscriptions. */
+export interface CohortEmailRow {
+  email: string;
+  cohort_date: string;
+  funnel: string;
+  campaign_path: string;
+}
+
+/**
+ * Fold active-subscription ids onto cohorts by joining each cohort user's email
+ * to the active-by-email map. Shared by the materialized and dynamic paths so
+ * both derive Active Users / Active Subscriptions identically.
+ */
+export function aggregateActiveSubscriptions(
+  activeByEmail: Map<string, string[]>,
+  rows: CohortEmailRow[],
+): Map<string, CohortActiveSubs> {
+  const result = new Map<string, CohortActiveSubs>();
+  if (activeByEmail.size === 0) return result;
+  const byCohort = new Map<string, { emails: Set<string>; subs: Set<string> }>();
+  for (const row of rows) {
+    const email = row.email?.trim().toLowerCase();
+    if (!email) continue;
+    const ids = activeByEmail.get(email);
+    if (!ids || ids.length === 0) continue;
+    const key = cohortKey(row.cohort_date, row.funnel, row.campaign_path);
+    const bucket = byCohort.get(key) ?? { emails: new Set<string>(), subs: new Set<string>() };
+    bucket.emails.add(email);
+    for (const id of ids) bucket.subs.add(id);
+    byCohort.set(key, bucket);
+  }
+  for (const [key, bucket] of byCohort) {
+    result.set(key, {
+      active_users: bucket.emails.size,
+      active_subscriptions: bucket.subs.size,
+      active_subscription_ids: [...bucket.subs],
+      active_user_ids: [...bucket.emails],
+    });
+  }
+  return result;
 }
 
 /**
@@ -50,9 +96,8 @@ export async function activeSubscriptionMetricsByCohort(input: {
   warehouseVersion: string;
   classificationVersion: string;
 }): Promise<Map<string, CohortActiveSubs>> {
-  const result = new Map<string, CohortActiveSubs>();
   const activeByEmail = await activeSubscriptionsByEmail(input.supabase);
-  if (activeByEmail.size === 0) return result;
+  if (activeByEmail.size === 0) return new Map();
 
   const rs = await input.clickhouse.query({
     query: `SELECT lowerUTF8(trim(BOTH ' ' FROM normalized_email)) email,
@@ -70,27 +115,8 @@ export async function activeSubscriptionMetricsByCohort(input: {
     },
     format: "JSONEachRow",
   });
-  const rows = (await rs.json()) as Array<{ email: string; cohort_date: string; funnel: string; campaign_path: string }>;
-
-  const byCohort = new Map<string, { emails: Set<string>; subs: Set<string> }>();
-  for (const row of rows) {
-    const ids = activeByEmail.get(row.email);
-    if (!ids || ids.length === 0) continue;
-    const key = cohortKey(row.cohort_date, row.funnel, row.campaign_path);
-    const bucket = byCohort.get(key) ?? { emails: new Set<string>(), subs: new Set<string>() };
-    bucket.emails.add(row.email);
-    for (const id of ids) bucket.subs.add(id);
-    byCohort.set(key, bucket);
-  }
-  for (const [key, bucket] of byCohort) {
-    result.set(key, {
-      active_users: bucket.emails.size,
-      active_subscriptions: bucket.subs.size,
-      active_subscription_ids: [...bucket.subs],
-      active_user_ids: [...bucket.emails],
-    });
-  }
-  return result;
+  const rows = (await rs.json()) as CohortEmailRow[];
+  return aggregateActiveSubscriptions(activeByEmail, rows);
 }
 
 /** Overlay the computed metrics onto cohort rows in place (by cohort key). */

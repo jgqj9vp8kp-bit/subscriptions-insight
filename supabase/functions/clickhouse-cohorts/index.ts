@@ -81,7 +81,7 @@ Deno.serve(async (req: Request) => {
       QUERY_TIMEOUT_MS,
     );
     if (materialized) return jsonResponse(materialized);
-    const result = await withTimeout(runCohortList({ authUserId: auth.id, clickhouse: ch, request }), QUERY_TIMEOUT_MS);
+    const result = await withTimeout(runCohortList({ authUserId: auth.id, clickhouse: ch, request, supabase: auth.supabase }), QUERY_TIMEOUT_MS);
     return jsonResponse(result);
   } catch (error) {
     // Validation errors are client faults (400); everything else is a warehouse

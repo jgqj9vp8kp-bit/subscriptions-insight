@@ -3,7 +3,11 @@ import type { FunnelFoxSubscriptionRaw, SubscriptionClean } from "./subscription
 // Status tokens that mean a subscription is NOT active regardless of period.
 const INACTIVE_STATUS_TOKENS = ["expired", "unpaid", "failed", "cancel"] as const;
 
-export type SubscriptionActiveInput = Pick<SubscriptionClean, "status" | "renews" | "period_ends_at">;
+export type SubscriptionActiveInput = Pick<SubscriptionClean, "status" | "renews" | "period_ends_at"> & {
+  // Optional so callers that pre-date the field (and hand-built test inputs) still
+  // compile; only an explicit true excludes.
+  sandbox?: boolean;
+};
 
 /**
  * Single source of truth for "is this subscription active right now".
@@ -19,6 +23,7 @@ export type SubscriptionActiveInput = Pick<SubscriptionClean, "status" | "renews
  * Invalid / empty period_ends_at is treated as NOT active.
  */
 export function isSubscriptionActiveNow(sub: SubscriptionActiveInput, nowMs: number): boolean {
+  if (sub.sandbox === true) return false; // FunnelFox test/sandbox subs are never a real active subscription
   if (sub.renews !== true) return false;
   const status = (sub.status ?? "").toLowerCase();
   if (INACTIVE_STATUS_TOKENS.some((token) => status.includes(token))) return false;
@@ -267,6 +272,7 @@ function cancellationType(
 export function normalizeSubscription(raw: FunnelFoxSubscriptionRaw): SubscriptionClean {
   const status = valueString(raw.status).toLowerCase();
   const renews = typeof raw.renews === "boolean" ? raw.renews : null;
+  const sandbox = raw.sandbox === true;
   const cancelledByStatus = statusContains(status, "cancel");
   const cancelledByRenews = renews === false;
   const isCancelled = cancelledByStatus || cancelledByRenews;
@@ -290,7 +296,7 @@ export function normalizeSubscription(raw: FunnelFoxSubscriptionRaw): Subscripti
     profile_id: extractSubscriptionProfileId(raw),
     status,
     renews,
-    sandbox: raw.sandbox === true,
+    sandbox,
     is_cancelled: isCancelled,
     cancelled_at: cancelledAt,
     cancellation_source: cancelledByStatus
@@ -303,7 +309,7 @@ export function normalizeSubscription(raw: FunnelFoxSubscriptionRaw): Subscripti
     hours_before_period_end: isCancelled ? hoursBeforePeriodEnd : null,
     cancellation_timing_bucket: cancellationTimingBucket(isCancelled, daysToCancel, hoursBeforePeriodEnd),
     cancellation_type: cancellationType(isCancelled, status, renews, cancellationReason),
-    is_active_now: periodEndsInFuture && !inactiveStatus,
+    is_active_now: periodEndsInFuture && !inactiveStatus && !sandbox,
     created_at: createdAt,
     updated_at: valueString(raw.updated_at),
     period_starts_at: valueString(raw.period_starts_at),

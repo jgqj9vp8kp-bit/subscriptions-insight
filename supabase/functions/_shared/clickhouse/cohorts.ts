@@ -14,7 +14,13 @@
 // Nothing here returns raw_payload / normalized_payload / raw emails / raw
 // transaction ids / credentials — only aggregates and non-reversible id hashes.
 
-import type { ClickHouseClientLike } from "./types.ts";
+import type { ClickHouseClientLike, SupabaseLikeClient } from "./types.ts";
+import {
+  activeSubscriptionsByEmail,
+  aggregateActiveSubscriptions,
+  mergeActiveSubscriptions,
+  type CohortEmailRow,
+} from "./cohortSubscriptions.ts";
 import { ANALYTICS_TRANSACTIONS_TABLE, FACT_SUPPORT_REQUESTS_TABLE } from "./schema.ts";
 import { FACT_SUBSCRIPTIONS_TABLE } from "./factSubscriptions.ts";
 import {
@@ -481,6 +487,22 @@ SELECT * FROM agg ${post}
 FORMAT JSONEachRow`;
 }
 
+// Per-user (email, cohort) rows for the active-subscription overlay. Reuses the
+// classifier's `tr` (trial cohort) + `userdim` (authoritative email) CTEs, so a
+// user's cohort key matches the list exactly. Scoped to auth_user only — NO
+// member/user filters — mirroring the materialized overlay, which counts active
+// subs across the full cohort membership and merges onto whichever rows survive.
+function buildDynamicCohortEmailQuery(params: Record<string, unknown>): string {
+  const baseWhere = `a.auth_user_id = {auth_user_id:String}`;
+  return `WITH
+${classifierSQL(baseWhere, "")}
+SELECT lowerUTF8(trim(BOTH ' ' FROM userdim.u_normalized_email)) email,
+  tr.c_date cohort_date, tr.c_funnel funnel, tr.c_camp campaign_path
+FROM tr INNER JOIN userdim USING(uid)
+WHERE userdim.u_normalized_email != ''
+FORMAT JSONEachRow`;
+}
+
 // ---- Map a raw aggregate row -> the frontend CohortAggregateRow -----------
 
 function toAggregateRow(r: RawCohortRow): CohortAggregateRow {
@@ -722,6 +744,9 @@ export async function runCohortList(input: {
   authUserId: string;
   clickhouse: ClickHouseClientLike;
   request: CohortRequest;
+  // Optional so callers without a Supabase client (tests, non-overlay paths)
+  // still work — the active-subscription overlay is simply skipped then.
+  supabase?: SupabaseLikeClient;
 }): Promise<CohortResponse> {
   const started = Date.now();
   const nreq = normalizeCohortRequest(input.request);
@@ -744,6 +769,27 @@ export async function runCohortList(input: {
   const optionsDurationMs = Date.now() - optionsStarted;
   const rawRows = (await rs.json()) as RawCohortRow[];
   const rows = rawRows.map(toAggregateRow);
+  // Active-subscription overlay (dynamic fallback parity with the materialized
+  // path): join FunnelFox active subs (Postgres) to the classifier's cohort
+  // emails and fill active_users / active_subscriptions before totals. Best-
+  // effort — any failure leaves the rows at 0, exactly as before.
+  if (input.supabase) {
+    try {
+      const activeByEmail = await activeSubscriptionsByEmail(input.supabase);
+      if (activeByEmail.size > 0) {
+        const emailParams: Record<string, unknown> = { auth_user_id: input.authUserId };
+        const emailRs = await input.clickhouse.query({
+          query: buildDynamicCohortEmailQuery(emailParams),
+          query_params: emailParams,
+          format: "JSONEachRow",
+        });
+        const emailRows = (await emailRs.json()) as CohortEmailRow[];
+        mergeActiveSubscriptions(rows, aggregateActiveSubscriptions(activeByEmail, emailRows));
+      }
+    } catch (error) {
+      console.error("[cohorts] dynamic active-subscription overlay failed:", error instanceof Error ? error.message : error);
+    }
+  }
   const totals = computeTotals(rows);
   const diagnostics: CohortDiagnostics = {
     transactions_scanned: scan.transactions_scanned,

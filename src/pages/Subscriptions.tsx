@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { ArrowDown, ArrowUp, ArrowUpDown, Search, ShieldAlert, Users, XCircle, CheckCircle2, RotateCw, Clock } from "lucide-react";
+import { ArrowDown, ArrowUp, ArrowUpDown, Search, ShieldAlert, Users, XCircle, CheckCircle2, RotateCw, Clock, FlaskConical } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { KpiCard } from "@/components/KpiCard";
 import { Badge } from "@/components/ui/badge";
@@ -31,6 +31,9 @@ import type { Transaction, UserAggregate } from "@/services/types";
 
 type CancellationFilter = "all" | "cancelled" | "not_cancelled";
 type ActiveFilter = "all" | "active" | "expired";
+// FunnelFox test/sandbox subscriptions are excluded by default so they never
+// pollute counts; the filter still lets you inspect or isolate them.
+type SandboxFilter = "hide" | "all" | "only";
 type CancelTypeFilter = "all" | SubscriptionClean["cancellation_type"];
 type CancelTimingFilter = "all" | SubscriptionClean["cancellation_timing_bucket"];
 type SubscriptionSortKey = "cohort_date" | "cohort_id" | "campaign_path";
@@ -40,6 +43,7 @@ const DEFAULT_SUBSCRIPTIONS_UI_STATE = {
   statusFilter: "all",
   cancellationFilter: "all" as CancellationFilter,
   activeFilter: "all" as ActiveFilter,
+  sandboxFilter: "hide" as SandboxFilter,
   cancelTypeFilter: "all" as CancelTypeFilter,
   cancelTimingFilter: "all" as CancelTimingFilter,
   cohortFilter: "all",
@@ -141,6 +145,7 @@ export default function SubscriptionsPage() {
     statusFilter,
     cancellationFilter,
     activeFilter,
+    sandboxFilter,
     cancelTypeFilter,
     cancelTimingFilter,
     cohortFilter,
@@ -195,6 +200,8 @@ export default function SubscriptionsPage() {
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     const list = displayRows.filter((sub) => {
+      if (sandboxFilter === "hide" && sub.sandbox) return false;
+      if (sandboxFilter === "only" && !sub.sandbox) return false;
       if (q && !(sub.email ?? "").toLowerCase().includes(q)) return false;
       if (statusFilter !== "all" && (sub.status || "unknown") !== statusFilter) return false;
       if (cancellationFilter === "cancelled" && !sub.is_cancelled) return false;
@@ -225,6 +232,7 @@ export default function SubscriptionsPage() {
     statusFilter,
     cancellationFilter,
     activeFilter,
+    sandboxFilter,
     cancelTypeFilter,
     cancelTimingFilter,
     cohortFilter,
@@ -237,16 +245,23 @@ export default function SubscriptionsPage() {
     sortDir,
   ]);
 
+  const sandboxCount = useMemo(() => subscriptions.filter((s) => s.sandbox).length, [subscriptions]);
+
   const kpis = useMemo(() => {
-    const total = subscriptions.length;
-    const activeNow = subscriptions.filter((s) => s.is_active_now).length;
-    const cancelled = subscriptions.filter((s) => s.is_cancelled).length;
-    const renewing = subscriptions.filter((s) => s.renews === true).length;
-    const cancelledButActive = subscriptions.filter((s) => s.is_cancelled && s.is_active_now).length;
-    const cancelledUnknownReason = subscriptions.filter((s) => cancelTypeOf(s) === "cancelled_unknown_reason").length;
-    const paymentRelatedCancellations = subscriptions.filter((s) => cancelTypeOf(s) === "auto_payment_related").length;
-    const cancelledBeforeRenewal48h = subscriptions.filter((s) => cancelTimingOf(s) === "before_renewal_48h").length;
-    const cancelledAfterPeriodEnd = subscriptions.filter((s) => cancelTimingOf(s) === "after_period_end").length;
+    // KPIs honour the sandbox filter: "hide" (default) excludes test subs so the
+    // counts reflect real subscriptions only; "only" scopes them to sandbox.
+    const scoped = subscriptions.filter((s) =>
+      sandboxFilter === "hide" ? !s.sandbox : sandboxFilter === "only" ? s.sandbox : true,
+    );
+    const total = scoped.length;
+    const activeNow = scoped.filter((s) => s.is_active_now).length;
+    const cancelled = scoped.filter((s) => s.is_cancelled).length;
+    const renewing = scoped.filter((s) => s.renews === true).length;
+    const cancelledButActive = scoped.filter((s) => s.is_cancelled && s.is_active_now).length;
+    const cancelledUnknownReason = scoped.filter((s) => cancelTypeOf(s) === "cancelled_unknown_reason").length;
+    const paymentRelatedCancellations = scoped.filter((s) => cancelTypeOf(s) === "auto_payment_related").length;
+    const cancelledBeforeRenewal48h = scoped.filter((s) => cancelTimingOf(s) === "before_renewal_48h").length;
+    const cancelledAfterPeriodEnd = scoped.filter((s) => cancelTimingOf(s) === "after_period_end").length;
     const cancellationRate = total ? (cancelled / total) * 100 : 0;
     return {
       total,
@@ -260,7 +275,7 @@ export default function SubscriptionsPage() {
       cancelledAfterPeriodEnd,
       cancellationRate,
     };
-  }, [subscriptions]);
+  }, [subscriptions, sandboxFilter]);
 
   const toggleSort = (key: SubscriptionSortKey) => {
     if (sortKey === key) updateUiState({ sortDir: sortDir === "asc" ? "desc" : "asc" });
@@ -287,6 +302,7 @@ export default function SubscriptionsPage() {
         <KpiCard label="Payment-related cancellations" value={String(kpis.paymentRelatedCancellations)} icon={<XCircle className="h-4 w-4" />} />
         <KpiCard label="Cancelled before renewal 48h" value={String(kpis.cancelledBeforeRenewal48h)} icon={<Clock className="h-4 w-4" />} />
         <KpiCard label="Cancelled after period end" value={String(kpis.cancelledAfterPeriodEnd)} icon={<Clock className="h-4 w-4" />} accent="warning" />
+        <KpiCard label="Sandbox (test)" value={String(sandboxCount)} icon={<FlaskConical className="h-4 w-4" />} />
       </div>
 
       <Card className="mt-4 p-4 shadow-card">
@@ -323,6 +339,14 @@ export default function SubscriptionsPage() {
               <SelectItem value="all">All activity</SelectItem>
               <SelectItem value="active">Active now</SelectItem>
               <SelectItem value="expired">Expired</SelectItem>
+            </SelectContent>
+          </Select>
+          <Select value={sandboxFilter} onValueChange={(v: SandboxFilter) => updateUiState({ sandboxFilter: v })}>
+            <SelectTrigger className="h-9 w-[160px]"><SelectValue placeholder="Sandbox" /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="hide">Hide sandbox</SelectItem>
+              <SelectItem value="all">Incl. sandbox</SelectItem>
+              <SelectItem value="only">Only sandbox</SelectItem>
             </SelectContent>
           </Select>
           <Select value={cancelTypeFilter} onValueChange={(v: CancelTypeFilter) => updateUiState({ cancelTypeFilter: v })}>
