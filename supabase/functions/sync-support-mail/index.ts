@@ -806,6 +806,7 @@ async function runMailSync(input: {
           lastSeenUid: existingState?.last_seen_uid ?? null,
           clickhouse: null,
           finalStatus: selectedUids.length ? "partial" as SyncStatus : "completed" as SyncStatus,
+          pendingNewMessages: input.action === "sync_new" ? selectedUids.length : 0,
           historyFirstUid,
           historyLastUid,
           historyTotal,
@@ -832,6 +833,7 @@ async function runMailSync(input: {
           lastSeenUid: input.action === "sync_new" ? existingState?.last_seen_uid ?? historyLastUid : historyLastUid,
           clickhouse,
           finalStatus: "completed" as SyncStatus,
+          pendingNewMessages: 0,
           historyFirstUid,
           historyLastUid,
           historyTotal,
@@ -948,6 +950,11 @@ async function runMailSync(input: {
         ? Math.max(0, candidateUids.length - invocationProcessed)
         : Math.max(0, historyTotal - totalImported);
       const finalStatus: SyncStatus = remainingAfterInvocation === 0 ? "completed" : "partial";
+      // sync_new reports the HISTORY remainder in history_remaining_messages, so its
+      // own leftover (new mail that did not fit into this invocation) had no field to
+      // live in: the run ended "partial" while every remaining-counter read 0, and the
+      // client had nothing to resume from. Report it explicitly.
+      const pendingNewMessages = input.action === "sync_new" ? remainingAfterInvocation : 0;
       const historyCompletedAt = input.action === "sync_new"
         ? existingState?.history_completed_at ?? null
         : finalStatus === "completed" ? existingState?.history_completed_at ?? nowIso() : null;
@@ -961,6 +968,7 @@ async function runMailSync(input: {
         lastSeenUid,
         clickhouse,
         finalStatus,
+        pendingNewMessages,
         historyFirstUid,
         historyLastUid,
         historyTotal,
@@ -1027,6 +1035,9 @@ async function runMailSync(input: {
       current_batch_total: result.currentBatchTotal,
       last_sync_imported: result.lastSyncImported,
       last_sync_new_messages: result.lastSyncNewMessages,
+      /** New mail left over from THIS invocation (sync_new only). > 0 means the run
+       * ended "partial" and must be resumed to import the newest messages. */
+      pending_new_messages: result.pendingNewMessages,
       clickhouse: result.clickhouse,
       state,
       duration_ms: Date.now() - new Date(started).getTime(),

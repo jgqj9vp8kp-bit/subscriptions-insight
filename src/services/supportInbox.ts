@@ -85,6 +85,9 @@ export interface SyncSupportMailSummary {
   history_total_messages?: number | null;
   history_imported_messages?: number | null;
   history_remaining_messages?: number | null;
+  /** New mail left over from the last "sync_new" invocation. > 0 means the run ended
+   * "partial" and must be resumed, or the newest messages stay unimported. */
+  pending_new_messages?: number | null;
   history_completed_at?: string | null;
   current_uid?: number | null;
   last_imported_uid?: number | null;

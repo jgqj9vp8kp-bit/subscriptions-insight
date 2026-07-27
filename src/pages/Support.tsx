@@ -348,17 +348,28 @@ export default function SupportPage() {
     void queryClient.invalidateQueries({ queryKey: ["support-mail-sync-status"] });
   };
 
+  // Resume until the mailbox is drained. "sync_new" used to be excluded here, and its
+  // leftover was reported through history_remaining_messages (which is the HISTORY
+  // remainder, always 0 for that action) — so a "Sync Now" that hit the per-invocation
+  // batch limit stopped half-way, still toasted success, and the newest messages never
+  // reached the warehouse. Each action now resumes on its own remaining-counter.
   const runMailWorkflow = async (action: SupportMailSyncAction, options: Record<string, unknown> = {}) => {
-    if (action !== "initial_sync" && action !== "continue_sync") return syncSupportMail(action, options);
+    const RESUMABLE: SupportMailSyncAction[] = ["initial_sync", "continue_sync", "sync_new"];
+    if (!RESUMABLE.includes(action)) return syncSupportMail(action, options);
+    const remainingOf = (summary: SyncSupportMailSummary): number =>
+      action === "sync_new"
+        ? summary.pending_new_messages ?? 0
+        : summary.state?.history_remaining_messages ?? summary.history_remaining_messages ?? 0;
+
     let currentAction: SupportMailSyncAction = action;
     let summary: SyncSupportMailSummary | null = null;
     for (let attempt = 0; attempt < 50; attempt += 1) {
       summary = await syncSupportMail(currentAction, options);
       setLastSync(summary);
       queryClient.setQueryData(["support-mail-sync-status", userScopeHash], summary);
-      const remaining = summary.state?.history_remaining_messages ?? summary.history_remaining_messages ?? 0;
-      if (summary.status !== "partial" || remaining <= 0) return summary;
-      currentAction = "continue_sync";
+      if (summary.status !== "partial" || remainingOf(summary) <= 0) return summary;
+      // History resumes through a dedicated action; new mail keeps calling sync_new.
+      if (action !== "sync_new") currentAction = "continue_sync";
     }
     if (!summary) throw new Error("Support mail import did not start.");
     return summary;
@@ -370,12 +381,25 @@ export default function SupportPage() {
     onSuccess: (summary, variables) => {
       setLastSync(summary);
       invalidateSupport();
+      const pending = summary.status === "partial"
+        ? (variables.action === "sync_new"
+          ? summary.pending_new_messages ?? 0
+          : summary.state?.history_remaining_messages ?? summary.history_remaining_messages ?? 0)
+        : 0;
       const title = variables.action === "test_connection"
         ? "Support mail connection checked"
         : variables.action === "stop"
           ? "Support mail sync stopped"
-          : "Support mail sync finished";
-      toast({ title, description: `${summary.synced} messages processed · ${summary.inserted} inserted · ${summary.skipped} skipped.` });
+          : pending > 0
+            ? "Support mail sync incomplete"
+            : "Support mail sync finished";
+      const base = `${summary.synced} messages processed · ${summary.inserted} inserted · ${summary.skipped} skipped.`;
+      toast({
+        title,
+        // A partial run left mail unimported: say so instead of reporting success.
+        description: pending > 0 ? `${base} ${pending} still pending — run it again to finish.` : base,
+        variant: pending > 0 ? "destructive" : undefined,
+      });
     },
     onError: (error) => {
       toast({
@@ -533,6 +557,22 @@ export default function SupportPage() {
       }
     >
       <div className="space-y-4">
+        {/* A failed read used to render exactly like "no rows": empty KPIs, empty table,
+            no message. Surface it — an unreachable warehouse must not look like an
+            empty inbox. */}
+        {supportData.status.error && (
+          <Card className="border-destructive/50 bg-destructive/5 p-4 shadow-card">
+            <div className="flex items-start gap-3">
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+              <div className="text-sm">
+                <p className="font-medium text-destructive">Could not load support data</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {supportData.status.error} — the figures below may be stale or empty. Try Refresh; if it persists, run a sync.
+                </p>
+              </div>
+            </div>
+          </Card>
+        )}
         <Card className="p-4 shadow-card">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="flex items-start gap-3">

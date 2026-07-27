@@ -616,4 +616,60 @@ describe("Support page", () => {
     await waitFor(() => expect(syncSupportMail).toHaveBeenCalledWith("sync_new", {}));
     expect(await screen.findByText("SpaceMail Support Sync")).toBeInTheDocument();
   });
+
+  it("resumes a partial sync_new until the new mail is drained", async () => {
+    // Regression: "Sync Now" that hit the per-invocation batch limit ended "partial"
+    // and stopped, so the newest messages never reached the warehouse. Each call must
+    // resume on pending_new_messages until it reaches 0.
+    const partial = (pending: number) => ({
+      ok: true, status: pending > 0 ? "partial" : "completed",
+      synced: 50, inserted: 50, skipped: 0, updated: 0,
+      pending_new_messages: pending,
+      history_remaining_messages: 0, // history is complete — must not stop the loop
+      state: { status: pending > 0 ? "partial" : "completed", history_remaining_messages: 0 },
+    });
+    vi.mocked(syncSupportMail)
+      .mockResolvedValueOnce(partial(120) as never)
+      .mockResolvedValueOnce(partial(70) as never)
+      .mockResolvedValueOnce(partial(0) as never);
+
+    renderPage();
+    await screen.findByText("refund@example.com");
+    fireEvent.click(screen.getByRole("button", { name: /sync now/i }));
+
+    await waitFor(() => expect(vi.mocked(syncSupportMail).mock.calls.length).toBe(3));
+    expect(vi.mocked(syncSupportMail).mock.calls.every(([action]) => action === "sync_new")).toBe(true);
+  });
+
+  it("stops resuming once nothing is pending", async () => {
+    vi.mocked(syncSupportMail).mockResolvedValue({
+      ok: true, status: "completed", synced: 5, inserted: 5, skipped: 0, updated: 0,
+      pending_new_messages: 0, history_remaining_messages: 0,
+    } as never);
+
+    renderPage();
+    await screen.findByText("refund@example.com");
+    fireEvent.click(screen.getByRole("button", { name: /sync now/i }));
+
+    await waitFor(() => expect(syncSupportMail).toHaveBeenCalledWith("sync_new", {}));
+    expect(vi.mocked(syncSupportMail).mock.calls.length).toBe(1);
+  });
+
+  it("surfaces a read failure instead of rendering an empty inbox", async () => {
+    // Regression: a failed read looked exactly like "no support requests".
+    vi.mocked(useSupportData).mockReturnValue({
+      bundle: undefined,
+      page: undefined,
+      status: { loading: false, error: "ClickHouse support request failed" },
+      isBackgroundRefreshing: false,
+      isInitialLoading: false,
+      progressPercent: 100,
+      dataUpdatedAt: Date.now(),
+    } as never);
+
+    renderPage();
+
+    expect(await screen.findByText("Could not load support data")).toBeInTheDocument();
+    expect(screen.getByText(/ClickHouse support request failed/)).toBeInTheDocument();
+  });
 });
