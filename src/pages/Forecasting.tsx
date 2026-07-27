@@ -9,7 +9,9 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { PlanMode } from "@/components/forecasting/PlanMode";
 import { ChartContainer, ChartTooltip, ChartTooltipContent, type ChartConfig } from "@/components/ui/chart";
 import { cn } from "@/lib/utils";
 import { useTransactions } from "@/services/sheets";
@@ -379,9 +381,18 @@ export default function ForecastingPage() {
 
   return (
     <AppLayout
-      title="Traffic Payback Forecast"
-      description="Select cohorts and costs to see which traffic pays back, when, and how much CAC you can afford."
+      title="Forecasting"
+      description="Plan future funnel economics (Plan) or analyze realized payback of past cohorts (Actuals)."
     >
+      <Tabs defaultValue="plan" className="space-y-4">
+        <TabsList>
+          <TabsTrigger value="plan">Plan</TabsTrigger>
+          <TabsTrigger value="actuals">Actuals</TabsTrigger>
+        </TabsList>
+        <TabsContent value="plan" className="mt-0">
+          <PlanMode />
+        </TabsContent>
+        <TabsContent value="actuals" className="mt-0">
       <TooltipProvider delayDuration={100}>
         <div className={cn("space-y-4", isStale && "opacity-70 transition-opacity")}>
           {/* -------- Section 1: Filters / cohort selection -------- */}
@@ -604,6 +615,8 @@ export default function ForecastingPage() {
           )}
         </div>
       </TooltipProvider>
+        </TabsContent>
+      </Tabs>
     </AppLayout>
   );
 }
