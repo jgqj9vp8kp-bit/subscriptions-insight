@@ -128,12 +128,6 @@ import {
   type TrafficCacheMetadata,
 } from "@/services/trafficCache";
 import {
-  BUILTIN_DEFAULT_RETENTION_CURVE,
-  loadDefaultRetentionCurve,
-  saveDefaultRetentionCurve,
-  resetDefaultRetentionCurve,
-} from "@/services/forecastingSettings";
-import {
   MAX_RENEWAL_COLUMN_OPTIONS,
   loadMaxRenewalColumns,
   saveMaxRenewalColumns,
@@ -323,8 +317,6 @@ export default function ImportPage() {
   const [stagedSyncError, setStagedSyncError] = useState<string | null>(null);
   const [stagedSyncMessage, setStagedSyncMessage] = useState<string | null>(null);
   const cancelStagedSyncRef = useRef(false);
-  const [retentionCurveDraft, setRetentionCurveDraft] = useState<string[]>(() => loadDefaultRetentionCurve().map(String));
-  const [retentionCurveMessage, setRetentionCurveMessage] = useState<string | null>(null);
   const [maxRenewalColumns, setMaxRenewalColumns] = useState(loadMaxRenewalColumns);
   const [dataSettingsMessage, setDataSettingsMessage] = useState<string | null>(null);
   const [warehouseHistory, setWarehouseHistory] = useState<ImportBatchInfo[]>([]);
@@ -1326,27 +1318,24 @@ export default function ImportPage() {
     }
   }
 
+  // NOTE (Forecasting redesign P8): the "forecasting_settings" snapshot channel
+  // now carries ONLY max_renewal_columns. The legacy default-retention-curve
+  // editor fed the deleted forecasting.ts engine; live forecasts seed retention
+  // from cohort actuals. Old snapshots with a retention_curve field load fine —
+  // the field is simply ignored.
   async function onSaveForecastingSettingsToCloud() {
     try {
       setCloudLoading("forecasting_settings");
       setCloudMessage(null);
       setCloudError(null);
-      const retentionCurve = loadDefaultRetentionCurve();
-      const sanitizedMaxRenewalColumns = saveMaxRenewalColumns(maxRenewalColumns);
-      const cloudInfo = await saveCloudSnapshot({
-        datasetType: "forecasting_settings",
-        name: "Forecasting and data settings",
-        payload: { retention_curve: retentionCurve, max_renewal_columns: sanitizedMaxRenewalColumns },
-        metadata: { retention_months: retentionCurve.length, max_renewal_columns: sanitizedMaxRenewalColumns },
-      });
+      const cloudInfo = await saveDataSettingsToCloud();
       if (!cloudInfo) {
-        setCloudMessage("Sign in with Supabase to save forecasting settings to cloud.");
+        setCloudMessage("Sign in with Supabase to save data settings to cloud.");
         return;
       }
-      setCloudSnapshots((current) => ({ ...current, forecasting_settings: cloudInfo }));
-      setCloudMessage("Forecasting and data settings saved to cloud.");
+      setCloudMessage("Data settings saved to cloud.");
     } catch (error) {
-      setCloudError(error instanceof Error ? error.message : "Could not save forecasting settings to cloud.");
+      setCloudError(error instanceof Error ? error.message : "Could not save data settings to cloud.");
     } finally {
       setCloudLoading(null);
     }
@@ -1357,55 +1346,36 @@ export default function ImportPage() {
       setCloudLoading("forecasting_settings");
       setCloudMessage(null);
       setCloudError(null);
-      const snapshot = await loadLatestCloudSnapshot<{ retention_curve?: number[]; max_renewal_columns?: number }>("forecasting_settings");
-      if (!snapshot?.payload.retention_curve && snapshot?.payload.max_renewal_columns == null) {
-        setCloudMessage("No forecasting or data settings cloud snapshot found.");
+      const snapshot = await loadLatestCloudSnapshot<{ max_renewal_columns?: number }>("forecasting_settings");
+      if (snapshot?.payload.max_renewal_columns == null) {
+        setCloudMessage("No data settings cloud snapshot found.");
         return;
       }
-      if (snapshot.payload.retention_curve) {
-        const saved = saveDefaultRetentionCurve(snapshot.payload.retention_curve);
-        setRetentionCurveDraft(saved.map(String));
-      }
-      if (snapshot.payload.max_renewal_columns != null) {
-        const savedMax = saveMaxRenewalColumns(snapshot.payload.max_renewal_columns);
-        setMaxRenewalColumns(savedMax);
-      }
+      const savedMax = saveMaxRenewalColumns(snapshot.payload.max_renewal_columns);
+      setMaxRenewalColumns(savedMax);
       setCloudSnapshots((current) => ({ ...current, forecasting_settings: snapshot }));
-      setCloudMessage("Forecasting and data settings loaded from cloud.");
+      setCloudMessage("Data settings loaded from cloud.");
     } catch (error) {
-      setCloudError(error instanceof Error ? error.message : "Could not load forecasting settings from cloud.");
+      setCloudError(error instanceof Error ? error.message : "Could not load data settings from cloud.");
     } finally {
       setCloudLoading(null);
     }
   }
 
   function onLoadLocalForecastingSettings() {
-    const curve = loadDefaultRetentionCurve();
-    setRetentionCurveDraft(curve.map(String));
     setMaxRenewalColumns(loadMaxRenewalColumns());
     setCloudError(null);
-    setCloudMessage("Loaded local Forecasting and data settings.");
-  }
-
-  function onClearLocalForecastingSettings() {
-    const curve = resetDefaultRetentionCurve();
-    setRetentionCurveDraft(curve.map(String));
-    setCloudError(null);
-    setCloudMessage("Local Forecasting settings cleared. Built-in default curve is active.");
+    setCloudMessage("Loaded local data settings.");
   }
 
   async function saveDataSettingsToCloud(nextMaxRenewalColumns = maxRenewalColumns) {
-    const retentionCurve = loadDefaultRetentionCurve();
     const sanitizedMaxRenewalColumns = saveMaxRenewalColumns(nextMaxRenewalColumns);
     setMaxRenewalColumns(sanitizedMaxRenewalColumns);
     const cloudInfo = await saveCloudSnapshot({
       datasetType: "forecasting_settings",
-      name: "Forecasting and data settings",
-      payload: { retention_curve: retentionCurve, max_renewal_columns: sanitizedMaxRenewalColumns },
-      metadata: {
-        retention_months: retentionCurve.length,
-        max_renewal_columns: sanitizedMaxRenewalColumns,
-      },
+      name: "Data settings",
+      payload: { max_renewal_columns: sanitizedMaxRenewalColumns },
+      metadata: { max_renewal_columns: sanitizedMaxRenewalColumns },
     });
     if (cloudInfo) setCloudSnapshots((current) => ({ ...current, forecasting_settings: cloudInfo }));
     return cloudInfo;
@@ -1425,98 +1395,6 @@ export default function ImportPage() {
     } catch (error) {
       setDataSettingsMessage(
         `Max Renewal Columns saved locally. Cloud save failed: ${
-          error instanceof Error ? error.message : "Unknown error"
-        }`,
-      );
-    }
-  }
-
-  function parseRetentionCurveDraftValue(value: string): number | null {
-    const normalized = value.trim().replace(",", ".");
-    if (!normalized) return null;
-    const parsed = Number(normalized);
-    if (!Number.isFinite(parsed)) return null;
-    return Math.min(100, Math.max(0, parsed));
-  }
-
-  function updateRetentionCurveMonth(index: number, value: string) {
-    setRetentionCurveDraft((current) =>
-      current.map((item, itemIndex) =>
-        itemIndex === index ? value : item,
-      ),
-    );
-    setRetentionCurveMessage(null);
-  }
-
-  function commitRetentionCurveMonth(index: number) {
-    const parsed = parseRetentionCurveDraftValue(retentionCurveDraft[index] ?? "");
-    if (parsed == null) {
-      setRetentionCurveMessage("Enter valid retention values from 0 to 100 before saving.");
-      return;
-    }
-    setRetentionCurveDraft((current) => current.map((item, itemIndex) => (itemIndex === index ? String(parsed) : item)));
-  }
-
-  async function onSaveForecastingSettings() {
-    const parsed = retentionCurveDraft.map(parseRetentionCurveDraftValue);
-    if (parsed.some((value) => value == null)) {
-      setRetentionCurveMessage("Enter valid retention values from 0 to 100 before saving.");
-      return;
-    }
-    const saved = saveDefaultRetentionCurve(parsed as number[]);
-    setRetentionCurveDraft(saved.map(String));
-    const sanitizedMaxRenewalColumns = saveMaxRenewalColumns(maxRenewalColumns);
-    setMaxRenewalColumns(sanitizedMaxRenewalColumns);
-    try {
-      const cloudInfo = await saveCloudSnapshot({
-        datasetType: "forecasting_settings",
-        name: "Forecasting and data settings",
-        payload: { retention_curve: saved, max_renewal_columns: sanitizedMaxRenewalColumns },
-        metadata: {
-          retention_months: saved.length,
-          max_renewal_columns: sanitizedMaxRenewalColumns,
-        },
-      });
-      if (!cloudInfo) {
-        setRetentionCurveMessage("Forecasting default retention curve saved locally. Sign in with Supabase to save it to cloud.");
-        return;
-      }
-      setCloudSnapshots((current) => ({ ...current, forecasting_settings: cloudInfo }));
-      setRetentionCurveMessage("Forecasting default retention curve and data settings saved.");
-    } catch (error) {
-      setRetentionCurveMessage(
-        `Forecasting settings saved locally. Cloud save failed: ${
-          error instanceof Error ? error.message : "Unknown error"
-        }`,
-      );
-    }
-  }
-
-  async function onResetForecastingSettings() {
-    const reset = resetDefaultRetentionCurve();
-    setRetentionCurveDraft(reset.map(String));
-    const sanitizedMaxRenewalColumns = saveMaxRenewalColumns(maxRenewalColumns);
-    setMaxRenewalColumns(sanitizedMaxRenewalColumns);
-    try {
-      const cloudInfo = await saveCloudSnapshot({
-        datasetType: "forecasting_settings",
-        name: "Forecasting and data settings",
-        payload: { retention_curve: reset, max_renewal_columns: sanitizedMaxRenewalColumns },
-        metadata: {
-          retention_months: reset.length,
-          max_renewal_columns: sanitizedMaxRenewalColumns,
-          reset_to_builtin: true,
-        },
-      });
-      if (!cloudInfo) {
-        setRetentionCurveMessage("Forecasting default retention curve reset locally. Sign in with Supabase to save it to cloud.");
-        return;
-      }
-      setCloudSnapshots((current) => ({ ...current, forecasting_settings: cloudInfo }));
-      setRetentionCurveMessage("Forecasting default retention curve reset to default values.");
-    } catch (error) {
-      setRetentionCurveMessage(
-        `Forecasting settings reset locally. Cloud save failed: ${
           error instanceof Error ? error.message : "Unknown error"
         }`,
       );
@@ -2623,49 +2501,9 @@ export default function ImportPage() {
         )}
       </Card>
 
-      <Card className="mt-3 p-4 shadow-card">
-        <div className="mb-3 flex items-center justify-between gap-3">
-          <div>
-            <h3 className="text-sm font-semibold text-foreground">Forecasting Settings</h3>
-            <p className="mt-1 text-xs text-muted-foreground">
-              These values are used only when actual or historical retention is unavailable.
-            </p>
-          </div>
-          <div className="flex shrink-0 gap-2">
-            <Button type="button" variant="outline" size="sm" onClick={onResetForecastingSettings}>
-              Reset to default
-            </Button>
-            <Button type="button" size="sm" onClick={onSaveForecastingSettings}>
-              Save settings
-            </Button>
-          </div>
-        </div>
-        <div className="mb-2 text-xs font-medium text-muted-foreground">Default Retention Curve</div>
-        <div className="grid gap-2 sm:grid-cols-3 lg:grid-cols-4">
-          {retentionCurveDraft.map((value, index) => (
-            <div key={index} className="space-y-1.5">
-              <Label htmlFor={`default-retention-m${index + 1}`} className="text-xs text-muted-foreground">
-                M{index + 1} %
-              </Label>
-              <Input
-                id={`default-retention-m${index + 1}`}
-                type="text"
-                inputMode="decimal"
-                value={value}
-                onChange={(event) => updateRetentionCurveMonth(index, event.target.value)}
-                onBlur={() => commitRetentionCurveMonth(index)}
-                className="h-9"
-              />
-            </div>
-          ))}
-        </div>
-        {retentionCurveMessage && (
-          <div className="mt-3 text-xs text-primary">{retentionCurveMessage}</div>
-        )}
-        <p className="mt-3 text-xs text-muted-foreground">
-          Built-in defaults: {BUILTIN_DEFAULT_RETENTION_CURVE.map((value, index) => `M${index + 1} ${value}%`).join(", ")}.
-        </p>
-      </Card>
+      {/* The legacy "Forecasting Settings" default-retention-curve editor was removed
+          with the Forecasting redesign (P8): it fed only the deleted forecasting.ts
+          engine — the live Forecasting → Plan seeds retention from cohort actuals. */}
 
       <Card className="mt-3 p-4 shadow-card">
         <div className="mb-3 flex items-center gap-2">
@@ -2811,12 +2649,10 @@ export default function ImportPage() {
           })}
 
           {renderSavedDataCard({
-            title: "Forecasting settings",
+            title: "Data settings",
             localStatus: (
               <>
-                Default curve loaded in this browser. M1{" "}
-                <span className="tabular-nums text-foreground">{retentionCurveDraft[0] ?? "35"}%</span>, M12{" "}
-                <span className="tabular-nums text-foreground">{retentionCurveDraft[11] ?? "2"}%</span>, max renewal{" "}
+                Max renewal columns:{" "}
                 <span className="tabular-nums text-foreground">{maxRenewalColumns}</span>
               </>
             ),
@@ -2832,10 +2668,6 @@ export default function ImportPage() {
                 <Button type="button" variant="outline" size="sm" onClick={onSaveForecastingSettingsToCloud} disabled={cloudLoading === "forecasting_settings"}>
                   {cloudLoading === "forecasting_settings" && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
                   Save cloud
-                </Button>
-                <Button type="button" variant="ghost" size="sm" onClick={onClearLocalForecastingSettings}>
-                  <Trash2 className="h-3.5 w-3.5" />
-                  Clear local
                 </Button>
               </>
             ),

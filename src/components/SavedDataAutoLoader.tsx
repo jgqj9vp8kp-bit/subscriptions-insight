@@ -2,7 +2,6 @@ import { useEffect, useRef, useState } from "react";
 import { Loader2 } from "lucide-react";
 import { autoLoadWarehouseIntoStore } from "@/services/analyticsAdapters";
 import { loadLatestCloudSnapshot } from "@/services/dataSnapshots";
-import { FORECASTING_DEFAULT_RETENTION_KEY, saveDefaultRetentionCurve } from "@/services/forecastingSettings";
 import {
   loadLastPalmerDatasetFromCache,
   savePalmerDatasetToCache,
@@ -38,10 +37,6 @@ type SubscriptionsCloudPayload = {
 
 type TrafficCloudPayload = {
   trafficMetrics?: TrafficMetric[];
-};
-
-type ForecastingCloudPayload = {
-  retention_curve?: number[];
 };
 
 export function SavedDataAutoLoader({ loadTransactions = true }: { loadTransactions?: boolean }) {
@@ -307,32 +302,9 @@ export function SavedDataAutoLoader({ loadTransactions = true }: { loadTransacti
         }
       }
 
-      try {
-        if (localStorage.getItem(FORECASTING_DEFAULT_RETENTION_KEY)) {
-          details.push("Forecasting settings already loaded");
-          throw new Error("__skip__");
-        }
-
-        const cloud = await traceAsync("forecasting.cloud_snapshot_load", () => loadLatestCloudSnapshot<ForecastingCloudPayload>("forecasting_settings")).catch((error) => {
-          console.warn("Could not read forecasting settings cloud snapshot.", error);
-          warnings.push("Forecasting settings cloud snapshot");
-          return null;
-        });
-        if (cloud?.payload.retention_curve) {
-          saveDefaultRetentionCurve(cloud.payload.retention_curve);
-          loadedCount += 1;
-          details.push("Loaded Forecasting settings from cloud");
-        } else {
-          details.push("No saved Forecasting settings found");
-        }
-      } catch (error) {
-        if (error instanceof Error && error.message === "__skip__") {
-          // Keep local forecasting settings.
-        } else {
-          console.warn("Could not restore forecasting settings.", error);
-          warnings.push("Forecasting settings");
-        }
-      }
+      // The legacy "default retention curve" cloud restore was removed with the
+      // Forecasting redesign (P8): the curve fed only the deleted forecasting.ts
+      // engine — live forecasts seed retention from cohort actuals instead.
 
       if (!mounted) return;
 
