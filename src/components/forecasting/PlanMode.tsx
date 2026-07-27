@@ -45,7 +45,10 @@ import { addCompareEntry } from "@/components/forecasting/compareStore";
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 const DEFAULT_PLAN_UI_STATE = {
-  funnel: "",
+  // Planning granularity is the campaign path — the workbook's scenario unit
+  // (soulmate-1-sp, soulmate-sketch, …); the funnels registry defines
+  // funnel_path == campaign_path, so this is also the scenario's funnel id.
+  campaignPath: "",
   windowDays: "180",
   cadence: "monthly" as Cadence,
   horizon: "",
@@ -243,32 +246,46 @@ export function PlanMode() {
   const cohorts = useMemo(() => computeCohorts(txs, subscriptions, {}), [txs, subscriptions]);
   const trafficByKey = useMemo(() => aggregateTrafficMetrics(trafficMetrics), [trafficMetrics]);
 
-  const funnelOptions = useMemo(
-    () => Array.from(new Set(cohorts.map((cohort) => cohort.funnel).filter(Boolean))).sort(),
-    [cohorts],
-  );
-  const funnel = ui.funnel && funnelOptions.includes(ui.funnel) ? ui.funnel : funnelOptions[0] ?? "";
+  // Campaign paths, each labelled with its parent funnel and trial volume in the
+  // window — paths are the workbook's scenario unit and the level at which prices,
+  // CPA and retention actually differ.
+  const pathOptions = useMemo(() => {
+    const byPath = new Map<string, { funnel: string; trials: number }>();
+    for (const cohort of cohorts) {
+      const path = cohort.campaign_path;
+      if (!path) continue;
+      const current = byPath.get(path) ?? { funnel: cohort.funnel, trials: 0 };
+      current.trials += cohort.trial_users;
+      byPath.set(path, current);
+    }
+    return [...byPath.entries()]
+      .map(([path, info]) => ({ path, funnel: info.funnel, trials: info.trials }))
+      .sort((a, b) => b.trials - a.trials || a.path.localeCompare(b.path));
+  }, [cohorts]);
+  const campaignPath = ui.campaignPath && pathOptions.some((option) => option.path === ui.campaignPath)
+    ? ui.campaignPath
+    : pathOptions[0]?.path ?? "";
 
   const seedRows = useMemo<CohortRowLike[]>(() => {
     const windowDays = parseNum(ui.windowDays);
     const fromMs = windowDays === undefined ? null : Date.parse(asOf) - windowDays * DAY_MS;
     return cohorts
-      .filter((cohort) => cohort.funnel === funnel)
+      .filter((cohort) => cohort.campaign_path === campaignPath)
       .filter((cohort) => fromMs === null || Date.parse(`${cohort.cohort_date}T00:00:00Z`) >= fromMs)
       .map((cohort) => ({
         ...cohort,
         fb_spend: trafficByKey.get(cohortTrafficKey(cohort))?.spend ?? undefined,
       }));
-  }, [cohorts, funnel, trafficByKey, ui.windowDays, asOf]);
+  }, [cohorts, campaignPath, trafficByKey, ui.windowDays, asOf]);
 
   const seed = useMemo(
     () => deriveFunnelActualsFromCohortRows({
-      funnelId: funnel || "(none)",
+      funnelId: campaignPath || "(none)",
       rows: seedRows,
       asOf,
       periodDays: ui.cadence === "weekly" ? 7 : 30,
     }),
-    [funnel, seedRows, asOf, ui.cadence],
+    [campaignPath, seedRows, asOf, ui.cadence],
   );
 
   const plan = useMemo(() => {
@@ -383,16 +400,25 @@ export function PlanMode() {
       {/* -------- Scenario setup -------- */}
       <Card className="p-4 shadow-card">
         <div className="mb-3 flex items-center justify-between">
-          <h3 className="text-sm font-semibold">Plan — funnel & seed</h3>
+          <h3 className="text-sm font-semibold">Plan — campaign path & seed</h3>
           <Button variant="ghost" size="sm" onClick={resetUi}><RotateCcw className="mr-1 h-3.5 w-3.5" /> Reset plan</Button>
         </div>
         <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
           <div className="space-y-1">
-            <Label className="text-xs text-muted-foreground">Funnel</Label>
-            <Select value={funnel} onValueChange={(value) => update({ funnel: value })}>
-              <SelectTrigger className="h-8"><SelectValue placeholder="Funnel" /></SelectTrigger>
+            <Label className="text-xs text-muted-foreground">Campaign Path</Label>
+            <Select value={campaignPath} onValueChange={(value) => update({ campaignPath: value })}>
+              {/* Explicit children: without them Radix mirrors the whole option
+                  (path + funnel + volume) into the trigger and truncates the path. */}
+              <SelectTrigger className="h-8">
+                <SelectValue placeholder="Campaign path">{campaignPath}</SelectValue>
+              </SelectTrigger>
               <SelectContent>
-                {funnelOptions.map((option) => <SelectItem key={option} value={option}>{option}</SelectItem>)}
+                {pathOptions.map((option) => (
+                  <SelectItem key={option.path} value={option.path}>
+                    {option.path}
+                    <span className="ml-2 text-xs text-muted-foreground">{option.funnel} · {fmtInt(option.trials)}</span>
+                  </SelectItem>
+                ))}
               </SelectContent>
             </Select>
           </div>
@@ -421,7 +447,9 @@ export function PlanMode() {
           <PlanInput label="Horizon (periods)" value={ui.horizon} seeded={ui.cadence === "weekly" ? "24" : "12"} provenance="config" onChange={(value) => update({ horizon: value })} />
         </div>
         <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-          <span>Seed: {seed.coverage.cohorts} cohorts · {fmtInt(seed.coverage.trialUsers)} trials · maturity {seed.coverage.maturityDays}d · spend coverage {seed.coverage.spendCoverage == null ? "—" : fmtPctValue(seed.coverage.spendCoverage, 0)}</span>
+          <span>
+            Seed: funnel {pathOptions.find((option) => option.path === campaignPath)?.funnel ?? "—"} · {seed.coverage.cohorts} cohorts · {fmtInt(seed.coverage.trialUsers)} trials · maturity {seed.coverage.maturityDays}d · spend coverage {seed.coverage.spendCoverage == null ? "—" : fmtPctValue(seed.coverage.spendCoverage, 0)}
+          </span>
           {plan.warnings.map((warning) => (
             <Badge key={warning.code + warning.message.slice(0, 12)} variant="outline" className="text-[10px] font-normal text-warning border-warning/40">{warning.code}</Badge>
           ))}
@@ -448,8 +476,8 @@ export function PlanMode() {
       {plan.frozen && (
         <ScenarioActions
           frozen={plan.frozen}
-          funnel={funnel}
-          defaultLabel={`${funnel} · ${ui.cadence} · $${ui.budget}`}
+          funnel={campaignPath}
+          defaultLabel={`${campaignPath} · ${ui.cadence} · $${ui.budget}`}
         />
       )}
 
