@@ -4,7 +4,7 @@
 // (live actuals → AssumptionBuilder), collects manual overrides, freezes them and
 // renders the engine result. Every formula lives in the engine; every displayed
 // input carries a provenance badge (auto / manual / config / extrapolated).
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { RotateCcw } from "lucide-react";
 import { CartesianGrid, ComposedChart, Line, ReferenceLine, XAxis, YAxis } from "recharts";
 import { KpiCard } from "@/components/KpiCard";
@@ -24,6 +24,8 @@ import { useTransactions } from "@/services/sheets";
 import { useDataStore } from "@/store/dataStore";
 import { computeCohorts, formatCurrency } from "@/services/analytics";
 import { aggregateTrafficMetrics, cohortTrafficKey } from "@/services/cohortReporting";
+import { cohortsDataSourceMode, loadCohortsFromClickHouse } from "@/services/cohortsDataSource";
+import type { CohortRow } from "@/services/types";
 import {
   ForecastInputError,
   buildForecastAssumptions,
@@ -243,8 +245,31 @@ export function PlanMode() {
   // Stable reference instant for the session (deterministic seeding while mounted).
   const [asOf] = useState(() => new Date().toISOString());
 
-  const cohorts = useMemo(() => computeCohorts(txs, subscriptions, {}), [txs, subscriptions]);
+  const localCohorts = useMemo(() => computeCohorts(txs, subscriptions, {}), [txs, subscriptions]);
   const trafficByKey = useMemo(() => aggregateTrafficMetrics(trafficMetrics), [trafficMetrics]);
+
+  // Live seed: the ClickHouse cohort endpoint carries FB spend attributed per
+  // cohort (fb_spend), which the in-memory path only has when a traffic sheet was
+  // imported. Without it the single most important AUTO input — CPA — is
+  // unavailable. Fall back to the in-memory cohorts when the endpoint is off or
+  // unreachable; the seed source is surfaced in the UI either way.
+  const [warehouse, setWarehouse] = useState<{ cohorts: CohortRow[]; error: string | null; loading: boolean }>(
+    { cohorts: [], error: null, loading: cohortsDataSourceMode() === "clickhouse" },
+  );
+  useEffect(() => {
+    if (cohortsDataSourceMode() !== "clickhouse") return;
+    let mounted = true;
+    setWarehouse((current) => ({ ...current, loading: true }));
+    loadCohortsFromClickHouse({ action: "list" })
+      .then((result) => { if (mounted) setWarehouse({ cohorts: result.cohorts, error: null, loading: false }); })
+      .catch((error) => {
+        if (mounted) setWarehouse({ cohorts: [], error: error instanceof Error ? error.message : String(error), loading: false });
+      });
+    return () => { mounted = false; };
+  }, []);
+
+  const usingWarehouse = warehouse.cohorts.length > 0;
+  const cohorts = usingWarehouse ? warehouse.cohorts : localCohorts;
 
   // Campaign paths, each labelled with its parent funnel and trial volume in the
   // window — paths are the workbook's scenario unit and the level at which prices,
@@ -274,7 +299,9 @@ export function PlanMode() {
       .filter((cohort) => fromMs === null || Date.parse(`${cohort.cohort_date}T00:00:00Z`) >= fromMs)
       .map((cohort) => ({
         ...cohort,
-        fb_spend: trafficByKey.get(cohortTrafficKey(cohort))?.spend ?? undefined,
+        // Warehouse rows already carry attributed FB spend; the in-memory path
+        // needs the imported traffic sheet. Absent stays undefined (never 0).
+        fb_spend: cohort.fb_spend ?? trafficByKey.get(cohortTrafficKey(cohort))?.spend ?? undefined,
       }));
   }, [cohorts, campaignPath, trafficByKey, ui.windowDays, asOf]);
 
@@ -450,6 +477,12 @@ export function PlanMode() {
           <span>
             Seed: funnel {pathOptions.find((option) => option.path === campaignPath)?.funnel ?? "—"} · {seed.coverage.cohorts} cohorts · {fmtInt(seed.coverage.trialUsers)} trials · maturity {seed.coverage.maturityDays}d · spend coverage {seed.coverage.spendCoverage == null ? "—" : fmtPctValue(seed.coverage.spendCoverage, 0)}
           </span>
+          <Badge variant="outline" className="text-[10px] font-normal">
+            {warehouse.loading ? "loading warehouse…" : usingWarehouse ? "warehouse (FB spend attributed)" : "in-memory cohorts"}
+          </Badge>
+          {warehouse.error && (
+            <span className="text-warning">Warehouse seed unavailable: {warehouse.error}</span>
+          )}
           {plan.warnings.map((warning) => (
             <Badge key={warning.code + warning.message.slice(0, 12)} variant="outline" className="text-[10px] font-normal text-warning border-warning/40">{warning.code}</Badge>
           ))}

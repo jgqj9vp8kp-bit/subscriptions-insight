@@ -49,11 +49,18 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const MAX_RENEWAL_LEVEL = 12;
 export const LOW_VOLUME_TRIALS_THRESHOLD = 50;
 
+/** Read an optional numeric field that may only exist on one of the cohort-row
+ * shapes (client CohortRow vs server CohortAggregateRow). Absent → null, which the
+ * callers treat as "not observed" — never as an observed zero. */
+function numericField(row: CohortRowLike, field: string): number | null {
+  const value = (row as unknown as Record<string, unknown>)[field];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
 function renewalUsersAtLevel(row: CohortRowLike, level: number): number | null {
   const byLevel = row.renewal_users_by_level?.[level];
   if (typeof byLevel === "number") return byLevel;
-  const flat = (row as Record<string, unknown>)[`renewal_${level}_users`];
-  return typeof flat === "number" ? flat : null;
+  return numericField(row, `renewal_${level}_users`);
 }
 
 function sumPresent(rows: CohortRowLike[], pick: (row: CohortRowLike) => number | null | undefined): { sum: number; present: boolean } {
@@ -159,8 +166,8 @@ export function deriveFunnelActualsFromCohortRows(input: {
   const hasTierFields = rows.some((row) => typeof row.upsell_1_users === "number");
   if (hasTierFields) {
     for (const tier of [1, 2, 3] as const) {
-      const users = sumPresent(rows, (row) => (row as Record<string, unknown>)[`upsell_${tier}_users`] as number | undefined);
-      const revenue = sumPresent(rows, (row) => (row as Record<string, unknown>)[`upsell_${tier}_revenue`] as number | undefined);
+      const users = sumPresent(rows, (row) => numericField(row, `upsell_${tier}_users`));
+      const revenue = sumPresent(rows, (row) => numericField(row, `upsell_${tier}_revenue`));
       if (!users.present || users.sum <= 0) continue;
       upsellTiersActual.push({
         takeRate: users.sum / trials,

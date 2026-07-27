@@ -96,9 +96,10 @@ export function buildPeriodSchedule(input: {
   trialDurationDays?: number;
 }): PeriodSchedule {
   const duration = input.periodDurationDays ?? CADENCE_DAYS[input.cadence];
-  const prices = Array.isArray(input.periodPrice)
-    ? input.periodPrice
-    : Array.from({ length: input.paidPeriods }, () => input.periodPrice);
+  const flatPrice = Array.isArray(input.periodPrice) ? null : input.periodPrice;
+  const prices: number[] = flatPrice === null
+    ? [...(input.periodPrice as number[])]
+    : Array.from({ length: input.paidPeriods }, () => flatPrice);
   const periods: PeriodSpec[] = [{
     index: 0,
     label: "Trial",
