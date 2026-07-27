@@ -18,6 +18,7 @@ import type { CohortRow, Transaction } from "@/services/types";
 import { dedupeTransactionsForAnalytics } from "@/services/analytics";
 import { buildCohortId } from "@/services/cohortIdentity";
 import { cohortTrafficKey, type TrafficAggregate } from "@/services/cohortReporting";
+import { clamp01, round2 } from "../../supabase/functions/_shared/clickhouse/financialPrimitives.ts";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const MONTH_DAYS = 30;
@@ -135,8 +136,7 @@ function netContribution(tx: Transaction): number {
   return tx.amount_usd;
 }
 
-const round2 = (n: number) => Math.round(n * 100) / 100;
-const clamp01 = (n: number) => Math.min(1, Math.max(0, Number.isFinite(n) ? n : 0));
+// round2 / clamp01 now come from the shared financialPrimitives module (P6).
 
 /** ROAS = net revenue / spend. Null when spend is unavailable or non-positive. */
 export function roas(netRevenue: number, spend: number | null | undefined): number | null {

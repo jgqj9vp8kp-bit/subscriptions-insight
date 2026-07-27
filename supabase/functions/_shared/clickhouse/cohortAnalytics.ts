@@ -1,5 +1,6 @@
 import type { CardType, CohortRow, MediaBuyer, PlanBreakdownRow, Transaction, UserAggregate } from "./serviceTypes.ts";
 import type { SubscriptionClean } from "./subscriptionTypes.ts";
+import { round2 } from "./financialPrimitives.ts";
 import { isSubscriptionActiveNow } from "./subscriptionTransform.ts";
 import { countryCodeForUserTransactions, normalizeCountryCode } from "./userCountry.ts";
 import { CARD_TYPE_VALUES, cardTypeForUserTransactions } from "./userCardType.ts";
@@ -1194,9 +1195,7 @@ export function computeCohortsWithDiagnostics(
   };
 }
 
-function round2(n: number) {
-  return Math.round(n * 100) / 100;
-}
+export { round2 } from "./financialPrimitives.ts";
 
 export function formatCurrency(n: number): string {
   return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 }).format(n);

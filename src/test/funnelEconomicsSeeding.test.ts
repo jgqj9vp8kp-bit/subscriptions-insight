@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   ForecastInputError,
   buildForecastAssumptions,
+  buildForecastSnapshotFromCohortRows,
   createCohortRowActualsProvider,
   createFrozenForecastInputs,
   deriveFunnelActualsFromCohortRows,
@@ -280,5 +281,42 @@ describe("buildForecastAssumptions (precedence + provenance, spec §8)", () => {
     );
     // Provenance flows through to the result untouched.
     expect(result.provenance["traffic.targetCpa"]).toBe("auto_derived");
+  });
+});
+
+describe("buildForecastSnapshotFromCohortRows (Dashboard consumer)", () => {
+  it("produces horizon LTVs and ROAS from seeded actuals; LTV is budget-invariant", () => {
+    const snapshot = buildForecastSnapshotFromCohortRows({ rows: [ROW_A, ROW_B], asOf: AS_OF });
+    expect(snapshot.available).toBe(true);
+    expect(snapshot.trials).toBe(200);
+    expect(snapshot.ltvP3).toBeGreaterThan(0);
+    expect(snapshot.ltvP6).toBeGreaterThan(snapshot.ltvP3 as number);
+    expect(snapshot.ltvP12).toBeGreaterThanOrEqual(snapshot.ltvP6 as number);
+    expect(snapshot.roasP6).toBeGreaterThan(0);
+    // Cross-check against a direct engine run with the same seed.
+    const built = buildForecastAssumptions({
+      cadence: "monthly",
+      plannedBudget: 100_000,
+      actuals: derive([ROW_A, ROW_B]).actuals,
+    });
+    const result = runFrozenForecast(createFrozenForecastInputs({ assumptions: built.assumptions, resolvedAt: AS_OF }));
+    const expectedLtvP3 = result.timeline.periods[3].cumulativePaymentNetRevenue / result.metrics.trials;
+    expect(snapshot.ltvP3).toBeCloseTo(expectedLtvP3, 9);
+  });
+
+  it("is unavailable with an explicit reason when no CPA can be derived", () => {
+    const snapshot = buildForecastSnapshotFromCohortRows({
+      rows: [{ ...ROW_A, fb_spend: undefined }, { ...ROW_B, fb_spend: undefined }],
+      asOf: AS_OF,
+    });
+    expect(snapshot.available).toBe(false);
+    expect(snapshot.reason).toMatch(/no CPA available/);
+    expect(snapshot.ltvP3).toBeNull();
+  });
+
+  it("is unavailable on empty rows", () => {
+    const snapshot = buildForecastSnapshotFromCohortRows({ rows: [], asOf: AS_OF });
+    expect(snapshot.available).toBe(false);
+    expect(snapshot.trials).toBe(0);
   });
 });

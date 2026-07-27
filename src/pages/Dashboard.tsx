@@ -52,6 +52,7 @@ import {
 import { useTransactions } from "@/services/sheets";
 import { computeCohorts, formatCurrency } from "@/services/analytics";
 import { aggregateTrafficMetrics, trafficForCohort } from "@/services/cohortReporting";
+import { buildForecastSnapshotFromCohortRows } from "@/services/funnelEconomics";
 import {
   buildCancellationBreakdown,
   buildCancellationsByDay,
@@ -416,6 +417,17 @@ export default function Dashboard() {
         };
       }),
     [cohorts, trafficByKey],
+  );
+
+  // Forecast Snapshot: seed the FunnelEconomics engine from the visible cohorts
+  // (same auto-derivation as Forecasting → Plan) and read horizon values off one
+  // run. Unavailable (with the reason) when no CPA can be derived — never 0.
+  const forecastSnapshot = useMemo(
+    () => buildForecastSnapshotFromCohortRows({
+      rows: dashboardCohorts.map((cohort) => ({ ...cohort, fb_spend: cohort.traffic_spend ?? undefined })),
+      asOf: new Date().toISOString(),
+    }),
+    [dashboardCohorts],
   );
 
   const cashRevenueSummary = useMemo(
@@ -938,12 +950,33 @@ export default function Dashboard() {
       </section>
 
       <section className="mt-5 space-y-3">
-        <SectionHeader title="Forecast Snapshot" description="Reserved for Forecasting scenario outputs." />
+        <SectionHeader
+          title="Forecast Snapshot"
+          description={forecastSnapshot.available
+            ? "Projected by the Forecasting engine from the visible cohorts' actual economics (auto-seeded, monthly cadence)."
+            : `Unavailable: ${forecastSnapshot.reason ?? "no data"}`}
+        />
         <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-4">
-          <MetricCard label="Forecast LTV 3M" value="—" hint="Coming soon" />
-          <MetricCard label="Forecast LTV 6M" value="—" hint="Coming soon" />
-          <MetricCard label="Forecast LTV 12M" value="—" hint="Coming soon" />
-          <MetricCard label="Forecast ROAS 6M" value="—" hint="Coming soon" />
+          <MetricCard
+            label="Forecast LTV 3M"
+            value={forecastSnapshot.ltvP3 != null ? formatCurrency(forecastSnapshot.ltvP3) : "—"}
+            hint="Contribution LTV: cumulative payment-net per trial by month 3."
+          />
+          <MetricCard
+            label="Forecast LTV 6M"
+            value={forecastSnapshot.ltvP6 != null ? formatCurrency(forecastSnapshot.ltvP6) : "—"}
+            hint="Cumulative payment-net per trial by month 6."
+          />
+          <MetricCard
+            label="Forecast LTV 12M"
+            value={forecastSnapshot.ltvP12 != null ? formatCurrency(forecastSnapshot.ltvP12) : "—"}
+            hint="Cumulative payment-net per trial over the full 12-period horizon."
+          />
+          <MetricCard
+            label="Forecast ROAS 6M"
+            value={forecastSnapshot.roasP6 != null ? forecastSnapshot.roasP6.toFixed(2) : "—"}
+            hint="Projected gross revenue through month 6 / traffic cash outflow."
+          />
         </div>
       </section>
     </AppLayout>

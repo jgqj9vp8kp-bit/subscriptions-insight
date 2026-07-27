@@ -32,6 +32,7 @@ import {
   type RevenueStreamKey,
 } from "./funnelEconomicsTypes.ts";
 import { prepareRuntimeInputs, type RuntimeForecastInputs } from "./funnelEconomicsStrategies.ts";
+import { firstCrossingIndex } from "./financialPrimitives.ts";
 
 // ---- Validation ------------------------------------------------------------------
 
@@ -189,9 +190,6 @@ export function runFunnelEconomics(runtime: RuntimeForecastInputs): ForecastResu
   let trialRevenueTotal = 0;
   let subscriptionRevenueTotal = 0;
   let tokenRevenueTotal = 0;
-  let paybackPeriodIndex: number | null = null;
-  let paybackDay: number | null = null;
-
   for (let t = 0; t < n; t += 1) {
     const period = periods[t];
     const bills = period.billingEvent === "on_period_start";
@@ -237,10 +235,6 @@ export function runFunnelEconomics(runtime: RuntimeForecastInputs): ForecastResu
 
     const dayStart = dayCursor;
     dayCursor += period.durationDays;
-    if (paybackPeriodIndex === null && cumulativePaymentNet >= trafficCashOutflow) {
-      paybackPeriodIndex = t;
-      paybackDay = dayCursor;
-    }
 
     rows.push({
       index: t,
@@ -268,6 +262,14 @@ export function runFunnelEconomics(runtime: RuntimeForecastInputs): ForecastResu
   const paymentCostsTotal = stripeTotal + refundTotal + providerTotal;
   const paymentNetRevenueTotal = cumulativePaymentNet;
   const contributionProfit = paymentNetRevenueTotal - trafficCashOutflow;
+
+  // Payback = first period whose cumulative payment-net reaches the traffic cash
+  // outflow (shared crossing primitive; the cumulative series is non-decreasing).
+  const paybackPeriodIndex = firstCrossingIndex(
+    rows.map((row) => row.cumulativePaymentNetRevenue),
+    trafficCashOutflow,
+  );
+  const paybackDay = paybackPeriodIndex === null ? null : rows[paybackPeriodIndex].dayEnd;
 
   const performanceBonus = bonusEvaluator({
     plannedBudget: a.traffic.plannedBudget,

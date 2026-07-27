@@ -121,6 +121,52 @@ function PlanInput({ label, value, seeded, provenance, onChange, suffix }: {
   );
 }
 
+// Export the projection table (period rows + totals) as CSV/XLSX, mirroring the
+// Cohorts-page export pattern (BOM for Excel, dynamic xlsx import).
+function buildPlanExportTable(result: ForecastResult): { headers: string[]; rows: Array<Array<string | number>> } {
+  const headers = [
+    "Period", "Users", "Cumulative retention", "Trial revenue", "Subscription revenue", "Upsell revenue",
+    "Token revenue", "Gross revenue", "Stripe", "Refunds", "Provider", "Payment-net", "Cumulative payment-net", "Cash flow",
+  ];
+  const rows = result.timeline.periods.map((row) => [
+    row.label, row.users, row.cumulativeRetention, row.revenue.trial, row.revenue.subscription, row.revenue.upsell,
+    row.revenue.token, row.revenue.gross, row.costs.stripe, row.costs.refund, row.costs.provider,
+    row.paymentNetRevenue, row.cumulativePaymentNetRevenue, row.cashFlowBalance,
+  ]);
+  rows.push([
+    "TOTAL", result.metrics.trials, "", result.revenue.trialTotal, result.revenue.subscriptionTotal, result.revenue.upsellTotal,
+    result.revenue.tokenTotal, result.revenue.grossTotal, result.costs.stripeTotal, result.costs.refundTotal,
+    result.costs.providerTotal, result.profitability.paymentNetRevenueTotal, result.profitability.paymentNetRevenueTotal,
+    result.payback.finalCashFlowBalance,
+  ]);
+  return { headers, rows };
+}
+
+async function exportPlanTable(result: ForecastResult, format: "csv" | "xlsx"): Promise<void> {
+  const table = buildPlanExportTable(result);
+  const stamp = new Date().toISOString().slice(0, 10);
+  if (format === "csv") {
+    const escape = (value: string | number) => {
+      const text = String(value);
+      return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+    };
+    const csv = [table.headers, ...table.rows].map((row) => row.map(escape).join(",")).join("\n");
+    const blob = new Blob(["﻿", csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `forecast-plan-${stamp}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+    return;
+  }
+  const XLSX = await import("xlsx");
+  const sheet = XLSX.utils.aoa_to_sheet([table.headers, ...table.rows]);
+  const book = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(book, sheet, "Forecast");
+  XLSX.writeFile(book, `forecast-plan-${stamp}.xlsx`);
+}
+
 const fmtMoney = (value: number | null | undefined) => (value == null ? "—" : formatCurrency(value));
 const fmtInt = (value: number) => Math.round(value).toLocaleString("en-US");
 const fmtPctValue = (value: number | null | undefined, digits = 1) => (value == null ? "—" : `${(value * 100).toFixed(digits)}%`);
@@ -562,7 +608,13 @@ export function PlanMode() {
 
           {/* -------- Period table -------- */}
           <Card className="p-4 shadow-card">
-            <h3 className="mb-3 text-sm font-semibold">Projection by period</h3>
+            <div className="mb-3 flex items-center justify-between">
+              <h3 className="text-sm font-semibold">Projection by period</h3>
+              <div className="flex gap-2">
+                <Button variant="outline" size="sm" onClick={() => void exportPlanTable(result, "csv")}>Export CSV</Button>
+                <Button variant="outline" size="sm" onClick={() => void exportPlanTable(result, "xlsx")}>Export XLSX</Button>
+              </div>
+            </div>
             <div className="overflow-x-auto">
               <Table>
                 <TableHeader>
