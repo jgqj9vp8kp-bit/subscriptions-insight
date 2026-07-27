@@ -305,15 +305,34 @@ export function PlanMode() {
       }));
   }, [cohorts, campaignPath, trafficByKey, ui.windowDays, asOf]);
 
+  const periodDays = ui.cadence === "weekly" ? 7 : 30;
+
   const seed = useMemo(
     () => deriveFunnelActualsFromCohortRows({
       funnelId: campaignPath || "(none)",
       rows: seedRows,
       asOf,
-      periodDays: ui.cadence === "weekly" ? 7 : 30,
+      periodDays,
     }),
-    [campaignPath, seedRows, asOf, ui.cadence],
+    [campaignPath, seedRows, asOf, periodDays],
   );
+
+  // A short window cannot observe a long renewal: picking "last 60 days" silently
+  // drops observed retention (5 periods -> 2 on real data) and the rest becomes
+  // extrapolation. Derive the depth the FULL history would give so the cost of the
+  // window choice is visible instead of silent. (Which window should be canonical
+  // is an open business question — this only reports, it does not decide.)
+  const depthWithFullHistory = useMemo(() => {
+    const allRows = cohorts
+      .filter((cohort) => cohort.campaign_path === campaignPath)
+      .map((cohort) => ({
+        ...cohort,
+        fb_spend: cohort.fb_spend ?? trafficByKey.get(cohortTrafficKey(cohort))?.spend ?? undefined,
+      }));
+    return deriveFunnelActualsFromCohortRows({ funnelId: campaignPath || "(none)", rows: allRows, asOf, periodDays })
+      .actuals?.observedRetentionDepth ?? 0;
+  }, [cohorts, campaignPath, trafficByKey, asOf, periodDays]);
+  const windowCostsDepth = Math.max(0, depthWithFullHistory - (seed.actuals?.observedRetentionDepth ?? 0));
 
   const plan = useMemo(() => {
     const budget = parseNum(ui.budget);
@@ -482,6 +501,11 @@ export function PlanMode() {
           </Badge>
           {warehouse.error && (
             <span className="text-warning">Warehouse seed unavailable: {warehouse.error}</span>
+          )}
+          {windowCostsDepth > 0 && (
+            <span className="text-warning">
+              This window observes {windowCostsDepth} fewer retention {windowCostsDepth === 1 ? "period" : "periods"} than the full history — widen it to extrapolate less.
+            </span>
           )}
           {plan.warnings.map((warning) => (
             <Badge key={warning.code + warning.message.slice(0, 12)} variant="outline" className="text-[10px] font-normal text-warning border-warning/40">{warning.code}</Badge>
