@@ -158,8 +158,15 @@ export function deriveFunnelActualsFromCohortRows(input: {
   // Prices from realized revenue.
   const trialRevenue = sumPresent(rows, (row) => row.trial_revenue);
   const trialPriceActual = trialRevenue.present && trials > 0 ? trialRevenue.sum / trials : null;
+  // Price is an average per payer and must NOT be maturity-gated: numerator and
+  // denominator have to cover the same cohorts. Dividing all-cohort revenue by the
+  // gated payer count inflated the price (a $29 plan read as $728 when most
+  // cohorts were younger than one period).
   const firstSubRevenue = sumPresent(rows, (row) => row.first_subscription_revenue);
-  const subPriceActual = firstSubRevenue.present && firstSub.sum > 0 ? firstSubRevenue.sum / firstSub.sum : null;
+  const firstSubAll = sumPresent(rows, (row) => row.first_subscription_users);
+  const subPriceActual = firstSubRevenue.present && firstSubAll.sum > 0
+    ? firstSubRevenue.sum / firstSubAll.sum
+    : null;
 
   // Upsell tiers: tiered fields when present, else one blended tier.
   const upsellTiersActual: FunnelActuals["upsellTiersActual"] = [];

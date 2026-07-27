@@ -320,3 +320,38 @@ describe("buildForecastSnapshotFromCohortRows (Dashboard consumer)", () => {
     expect(snapshot.trials).toBe(0);
   });
 });
+
+describe("price derivation is not maturity-gated (regression)", () => {
+  it("young cohorts contribute to both numerator and denominator of the sub price", () => {
+    // ROW_A/ROW_B are mature (April); this one is a week old — its first-sub
+    // revenue and payers must BOTH count, or the price inflates.
+    const young: CohortRowLike = {
+      cohort_date: "2026-07-20",
+      trial_users: 500,
+      first_subscription_users: 200,
+      first_subscription_revenue: 5800, // 200 × $29
+      renewal_users_by_level: { 2: 0 },
+    };
+    const { actuals } = derive([ROW_A, ROW_B, young]);
+    const facts = actuals as FunnelActuals;
+    // (1160 + 1334 + 5800) / (40 + 46 + 200) = 8294 / 286 = $29.00
+    expect(facts.subPriceActual).toBeCloseTo(29, 6);
+    // The conversion chain stays maturity-gated and ignores the young cohort.
+    expect(facts.firstPaidConversion).toBeCloseTo(0.43, 9);
+  });
+
+  it("a plausible plan price comes out of a realistic young-heavy funnel", () => {
+    // 1 mature cohort + 9 young ones, all selling the same $29 plan.
+    const rows: CohortRowLike[] = [
+      { cohort_date: "2026-04-01", trial_users: 100, first_subscription_users: 40, first_subscription_revenue: 1160 },
+      ...Array.from({ length: 9 }, (_, index) => ({
+        cohort_date: `2026-07-${String(10 + index).padStart(2, "0")}`,
+        trial_users: 100,
+        first_subscription_users: 40,
+        first_subscription_revenue: 1160,
+      })),
+    ];
+    const facts = derive(rows).actuals as FunnelActuals;
+    expect(facts.subPriceActual).toBeCloseTo(29, 6);
+  });
+});
