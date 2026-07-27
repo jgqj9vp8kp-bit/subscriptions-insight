@@ -39,6 +39,8 @@ import {
   type Provenance,
   type ProvenanceMap,
 } from "@/services/funnelEconomics";
+import { saveForecastScenario } from "@/services/forecastScenarios";
+import { addCompareEntry } from "@/components/forecasting/compareStore";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -128,6 +130,61 @@ const CHART_CONFIG: ChartConfig = {
   cumulative: { label: "Cumulative payment-net", color: "hsl(var(--primary))" },
 };
 
+/** Save the frozen snapshot as a named scenario and/or push it into the Compare tab's
+ * working set. The snapshot is fully serializable — what you save is what re-runs. */
+function ScenarioActions({ frozen, funnel, defaultLabel }: {
+  frozen: NonNullable<ReturnType<typeof createFrozenForecastInputs>>;
+  funnel: string;
+  defaultLabel: string;
+}) {
+  const [label, setLabel] = useState("");
+  const [status, setStatus] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const effectiveLabel = label.trim() || defaultLabel;
+
+  const handleAddToComparison = () => {
+    addCompareEntry({
+      id: `plan:${Date.now().toString(36)}`,
+      label: effectiveLabel,
+      frozen,
+      addedAt: new Date().toISOString(),
+    });
+    setStatus(`Added "${effectiveLabel}" to Compare.`);
+  };
+
+  const handleSave = async () => {
+    setSaving(true);
+    setStatus(null);
+    try {
+      await saveForecastScenario({
+        name: effectiveLabel,
+        funnelId: funnel,
+        horizonPeriods: frozen.assumptions.pricing.schedule.periods.length,
+        frozen,
+      });
+      setStatus(`Saved scenario "${effectiveLabel}".`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Could not save the scenario.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Card className="p-4 shadow-card">
+      <div className="flex flex-wrap items-end gap-3">
+        <div className="min-w-[260px] flex-1 space-y-1">
+          <Label className="text-xs text-muted-foreground">Scenario name</Label>
+          <Input className="h-8" placeholder={defaultLabel} value={label} onChange={(event) => setLabel(event.target.value)} />
+        </div>
+        <Button variant="outline" size="sm" onClick={handleAddToComparison}>Add to comparison</Button>
+        <Button size="sm" onClick={handleSave} disabled={saving}>{saving ? "Saving…" : "Save scenario"}</Button>
+        {status && <span className="text-xs text-muted-foreground">{status}</span>}
+      </div>
+    </Card>
+  );
+}
+
 export function PlanMode() {
   const txs = useTransactions();
   const subscriptions = useDataStore((state) => state.subscriptions);
@@ -159,14 +216,19 @@ export function PlanMode() {
   }, [cohorts, funnel, trafficByKey, ui.windowDays, asOf]);
 
   const seed = useMemo(
-    () => deriveFunnelActualsFromCohortRows({ funnelId: funnel || "(none)", rows: seedRows, asOf }),
-    [funnel, seedRows, asOf],
+    () => deriveFunnelActualsFromCohortRows({
+      funnelId: funnel || "(none)",
+      rows: seedRows,
+      asOf,
+      periodDays: ui.cadence === "weekly" ? 7 : 30,
+    }),
+    [funnel, seedRows, asOf, ui.cadence],
   );
 
   const plan = useMemo(() => {
     const budget = parseNum(ui.budget);
     if (budget === undefined || budget <= 0) {
-      return { error: "Enter a planned budget (USD) to run the projection.", result: null, provenance: {} as ProvenanceMap, assumptions: null, warnings: [] };
+      return { error: "Enter a planned budget (USD) to run the projection.", result: null, provenance: {} as ProvenanceMap, assumptions: null, frozen: null, warnings: [] };
     }
     const overrides: AssumptionPatch = {};
     const stripePct = parsePct(ui.stripePct);
@@ -246,10 +308,10 @@ export function PlanMode() {
         },
       });
       const result = runFrozenForecast(frozen);
-      return { error: null, result, provenance: built.provenance, assumptions: built.assumptions, warnings: [...seed.warnings, ...built.warnings, ...result.warnings.map((warning) => ({ code: warning.code, message: warning.message }))] };
+      return { error: null, result, provenance: built.provenance, assumptions: built.assumptions, frozen, warnings: [...seed.warnings, ...built.warnings, ...result.warnings.map((warning) => ({ code: warning.code, message: warning.message }))] };
     } catch (error) {
       if (error instanceof ForecastInputError) {
-        return { error: error.message, result: null, provenance: {} as ProvenanceMap, assumptions: null, warnings: seed.warnings };
+        return { error: error.message, result: null, provenance: {} as ProvenanceMap, assumptions: null, frozen: null, warnings: seed.warnings };
       }
       throw error;
     }
@@ -335,6 +397,14 @@ export function PlanMode() {
         <Card className="border-warning/50 p-4 text-sm text-warning shadow-card">
           {plan.error}
         </Card>
+      )}
+
+      {plan.frozen && (
+        <ScenarioActions
+          frozen={plan.frozen}
+          funnel={funnel}
+          defaultLabel={`${funnel} · ${ui.cadence} · $${ui.budget}`}
+        />
       )}
 
       {result && assumptions && (

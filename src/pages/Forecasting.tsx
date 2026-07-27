@@ -12,6 +12,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { PlanMode } from "@/components/forecasting/PlanMode";
+import { CompareMode } from "@/components/forecasting/CompareMode";
 import { ChartContainer, ChartTooltip, ChartTooltipContent, type ChartConfig } from "@/components/ui/chart";
 import { cn } from "@/lib/utils";
 import { useTransactions } from "@/services/sheets";
@@ -387,10 +388,14 @@ export default function ForecastingPage() {
       <Tabs defaultValue="plan" className="space-y-4">
         <TabsList>
           <TabsTrigger value="plan">Plan</TabsTrigger>
+          <TabsTrigger value="compare">Compare</TabsTrigger>
           <TabsTrigger value="actuals">Actuals</TabsTrigger>
         </TabsList>
         <TabsContent value="plan" className="mt-0">
           <PlanMode />
+        </TabsContent>
+        <TabsContent value="compare" className="mt-0">
+          <CompareMode />
         </TabsContent>
         <TabsContent value="actuals" className="mt-0">
       <TooltipProvider delayDuration={100}>

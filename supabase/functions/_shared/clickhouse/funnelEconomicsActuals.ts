@@ -69,12 +69,19 @@ function sumPresent(rows: CohortRowLike[], pick: (row: CohortRowLike) => number 
   return { sum, present };
 }
 
-/** Pure rollup: cohort rows (one funnel) → immutable FunnelActuals + coverage + warnings. */
+/** Pure rollup: cohort rows (one funnel) → immutable FunnelActuals + coverage + warnings.
+ *
+ * Conversion-chain maturity gating: level k (k=1 → first paid, k≥2 → renewal_k) is
+ * derived ONLY from cohorts old enough to have reached that level (age ≥ k·periodDays).
+ * Without this, week-old cohorts contribute structural zeroes ("nobody renewed yet")
+ * that would be indistinguishable from real churn and poison the survival tail. */
 export function deriveFunnelActualsFromCohortRows(input: {
   funnelId: string;
   rows: CohortRowLike[];
   asOf: string;
   window?: DateWindow | null;
+  /** Length of one billing period in days (monthly 30, weekly 7). Default 30. */
+  periodDays?: number;
 }): Omit<FunnelActualsResult, "sourceMetadata"> {
   const warnings: DataWarning[] = [];
   const rows = input.rows.filter((row) => Number.isFinite(row.trial_users));
@@ -109,18 +116,34 @@ export function deriveFunnelActualsFromCohortRows(input: {
   }
   const cpaActual = spend !== null && spendTrials > 0 ? spend / spendTrials : null;
 
-  // Retention chain: c1 = first-paid conversion; then renewal_N / renewal_{N-1}.
-  const firstSub = sumPresent(rows, (row) => row.first_subscription_users);
-  const firstPaidConversion = firstSub.present && trials > 0 ? firstSub.sum / trials : null;
+  // Retention chain (maturity-gated): c1 = first-paid conversion over cohorts aged
+  // ≥ 1 period; c_k = renewal_k / renewal_{k−1} over the SAME subset of cohorts aged
+  // ≥ k periods. An empty mature subset ends the chain (unobservable ≠ zero); a real
+  // zero among mature cohorts records 0 and ends it (later levels can't exist).
+  const periodDays = input.periodDays ?? 30;
+  const asOfMs = Date.parse(input.asOf);
+  const rowAgeDays = (row: CohortRowLike): number =>
+    Math.floor((asOfMs - Date.parse(`${row.cohort_date}T00:00:00Z`)) / DAY_MS);
+  const matureRows = (level: number): CohortRowLike[] =>
+    rows.filter((row) => rowAgeDays(row) >= level * periodDays);
+
+  const c1Rows = matureRows(1);
+  const c1Trials = c1Rows.reduce((sum, row) => sum + row.trial_users, 0);
+  const firstSub = sumPresent(c1Rows, (row) => row.first_subscription_users);
+  const firstPaidConversion = firstSub.present && c1Trials > 0 ? firstSub.sum / c1Trials : null;
   const renewalConversions: number[] = [];
-  let previousLevelUsers = firstSub.present ? firstSub.sum : 0;
   if (firstSub.present && firstSub.sum > 0) {
     for (let level = 2; level <= MAX_RENEWAL_LEVEL; level += 1) {
-      const current = sumPresent(rows, (row) => renewalUsersAtLevel(row, level));
-      if (!current.present) break; // field absent in the data — not an observed zero
-      renewalConversions.push(previousLevelUsers > 0 ? current.sum / previousLevelUsers : 0);
-      if (current.sum <= 0) break; // real zero: every later level is unobservable
-      previousLevelUsers = current.sum;
+      const subset = matureRows(level);
+      if (subset.length === 0) break; // no cohort is old enough to observe this level yet
+      const previous = level === 2
+        ? sumPresent(subset, (row) => row.first_subscription_users)
+        : sumPresent(subset, (row) => renewalUsersAtLevel(row, level - 1));
+      const current = sumPresent(subset, (row) => renewalUsersAtLevel(row, level));
+      if (!current.present || !previous.present) break; // field absent — not an observed zero
+      if (previous.sum <= 0) break; // nobody reached the prior level in the mature subset
+      renewalConversions.push(current.sum / previous.sum);
+      if (current.sum <= 0) break; // real zero among mature cohorts: chain ends
     }
   }
   const observedRetentionDepth = 1 + (firstPaidConversion !== null ? 1 : 0) + renewalConversions.length;
@@ -230,7 +253,14 @@ export function createCohortRowActualsProvider(deps: {
       const asOf = deps.asOf ?? new Date().toISOString();
       const window = resolveHistoricalWindow(request.windowPolicy, asOf);
       const rows = await deps.loadCohortRows(window, request);
-      const derived = deriveFunnelActualsFromCohortRows({ funnelId: request.funnelId, rows, asOf, window });
+      const periodDaysByCadence: Record<string, number> = { monthly: 30, weekly: 7, quarterly: 90, annual: 365 };
+      const derived = deriveFunnelActualsFromCohortRows({
+        funnelId: request.funnelId,
+        rows,
+        asOf,
+        window,
+        periodDays: request.pricingCadence ? periodDaysByCadence[request.pricingCadence] ?? 30 : 30,
+      });
       return {
         ...derived,
         sourceMetadata: { source: deps.source, generatedAt: asOf, windowResolved: window },

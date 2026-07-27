@@ -14,8 +14,10 @@ import {
 
 const AS_OF = "2026-07-27T00:00:00.000Z";
 
+// Ages vs asOf 2026-07-27: A = 117d, B = 110d → mature through renewal level 3
+// (90d) but NOT level 4 (120d) under the 30-day maturity gating.
 const ROW_A: CohortRowLike = {
-  cohort_date: "2026-05-01",
+  cohort_date: "2026-04-01",
   funnel: "soulmate",
   campaign_path: "soulmate-1-sp",
   trial_users: 100,
@@ -32,7 +34,7 @@ const ROW_A: CohortRowLike = {
 };
 
 const ROW_B: CohortRowLike = {
-  cohort_date: "2026-05-08",
+  cohort_date: "2026-04-08",
   funnel: "soulmate",
   campaign_path: "soulmate-1-sp",
   trial_users: 100,
@@ -61,7 +63,8 @@ describe("deriveFunnelActualsFromCohortRows", () => {
     expect(facts.spend).toBe(2600);
     expect(facts.cpaActual).toBeCloseTo(13, 9);
     expect(facts.firstPaidConversion).toBeCloseTo(0.43, 9);
-    // Chain: c1→2 = 43/86, c2→3 = 22/43; level 4 fields absent → chain stops (not zero).
+    // Chain: c1→2 = 43/86, c2→3 = 22/43; level 4 needs 120-day-old cohorts (none) →
+    // chain stops as unobservable, NOT as zero.
     expect(facts.renewalConversions).toHaveLength(2);
     expect(facts.renewalConversions[0]).toBeCloseTo(0.5, 9);
     expect(facts.renewalConversions[1]).toBeCloseTo(22 / 43, 9);
@@ -73,7 +76,7 @@ describe("deriveFunnelActualsFromCohortRows", () => {
     expect(facts.upsellTiersActual[0].price).toBeCloseTo(14.98, 6);
     expect(facts.tokenArpuPerTrialActual).toBeCloseTo(0.4, 9);
     expect(facts.refundRateActual).toBeCloseTo(0.1, 9);
-    expect(facts.maturityDays).toBe(87);
+    expect(facts.maturityDays).toBe(117);
     expect(coverage.spendCoverage).toBe(1);
     expect(warnings.map((warning) => warning.code)).not.toContain("spend_unavailable");
   });
@@ -103,6 +106,29 @@ describe("deriveFunnelActualsFromCohortRows", () => {
     ]);
     const facts = actuals as FunnelActuals;
     expect(facts.renewalConversions).toEqual([0]);
+  });
+
+  it("young cohorts are excluded from conversion levels they cannot have reached", () => {
+    // A week-old cohort with 1000 trials and (structurally) zero conversions must
+    // not drag c1 down or terminate the renewal chain with a fake zero.
+    const young: CohortRowLike = {
+      cohort_date: "2026-07-20",
+      trial_users: 1000,
+      first_subscription_users: 0,
+      renewal_users_by_level: { 2: 0, 3: 0 },
+    };
+    const { actuals } = derive([ROW_A, ROW_B, young]);
+    const facts = actuals as FunnelActuals;
+    expect(facts.trials).toBe(1200); // volume still counts everything
+    expect(facts.firstPaidConversion).toBeCloseTo(0.43, 9); // young row gated out of c1
+    expect(facts.renewalConversions).toHaveLength(2);
+    expect(facts.renewalConversions[1]).toBeCloseTo(22 / 43, 9);
+  });
+
+  it("weekly period gating uses 7-day steps", () => {
+    // With periodDays=7 the same April cohorts are mature far beyond level 3.
+    const result = deriveFunnelActualsFromCohortRows({ funnelId: "f", rows: [ROW_A, ROW_B], asOf: AS_OF, periodDays: 7 });
+    expect((result.actuals as FunnelActuals).renewalConversions).toHaveLength(2);
   });
 
   it("flags low volume and shallow retention", () => {
