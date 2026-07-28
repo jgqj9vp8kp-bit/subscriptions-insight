@@ -48,6 +48,42 @@ function queryParams(params: Record<string, unknown> | undefined): URLSearchPara
   return search;
 }
 
+// ---- transient-failure handling -------------------------------------------------
+//
+// ClickHouse Cloud idles a service and resets connections while it wakes, so a
+// perfectly healthy warehouse regularly answers the first request with
+// "Connection reset by peer (os error 104)". A single fetch turned that into a
+// hard failure: every page dropped to the legacy client-side engine for the whole
+// session. Reads are retried with backoff so the wake-up heals itself.
+//
+// WRITES ARE NOT RETRIED. A reset can arrive after the server already accepted the
+// body, so re-sending an INSERT could duplicate rows (fact_support_requests in
+// particular has a sorting key that does not collapse re-inserts). Sync callers
+// already own resumable cursors — a failed write is safer surfaced than repeated.
+
+const READ_RETRY_ATTEMPTS = 3;
+const RETRY_BASE_DELAY_MS = 400;
+/** Statuses worth retrying: gateway/availability, never 4xx (auth, bad SQL). */
+const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** HTTP-level failure — carries the status so the retry decision stays explicit. */
+class ClickHouseHttpError extends Error {
+  constructor(readonly status: number, body: string) {
+    super(`ClickHouse HTTP ${status}: ${body.slice(0, 500)}`);
+    this.name = "ClickHouseHttpError";
+  }
+}
+
+/** The raw fetch error embeds the full endpoint URL — host, database and every
+ * query parameter (including auth_user_id). Keep the cause, drop the URL. */
+function describeTransport(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  const withoutUrl = raw.replace(/\s*for url \([^)]*\)/i, "").replace(/https?:\/\/\S+/g, "").trim();
+  return withoutUrl || "connection failed";
+}
+
 class FetchClickHouseResultSet implements ClickHouseResultSet {
   constructor(private readonly responseText: string, private readonly format?: string) {}
 
@@ -68,30 +104,46 @@ export class FetchClickHouseClient implements ClickHouseClientLike {
     this.database = input.database;
   }
 
-  private async request(query: string, params?: Record<string, unknown>): Promise<string> {
+  /** `attempts` > 1 only for reads — see the note above on write safety. */
+  private async request(query: string, params?: Record<string, unknown>, attempts = 1): Promise<string> {
     const url = new URL("/", this.endpoint);
     url.searchParams.set("database", this.database);
     const parameterSearch = queryParams(params);
     parameterSearch.forEach((value, key) => url.searchParams.set(key, value));
 
-    const response = await fetch(url.toString(), {
-      method: "POST",
-      headers: {
-        Authorization: this.authHeader,
-        "Content-Type": "text/plain; charset=utf-8",
-      },
-      body: query,
-    });
-    const text = await response.text();
-    if (!response.ok) {
-      throw new Error(`ClickHouse HTTP ${response.status}: ${text.slice(0, 500)}`);
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      let retryable: boolean;
+      try {
+        const response = await fetch(url.toString(), {
+          method: "POST",
+          headers: {
+            Authorization: this.authHeader,
+            "Content-Type": "text/plain; charset=utf-8",
+          },
+          body: query,
+        });
+        const text = await response.text();
+        if (response.ok) return text;
+        lastError = new ClickHouseHttpError(response.status, text);
+        retryable = RETRYABLE_STATUS.has(response.status);
+      } catch (error) {
+        // Never reached the server (DNS/TLS/connection reset) — always worth a retry.
+        lastError = new Error(`ClickHouse unreachable: ${describeTransport(error)}`);
+        retryable = true;
+      }
+      if (!retryable || attempt === attempts) break;
+      await sleep(RETRY_BASE_DELAY_MS * attempt);
     }
-    return text;
+    const failure = lastError instanceof Error ? lastError : new Error(String(lastError));
+    if (attempts > 1) failure.message = `${failure.message} (after ${attempts} attempts)`;
+    throw failure;
   }
 
   async query(input: { query: string; query_params?: Record<string, unknown>; format?: string }): Promise<ClickHouseResultSet> {
     const query = appendFormat(input.query, input.format);
-    const text = await this.request(query, input.query_params);
+    // Reads are pure: retrying is always safe and covers the idle-wake reset.
+    const text = await this.request(query, input.query_params, READ_RETRY_ATTEMPTS);
     return new FetchClickHouseResultSet(text, input.format);
   }
 
