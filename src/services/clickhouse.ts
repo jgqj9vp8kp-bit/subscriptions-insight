@@ -567,6 +567,9 @@ export interface ClickHouseValidationProgress {
   parity_status: string | null;
   source: AggregateLike | null;
   clickhouse: AggregateLike | null;
+  /** When this run started / finished — a stale verdict must be recognisable. */
+  started_at?: string | null;
+  completed_at?: string | null;
   duration_ms: number;
   completed: boolean;
   diagnostics: ClickHouseValidationDiagnostics | null;

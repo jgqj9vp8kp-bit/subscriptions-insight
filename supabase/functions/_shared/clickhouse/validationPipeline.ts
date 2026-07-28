@@ -100,6 +100,10 @@ export interface ValidationResponse {
   parity_status: string | null;
   source: AggregateSnapshot | null;
   clickhouse: AggregateSnapshot | null;
+  /** When this validation run started / finished. Without them a verdict from
+   * weeks ago is indistinguishable from one produced a minute ago. */
+  started_at: string | null;
+  completed_at: string | null;
   duration_ms: number;
   completed: boolean;
   diagnostics: ValidationChunkDiagnostics | null;
@@ -658,6 +662,8 @@ function toResponse(
       parity_status: null,
       source: null,
       clickhouse: null,
+      started_at: null,
+      completed_at: null,
       duration_ms: durationMs,
       completed: false,
       diagnostics,
@@ -695,6 +701,8 @@ function toResponse(
     parity_status: state.parity_status,
     source: completed ? state.source_aggregates : null,
     clickhouse: completed ? state.clickhouse_aggregates : null,
+    started_at: state.started_at,
+    completed_at: state.completed_at,
     duration_ms: durationMs,
     completed,
     diagnostics,

@@ -21,6 +21,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useToast } from "@/hooks/use-toast";
+import { validationStaleness } from "@/services/validationStaleness";
 import { CampaignIdSplitDiagnostics } from "@/components/CampaignIdSplitDiagnostics";
 import { ExportApiHealth } from "@/components/ExportApiHealth";
 import {
@@ -158,6 +159,19 @@ export default function IntegrationsPage() {
   const [clickHouseSummary, setClickHouseSummary] = useState<ClickHouseSummary | null>(null);
   const [clickHouseLastBackfill, setClickHouseLastBackfill] = useState<ClickHouseBackfillResult | null>(null);
   const [clickHouseValidation, setClickHouseValidation] = useState<ClickHouseValidationProgress | null>(null);
+  // The validation verdict survives until the next run — surface how old it is and
+  // whether the source has grown past what was actually checked.
+  const clickHouseValidationStaleness = useMemo(
+    () =>
+      validationStaleness({
+        completedAt: clickHouseValidation?.completed_at,
+        startedAt: clickHouseValidation?.started_at,
+        status: clickHouseValidation?.status,
+        validatedRows: clickHouseValidation?.source_rows ?? null,
+        currentSourceRows: clickHouseSummary?.sync_state?.source_total ?? null,
+      }),
+    [clickHouseValidation, clickHouseSummary],
+  );
   const [clickHouseValidationRunning, setClickHouseValidationRunning] = useState(false);
   const clickHouseValidationStopRef = useRef(false);
   const clickHouseValidationInFlightRef = useRef(false);
@@ -381,9 +395,19 @@ export default function IntegrationsPage() {
         setClickHouseValidation(progress);
 
         if (progress.completed || progress.status === "completed") {
+          // "Continue" on an already-completed run returns the stored verdict
+          // untouched, so this toast can be replaying a result from weeks ago. Say
+          // when it was produced instead of letting it read as a fresh finding.
+          const replayed = validationStaleness({
+            completedAt: progress.completed_at,
+            startedAt: progress.started_at,
+            status: progress.status,
+            validatedRows: progress.source_rows ?? null,
+            currentSourceRows: clickHouseSummary?.sync_state?.source_total ?? null,
+          });
           toast({
-            title: `Validation ${progress.parity_status ?? "completed"}`,
-            description: `${formatNumber(progress.source_rows)} source rows · missing ${progress.missing_ids ?? 0} · extra ${progress.extra_ids ?? 0} · duplicates ${progress.duplicate_ids ?? 0}.`,
+            title: `Validation ${progress.parity_status ?? "completed"}${replayed ? ` (${replayed.ageLabel})` : ""}`,
+            description: `${formatNumber(progress.source_rows)} source rows · missing ${progress.missing_ids ?? 0} · extra ${progress.extra_ids ?? 0} · duplicates ${progress.duplicate_ids ?? 0}.${replayed?.sourceGrew ? ` Source now has ${formatNumber(replayed.currentRows)} rows — re-run to re-check.` : ""}`,
             variant: progress.parity_status === "PASS" ? undefined : "destructive",
           });
           break;
@@ -663,6 +687,7 @@ export default function IntegrationsPage() {
             <div><span className="text-xs text-muted-foreground">Last sync</span><div className="text-sm font-medium">{formatDateTime(clickHouseSummary?.sync_state?.finished_at ?? null)}</div></div>
             <div><span className="text-xs text-muted-foreground">Duration</span><div className="text-sm font-medium">{clickHouseSummary?.sync_state?.duration_ms == null ? "-" : `${clickHouseSummary.sync_state.duration_ms} ms`}</div></div>
             <div><span className="text-xs text-muted-foreground">Validation</span><div className="text-sm font-medium">{clickHouseValidation?.parity_status ?? clickHouseSummary?.sync_state?.parity_status ?? "Never run"}</div></div>
+            <div><span className="text-xs text-muted-foreground">Validated at</span><div className="text-sm font-medium">{formatDateTime(clickHouseValidation?.completed_at ?? clickHouseValidation?.started_at ?? null)}</div></div>
             <div><span className="text-xs text-muted-foreground">Validation status</span><div className="text-sm font-medium">{clickHouseValidation?.status ?? "-"}</div></div>
             <div><span className="text-xs text-muted-foreground">Validation stage</span><div className="text-sm font-medium">{clickHouseValidation?.stage ?? "-"}</div></div>
             <div><span className="text-xs text-muted-foreground">Rows processed / expected</span><div className="text-sm font-medium">{formatNumber(clickHouseValidation?.rows_processed)} / {formatNumber(clickHouseValidation?.source_rows_expected ?? null)}</div></div>
@@ -678,6 +703,18 @@ export default function IntegrationsPage() {
             <div><span className="text-xs text-muted-foreground">Net difference</span><div className="text-sm font-medium">{formatMoney(clickHouseValidation?.net_difference ?? null)}</div></div>
             <div><span className="text-xs text-muted-foreground">Refund difference</span><div className="text-sm font-medium">{formatMoney(clickHouseValidation?.refund_difference ?? null)}</div></div>
           </div>
+
+          {/* A completed validation keeps its verdict until the next run, so a FAIL
+              from weeks ago reads as if it described the warehouse right now. Say how
+              old it is, and whether the source has moved on since. */}
+          {clickHouseValidationStaleness && (
+            <div className="mt-3 rounded-md border border-warning/40 bg-warning/10 p-3 text-xs text-warning">
+              This validation result is from {clickHouseValidationStaleness.ageLabel} ({formatDateTime(clickHouseValidationStaleness.at)})
+              {clickHouseValidationStaleness.sourceGrew
+                ? ` — the source has grown from ${formatNumber(clickHouseValidationStaleness.validatedRows)} to ${formatNumber(clickHouseValidationStaleness.currentRows)} rows since, so it no longer describes the warehouse.`
+                : " — re-run it to check the warehouse as it is now."}
+            </div>
+          )}
 
           {(clickHouseHealth?.error || clickHouseSummary?.error || clickHouseSummary?.sync_state?.last_error) && (
             <div className="mt-3 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-xs text-destructive">
