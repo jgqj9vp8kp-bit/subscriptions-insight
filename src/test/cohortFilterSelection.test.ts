@@ -2,7 +2,7 @@
 // and scope-freshness guarantees the pruner depends on.
 
 import { describe, expect, it } from "vitest";
-import { pruneInvalidCohortSelections, type CohortFilterSelection } from "@/services/cohortFilterSelection";
+import { pruneLegacyCampaignPathSelection, pruneInvalidCohortSelections, type CohortFilterSelection } from "@/services/cohortFilterSelection";
 import { cohortsListKey, normalizeCohortRequest } from "@/services/cohortsCache";
 import type { CohortFilterOptionsView } from "@/services/cohortsDataSource";
 import type { CardType, MediaBuyer } from "@/services/types";
@@ -163,5 +163,31 @@ describe("cohorts options cache key", () => {
     const us = JSON.stringify(cohortsListKey({ ...base, request: req({ campaign_path: ["soulmate-sketch"], country: ["US"] }) }));
     const ca = JSON.stringify(cohortsListKey({ ...base, request: req({ campaign_path: ["soulmate-sketch"], country: ["CA"] }) }));
     expect(us).not.toEqual(ca);
+  });
+});
+
+describe("pruneLegacyCampaignPathSelection (client-compute path)", () => {
+  it("keeps the selection while the option list is still empty (data not loaded yet)", () => {
+    // Regression: the legacy cohorts are empty while the transaction store hydrates.
+    // Pruning against that empty list wiped the campaign-path selection the moment
+    // the user picked one, and the report then showed every path instead.
+    expect(pruneLegacyCampaignPathSelection(["palm-reading"], [])).toBeNull();
+  });
+
+  it("returns null when every selected path is still offered (no needless update)", () => {
+    expect(pruneLegacyCampaignPathSelection(["palm-reading"], ["palm-reading", "soulmate-sketch"])).toBeNull();
+  });
+
+  it("drops only the paths that are genuinely absent", () => {
+    expect(pruneLegacyCampaignPathSelection(["palm-reading", "gone"], ["palm-reading", "soulmate-sketch"]))
+      .toEqual(["palm-reading"]);
+  });
+
+  it("clears a selection that is entirely absent from a non-empty list", () => {
+    expect(pruneLegacyCampaignPathSelection(["gone"], ["palm-reading"])).toEqual([]);
+  });
+
+  it("no selection means nothing to prune", () => {
+    expect(pruneLegacyCampaignPathSelection([], ["palm-reading"])).toBeNull();
   });
 });

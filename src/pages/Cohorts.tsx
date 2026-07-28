@@ -53,7 +53,7 @@ import {
 } from "@/services/fbCohortFormatting";
 import { useFbWarehouseStatus } from "@/hooks/useFbWarehouse";
 import { buildCohortsExportTable, cohortsTableToCsv } from "@/services/cohortsExport";
-import { pruneInvalidCohortSelections } from "@/services/cohortFilterSelection";
+import { pruneInvalidCohortSelections, pruneLegacyCampaignPathSelection } from "@/services/cohortFilterSelection";
 import { listFunnels } from "@/services/funnels";
 import type { CohortRequest } from "../../supabase/functions/_shared/clickhouse/cohortContract";
 import type { FbAllocationStatus, FbTimezoneSource } from "../../supabase/functions/_shared/clickhouse/fbCohortStats";
@@ -1749,13 +1749,23 @@ export default function CohortsPage() {
   // Legacy path only: the ClickHouse path prunes every dimension together in the
   // cascading pruner below (which additionally waits for the CURRENT scope's
   // options, so a keepPreviousData list can never clear a valid selection).
+  //
+  // The legacy option list is derived from the in-memory cohorts, which are EMPTY
+  // while the transaction store is still hydrating. Pruning against that empty list
+  // wiped the user's campaign-path selection the moment they picked one — the report
+  // then silently showed every path. An empty option list means "not loaded yet",
+  // never "this selection is invalid", so only prune once options actually exist.
   useEffect(() => {
     if (clickHouseDriving) return;
-    if (!selectedCampaignPaths.length) return;
-    const next = selectedCampaignPaths.filter((path) => campaignPathOptions.includes(path));
-    if (next.length === selectedCampaignPaths.length && (!legacyCampaignPathFilter || legacyCampaignPathFilter === "all")) return;
+    const next = pruneLegacyCampaignPathSelection(selectedCampaignPaths, campaignPathOptions);
+    const needsMirrorReset = Boolean(legacyCampaignPathFilter) && legacyCampaignPathFilter !== "all";
+    if (!next && !needsMirrorReset) return;
     markCohortsUiSettingsUpdated();
-    setUiState((current) => ({ ...current, selectedCampaignPaths: next, campaignPathFilter: "all" }));
+    setUiState((current) => ({
+      ...current,
+      ...(next ? { selectedCampaignPaths: next } : {}),
+      campaignPathFilter: "all",
+    }));
   }, [clickHouseDriving, selectedCampaignPaths, legacyCampaignPathFilter, campaignPathOptions, setUiState]);
   const filteredCohortResult = useMemo(
     () =>

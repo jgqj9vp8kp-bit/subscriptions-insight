@@ -110,3 +110,26 @@ export function pruneInvalidCohortSelections(
 
   return Object.keys(patch).length ? patch : null;
 }
+
+/**
+ * Legacy (client-compute) counterpart for the Campaign path dropdown.
+ *
+ * The legacy option list is derived from the in-memory cohorts, which are EMPTY
+ * while the transaction store is still hydrating. Pruning against that empty list
+ * cleared the user's selection the moment they picked a path, and the report then
+ * silently showed every path instead of the chosen one. Same invariant as the
+ * server pruner above: an empty option list means "not loaded yet", never
+ * "every selection is invalid".
+ *
+ * Returns the surviving selection, or null when nothing should change.
+ */
+export function pruneLegacyCampaignPathSelection(
+  selected: readonly string[],
+  options: readonly string[],
+): string[] | null {
+  if (!selected.length) return null;
+  if (!options.length) return null;
+  const valid = new Set(options);
+  const next = selected.filter((path) => valid.has(path));
+  return next.length === selected.length ? null : next;
+}
