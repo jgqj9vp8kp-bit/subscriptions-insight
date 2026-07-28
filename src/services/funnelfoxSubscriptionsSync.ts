@@ -1,5 +1,6 @@
 import { supabase } from "@/services/supabaseClient";
 import { publicRuntimeConfig } from "@/config/publicRuntimeConfig";
+import { fetchRangesConcurrently } from "@/services/supabasePagination";
 import { normalizeSubscription } from "@/services/subscriptionTransform";
 import type { FunnelFoxSubscriptionRaw, SubscriptionClean } from "@/types/subscriptions";
 import {
@@ -178,16 +179,36 @@ export async function loadFunnelFoxSubscriptions(): Promise<SubscriptionClean[]>
   const client = ensureSupabase();
   const PAGE = 1000;
   const MAX_PAGES = 200; // 200k-row backstop against an unexpected loop.
-  const rows: FunnelFoxSubscriptionRow[] = [];
-  for (let page = 0; page < MAX_PAGES; page += 1) {
-    const from = page * PAGE;
+
+  const fetchPage = async (from: number, to: number): Promise<FunnelFoxSubscriptionRow[]> => {
     const { data, error } = await client
       .from("funnelfox_subscriptions")
       .select("subscription_id, email, normalized_email, raw_list, raw_detail")
       .order("subscription_id", { ascending: true })
-      .range(from, from + PAGE - 1);
+      .range(from, to);
     if (error) throw new Error(`Could not load FunnelFox subscriptions: ${error.message}`);
-    const batch = (data ?? []) as FunnelFoxSubscriptionRow[];
+    return (data ?? []) as FunnelFoxSubscriptionRow[];
+  };
+
+  // ~9k rows = 10 pages; fetching them one after another cost ~6 s of app start.
+  // The order key is the immutable subscription_id, so concurrent ranges are safe.
+  // Sequential walk stays as the fallback when the count is unavailable.
+  const { count, error: countError } = await client
+    .from("funnelfox_subscriptions")
+    .select("subscription_id", { count: "exact", head: true });
+  if (countError == null && typeof count === "number") {
+    const rows = await fetchRangesConcurrently<FunnelFoxSubscriptionRow>({
+      totalRows: Math.min(count, MAX_PAGES * PAGE),
+      pageSize: PAGE,
+      fetchRange: fetchPage,
+    });
+    return rows.map(subscriptionRowToClean);
+  }
+
+  const rows: FunnelFoxSubscriptionRow[] = [];
+  for (let page = 0; page < MAX_PAGES; page += 1) {
+    const from = page * PAGE;
+    const batch = await fetchPage(from, from + PAGE - 1);
     rows.push(...batch);
     if (batch.length < PAGE) break;
   }

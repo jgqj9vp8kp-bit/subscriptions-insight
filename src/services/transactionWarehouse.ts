@@ -4,6 +4,7 @@ import { addCohortFields, backfillTransactionCardTypesFromRawRows, classifyUserT
 import { declineDetailsForTransaction } from "@/services/paymentFailures";
 import { sha256Hex } from "@/services/sha256";
 import { traceAsync, traceEvent, traceRequest } from "@/services/performanceTrace";
+import { fetchRangesConcurrently } from "@/services/supabasePagination";
 import type { TrafficSource, Transaction } from "@/services/types";
 
 export const USE_TRANSACTION_WAREHOUSE = publicRuntimeConfig.useTransactionWarehouse;
@@ -726,7 +727,6 @@ export async function loadWarehouseTransactions(options: {
     const totalRowsExpected = options.totalRowsExpected ?? options.limit ?? null;
     const pagesExpected = totalRowsExpected ? Math.ceil(totalRowsExpected / pageSize) : null;
     const records: WarehouseLoadedRecord[] = [];
-    let pageOffset = offset;
     let pages = 0;
     let rowsDownloaded = 0;
     let hasMore = true;
@@ -746,35 +746,75 @@ export async function loadWarehouseTransactions(options: {
       });
     };
 
-    while (options.limit == null || records.length < options.limit) {
-      const remaining = options.limit == null ? pageSize : Math.min(pageSize, options.limit - records.length);
-      if (remaining <= 0) break;
-
+    const fetchPage = async (from: number, to: number): Promise<WarehouseLoadedRecord[]> => {
       const { data, error } = await traceRequest(
         "supabase.transactions_page",
-        `supabase:transactions:page:${pageOffset}:${remaining}`,
+        `supabase:transactions:page:${from}:${to - from + 1}`,
         () => client
           .from("transactions")
           .select("source,raw_payload,normalized_payload")
           .is("deleted_at", null)
           .order("event_time", { ascending: false })
-          .range(pageOffset, pageOffset + remaining - 1),
-        { table: "transactions", operation: "page", page_size: remaining },
+          .range(from, to),
+        { table: "transactions", operation: "page", page_size: to - from + 1 },
       );
       if (error) throw new Error(`Could not load warehouse transactions: ${error.message}`);
+      return (data ?? []) as WarehouseLoadedRecord[];
+    };
 
-      const sourceRows = (data ?? []) as WarehouseLoadedRecord[];
-      const pageRows = ((data ?? []) as WarehouseLoadedRecord[])
-        .filter((record) => Boolean(record.normalized_payload && typeof record.normalized_payload === "object"));
+    // Sequential pagination made the load scale with round-trips (41 pages = 76 s
+    // measured): fetch the exact row count first, then pull the ranges with a small
+    // worker pool. Falls back to the original sequential walk when the count is
+    // unavailable (older mocks / restricted roles), so behavior never regresses.
+    // The auto-load adapter already counted the table — reuse its number instead of
+    // issuing a second head+count round-trip.
+    let exactCount: number | null = typeof options.totalRowsExpected === "number" ? options.totalRowsExpected : null;
+    let countError: unknown = null;
+    if (exactCount == null) {
+      const counted = await client
+        .from("transactions")
+        .select("id", { count: "exact", head: true })
+        .is("deleted_at", null);
+      exactCount = counted.count ?? null;
+      countError = counted.error ?? null;
+    }
 
-      records.push(...pageRows);
-      pages += 1;
-      rowsDownloaded += sourceRows.length;
-      hasMore = sourceRows.length >= remaining;
-      traceEvent("supabase.transactions_page_completed", { page_rows: pageRows.length, source_rows: sourceRows.length, pages, total_rows: records.length });
-      emit(false, "loading");
-      if (sourceRows.length < remaining) break;
-      pageOffset += remaining;
+    if (countError == null && typeof exactCount === "number") {
+      const available = Math.max(0, exactCount - offset);
+      const totalRows = options.limit == null ? available : Math.min(available, options.limit);
+      const sourceRows = await fetchRangesConcurrently<WarehouseLoadedRecord>({
+        totalRows,
+        pageSize,
+        startOffset: offset,
+        fetchRange: fetchPage,
+        onPage: (completed, totalPages, rowsInPage) => {
+          pages = completed;
+          rowsDownloaded += rowsInPage;
+          hasMore = completed < totalPages;
+          emit(false, "loading");
+        },
+      });
+      for (const record of sourceRows) {
+        if (record.normalized_payload && typeof record.normalized_payload === "object") records.push(record);
+      }
+      traceEvent("supabase.transactions_pages_completed", { mode: "concurrent", pages, source_rows: sourceRows.length, total_rows: records.length });
+    } else {
+      let pageOffset = offset;
+      while (options.limit == null || records.length < options.limit) {
+        const remaining = options.limit == null ? pageSize : Math.min(pageSize, options.limit - records.length);
+        if (remaining <= 0) break;
+        const sourceRows = await fetchPage(pageOffset, pageOffset + remaining - 1);
+        const pageRows = sourceRows
+          .filter((record) => Boolean(record.normalized_payload && typeof record.normalized_payload === "object"));
+        records.push(...pageRows);
+        pages += 1;
+        rowsDownloaded += sourceRows.length;
+        hasMore = sourceRows.length >= remaining;
+        traceEvent("supabase.transactions_page_completed", { page_rows: pageRows.length, source_rows: sourceRows.length, pages, total_rows: records.length });
+        emit(false, "loading");
+        if (sourceRows.length < remaining) break;
+        pageOffset += remaining;
+      }
     }
 
     hasMore = false;
