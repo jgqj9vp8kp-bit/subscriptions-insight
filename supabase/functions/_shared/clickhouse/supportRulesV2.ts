@@ -307,8 +307,14 @@ const NEGATIVE = /scam|fraud|estafa|robbed|angry|terrible|horrible|worst|unautho
 
 /** Cheap language guess. Only three languages matter here (measured: 650 es,
  * 512 en, 5 ru), and "unknown" is an honest answer for a two-word email. */
+/** Placeholders the importer inserted, not words the customer wrote. "<Без
+ * темы>" is the spreadsheet's own "no subject" marker: left in, it made 158
+ * English and Spanish emails look Russian. */
+const PLACEHOLDERS = /<без темы>|\(no subject\)|\(sin asunto\)|sent from (my|yahoo|gmail)[^\n]*/gi;
+
 export function detectLanguageV2(raw: string, folded: string): string {
-  if (/[а-яё]/i.test(raw)) return "ru";
+  const authored = raw.replace(PLACEHOLDERS, " ");
+  if (/[а-яё]/i.test(authored)) return "ru";
   if (/[ñ¿¡]/.test(raw)) return "es";
   const spanish = /\b(no|mi|me|que|por|para|los|las|del|una|cobro|dinero|cuenta|suscripcion|quiero|gracias|hola|favor|pago|tarjeta)\b/;
   const english = /\b(the|my|is|to|and|you|please|charge|money|refund|cancel|subscription|account|thank|help|want)\b/;

@@ -158,6 +158,17 @@ describe("language detection", () => {
     expect(classify("RETRATO", null).language).toBe("unknown");
   });
 
+  it("ignores importer placeholders when reading the language", () => {
+    // Regression: the spreadsheet importer writes "<Без темы>" as its own
+    // "no subject" marker. Counting it as customer text labelled 158 English
+    // and Spanish emails as Russian.
+    expect(classify("<Без темы>", "I would like to cancel my subscription").language).toBe("en");
+    expect(classify("<Без темы>", "El retrato no llegó").language).toBe("es");
+    expect(classify("<Без темы>", "Hello I didn't get the image. Sent from Yahoo Mail for iPhone").language).toBe("en");
+    // A genuinely Russian email is still Russian.
+    expect(classify("Ваше сообщение не доставлено", "Это письмо создано автоматически").language).toBe("ru");
+  });
+
   it("folds accents and case so one pattern covers every spelling", () => {
     expect(foldText("DEVOLUCIÓN  Ya")).toBe("devolucion ya");
     expect(detectLanguageV2("¿Por qué?", foldText("¿Por qué?"))).toBe("es");
