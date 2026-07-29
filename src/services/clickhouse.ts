@@ -245,8 +245,54 @@ async function readFunctionError(error: unknown): Promise<string> {
   return error instanceof Error ? error.message : "ClickHouse Edge Function request failed.";
 }
 
-async function clickHouseRequest<T>(functionName: string, body: Record<string, unknown> = {}): Promise<T> {
+// --- ClickHouse circuit breaker (client-side) ------------------------------
+// While the warehouse itself is down (e.g. the Cloud instance is stopped: TCP
+// connects, TLS resets), every report request still costs a full edge
+// round-trip in which the edge function retries ClickHouse with backoff before
+// failing. On filter-heavy pages each filter change re-keys a query into that
+// doomed round-trip, so the table sat in "Loading…" for tens of seconds before
+// the legacy in-browser engine took over. The breaker remembers the last
+// warehouse-down failure and fails REPORT reads instantly for a cooldown
+// window — the legacy fallback then renders immediately from in-memory data.
+// Maintenance calls (health/init/backfill/validation) are never gated: they
+// must be able to probe the real state. Any successful edge response closes
+// the breaker, so recovery is automatic once the warehouse is back.
+const CLICKHOUSE_BREAKER_COOLDOWN_MS = 45_000;
+let clickHouseBreakerOpenUntil = 0;
+
+export const CLICKHOUSE_UNAVAILABLE_MESSAGE =
+  "ClickHouse warehouse is unavailable right now; reports fall back to the in-browser engine and will retry automatically.";
+
+export function isClickHouseCircuitOpen(): boolean {
+  return Date.now() < clickHouseBreakerOpenUntil;
+}
+
+/** Close the breaker (a request reached the warehouse, or state is stale). */
+export function noteClickHouseReachable(): void {
+  clickHouseBreakerOpenUntil = 0;
+}
+
+/** True for error texts whose shape means "the warehouse itself is
+ * unreachable" (stopped instance, TLS reset, gateway timeouts) rather than a
+ * query/auth/validation problem. Only these open the breaker. */
+export function isWarehouseDownError(message: string): boolean {
+  return /connection reset|connection refused|connection closed|econnreset|econnrefused|etimedout|timed out|timeout|tls|handshake|socket hang|network error|failed to fetch|fetch failed|unavailable|bad gateway|status 50[234]|50[234] /i.test(message);
+}
+
+function openClickHouseCircuit(functionName: string, message: string): void {
+  clickHouseBreakerOpenUntil = Date.now() + CLICKHOUSE_BREAKER_COOLDOWN_MS;
+  traceEvent("clickhouse.circuit_opened", { edge_function: functionName, cooldown_ms: CLICKHOUSE_BREAKER_COOLDOWN_MS, message: message.slice(0, 200) });
+}
+
+async function clickHouseRequest<T>(
+  functionName: string,
+  body: Record<string, unknown> = {},
+  options: { breakerGated?: boolean } = {},
+): Promise<T> {
   if (!supabase) throw new Error("Supabase is not configured.");
+  if (options.breakerGated && isClickHouseCircuitOpen()) {
+    throw new Error(CLICKHOUSE_UNAVAILABLE_MESSAGE);
+  }
   const token = await sessionToken();
   const { data, error } = await traceRequest(`edge.${functionName}`, `edge:${functionName}:${JSON.stringify(body).length}`, () => supabase.functions.invoke(functionName, {
     body,
@@ -257,9 +303,20 @@ async function clickHouseRequest<T>(functionName: string, body: Record<string, u
   });
   if (error) {
     const message = await readFunctionError(error);
+    if (isWarehouseDownError(message)) openClickHouseCircuit(functionName, message);
     throw new Error(`ClickHouse Edge Function failed: ${message}`);
   }
   if (!data || typeof data !== "object") throw new Error("Invalid ClickHouse Edge Function response.");
+  // Some endpoints report failures as 200 + {ok:false,error}: never treat those
+  // as proof the warehouse is reachable, and open the breaker on a down-shaped
+  // embedded error. The health endpoint also answers 200 while disconnected —
+  // testClickHouseConnection closes the breaker only on connected=true.
+  const embedded = (data as { ok?: unknown; error?: unknown }).ok === false ? String((data as { error?: unknown }).error ?? "") : null;
+  if (embedded != null) {
+    if (isWarehouseDownError(embedded)) openClickHouseCircuit(functionName, embedded);
+  } else if (functionName !== CLICKHOUSE_HEALTH_FUNCTION) {
+    noteClickHouseReachable();
+  }
   traceEvent(`edge.${functionName}.response`, {
     edge_function: functionName,
     response_bytes: JSON.stringify(data).length,
@@ -275,7 +332,12 @@ async function clickHouseRequest<T>(functionName: string, body: Record<string, u
  */
 export async function testClickHouseConnection(): Promise<ClickHouseHealth> {
   try {
-    return await clickHouseRequest<ClickHouseHealth>(CLICKHOUSE_HEALTH_FUNCTION);
+    const health = await clickHouseRequest<ClickHouseHealth>(CLICKHOUSE_HEALTH_FUNCTION);
+    // The health endpoint answers 200 even while disconnected, so the breaker
+    // is closed only on a positive probe — this is also the manual recovery
+    // path (Integrations → Test connection) right after the warehouse resumes.
+    if (health.connected) noteClickHouseReachable();
+    return health;
   } catch (error) {
     return { connected: false, error: error instanceof Error ? error.message : "Could not reach the ClickHouse health endpoint." };
   }
@@ -467,7 +529,7 @@ let summaryInFlight: Promise<ClickHouseSummary> | null = null;
 export async function getClickHouseSummary(): Promise<ClickHouseSummary> {
   if (summaryCache && Date.now() - summaryCache.at < SUMMARY_TTL_MS) return summaryCache.value;
   if (summaryInFlight) return summaryInFlight;
-  summaryInFlight = clickHouseRequest<ClickHouseSummary>(CLICKHOUSE_SUMMARY_FUNCTION)
+  summaryInFlight = clickHouseRequest<ClickHouseSummary>(CLICKHOUSE_SUMMARY_FUNCTION, {}, { breakerGated: true })
     .then((value) => {
       summaryCache = { at: Date.now(), value };
       return value;
@@ -486,15 +548,15 @@ export function invalidateClickHouseSummaryCache(): void {
 // --- Cohorts read path (clickhouse-cohorts Edge Function) -----------------
 
 export async function runClickHouseCohorts(request: CohortRequest): Promise<CohortResponse> {
-  return clickHouseRequest<CohortResponse>(CLICKHOUSE_COHORTS_FUNCTION, request as Record<string, unknown>);
+  return clickHouseRequest<CohortResponse>(CLICKHOUSE_COHORTS_FUNCTION, request as Record<string, unknown>, { breakerGated: true });
 }
 
 export async function runClickHouseCohortDetails(request: CohortRequest): Promise<CohortDetailsResponse> {
-  return clickHouseRequest<CohortDetailsResponse>(CLICKHOUSE_COHORTS_FUNCTION, request as Record<string, unknown>);
+  return clickHouseRequest<CohortDetailsResponse>(CLICKHOUSE_COHORTS_FUNCTION, request as Record<string, unknown>, { breakerGated: true });
 }
 
 export async function getClickHouseCohortMembershipStatus(): Promise<ClickHouseCohortMembershipResult> {
-  return clickHouseRequest<ClickHouseCohortMembershipResult>(CLICKHOUSE_COHORT_MEMBERSHIP_FUNCTION, { action: "status" });
+  return clickHouseRequest<ClickHouseCohortMembershipResult>(CLICKHOUSE_COHORT_MEMBERSHIP_FUNCTION, { action: "status" }, { breakerGated: true });
 }
 
 export async function rebuildClickHouseCohortMembership(force = false): Promise<ClickHouseCohortMembershipResult> {
@@ -512,21 +574,21 @@ export async function validateClickHouseCohortMembership(): Promise<ClickHouseCo
 // --- Users / Payment Analytics read path (clickhouse-users) ---------------
 
 export async function runClickHouseUsers(request: UsersRequest): Promise<UsersResponse> {
-  return clickHouseRequest<UsersResponse>(CLICKHOUSE_USERS_FUNCTION, request as Record<string, unknown>);
+  return clickHouseRequest<UsersResponse>(CLICKHOUSE_USERS_FUNCTION, request as Record<string, unknown>, { breakerGated: true });
 }
 
 export async function runClickHouseUserDetails(request: UsersRequest): Promise<UsersDetailsResponse> {
-  return clickHouseRequest<UsersDetailsResponse>(CLICKHOUSE_USERS_FUNCTION, request as Record<string, unknown>);
+  return clickHouseRequest<UsersDetailsResponse>(CLICKHOUSE_USERS_FUNCTION, request as Record<string, unknown>, { breakerGated: true });
 }
 
 export async function runClickHouseUsersDecline(request: UsersRequest): Promise<UsersDeclineResponse> {
-  return clickHouseRequest<UsersDeclineResponse>(CLICKHOUSE_USERS_FUNCTION, request as Record<string, unknown>);
+  return clickHouseRequest<UsersDeclineResponse>(CLICKHOUSE_USERS_FUNCTION, request as Record<string, unknown>, { breakerGated: true });
 }
 
 // --- Payment Pass Analytics read path (clickhouse-payment-analytics) -------
 
 export async function runClickHousePaymentAnalytics<T = unknown>(request: Record<string, unknown>): Promise<T> {
-  return clickHouseRequest<T>(CLICKHOUSE_PAYMENT_ANALYTICS_FUNCTION, request);
+  return clickHouseRequest<T>(CLICKHOUSE_PAYMENT_ANALYTICS_FUNCTION, request, { breakerGated: true });
 }
 
 // --- Support Analytics read path + sync (clickhouse-support) --------------

@@ -28,7 +28,11 @@ export const GC_MS = 60 * 60 * 1000;
 // Retry only transient failures: not validation (400) or auth ("Sign in").
 export function transientRetry(failureCount: number, error: unknown): boolean {
   const msg = error instanceof Error ? error.message : String(error ?? "");
-  if (/Sign in|not configured|400|invalid|unauthor/i.test(msg)) return false;
+  // "unavailable" = the ClickHouse circuit breaker's instant failure (the edge
+  // function already retried the warehouse with backoff); re-asking cannot
+  // succeed inside the cooldown, and skipping the retry is what lets the
+  // legacy in-browser fallback take over immediately on filter changes.
+  if (/Sign in|not configured|400|invalid|unauthor|unavailable/i.test(msg)) return false;
   return failureCount < 2;
 }
 
