@@ -36,6 +36,9 @@ const SUPPORT_SELECT = [
   "id,auth_user_id,import_batch_id,source_row_number,sender_name,subject,message_body,received_at,received_date_raw",
   "customer_email,normalized_email,matched_contact_name,manual_category,manual_subcategory,manual_urgency,manual_changed_at",
   "source_hash,imported_at,updated_at",
+  "category,subcategory,secondary_categories,language,sentiment,urgency",
+  "requires_refund,requires_cancellation,payment_related,delivery_related,possible_unauthorized_charge,duplicate_charge",
+  "classification_source,classification_version,classification_model,classification_confidence,classification_reason",
 ].join(",");
 
 type SupportAction = "bundle" | "list" | "details" | "options" | "sync" | "status";
@@ -73,6 +76,26 @@ type SupabaseSupportRow = {
   source_hash: string;
   imported_at: string | null;
   updated_at: string | null;
+  // Stored classification (v2). Written by the classification job; the sync
+  // copies it instead of recomputing, so Postgres and the warehouse can no
+  // longer disagree about what a request is.
+  category: string | null;
+  subcategory: string | null;
+  secondary_categories: unknown;
+  language: string | null;
+  sentiment: string | null;
+  urgency: string | null;
+  requires_refund: boolean | null;
+  requires_cancellation: boolean | null;
+  payment_related: boolean | null;
+  delivery_related: boolean | null;
+  possible_unauthorized_charge: boolean | null;
+  duplicate_charge: boolean | null;
+  classification_source: string | null;
+  classification_version: string | null;
+  classification_model: string | null;
+  classification_confidence: number | null;
+  classification_reason: string | null;
 };
 
 type Classification = {
@@ -846,9 +869,60 @@ export function supportAttributionStatus(input: {
   return "unmatched_email";
 }
 
+/** The automatic classification the warehouse should show for a row.
+ *
+ * Precedence is manual > stored > rules. The stored classification is what the
+ * model wrote into Postgres; the rules only run when a row has never been
+ * classified (a brand-new email between ingest and the next job tick), so a
+ * request is never left without a category. Re-running the rules here — the old
+ * behaviour — is what made Postgres and the warehouse disagree, and it would
+ * also have overwritten every model result on the next sync. */
+export function automaticClassificationFor(row: SupabaseSupportRow): Classification & {
+  secondary_categories: string[];
+  source: string;
+  model: string;
+  version: string;
+} {
+  const stored = typeof row.category === "string" && row.category.trim().length > 0;
+  if (!stored) {
+    const rules = classifySupportRequestServer(row.subject ?? "", row.message_body ?? "");
+    return {
+      ...rules,
+      secondary_categories: [],
+      source: "rule",
+      model: "",
+      version: SUPPORT_CLASSIFICATION_VERSION,
+    };
+  }
+  const secondary = Array.isArray(row.secondary_categories)
+    ? (row.secondary_categories as unknown[]).filter((value): value is string => typeof value === "string" && value.length > 0)
+    : [];
+  const urgency = row.urgency ?? "low";
+  return {
+    category: row.category as string,
+    subcategory: row.subcategory ?? "",
+    language: row.language ?? "unknown",
+    sentiment: row.sentiment ?? "neutral",
+    urgency,
+    requires_refund: Boolean(row.requires_refund),
+    requires_cancellation: Boolean(row.requires_cancellation),
+    payment_related: Boolean(row.payment_related),
+    delivery_related: Boolean(row.delivery_related),
+    possible_unauthorized_charge: Boolean(row.possible_unauthorized_charge),
+    duplicate_charge: Boolean(row.duplicate_charge),
+    urgent: urgency === "high",
+    classification_confidence: Number(row.classification_confidence ?? 0),
+    classification_reason: row.classification_reason ?? "",
+    secondary_categories: secondary,
+    source: row.classification_source ?? "rule",
+    model: row.classification_model ?? "",
+    version: row.classification_version ?? SUPPORT_CLASSIFICATION_VERSION,
+  };
+}
+
 function mapSupportRow(row: SupabaseSupportRow, syncedAt: string): Record<string, unknown> | null {
   if (!row.received_at) return null;
-  const c = classifySupportRequestServer(row.subject ?? "", row.message_body ?? "");
+  const c = automaticClassificationFor(row);
   const category = row.manual_category || c.category;
   const subcategory = row.manual_subcategory || c.subcategory;
   const urgency = row.manual_urgency || c.urgency;
@@ -875,6 +949,7 @@ function mapSupportRow(row: SupabaseSupportRow, syncedAt: string): Record<string
     language: c.language,
     category,
     subcategory,
+    secondary_categories: c.secondary_categories,
     automatic_category: c.category,
     automatic_subcategory: c.subcategory,
     manual_category: row.manual_category ?? "",
@@ -893,7 +968,9 @@ function mapSupportRow(row: SupabaseSupportRow, syncedAt: string): Record<string
     subject: row.subject ?? "",
     message_body: row.message_body ?? "",
     source_hash: row.source_hash,
-    classification_version: SUPPORT_CLASSIFICATION_VERSION,
+    classification_source: c.source,
+    classification_version: c.version,
+    classification_model: c.model,
     classification_confidence: c.classification_confidence,
     classification_reason: c.classification_reason,
     imported_at: chTime(row.imported_at),

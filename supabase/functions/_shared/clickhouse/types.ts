@@ -46,6 +46,10 @@ export interface SupabaseQueryBuilder extends PromiseLike<SupabaseQueryResult> {
   /** Append-only history writes (Facebook Warehouse V2 Phase 1). Optional: fakes without them stay valid — the history layer is fail-safe. */
   insert?(values: unknown, options?: Record<string, unknown>): PromiseLike<SupabaseQueryResult>;
   update?(values: unknown): SupabaseQueryBuilder;
+  /** Support classification job: "not yet on the current version" scans and
+   * resetting job state. Optional so existing test fakes stay valid. */
+  neq?(column: string, value: unknown): SupabaseQueryBuilder;
+  delete?(): SupabaseQueryBuilder;
 }
 
 export interface SupabaseLikeClient {
