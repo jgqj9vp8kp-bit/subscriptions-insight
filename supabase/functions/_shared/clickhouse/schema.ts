@@ -114,6 +114,14 @@ ORDER BY
 )
 `;
 
+// Sorting key note (load-bearing): it must contain ONLY stable identity
+// columns. It used to include category/urgency, and ReplacingMergeTree collapses
+// two rows only when their whole sorting key matches — so re-classifying an
+// email (or a human correcting its category) produced a SECOND row instead of
+// replacing the first, and the request was then counted once in each category.
+// See rebuildFactSupportRequestsSortingKey below for the in-place repair.
+const FACT_SUPPORT_REQUESTS_SORTING_KEY = "auth_user_id, request_date, request_id";
+
 export const CREATE_FACT_SUPPORT_REQUESTS_SQL = `
 CREATE TABLE IF NOT EXISTS ${FACT_SUPPORT_REQUESTS_TABLE}
 (
@@ -138,6 +146,7 @@ CREATE TABLE IF NOT EXISTS ${FACT_SUPPORT_REQUESTS_TABLE}
     language LowCardinality(String),
     category LowCardinality(String),
     subcategory String,
+    secondary_categories Array(LowCardinality(String)),
     automatic_category LowCardinality(String),
     automatic_subcategory String,
     manual_category String,
@@ -156,7 +165,9 @@ CREATE TABLE IF NOT EXISTS ${FACT_SUPPORT_REQUESTS_TABLE}
     subject String,
     message_body String,
     source_hash String,
+    classification_source LowCardinality(String) DEFAULT 'rule',
     classification_version String,
+    classification_model LowCardinality(String),
     classification_confidence Float64,
     classification_reason String,
     imported_at DateTime64(3, 'UTC'),
@@ -166,15 +177,7 @@ CREATE TABLE IF NOT EXISTS ${FACT_SUPPORT_REQUESTS_TABLE}
 )
 ENGINE = ReplacingMergeTree(row_version)
 PARTITION BY toYYYYMM(request_date)
-ORDER BY
-(
-    auth_user_id,
-    request_date,
-    category,
-    urgency,
-    matched_customer,
-    request_id
-)
+ORDER BY (${FACT_SUPPORT_REQUESTS_SORTING_KEY})
 `;
 
 // CREATE TABLE IF NOT EXISTS does not evolve an already-created production
@@ -189,11 +192,77 @@ export const ALTER_FACT_SUPPORT_REQUESTS_ATTRIBUTION_SQL = [
   `ALTER TABLE ${FACT_SUPPORT_REQUESTS_TABLE} ADD COLUMN IF NOT EXISTS attribution_version String AFTER attribution_status`,
 ];
 
+// Classification v2 columns. Additive, same discipline as the attribution
+// rollout above: existing rows and manual overrides stay untouched.
+export const ALTER_FACT_SUPPORT_REQUESTS_CLASSIFICATION_SQL = [
+  `ALTER TABLE ${FACT_SUPPORT_REQUESTS_TABLE} ADD COLUMN IF NOT EXISTS secondary_categories Array(LowCardinality(String)) AFTER subcategory`,
+  `ALTER TABLE ${FACT_SUPPORT_REQUESTS_TABLE} ADD COLUMN IF NOT EXISTS classification_source LowCardinality(String) DEFAULT 'rule' AFTER source_hash`,
+  `ALTER TABLE ${FACT_SUPPORT_REQUESTS_TABLE} ADD COLUMN IF NOT EXISTS classification_model LowCardinality(String) AFTER classification_version`,
+];
+
+const REBUILD_TABLE = `${FACT_SUPPORT_REQUESTS_TABLE}_rebuild`;
+
+/** True when the live table still sorts by mutable classification columns. */
+export function sortingKeyNeedsRebuild(sortingKey: string): boolean {
+  const key = sortingKey.replace(/\s+/g, " ").toLowerCase();
+  if (!key) return false;
+  return /\bcategory\b/.test(key) || /\burgency\b/.test(key);
+}
+
+/** Repair the sorting key of an already-created table.
+ *
+ * ReplacingMergeTree deduplicates by the FULL sorting key, so while category and
+ * urgency were part of it, changing an email's category inserted a second row
+ * instead of replacing the first — the request then showed up in both the old
+ * and the new category and every count above it was inflated. ALTER cannot
+ * change a sorting key, so the table is rebuilt: copy the deduplicated rows
+ * (FINAL) into a table keyed by identity only, then swap the two atomically.
+ *
+ * `CREATE TABLE ... AS <table>` clones the exact column list, which is what
+ * makes the positional `SELECT *` copy safe here. */
+export async function rebuildFactSupportRequestsSortingKey(client: ClickHouseClientLike): Promise<boolean> {
+  const inspected = await client.query({
+    query: `SELECT sorting_key FROM system.tables WHERE database = currentDatabase() AND name = '${FACT_SUPPORT_REQUESTS_TABLE}'`,
+    format: "JSONEachRow",
+  });
+  const rows = (await inspected.json()) as Array<{ sorting_key?: string }>;
+  const sortingKey = rows[0]?.sorting_key ?? "";
+  if (!sortingKey || !sortingKeyNeedsRebuild(sortingKey)) return false;
+
+  await client.command({ query: `DROP TABLE IF EXISTS ${REBUILD_TABLE}` });
+  await client.command({
+    query: `CREATE TABLE ${REBUILD_TABLE} AS ${FACT_SUPPORT_REQUESTS_TABLE}
+      ENGINE = ReplacingMergeTree(row_version)
+      PARTITION BY toYYYYMM(request_date)
+      ORDER BY (${FACT_SUPPORT_REQUESTS_SORTING_KEY})`,
+  });
+  // FINAL collapses any duplicate-key rows the old key already produced, so the
+  // rebuild also repairs history rather than carrying the double-counting over.
+  await client.command({
+    query: `INSERT INTO ${REBUILD_TABLE} SELECT * FROM ${FACT_SUPPORT_REQUESTS_TABLE} FINAL`,
+  });
+  try {
+    await client.command({ query: `EXCHANGE TABLES ${FACT_SUPPORT_REQUESTS_TABLE} AND ${REBUILD_TABLE}` });
+  } catch {
+    // EXCHANGE needs the Atomic database engine; fall back to a rename pair.
+    await client.command({
+      query: `RENAME TABLE ${FACT_SUPPORT_REQUESTS_TABLE} TO ${FACT_SUPPORT_REQUESTS_TABLE}_legacy, ${REBUILD_TABLE} TO ${FACT_SUPPORT_REQUESTS_TABLE}`,
+    });
+    await client.command({ query: `DROP TABLE IF EXISTS ${FACT_SUPPORT_REQUESTS_TABLE}_legacy` });
+    return true;
+  }
+  await client.command({ query: `DROP TABLE IF EXISTS ${REBUILD_TABLE}` });
+  return true;
+}
+
 export async function ensureFactSupportRequestsSchema(client: ClickHouseClientLike): Promise<void> {
   await client.command({ query: CREATE_FACT_SUPPORT_REQUESTS_SQL });
-  for (const query of ALTER_FACT_SUPPORT_REQUESTS_ATTRIBUTION_SQL) {
+  for (const query of [...ALTER_FACT_SUPPORT_REQUESTS_ATTRIBUTION_SQL, ...ALTER_FACT_SUPPORT_REQUESTS_CLASSIFICATION_SQL]) {
     await client.command({ query });
   }
+  // Columns first: the rebuild clones the live structure, so it must run after
+  // the ALTERs or the new columns would be dropped by the swap.
+  await rebuildFactSupportRequestsSortingKey(client);
 }
 
 // Facebook ad performance warehouse, populated from the Capsuled fb-stats API by
