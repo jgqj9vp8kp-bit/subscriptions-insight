@@ -38,6 +38,7 @@ import {
 import { normalizeCampaignPath, type TrafficMetric } from "@/services/trafficImport";
 import type { CardType, CohortRow, MediaBuyer, PlanBreakdownRow } from "@/services/types";
 import { cohortsDataSourceMode } from "@/services/cohortsDataSource";
+import { isClickHouseCircuitOpen } from "@/services/clickhouse";
 import { deriveCohortSnapshotHealth, ensureCohortSnapshotRebuild } from "@/services/cohortSnapshotHealth";
 import {
   FB_COHORT_COLUMN_LABELS,
@@ -1591,10 +1592,16 @@ export default function CohortsPage() {
   // WITH no cached result to fall back on. A failed BACKGROUND refresh (cached
   // rows present) keeps the previous ClickHouse rows visible instead of dropping
   // to legacy — the emergency legacy path still applies when there is no data.
+  // An OPEN circuit breaker with no cached rows also engages legacy right away:
+  // waiting for the (instantly failing) query to settle into an error state
+  // left a render window where the table showed the loading takeover and the
+  // filter dropdowns showed "No … data" even though every transaction was
+  // already in memory.
   const needLegacy =
     cohortsSource !== "clickhouse" ||
     (chStatus.error !== null && chResult == null) ||
-    !chStatus.applicable;
+    !chStatus.applicable ||
+    (chResult == null && isClickHouseCircuitOpen());
   const legacyWarehouseLoadInProgress =
     legacyWarehouseProgress.status === "counting" ||
     legacyWarehouseProgress.status === "loading" ||
