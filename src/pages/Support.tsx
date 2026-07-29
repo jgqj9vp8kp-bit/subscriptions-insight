@@ -287,6 +287,9 @@ export default function SupportPage() {
   /** Off by default: a normal run only touches emails that are not yet on the
    * current taxonomy, so re-running it is cheap and idempotent. */
   const [classifyAll, setClassifyAll] = useState(false);
+  /** Rules by default: it needs no API key and no budget, so the button always
+   * does something. Switch to the model for the harder long tail. */
+  const [classifyEngine, setClassifyEngine] = useState<"rules" | "model">("rules");
   const [lastImport, setLastImport] = useState<SupportImportSummary | null>(null);
   const [manualCategory, setManualCategory] = useState<SupportCategory>("Other/unclear");
   const [manualSubcategory, setManualSubcategory] = useState("other_unclear");
@@ -482,7 +485,14 @@ export default function SupportPage() {
     let action: "start" | "continue" = initial;
     try {
       for (;;) {
-        const progress = await runSupportClassification(action, { reclassify_all: initial === "start" && classifyAll });
+        // reclassify_all must ride on EVERY call, not just the first: each
+        // invocation re-derives "what is still pending", so dropping the flag
+        // on the continues makes the run stop as soon as the first chunk is
+        // on the current version.
+        const progress = await runSupportClassification(action, {
+          engine: classifyEngine,
+          reclassify_all: classifyAll,
+        });
         setClassification(progress);
         if (progress.status === "completed") {
           toast({
@@ -721,6 +731,13 @@ export default function SupportPage() {
               </div>
             </div>
             <div className="flex flex-wrap items-center gap-2">
+              <Select value={classifyEngine} onValueChange={(value) => setClassifyEngine(value as "rules" | "model")} disabled={classifying}>
+                <SelectTrigger className="h-9 w-[190px]"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="rules">Rules (free)</SelectItem>
+                  <SelectItem value="model">Claude (needs API credit)</SelectItem>
+                </SelectContent>
+              </Select>
               <label className="flex items-center gap-2 text-xs text-muted-foreground">
                 <input
                   type="checkbox"

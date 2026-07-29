@@ -33,6 +33,9 @@ export interface SupportClassificationProgress {
 }
 
 export interface SupportClassificationOptions {
+  /** "rules" runs the deterministic taxonomy-v2 patterns locally — no API key,
+   * no cost. "model" reads each email with Claude. */
+  engine?: "model" | "rules";
   batch_size?: number;
   max_batches?: number;
   reclassify_all?: boolean;

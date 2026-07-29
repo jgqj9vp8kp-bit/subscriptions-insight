@@ -325,6 +325,33 @@ describe("runSupportClassificationJob", () => {
     expect(saved.status).toBe("completed");
   });
 
+  it("classifies with the rules engine without an API key or a single request", async () => {
+    const rows = makeRows(6).map((row, index) => ({
+      ...row,
+      subject: index % 2 === 0 ? "Stop billing" : "Quiero mi rembolso",
+      message_body: index % 2 === 0 ? "stop charging my account" : "devuelvan mi dinero",
+    }));
+    const { client, updates } = fakeSupabase(rows);
+    const spy = vi.fn();
+
+    const progress = await runSupportClassificationJob({
+      ...base,
+      supabase: client,
+      request: { action: "start", engine: "rules", batch_size: 10 },
+      callModel: null, // no key at all
+    });
+
+    expect(spy).not.toHaveBeenCalled();
+    expect(progress.status).toBe("completed");
+    expect(progress.rows_classified).toBe(6);
+    expect(progress.api_requests).toBe(0);
+    expect(progress.classification_version).toBe("support_rules_v2");
+    expect(updates).toHaveLength(6);
+    // The phrasings v1 could not read at all.
+    expect(updates[0].patch).toMatchObject({ category: "Cancellation", classification_source: "rule" });
+    expect(updates[1].patch).toMatchObject({ category: "Refund" });
+  });
+
   it("status is read-only and never calls the model", async () => {
     const { client, updates } = fakeSupabase(makeRows(3));
     const spy = vi.fn();

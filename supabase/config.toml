@@ -5,3 +5,11 @@ verify_jwt = false
 
 [functions.sync-support-mail]
 verify_jwt = false
+
+# The hourly classification tick authenticates with the support pipeline's
+# shared secret, not a user JWT, so the gateway must let the request through to
+# the function — otherwise pg_net gets a 401 before any of our checks run.
+# Browser calls still require a session: the function itself demands one unless
+# the request carries the internal secret.
+[functions.classify-support-requests]
+verify_jwt = false

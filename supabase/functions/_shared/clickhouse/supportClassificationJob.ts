@@ -16,6 +16,7 @@ import {
   type ModelCaller,
 } from "./supportClassifier.ts";
 import { SUPPORT_CLASSIFICATION_VERSION_V2 } from "./supportTaxonomy.ts";
+import { SUPPORT_RULES_VERSION_V2, classifySupportRequestV2 } from "./supportRulesV2.ts";
 import type { SupabaseLikeClient, SupabaseQueryResult } from "./types.ts";
 
 /** The chain this job builds. Declared standalone rather than as an
@@ -52,6 +53,9 @@ export type ClassificationStatus = "never_started" | "running" | "partial" | "co
 
 export interface ClassificationJobRequest {
   action?: ClassificationAction | string;
+  /** "model" reads each email with Claude; "rules" uses the deterministic
+   * taxonomy-v2 patterns — same output shape, no API, no cost. */
+  engine?: "model" | "rules";
   model?: string;
   batch_size?: number;
   max_batches?: number;
@@ -184,19 +188,20 @@ async function saveState(supabase: SupabaseLikeClient, state: JobState): Promise
 }
 
 /** Rows still to classify. `reclassify_all` widens it to the whole mailbox. */
-function staleFilter(query: JobQueryBuilder, reclassifyAll: boolean): JobQueryBuilder {
-  return reclassifyAll ? query : query.neq("classification_version", SUPPORT_CLASSIFICATION_VERSION_V2);
+function staleFilter(query: JobQueryBuilder, reclassifyAll: boolean, version: string): JobQueryBuilder {
+  return reclassifyAll ? query : query.neq("classification_version", version);
 }
 
 async function countPending(
   supabase: SupabaseLikeClient,
   authUserId: string,
   reclassifyAll: boolean,
+  version: string,
 ): Promise<number | null> {
   const base = table(supabase, "support_requests")
     .select("id", { count: "exact", head: true })
     .eq("auth_user_id", authUserId);
-  const { count, error } = await staleFilter(base, reclassifyAll);
+  const { count, error } = await staleFilter(base, reclassifyAll, version);
   if (error) return null;
   return count ?? null;
 }
@@ -250,6 +255,8 @@ export async function runSupportClassificationJob(input: ClassificationJobInput)
     return toProgress(emptyState(input.authUserId), action, now() - startedAt);
   }
 
+  const engine = input.request.engine === "rules" ? "rules" : "model";
+  const version = engine === "rules" ? SUPPORT_RULES_VERSION_V2 : SUPPORT_CLASSIFICATION_VERSION_V2;
   const batchSize = clampInt(input.request.batch_size, DEFAULT_BATCH_SIZE, 1, MAX_BATCH_SIZE);
   const maxBatches = clampInt(input.request.max_batches, DEFAULT_MAX_BATCHES, 1, MAX_MAX_BATCHES);
   const softTimeoutMs = clampInt(input.request.soft_timeout_ms, DEFAULT_SOFT_TIMEOUT_MS, 5_000, 120_000);
@@ -258,18 +265,19 @@ export async function runSupportClassificationJob(input: ClassificationJobInput)
   if (action === "start") {
     state = {
       ...emptyState(input.authUserId),
-      classification_version: SUPPORT_CLASSIFICATION_VERSION_V2,
-      model,
-      rows_expected: await countPending(input.supabase, input.authUserId, reclassifyAll),
+      classification_version: version,
+      model: engine === "rules" ? "rules" : model,
+      rows_expected: await countPending(input.supabase, input.authUserId, reclassifyAll, version),
       started_at: new Date(now()).toISOString(),
       status: "running",
     };
     await saveState(input.supabase, state);
   }
 
-  // Without a key the job reports why and stops. Rows keep the classification
-  // the rules already gave them, so the Support page never goes blank.
-  if (!input.callModel) {
+  // Without a key the MODEL engine reports why and stops. Rows keep the
+  // classification the rules already gave them, so the page never goes blank.
+  // The rules engine needs no key and runs regardless.
+  if (engine === "model" && !input.callModel) {
     state.status = "failed";
     state.stopped_reason = "no_api_key";
     state.last_error = "ANTHROPIC_API_KEY is not configured for this project.";
@@ -278,8 +286,8 @@ export async function runSupportClassificationJob(input: ClassificationJobInput)
   }
 
   state.status = "running";
-  state.model = model;
-  state.classification_version = SUPPORT_CLASSIFICATION_VERSION_V2;
+  state.model = engine === "rules" ? "rules" : model;
+  state.classification_version = version;
 
   let stopped: string = "chunk_complete";
   try {
@@ -292,7 +300,7 @@ export async function runSupportClassificationJob(input: ClassificationJobInput)
       let query = table(input.supabase, "support_requests")
         .select("id,subject,message_body,received_at")
         .eq("auth_user_id", input.authUserId);
-      query = staleFilter(query, reclassifyAll);
+      query = staleFilter(query, reclassifyAll, version);
       if (state.cursor_received_at && state.cursor_request_id) {
         // Keyset pagination: strictly after the last row of the previous chunk.
         query = query.or(
@@ -311,7 +319,20 @@ export async function runSupportClassificationJob(input: ClassificationJobInput)
         break;
       }
 
-      const outcome = await classifyEmails(toClassifiableEmails(rows), input.callModel, { batchSize });
+      const classifiable = toClassifiableEmails(rows);
+      // The rules engine produces the same result shape as the model, so
+      // everything downstream — the patch, the sync, the UI — is identical.
+      const outcome = engine === "rules"
+        ? {
+            results: new Map(
+              classifiable.map((email) => [email.id, classifySupportRequestV2(email.id, email.subject, email.body)]),
+            ),
+            usage: { api_requests: 0, input_tokens: 0, output_tokens: 0 },
+            batches: 1,
+            unresolvedIds: [] as string[],
+            errors: [] as string[],
+          }
+        : await classifyEmails(classifiable, input.callModel!, { batchSize });
       state.rows_scanned += rows.length;
       state.batches_processed += outcome.batches;
       state.api_requests += outcome.usage.api_requests;
@@ -340,7 +361,11 @@ export async function runSupportClassificationJob(input: ClassificationJobInput)
           continue;
         }
         const { error: updateError } = await table(input.supabase, "support_requests")
-          .update(buildSupportRequestPatch(result, model))
+          .update({
+            ...buildSupportRequestPatch(result, engine === "rules" ? "" : model),
+            classification_source: engine === "rules" ? "rule" : "llm",
+            classification_version: version,
+          })
           .eq("id", row.id)
           .eq("auth_user_id", input.authUserId);
         if (updateError) {
