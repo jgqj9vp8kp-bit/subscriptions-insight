@@ -45,6 +45,7 @@ import {
   clickHouseStatusLabel,
   getClickHouseSummary,
   initializeClickHouseSchema,
+  invalidateClickHouseSummaryCache,
   runClickHouseBackfill,
   runClickHouseValidation,
   testClickHouseConnection,
@@ -53,6 +54,7 @@ import {
   type ClickHouseSummary,
   type ClickHouseValidationProgress,
 } from "@/services/clickhouse";
+import { repairLegacyNormalizedPayloads, type RepairSummary } from "@/services/normalizedPayloadRepair";
 import { campaignIdForTransaction, UNKNOWN_CAMPAIGN_ID } from "@/services/cohortFiltering";
 import { buildFbTrafficDiagnostics, type FbTrafficDiagnosticsResult } from "@/services/fbTrafficDiagnostics";
 import { useTransactions } from "@/services/sheets";
@@ -159,6 +161,25 @@ export default function IntegrationsPage() {
   const [clickHouseSummary, setClickHouseSummary] = useState<ClickHouseSummary | null>(null);
   const [clickHouseLastBackfill, setClickHouseLastBackfill] = useState<ClickHouseBackfillResult | null>(null);
   const [clickHouseValidation, setClickHouseValidation] = useState<ClickHouseValidationProgress | null>(null);
+  const [payloadRepair, setPayloadRepair] = useState<{ running: boolean; progress: string | null; result: RepairSummary | null }>({ running: false, progress: null, result: null });
+
+  const onRepairLegacyPayloads = async () => {
+    setPayloadRepair({ running: true, progress: "Scanning…", result: null });
+    try {
+      const result = await repairLegacyNormalizedPayloads({
+        onProgress: ({ scanned, total, repaired }) =>
+          setPayloadRepair((current) => ({ ...current, progress: `${scanned.toLocaleString()} / ${total.toLocaleString()} scanned · ${repaired.toLocaleString()} repaired` })),
+      });
+      setPayloadRepair({ running: false, progress: null, result });
+      toast({
+        title: "Legacy payload repair finished",
+        description: `${result.scanned.toLocaleString()} rows scanned · ${result.repaired.toLocaleString()} repaired in ${result.batches} batches.`,
+      });
+    } catch (error) {
+      setPayloadRepair({ running: false, progress: null, result: null });
+      toast({ title: "Payload repair failed", description: error instanceof Error ? error.message : "Unknown error", variant: "destructive" });
+    }
+  };
   // The validation verdict survives until the next run — surface how old it is and
   // whether the source has grown past what was actually checked.
   const clickHouseValidationStaleness = useMemo(
@@ -180,6 +201,8 @@ export default function IntegrationsPage() {
 
   const refresh = useCallback(async () => {
     setLoading(true);
+    // Manual refresh must bypass the short-lived summary memo.
+    invalidateClickHouseSummaryCache();
     try {
       const [keys, exportLogs, status, rows, chSummary] = await Promise.all([
         listApiKeys(),
@@ -651,6 +674,15 @@ export default function IntegrationsPage() {
               {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
               Refresh Status
             </Button>
+            <Button type="button" variant="outline" onClick={() => void onRepairLegacyPayloads()} disabled={payloadRepair.running}>
+              {payloadRepair.running ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+              Repair Legacy Payloads
+            </Button>
+            {(payloadRepair.progress || payloadRepair.result) && (
+              <span className="self-center text-xs text-muted-foreground">
+                {payloadRepair.progress ?? `Repair done: ${payloadRepair.result?.repaired.toLocaleString()} of ${payloadRepair.result?.scanned.toLocaleString()} rows updated.`}
+              </span>
+            )}
             {clickHouseHealth && (
               <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
                 {clickHouseHealth.database && (

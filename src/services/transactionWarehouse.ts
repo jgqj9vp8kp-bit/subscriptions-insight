@@ -750,9 +750,17 @@ export async function loadWarehouseTransactions(options: {
       const { data, error } = await traceRequest(
         "supabase.transactions_page",
         `supabase:transactions:page:${from}:${to - from + 1}`,
+        // raw_payload is deliberately NOT fetched: it is 56% of the page bytes
+        // (7.3 MB vs 3.2 MB per 1000 rows, ~278 MB per cold start) and hydration
+        // only needed it for legacy rows whose normalized_payload lacked the
+        // card-type/decline enrichment. Those rows are repaired in place by
+        // repairLegacyNormalizedPayloads (Integrations → warehouse card), after
+        // which the slim fetch reproduces the full hydration exactly (verified
+        // per-row against the with-raw hydration on live data). raw_payload
+        // itself stays in Postgres as the source of truth.
         () => client
           .from("transactions")
-          .select("source,raw_payload,normalized_payload")
+          .select("source,normalized_payload")
           .is("deleted_at", null)
           .order("event_time", { ascending: false })
           .range(from, to),

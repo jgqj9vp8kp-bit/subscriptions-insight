@@ -6,7 +6,7 @@
 
 import { useEffect, useReducer, useRef } from "react";
 import { useQuery, type QueryClient } from "@tanstack/react-query";
-import { getClickHouseSummary } from "@/services/clickhouse";
+import { getClickHouseSummary, invalidateClickHouseSummaryCache } from "@/services/clickhouse";
 import {
   warehouseVersionFromSummary,
   supportWarehouseVersionFromSummary,
@@ -129,6 +129,10 @@ export function useAnalyticsProgress(params: {
 // Cached data is never deleted — on sync failure the caller simply does not call
 // this, so stale cache stays visible.
 export async function invalidateWarehouseAnalyticsCache(client: QueryClient): Promise<void> {
+  // The summary memo must not outlive a sync: the version keys below re-derive
+  // their fingerprints from getClickHouseSummary, which would otherwise serve
+  // the pre-sync summary for up to its TTL.
+  invalidateClickHouseSummaryCache();
   await Promise.all([
     client.invalidateQueries({ queryKey: WAREHOUSE_VERSION_KEY }),
     client.invalidateQueries({ queryKey: SUPPORT_WAREHOUSE_VERSION_KEY }),
@@ -140,6 +144,7 @@ export async function invalidateWarehouseAnalyticsCache(client: QueryClient): Pr
 
 
 export async function invalidateSupportAnalyticsCache(client: QueryClient): Promise<void> {
+  invalidateClickHouseSummaryCache();
   await client.invalidateQueries({ queryKey: SUPPORT_WAREHOUSE_VERSION_KEY });
   await client.invalidateQueries({ queryKey: ["support"] });
 }

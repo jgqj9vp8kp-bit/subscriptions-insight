@@ -454,8 +454,33 @@ export async function validateClickHouseTransactions(validationScope: "full_data
   });
 }
 
+// Three independent cache hooks (cohorts warehouse version, support warehouse
+// version, generic summary) all call this on app start, which cost three
+// identical edge-function round-trips (~4.1 s summed, measured). Coalesce
+// concurrent calls into one request and reuse a fresh result for a short TTL —
+// version fingerprints cannot change faster than a sync anyway. Errors are
+// never cached, so a failed probe retries immediately.
+const SUMMARY_TTL_MS = 30_000;
+let summaryCache: { at: number; value: ClickHouseSummary } | null = null;
+let summaryInFlight: Promise<ClickHouseSummary> | null = null;
+
 export async function getClickHouseSummary(): Promise<ClickHouseSummary> {
-  return clickHouseRequest<ClickHouseSummary>(CLICKHOUSE_SUMMARY_FUNCTION);
+  if (summaryCache && Date.now() - summaryCache.at < SUMMARY_TTL_MS) return summaryCache.value;
+  if (summaryInFlight) return summaryInFlight;
+  summaryInFlight = clickHouseRequest<ClickHouseSummary>(CLICKHOUSE_SUMMARY_FUNCTION)
+    .then((value) => {
+      summaryCache = { at: Date.now(), value };
+      return value;
+    })
+    .finally(() => {
+      summaryInFlight = null;
+    });
+  return summaryInFlight;
+}
+
+/** Drop the memoized summary so the next call refetches (post-sync refresh). */
+export function invalidateClickHouseSummaryCache(): void {
+  summaryCache = null;
 }
 
 // --- Cohorts read path (clickhouse-cohorts Edge Function) -----------------
