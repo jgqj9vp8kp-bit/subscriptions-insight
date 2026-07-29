@@ -7,6 +7,11 @@ vi.mock("@/services/transactionWarehouse", () => ({
   getWarehouseTransactionCount: vi.fn(),
   loadWarehouseTransactions: vi.fn(),
 }));
+// The auto-load path goes through the IndexedDB-cached loader (delta warm
+// starts); behaviorally it is a drop-in for loadWarehouseTransactions.
+vi.mock("@/services/transactionWarehouseCache", () => ({
+  loadWarehouseTransactionsCached: vi.fn(),
+}));
 
 import {
   autoLoadWarehouseIntoStore,
@@ -16,14 +21,14 @@ import {
 import {
   getWarehouseTransactionCount,
   isTransactionWarehouseEnabled,
-  loadWarehouseTransactions,
 } from "@/services/transactionWarehouse";
+import { loadWarehouseTransactionsCached } from "@/services/transactionWarehouseCache";
 import { useDataStore } from "@/store/dataStore";
 import type { Transaction } from "@/services/types";
 
 const enabledMock = vi.mocked(isTransactionWarehouseEnabled);
 const countMock = vi.mocked(getWarehouseTransactionCount);
-const loadMock = vi.mocked(loadWarehouseTransactions);
+const loadMock = vi.mocked(loadWarehouseTransactionsCached);
 
 function whTx(id: string): Transaction {
   return {

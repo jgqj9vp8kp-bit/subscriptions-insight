@@ -11,6 +11,7 @@ import {
   type WarehouseTransactionsLoadProgress,
   type WarehouseManagementClient,
 } from "@/services/transactionWarehouse";
+import { loadWarehouseTransactionsCached } from "@/services/transactionWarehouseCache";
 import type { Transaction } from "@/services/types";
 import { traceAsync, traceEvent, traceRequest } from "@/services/performanceTrace";
 
@@ -43,7 +44,10 @@ export async function refreshLocalAnalyticsCacheFromWarehouse(): Promise<Transac
     const rows = await traceRequest(
       "warehouse.local_cache_refresh_query",
       "supabase:transactions:refresh_full_load",
-      () => loadWarehouseTransactions(),
+      // Cached loader: after an import the delta picks up exactly the new rows
+      // (imports bump updated_at), so a manual refresh no longer re-downloads
+      // the whole table; the count invariant still forces a full reload on drift.
+      () => loadWarehouseTransactionsCached(),
       { table: "transactions", source: "supabase" },
     );
     useDataStore.getState().setImported(rows, {
@@ -275,7 +279,7 @@ async function autoLoadWarehouseIntoStoreInner(options: WarehouseAutoLoadOptions
     const transactions = await traceRequest(
       "warehouse.global_transactions_query",
       "supabase:transactions:full_load",
-      () => loadWarehouseTransactions({ totalRowsExpected: count, onProgress: publishPageProgress }),
+      () => loadWarehouseTransactionsCached({ totalRowsExpected: count, onProgress: publishPageProgress }),
       { table: "transactions", blocks_render: false, source: "supabase" },
     );
 

@@ -712,13 +712,27 @@ function warehouseProgressPercent(rowsDownloaded: number, totalRowsExpected: num
   return sourceComplete ? Math.min(100, percent) : Math.min(99, percent);
 }
 
-export async function loadWarehouseTransactions(options: {
+/** A warehouse row as fetched by the slim startup select. Extends the shared
+ * hydration record with identity (`id`) and freshness (`updated_at`) so the
+ * IndexedDB delta cache can upsert rows in place and resume from the newest
+ * `updated_at` it has stored. Hydration ignores the extra fields. */
+export interface WarehouseRecord extends WarehouseLoadedRecord {
+  id: string;
+  updated_at: string;
+}
+
+export interface WarehouseRecordsLoadOptions {
   limit?: number;
   offset?: number;
   pageSize?: number;
   totalRowsExpected?: number | null;
   onProgress?: (progress: WarehouseTransactionsLoadProgress) => void;
-} = {}): Promise<Transaction[]> {
+}
+
+/** Record-level startup loader: pages the slim select into memory WITHOUT
+ * hydrating. `loadWarehouseTransactions` = this + hydration; the IndexedDB
+ * cache reuses this as its cold path so both paths fetch identical rows. */
+export async function loadWarehouseRecords(options: WarehouseRecordsLoadOptions = {}): Promise<WarehouseRecord[]> {
   return traceAsync("supabase.transactions_full_load", async () => {
     const client = ensureSupabase();
     const pageSize = options.pageSize ?? TRANSACTION_WAREHOUSE_SELECT_PAGE_SIZE;
@@ -726,7 +740,7 @@ export async function loadWarehouseTransactions(options: {
     const startedAt = Date.now();
     const totalRowsExpected = options.totalRowsExpected ?? options.limit ?? null;
     const pagesExpected = totalRowsExpected ? Math.ceil(totalRowsExpected / pageSize) : null;
-    const records: WarehouseLoadedRecord[] = [];
+    const records: WarehouseRecord[] = [];
     let pages = 0;
     let rowsDownloaded = 0;
     let hasMore = true;
@@ -746,7 +760,7 @@ export async function loadWarehouseTransactions(options: {
       });
     };
 
-    const fetchPage = async (from: number, to: number): Promise<WarehouseLoadedRecord[]> => {
+    const fetchPage = async (from: number, to: number): Promise<WarehouseRecord[]> => {
       const { data, error } = await traceRequest(
         "supabase.transactions_page",
         `supabase:transactions:page:${from}:${to - from + 1}`,
@@ -757,17 +771,18 @@ export async function loadWarehouseTransactions(options: {
         // repairLegacyNormalizedPayloads (Integrations → warehouse card), after
         // which the slim fetch reproduces the full hydration exactly (verified
         // per-row against the with-raw hydration on live data). raw_payload
-        // itself stays in Postgres as the source of truth.
+        // itself stays in Postgres as the source of truth. id/updated_at ride
+        // along (~70 bytes/row) so the IndexedDB delta cache can key its rows.
         () => client
           .from("transactions")
-          .select("source,normalized_payload")
+          .select("id,updated_at,source,normalized_payload")
           .is("deleted_at", null)
           .order("event_time", { ascending: false })
           .range(from, to),
         { table: "transactions", operation: "page", page_size: to - from + 1 },
       );
       if (error) throw new Error(`Could not load warehouse transactions: ${error.message}`);
-      return (data ?? []) as WarehouseLoadedRecord[];
+      return (data ?? []) as WarehouseRecord[];
     };
 
     // Sequential pagination made the load scale with round-trips (41 pages = 76 s
@@ -790,7 +805,7 @@ export async function loadWarehouseTransactions(options: {
     if (countError == null && typeof exactCount === "number") {
       const available = Math.max(0, exactCount - offset);
       const totalRows = options.limit == null ? available : Math.min(available, options.limit);
-      const sourceRows = await fetchRangesConcurrently<WarehouseLoadedRecord>({
+      const sourceRows = await fetchRangesConcurrently<WarehouseRecord>({
         totalRows,
         pageSize,
         startOffset: offset,
@@ -826,11 +841,16 @@ export async function loadWarehouseTransactions(options: {
     }
 
     hasMore = false;
-    const hydrated = hydrateWarehouseTransactionsForAnalytics(records);
-    traceEvent("warehouse.transactions_hydrated", { source_rows: records.length, hydrated_rows: hydrated.length });
     emit(true, options.limit != null && rowsDownloaded >= options.limit ? "limit_reached" : rowsDownloaded === 0 ? "empty_page" : "completed");
-    return hydrated;
+    return records;
   }, { table: "transactions", limit: options.limit ?? "all", page_size: options.pageSize ?? TRANSACTION_WAREHOUSE_SELECT_PAGE_SIZE });
+}
+
+export async function loadWarehouseTransactions(options: WarehouseRecordsLoadOptions = {}): Promise<Transaction[]> {
+  const records = await loadWarehouseRecords(options);
+  const hydrated = hydrateWarehouseTransactionsForAnalytics(records);
+  traceEvent("warehouse.transactions_hydrated", { source_rows: records.length, hydrated_rows: hydrated.length });
+  return hydrated;
 }
 
 
