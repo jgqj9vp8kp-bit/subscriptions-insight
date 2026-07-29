@@ -1,28 +1,18 @@
 import Papa from "papaparse";
 import { read, utils } from "xlsx";
 import { supabase } from "@/services/supabaseClient";
+import { SUPPORT_CATEGORIES_V2, type SupportCategoryV2 } from "@/services/supportTaxonomy";
 
 export const SUPPORT_CLASSIFICATION_VERSION = "support_rules_v1";
 
-export const SUPPORT_CATEGORIES = [
-  "Cancellation",
-  "Refund",
-  "Unauthorized or unexpected charge",
-  "Payment issue",
-  "Product/report not received",
-  "Product/report question",
-  "Technical issue",
-  "Subscription question",
-  "Duplicate charge",
-  "Account/access issue",
-  "Complaint",
-  "Positive feedback",
-  "Spam/unrelated",
-  "Other/unclear",
-] as const;
+// The taxonomy lives in the shared module so the Edge classifier, the
+// ClickHouse sync and this page cannot drift apart. v2 keeps every v1 name and
+// adds the six the corpus needed (billing inquiry, accidental signup,
+// mailing-list unsubscribe, wrong product, not-our-customer, automated bounce).
+export const SUPPORT_CATEGORIES = SUPPORT_CATEGORIES_V2;
 
 export const SUPPORT_URGENCIES = ["low", "medium", "high"] as const;
-export type SupportCategory = (typeof SUPPORT_CATEGORIES)[number];
+export type SupportCategory = SupportCategoryV2;
 export type SupportUrgency = (typeof SUPPORT_URGENCIES)[number];
 export type SupportLanguage = "en" | "es" | "ru" | "unknown";
 export type SupportSentiment = "negative" | "neutral" | "positive";
@@ -164,6 +154,10 @@ export interface SupportRequestSummaryRow {
   duplicate_charge: boolean;
   urgent: boolean;
   matched_customer: boolean;
+  /** Intents the email also expresses beyond `category` (taxonomy v2). */
+  secondary_categories: string[];
+  classification_source: string;
+  classification_model: string | null;
   classification_confidence: number;
   classification_reason: string | null;
   manual_category: SupportCategory | null;

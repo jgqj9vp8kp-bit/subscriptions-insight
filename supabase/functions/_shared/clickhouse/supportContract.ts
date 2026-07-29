@@ -88,6 +88,10 @@ export interface SupportRequestRow {
   duplicate_charge: boolean;
   urgent: boolean;
   matched_customer: boolean;
+  /** Other intents the email also expresses, beyond `category`. */
+  secondary_categories: string[];
+  classification_source: string;
+  classification_model: string | null;
   classification_confidence: number;
   classification_reason: string | null;
   manual_category: string | null;

@@ -15,7 +15,8 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { AlertCircle, FileSpreadsheet, Inbox, Loader2, MailCheck, RefreshCw, Search } from "lucide-react";
+import { AlertCircle, FileSpreadsheet, Inbox, Loader2, MailCheck, RefreshCw, Search, Sparkles } from "lucide-react";
+import { Progress } from "@/components/ui/progress";
 import { AppLayout } from "@/components/AppLayout";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -49,6 +50,11 @@ import {
   type SupportMailSyncAction,
   type SyncSupportMailSummary,
 } from "@/services/supportInbox";
+import {
+  isTerminalClassificationState,
+  runSupportClassification,
+  type SupportClassificationProgress,
+} from "@/services/supportClassification";
 import {
   SUPPORT_CATEGORIES,
   SUPPORT_URGENCIES,
@@ -278,6 +284,9 @@ export default function SupportPage() {
   const [importYear, setImportYear] = useState(() => new Date().getFullYear());
   const [preview, setPreview] = useState<SupportParseResult | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
+  /** Off by default: a normal run only touches emails that are not yet on the
+   * current taxonomy, so re-running it is cheap and idempotent. */
+  const [classifyAll, setClassifyAll] = useState(false);
   const [lastImport, setLastImport] = useState<SupportImportSummary | null>(null);
   const [manualCategory, setManualCategory] = useState<SupportCategory>("Other/unclear");
   const [manualSubcategory, setManualSubcategory] = useState("other_unclear");
@@ -446,6 +455,69 @@ export default function SupportPage() {
       });
     },
   });
+
+  // Re-classification runner. One Edge call handles a bounded chunk and returns
+  // "partial"; the loop keeps calling until the job reports it is done, so a
+  // 2 700-email backfill is not bound by the Edge Function time limit.
+  const [classification, setClassification] = useState<SupportClassificationProgress | null>(null);
+  const [classifying, setClassifying] = useState(false);
+  const classifyStopRef = useRef(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    void runSupportClassification("status")
+      .then((progress) => {
+        if (!cancelled) setClassification(progress);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function runClassification(initial: "start" | "continue") {
+    if (classifying) return;
+    classifyStopRef.current = false;
+    setClassifying(true);
+    let action: "start" | "continue" = initial;
+    try {
+      for (;;) {
+        const progress = await runSupportClassification(action, { reclassify_all: initial === "start" && classifyAll });
+        setClassification(progress);
+        if (progress.status === "completed") {
+          toast({
+            title: "Classification finished",
+            description: `${progress.rows_classified.toLocaleString()} classified · ${progress.rows_failed.toLocaleString()} left on the previous result.`,
+          });
+          break;
+        }
+        if (progress.status === "failed") {
+          toast({
+            title: "Classification stopped",
+            description: progress.last_error ?? progress.stopped_reason ?? "Unknown error",
+            variant: "destructive",
+          });
+          break;
+        }
+        if (classifyStopRef.current) {
+          toast({ title: "Classification paused", description: "Progress is saved — press Continue to resume." });
+          break;
+        }
+        action = "continue";
+      }
+      invalidateSupport();
+      await syncSupportToClickHouse(false).catch(() => undefined);
+      invalidateSupport();
+    } catch (error) {
+      toast({
+        title: "Classification failed",
+        description: error instanceof Error ? error.message : "Unknown error",
+        variant: "destructive",
+      });
+    } finally {
+      setClassifying(false);
+    }
+  }
 
   const manualMutation = useMutation({
     mutationFn: async () => {
@@ -632,6 +704,71 @@ export default function SupportPage() {
             <div><span className="text-muted-foreground">Password secret</span><div className="font-medium">{mailStatus?.config?.password ? "Configured" : "Missing"}</div></div>
             <div><span className="text-muted-foreground">Last error</span><div className="font-medium truncate">{mailState?.last_error_code ?? lastSync?.error_code ?? "-"}</div></div>
           </div>
+        </Card>
+
+        <Card className="p-4 shadow-card">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="flex items-start gap-3">
+              <div className="flex h-10 w-10 items-center justify-center rounded-md bg-primary/10 text-primary">
+                <Sparkles className="h-5 w-5" />
+              </div>
+              <div>
+                <h2 className="text-sm font-semibold text-foreground">Classification</h2>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Reads each email and assigns a primary intent plus the other intents it expresses. Only emails not yet on the current
+                  taxonomy are processed, so re-running costs nothing.
+                </p>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                <input
+                  type="checkbox"
+                  className="h-3.5 w-3.5"
+                  checked={classifyAll}
+                  disabled={classifying}
+                  onChange={(event) => setClassifyAll(event.target.checked)}
+                />
+                Re-classify everything
+              </label>
+              <Button type="button" onClick={() => void runClassification("start")} disabled={classifying}>
+                {classifying && <Loader2 className="h-4 w-4 animate-spin" />}
+                {classification?.status === "partial" ? "Restart" : "Classify"}
+              </Button>
+              {classification?.status === "partial" && !classifying && (
+                <Button type="button" variant="outline" onClick={() => void runClassification("continue")}>
+                  Continue
+                </Button>
+              )}
+              {classifying && (
+                <Button type="button" variant="outline" onClick={() => { classifyStopRef.current = true; }}>
+                  Stop
+                </Button>
+              )}
+            </div>
+          </div>
+          {classification && (
+            <>
+              {classification.rows_expected != null && classification.rows_expected > 0 && (
+                <Progress value={classification.progress_percent} className="mt-4 h-2" />
+              )}
+              <div className="mt-3 grid gap-3 text-xs sm:grid-cols-3 lg:grid-cols-6">
+                <div><span className="text-muted-foreground">Status</span><div className="font-medium">{classification.status}</div></div>
+                <div><span className="text-muted-foreground">Classified</span><div className="font-medium">{classification.rows_classified.toLocaleString()}</div></div>
+                <div><span className="text-muted-foreground">Remaining</span><div className="font-medium">{classification.rows_remaining?.toLocaleString() ?? "-"}</div></div>
+                <div><span className="text-muted-foreground">Kept previous</span><div className="font-medium">{classification.rows_failed.toLocaleString()}</div></div>
+                <div><span className="text-muted-foreground">Model</span><div className="font-medium truncate">{classification.model ?? "-"}</div></div>
+                <div><span className="text-muted-foreground">Tokens in/out</span><div className="font-medium">{classification.input_tokens.toLocaleString()} / {classification.output_tokens.toLocaleString()}</div></div>
+              </div>
+              {classification.last_error && (
+                <p className="mt-2 text-xs text-warning">
+                  {classification.stopped_reason === "no_api_key"
+                    ? "ANTHROPIC_API_KEY is not set for this project — emails keep their rule-based classification until it is."
+                    : classification.last_error}
+                </p>
+              )}
+            </>
+          )}
         </Card>
 
         <Card className="p-4 shadow-card">
@@ -1186,8 +1323,28 @@ export default function SupportPage() {
                   <div><span className="text-muted-foreground">Campaign Path</span><div>{selected.campaign_path || EMPTY_CAMPAIGN_PATH}</div></div>
                   <div><span className="text-muted-foreground">Attribution status</span><div>{selected.attribution_status}</div></div>
                   <div><span className="text-muted-foreground">Automatic category</span><div>{selected.automatic_category ?? selected.category} / {selected.automatic_subcategory ?? selected.subcategory}</div></div>
-                  <div><span className="text-muted-foreground">Confidence</span><div>{Math.round(Number(selected.classification_confidence ?? 0) * 100)}%</div></div>
+                  <div>
+                    <span className="text-muted-foreground">Confidence</span>
+                    <div>
+                      {Math.round(Number(selected.classification_confidence ?? 0) * 100)}%
+                      <span className="ml-2 text-xs text-muted-foreground">
+                        {selected.classification_source === "llm" ? selected.classification_model || "model" : "keyword rules"}
+                      </span>
+                    </div>
+                  </div>
                 </div>
+                {(selected.secondary_categories?.length ?? 0) > 0 && (
+                  <div className="flex flex-wrap items-center gap-2">
+                    {/* The intents the email also expresses. A single category
+                        used to hide these — "cancel and refund me" counted once. */}
+                    <span className="text-xs text-muted-foreground">Also asks about</span>
+                    {selected.secondary_categories.map((category) => (
+                      <span key={category} className="rounded-full border border-border px-2 py-0.5 text-xs text-foreground">
+                        {category}
+                      </span>
+                    ))}
+                  </div>
+                )}
                 <div className="rounded-md border border-border p-3">
                   <h3 className="text-xs font-semibold text-muted-foreground">Message Body</h3>
                   <p className="mt-2 whitespace-pre-wrap text-sm text-foreground">{selected.message_body || "No message body available."}</p>

@@ -221,7 +221,7 @@ describe("runSupportClassificationJob", () => {
     expect(rows[1].classification_version).toBe("support_rules_v1");
   });
 
-  it("saves progress when the source read fails mid-run, so Continue resumes", async () => {
+  it("keeps the work done before an API failure and leaves the failed rows for Continue", async () => {
     const rows = makeRows(6);
     const { client, state } = fakeSupabase(rows);
     let calls = 0;
@@ -239,11 +239,57 @@ describe("runSupportClassificationJob", () => {
       callModel: flakyModel,
     });
 
-    // The failed batch counts as failed rows, the run stays resumable.
-    expect(progress.rows_classified).toBe(4);
-    expect(progress.rows_failed).toBe(2);
+    // The first batch's work is kept and its cursor persisted; the batch that
+    // failed is NOT counted as failed rows — the cursor never passed it, so
+    // Continue re-reads exactly those emails once the API recovers.
+    expect(progress.rows_classified).toBe(2);
+    expect(progress.rows_failed).toBe(0);
+    expect(progress.status).toBe("failed");
     expect(progress.last_error).toContain("529");
-    expect(state.get(SUPPORT_CLASSIFICATION_JOB)?.cursor_request_id).toBeTruthy();
+    expect(state.get(SUPPORT_CLASSIFICATION_JOB)?.cursor_request_id).toBe("row-02");
+  });
+
+  it("stops immediately on a rejected API key instead of grinding through the archive", async () => {
+    // Regression: a wrong key fails every batch identically. The runner used to
+    // keep calling Continue, so one bad key would burn ~120 doomed requests
+    // across the whole mailbox before anyone noticed.
+    const rows = makeRows(40);
+    const { client, updates } = fakeSupabase(rows);
+    const rejecting: ModelCaller = vi.fn(async () => {
+      throw new Error('{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}');
+    });
+
+    const progress = await runSupportClassificationJob({
+      ...base,
+      supabase: client,
+      request: { action: "start", batch_size: 2, max_batches: 20 },
+      callModel: rejecting,
+    });
+
+    expect(progress.status).toBe("failed");
+    expect(progress.stopped_reason).toBe("api_error");
+    expect(progress.last_error).toContain("authentication_error");
+    expect(rejecting).toHaveBeenCalledTimes(1); // one probe, not twenty
+    expect(updates).toHaveLength(0);
+  });
+
+  it("stops when every batch of a chunk failed, even on a retryable-looking error", async () => {
+    const rows = makeRows(10);
+    const { client } = fakeSupabase(rows);
+    const overloaded: ModelCaller = vi.fn(async () => {
+      throw new Error("529 overloaded");
+    });
+
+    const progress = await runSupportClassificationJob({
+      ...base,
+      supabase: client,
+      request: { action: "start", batch_size: 5, max_batches: 5 },
+      callModel: overloaded,
+    });
+
+    expect(progress.status).toBe("failed");
+    expect(progress.stopped_reason).toBe("api_error");
+    expect(overloaded).toHaveBeenCalledTimes(1);
   });
 
   it("reports a missing API key instead of failing loudly, leaving rules classification in place", async () => {

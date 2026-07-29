@@ -125,6 +125,13 @@ const clampInt = (value: unknown, fallback: number, min: number, max: number): n
   return Math.min(max, Math.max(min, Math.floor(numeric)));
 };
 
+/** Errors that will fail identically on every retry: a bad key, a revoked key,
+ * a request the API refuses. Grinding through 2 700 emails one doomed batch at
+ * a time is pure waste, so these stop the run immediately. */
+export function isNonRetryableApiError(message: string): boolean {
+  return /authentication_error|invalid x-api-key|permission_error|not_found_error|invalid_request_error|\b40[0134]\b/i.test(message);
+}
+
 export function normalizeAction(action: unknown): ClassificationAction {
   const value = String(action ?? "status").toLowerCase();
   if (value === "start" || value === "continue" || value === "status" || value === "reset") return value;
@@ -311,6 +318,18 @@ export async function runSupportClassificationJob(input: ClassificationJobInput)
       state.input_tokens += outcome.usage.input_tokens;
       state.output_tokens += outcome.usage.output_tokens;
       if (outcome.errors.length) state.last_error = outcome.errors[outcome.errors.length - 1];
+
+      // A wrong key (or an API that refuses the request) fails every batch the
+      // same way. Stop instead of walking the whole archive burning calls; the
+      // cursor has not moved, so Continue resumes exactly here once fixed.
+      const fatal = outcome.errors.find((message) => isNonRetryableApiError(message));
+      if (fatal || (outcome.results.size === 0 && outcome.errors.length > 0)) {
+        state.status = "failed";
+        state.stopped_reason = "api_error";
+        state.last_error = fatal ?? outcome.errors[outcome.errors.length - 1];
+        await saveState(input.supabase, state);
+        return toProgress(state, action, now() - startedAt);
+      }
 
       for (const row of rows) {
         const result = outcome.results.get(row.id);
