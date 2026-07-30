@@ -57,16 +57,16 @@ Authorization: Bearer subengine_live_xxxxx
       "trial_to_first_sub_cr": 0.3092,
       "refund_users": 31,
       "net_revenue": 5234.5,
-      "spend": 1800,
-      "cac": 3.84,
-      "roas": 2.91
+      "spend": null,
+      "cac": null,
+      "roas": null
     }
   ],
   "meta": {
     "date_from": "2026-05-01",
     "date_to": "2026-05-08",
     "rows": 1,
-    "traffic_rows": 42,
+    "traffic_rows": 0,
     "transactions_loaded": 5123,
     "import_batches_loaded": 7,
     "latest_batch_rows": 812,
@@ -76,7 +76,7 @@ Authorization: Bearer subengine_live_xxxxx
 }
 ```
 
-Все метрики вычисляются **на сервере** из склада транзакций и последнего сохранённого снимка Facebook-трафика на момент запроса. Классификация (trial / upsell / first_subscription) пересчитывается по полной истории пользователя внутри Edge Function — нажимать «Refresh local analytics cache from DB» в приложении для корректности API не требуется.
+Все метрики вычисляются **на сервере** из склада транзакций ClickHouse на момент запроса. Данные о расходах Facebook больше не выгружаются: `spend`, `cac` и `roas` всегда `null` (поля сохранены в ответе, чтобы не менять форму контракта). Классификация (trial / upsell / first_subscription) пересчитывается по полной истории пользователя внутри Edge Function — нажимать «Refresh local analytics cache from DB» в приложении для корректности API не требуется.
 
 API всегда читает **весь** склад транзакций по всем загруженным CSV-частям (`auth_user_id = владелец ключа`, `deleted_at is null`), без фильтра по последнему `import_batch_id`. Поля `meta` это подтверждают:
 
@@ -102,11 +102,11 @@ API всегда читает **весь** склад транзакций по 
 | `trial_to_first_sub_cr` | `first_sub_users / trial_users`, до 4 знаков |
 | `refund_users` | Пользователи хотя бы с одним рефандом |
 | `net_revenue` | Чистая выручка группы (gross успешных продаж − рефанды/чарджбэки), USD |
-| `spend` | Расходы на трафик из снимка Facebook за период; `null`, если данных нет или путь делят несколько кампаний |
-| `cac` | `spend / trial_users`; `null`, если `spend` недоступен |
-| `roas` | `net_revenue / spend`; `null`, если `spend` недоступен или равен 0 |
+| `spend` | Не выгружается — всегда `null` |
+| `cac` | Не выгружается — всегда `null` |
+| `roas` | Не выгружается — всегда `null` |
 
-`meta.traffic_rows` — число строк трафика, прочитанных из последнего снимка Facebook (0, если снимок не сохранён).
+`meta.traffic_rows` — всегда `0`: расходы Facebook не выгружаются. Поле оставлено для совместимости формы ответа.
 
 ## 5. Ошибки
 
