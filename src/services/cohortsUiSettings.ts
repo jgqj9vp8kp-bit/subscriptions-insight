@@ -317,6 +317,25 @@ export function mergeCohortsUiSettings(
   };
 }
 
+/** Which view a page open should land on.
+ *
+ * An explicitly recorded choice always wins. With none recorded, the operator's
+ * own saved view beats the built-in Default: a custom view exists precisely
+ * because it is the layout they want to see, and the alternative was landing on
+ * the factory columns and re-picking the view by hand on every open.
+ *
+ * Returns the newest saved view (views are appended on save), or `fallback` when
+ * the operator has none.
+ */
+export function resolveLandingView(
+  selectedView: string | null | undefined,
+  savedViews: readonly { id: string }[],
+  fallback: string | null = null,
+): string | null {
+  if (selectedView) return selectedView;
+  return savedViews.length > 0 ? savedViews[savedViews.length - 1].id : fallback;
+}
+
 export function markCohortsUiSettingsUpdated(updatedAt = new Date().toISOString()) {
   try {
     localStorage.setItem(COHORTS_UI_SETTINGS_UPDATED_AT_KEY, updatedAt);

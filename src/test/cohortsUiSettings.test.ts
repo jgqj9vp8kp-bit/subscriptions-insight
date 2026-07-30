@@ -7,6 +7,7 @@ import {
   loadCohortsUiSettingsLocal,
   mergeCohortsUiSettings,
   newerCohortsUiSettings,
+  resolveLandingView,
   saveCohortsUiSettingsCloud,
   saveCohortsUiSettingsLocal,
   sanitizeColumnOrder,
@@ -454,5 +455,33 @@ describe("cohorts UI settings", () => {
       "renewal_11_users",
       "renewal_12_users",
     ]);
+  });
+});
+
+describe("resolveLandingView", () => {
+  const myView = { id: "custom_1784886845225" };
+
+  it("lands on the operator's saved view when nothing is selected", () => {
+    // The live cloud snapshot had savedViews:["My view"] with selectedView:null —
+    // toggling a column clears the selection — so every open showed the factory
+    // columns until the view was re-picked by hand.
+    expect(resolveLandingView(null, [myView])).toBe("custom_1784886845225");
+    expect(resolveLandingView(undefined, [myView])).toBe("custom_1784886845225");
+    expect(resolveLandingView("", [myView])).toBe("custom_1784886845225");
+  });
+
+  it("never overrides an explicit choice, including a built-in one", () => {
+    expect(resolveLandingView("default", [myView])).toBe("default");
+    expect(resolveLandingView("revenue", [myView])).toBe("revenue");
+    expect(resolveLandingView(myView.id, [myView])).toBe(myView.id);
+  });
+
+  it("prefers the newest saved view when several exist", () => {
+    expect(resolveLandingView(null, [{ id: "older" }, { id: "newer" }])).toBe("newer");
+  });
+
+  it("falls back only when the operator has no saved view", () => {
+    expect(resolveLandingView(null, [])).toBeNull();
+    expect(resolveLandingView(null, [], "default")).toBe("default");
   });
 });

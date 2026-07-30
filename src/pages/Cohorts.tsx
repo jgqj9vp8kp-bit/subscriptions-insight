@@ -77,6 +77,7 @@ import {
   markCohortsUiSettingsUpdated,
   mergeCohortsUiSettings,
   readLocalCohortsUiSettings,
+  resolveLandingView,
   saveCohortsUiSettingsCloud,
   sanitizeColumnOrder,
   sanitizeColumnVisibility,
@@ -1098,7 +1099,7 @@ export default function CohortsPage() {
   // (real transactions) only as the fallback when ClickHouse errors or a
   // not-yet-server-reproduced filter is active.
   const cohortsSource = useMemo(() => cohortsDataSourceMode(), []);
-  const { user } = useAuth();
+  const { user, loading: authLoading } = useAuth();
   // Non-reversible per-user scope for cache isolation; hashed warehouse version so
   // a warehouse advance busts stale cache. chResult / chStatus (+ progress) are
   // produced by the cached cohorts query defined just above `needLegacy` below.
@@ -1280,6 +1281,7 @@ export default function CohortsPage() {
   const [cohortsUiCloudError, setCohortsUiCloudError] = useState<string | null>(null);
   const skipNextCloudSaveRef = useRef(false);
   const didLoadCloudSettingsRef = useRef(false);
+  const didLandOnViewRef = useRef(false);
 
   const cohortsUiSettingsDefaults = useMemo<CohortsUiSettingsDefaults>(
     () => ({
@@ -1427,16 +1429,43 @@ export default function CohortsPage() {
     }
   };
 
+  // The restore below must not depend on these directly. They are rebuilt on
+  // ordinary state churn (column width, a filter, a sort), and an effect that
+  // lists them re-runs constantly — each re-run firing the cleanup that flips
+  // `mounted` to false and abandoning the in-flight restore, while the one-shot
+  // ref guard blocks any retry. Measured on a cold load: the restore started,
+  // reached its first await, and never got past `if (!mounted) return`, so the
+  // saved view stayed unloaded until "Load settings from cloud" was pressed by
+  // hand. Reading them through a ref keeps the effect's deps stable.
+  const restoreDepsRef = useRef({
+    defaults: cohortsUiSettingsDefaults,
+    apply: applyCohortsUiSettings,
+    saveToCloud: saveCohortsUiSettingsToCloud,
+  });
   useEffect(() => {
+    restoreDepsRef.current = {
+      defaults: cohortsUiSettingsDefaults,
+      apply: applyCohortsUiSettings,
+      saveToCloud: saveCohortsUiSettingsToCloud,
+    };
+  }, [applyCohortsUiSettings, cohortsUiSettingsDefaults, saveCohortsUiSettingsToCloud]);
+
+  useEffect(() => {
+    // Wait for AuthProvider to resolve the session before reading the cloud
+    // snapshot: loadLatestCloudSnapshot needs a user id (auth.getUser()), and on a
+    // cold load that call lost the race against session hydration, returning null
+    // so the merge concluded there was no cloud snapshot at all.
+    if (authLoading) return;
     if (didLoadCloudSettingsRef.current) return;
     didLoadCloudSettingsRef.current = true;
 
     let mounted = true;
 
     async function restoreCohortsUiSettings() {
+      const { defaults, apply, saveToCloud } = restoreDepsRef.current;
       try {
-        const local = readLocalCohortsUiSettings(cohortsUiSettingsDefaults);
-        const cloud = await loadCohortsUiSettingsCloud(cohortsUiSettingsDefaults).catch((error) => {
+        const local = readLocalCohortsUiSettings(defaults);
+        const cloud = await loadCohortsUiSettingsCloud(defaults).catch((error) => {
           console.warn("Could not load Cohorts UI settings cloud snapshot.", error);
           return null;
         });
@@ -1444,14 +1473,14 @@ export default function CohortsPage() {
 
         const merged = mergeCohortsUiSettings(local, cloud);
         if (merged.source === "cloud" && merged.settings) {
-          applyCohortsUiSettings(merged.settings);
+          apply(merged.settings);
           setCohortsUiCloudMessage("Cohorts view loaded from cloud.");
         } else if (merged.source === "local" && merged.settings && cloud) {
-          void saveCohortsUiSettingsToCloud(merged.settings).catch((error) =>
+          void saveToCloud(merged.settings).catch((error) =>
             console.warn("Could not sync local Cohorts UI settings to cloud.", error),
           );
         } else if (merged.source === "local" && merged.settings && !cloud) {
-          void saveCohortsUiSettingsToCloud(merged.settings).catch((error) =>
+          void saveToCloud(merged.settings).catch((error) =>
             console.warn("Could not save local Cohorts UI settings to cloud.", error),
           );
         }
@@ -1468,7 +1497,7 @@ export default function CohortsPage() {
     return () => {
       mounted = false;
     };
-  }, [applyCohortsUiSettings, cohortsUiSettingsDefaults, saveCohortsUiSettingsToCloud]);
+  }, [authLoading]);
 
   useEffect(() => {
     if (!cohortsUiCloudReady) return;
@@ -2120,6 +2149,20 @@ export default function CohortsPage() {
       markCohortsUiSettingsUpdated();
     }
   };
+
+  // Land on a view once the restore above has settled. Reuses applyView so the
+  // columns, widths and the "View:" label can never disagree — setting only the id
+  // would label the table "My view" while showing whatever layout was last used.
+  useEffect(() => {
+    if (!cohortsUiCloudReady) return;
+    if (didLandOnViewRef.current) return;
+    didLandOnViewRef.current = true;
+
+    const landing = resolveLandingView(activeViewId, customViews);
+    if (!landing || landing === activeViewId) return;
+    const view = customViews.find((candidate) => candidate.id === landing);
+    if (view) applyView(view);
+  }, [activeViewId, applyView, cohortsUiCloudReady, customViews]);
 
   const onHeaderDragStart = (id: CohortColumnId) => {
     dragColRef.current = id;
