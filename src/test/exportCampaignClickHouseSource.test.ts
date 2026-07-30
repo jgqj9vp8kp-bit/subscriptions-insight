@@ -106,6 +106,35 @@ describe("query shape", () => {
   });
 });
 
+describe("money comes from the warehouse's converted columns", () => {
+  // The old Postgres path read normalized_payload.net_amount_usd, which — despite
+  // the name — holds the amount in the PAYMENT's currency and never carries an
+  // fx_status. 23.7% of the warehouse is non-USD, so COP 105000 was exported as
+  // $105000 instead of $26.25. transactionMapper writes the ClickHouse columns
+  // already converted (convertAmountToUsd), so reading those columns is what makes
+  // net_revenue correct. If anyone reintroduces a payload read here, this fails.
+  it("selects the ClickHouse money columns, never the payload's same-named fields", () => {
+    for (const column of ["amount_usd", "gross_amount_usd", "net_amount_usd", "refund_amount_usd"]) {
+      // Present as a bare column reference wrapped in toFloat64(...), not as JSON access.
+      expect(EXPORT_TRANSACTIONS_SELECT).toContain(`toFloat64(${column})`);
+    }
+    expect(EXPORT_TRANSACTIONS_SELECT).not.toMatch(/normalized_payload\s*(->|\[)/);
+    expect(EXPORT_TRANSACTIONS_SELECT).not.toMatch(/JSONExtract/i);
+  });
+
+  it("passes the converted amounts through untouched — no second conversion here", () => {
+    // The mapper must not re-apply FX: the column is already USD. COP 105000 at
+    // 0.00025 is $26.25 in ClickHouse; the export must report exactly that.
+    const tx = mapExportSourceRow(warehouseRow({
+      currency: "COP", gross_amount_usd: 26.25, net_amount_usd: 26.25, amount_usd: 26.25,
+    }))!;
+    expect(tx.gross_amount_usd).toBe(26.25);
+    expect(tx.net_amount_usd).toBe(26.25);
+    expect(tx.amount_usd).toBe(26.25);
+    expect(tx.currency).toBe("COP");
+  });
+});
+
 describe("mapExportSourceRow", () => {
   it("maps a warehouse row onto the compute's transaction shape", () => {
     const tx = mapExportSourceRow(warehouseRow())!;
