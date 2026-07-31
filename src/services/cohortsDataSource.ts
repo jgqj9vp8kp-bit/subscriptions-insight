@@ -15,7 +15,7 @@ import { buildCohortId } from "@/services/cohortIdentity";
 import { deriveFbBusinessMetrics } from "@/services/fbCohortFormatting";
 import { runClickHouseCohorts, runClickHouseCohortDetails } from "@/services/clickhouse";
 import { publicRuntimeConfig } from "@/config/publicRuntimeConfig";
-import type { CardType, CohortRow, Funnel, MediaBuyer, Transaction } from "@/services/types";
+import type { CardType, CohortRow, Funnel, MediaBuyer, PlanBreakdownRow, Transaction } from "@/services/types";
 import type { FxNormalizationDiagnostics } from "@/services/currencyNormalization";
 import type { CampaignIdOption } from "@/services/cohortCampaignIds";
 import type { CountryUserCount } from "@/services/userCountry";
@@ -290,6 +290,55 @@ export async function loadCohortDetailsFromClickHouse(
   const response = await runClickHouseCohortDetails({ ...request, action: "details", cohort_key: cohortKey });
   if (!response.ok) throw new Error(response.error || "ClickHouse cohort details request failed.");
   return response;
+}
+
+// ---- Expanded-row price-plan breakdown ------------------------------------
+// Each details plan row embeds a full CohortAggregateRow computed over ONLY
+// that plan's users, so it goes through the SAME mapAggregateToCohortRow as the
+// parent row and is then projected onto the PlanBreakdownRow the table renders.
+// Subscription-state fields (active/cancelled) are deliberately left undefined:
+// the FunnelFox overlay joins per cohort, not per plan, and a fake 0 would read
+// as "nobody is active on this plan". The UI renders "—" for them.
+
+export function mapDetailsPlanBreakdown(details: CohortDetailsResponse): PlanBreakdownRow[] {
+  return (details.price_breakdown ?? []).map((planRow) => {
+    const full = mapAggregateToCohortRow(planRow);
+    return {
+      price: planRow.price,
+      plan_name: planRow.plan_name,
+      trial_users: full.trial_users,
+      // Read from the aggregate row: the CohortRow view-model type predates the
+      // support columns (reading them off `full` is a known baseline TS gap).
+      support_users: planRow.support_users,
+      support_rate: planRow.support_rate,
+      upsell_users: full.upsell_users,
+      first_subscription_users: full.first_subscription_users,
+      renewal_2_users: full.renewal_2_users,
+      renewal_3_users: full.renewal_3_users,
+      renewal_4_users: full.renewal_4_users,
+      renewal_5_users: full.renewal_5_users,
+      renewal_6_users: full.renewal_6_users,
+      renewal_users_by_level: full.renewal_users_by_level,
+      renewal_users: full.renewal_users,
+      refund_users: full.refund_users,
+      trial_to_upsell_cr: full.trial_to_upsell_cr,
+      trial_to_first_subscription_cr: full.trial_to_first_subscription_cr,
+      first_subscription_to_renewal_2_cr: full.first_subscription_to_renewal_2_cr,
+      renewal_2_to_renewal_3_cr: full.renewal_2_to_renewal_3_cr,
+      renewal_3_to_renewal_4_cr: full.renewal_3_to_renewal_4_cr,
+      renewal_4_to_renewal_5_cr: full.renewal_4_to_renewal_5_cr,
+      renewal_5_to_renewal_6_cr: full.renewal_5_to_renewal_6_cr,
+      refund_rate: full.refund_rate,
+      gross_revenue: full.gross_revenue,
+      amount_refunded: full.amount_refunded,
+      net_revenue: full.net_revenue,
+      revenue_d0: full.revenue_d0,
+      revenue_d7: full.revenue_d7,
+      revenue_d30: full.revenue_d30,
+      revenue_d60: full.revenue_d60,
+      net_ltv: full.net_ltv,
+    };
+  });
 }
 
 export function loadCohortsFromLegacyClient(

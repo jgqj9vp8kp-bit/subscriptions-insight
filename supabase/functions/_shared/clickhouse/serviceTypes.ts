@@ -109,19 +109,26 @@ export interface UserAggregate {
 
 export interface PlanBreakdownRow {
   price: number;
+  /** Display label ("$7.49", "Unknown"). Absent on the legacy client engine, which keys plans by price alone. */
+  plan_name?: string;
   trial_users: number;
   support_users?: number;
   support_rate?: number;
-  active_users: number;
-  active_rate: number;
-  active_subscriptions: number;
-  active_subscriptions_rate: number;
-  cancelled_users: number;
-  cancellation_rate: number;
-  user_cancelled_users: number;
-  user_cancel_rate: number;
-  auto_cancelled_users: number;
-  auto_cancel_rate: number;
+  // Subscription-state metrics (active/cancelled) come from the FunnelFox
+  // overlay, which is joined per cohort — not per plan — on the ClickHouse
+  // path. They are optional so server-built plan rows can omit them (the UI
+  // renders "—") instead of showing a fake 0; the legacy client engine still
+  // fills them from its per-user subscription flags.
+  active_users?: number;
+  active_rate?: number;
+  active_subscriptions?: number;
+  active_subscriptions_rate?: number;
+  cancelled_users?: number;
+  cancellation_rate?: number;
+  user_cancelled_users?: number;
+  user_cancel_rate?: number;
+  auto_cancelled_users?: number;
+  auto_cancel_rate?: number;
   upsell_users: number;
   first_subscription_users: number;
   renewal_2_users: number;

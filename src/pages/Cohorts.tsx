@@ -37,7 +37,7 @@ import {
 } from "@/services/funnelfoxSubscriptionsSync";
 import { normalizeCampaignPath, type TrafficMetric } from "@/services/trafficImport";
 import type { CardType, CohortRow, MediaBuyer, PlanBreakdownRow } from "@/services/types";
-import { cohortsDataSourceMode } from "@/services/cohortsDataSource";
+import { cohortsDataSourceMode, loadCohortDetailsFromClickHouse, mapDetailsPlanBreakdown } from "@/services/cohortsDataSource";
 import { isClickHouseCircuitOpen } from "@/services/clickhouse";
 import { deriveCohortSnapshotHealth, ensureCohortSnapshotRebuild } from "@/services/cohortSnapshotHealth";
 import {
@@ -1989,6 +1989,63 @@ export default function CohortsPage() {
     if (!import.meta.env.DEV || !tokenDiagnostics.unknown_products.length) return;
     console.debug("[Cohorts] Unknown monetization products — add to monetizationProductMap.ts", tokenDiagnostics.unknown_products);
   }, [tokenDiagnostics]);
+  // ---- Expanded-row price-plan breakdown (ClickHouse path) ----------------
+  // The server list aggregate has no plan dimension, so plan rows load lazily
+  // per expanded cohort from action=cohort_details — the call the migration
+  // designed for exactly this and the page never wired. The legacy client
+  // engine still fills c.plan_breakdown eagerly; rows that already have one
+  // are never fetched. Cache lives per cohort_id and is dropped whenever the
+  // ClickHouse result changes (new filters or a background refresh), because
+  // the details request embeds the same member filters as the list.
+  type PlanDetailsEntry = { status: "loading" | "ready" | "error"; rows: PlanBreakdownRow[]; error?: string };
+  const [planDetails, setPlanDetails] = useState<ReadonlyMap<string, PlanDetailsEntry>>(new Map());
+  const planDetailsGenRef = useRef(0);
+  useEffect(() => {
+    planDetailsGenRef.current += 1;
+    setPlanDetails(new Map());
+  }, [chResult]);
+
+  const planDetailsRequest = useMemo(
+    () => ({
+      date_from: chRequest.date_from,
+      date_to: chRequest.date_to,
+      filters: chRequest.filters,
+      max_renewal_depth: chRequest.max_renewal_depth,
+    }),
+    [chRequest],
+  );
+
+  useEffect(() => {
+    if (!clickHouseDriving) return;
+    for (const cohortId of expandedCohortIdList) {
+      if (planDetails.has(cohortId)) continue;
+      const cohort = effectiveFilteredCohorts.find((row) => row.cohort_id === cohortId);
+      if (!cohort || cohort.plan_breakdown.length > 0) continue;
+      const generation = planDetailsGenRef.current;
+      setPlanDetails((current) => new Map(current).set(cohortId, { status: "loading", rows: [] }));
+      void loadCohortDetailsFromClickHouse(
+        { cohort_date: cohort.cohort_date, funnel: cohort.funnel, campaign_path: cohort.campaign_path },
+        planDetailsRequest,
+      )
+        .then((details) => {
+          if (planDetailsGenRef.current !== generation) return;
+          setPlanDetails((current) => new Map(current).set(cohortId, {
+            status: "ready",
+            rows: mapDetailsPlanBreakdown(details),
+            error: details.error,
+          }));
+        })
+        .catch((error) => {
+          if (planDetailsGenRef.current !== generation) return;
+          setPlanDetails((current) => new Map(current).set(cohortId, {
+            status: "error",
+            rows: [],
+            error: error instanceof Error ? error.message : String(error),
+          }));
+        });
+    }
+  }, [clickHouseDriving, effectiveFilteredCohorts, expandedCohortIdList, planDetails, planDetailsRequest]);
+
   const cohorts = useMemo(
     () => {
       if (sortColumn && sortDirection) {
@@ -2700,29 +2757,35 @@ export default function CohortsPage() {
         return <TableCell key={id} className={className}>{dash}</TableCell>;
       case "trial_users":
         return <TableCell key={id} className={className}>{plan.trial_users}</TableCell>;
+      // Per-plan support counts exist on the ClickHouse path (same measure list
+      // as the parent row); the legacy engine leaves them undefined → "—".
       case "support_users":
+        return <TableCell key={id} className={className}>{plan.support_users ?? dash}</TableCell>;
       case "support_rate":
-        return <TableCell key={id} className={className}>{dash}</TableCell>;
+        return <TableCell key={id} className={className}>{plan.support_rate != null ? formatPct(plan.support_rate) : dash}</TableCell>;
+      // Subscription-state metrics exist per plan only on the legacy engine
+      // (FunnelFox flags are joined per cohort on the ClickHouse path); an
+      // undefined value renders as "—", never as a fake 0.
       case "active_users":
-        return <TableCell key={id} className={className}>{plan.active_users}</TableCell>;
+        return <TableCell key={id} className={className}>{plan.active_users ?? dash}</TableCell>;
       case "active_subscriptions":
-        return <TableCell key={id} className={className}>{plan.active_subscriptions}</TableCell>;
+        return <TableCell key={id} className={className}>{plan.active_subscriptions ?? dash}</TableCell>;
       case "active_subscriptions_rate":
-        return <TableCell key={id} className={className}>{formatPct(plan.active_subscriptions_rate)}</TableCell>;
+        return <TableCell key={id} className={className}>{plan.active_subscriptions_rate != null ? formatPct(plan.active_subscriptions_rate) : dash}</TableCell>;
       case "active_rate":
-        return <TableCell key={id} className={className}>{formatPct(plan.active_rate)}</TableCell>;
+        return <TableCell key={id} className={className}>{plan.active_rate != null ? formatPct(plan.active_rate) : dash}</TableCell>;
       case "cancelled_users":
-        return <TableCell key={id} className={className}>{plan.cancelled_users}</TableCell>;
+        return <TableCell key={id} className={className}>{plan.cancelled_users ?? dash}</TableCell>;
       case "user_cancelled_users":
-        return <TableCell key={id} className={className}>{plan.user_cancelled_users}</TableCell>;
+        return <TableCell key={id} className={className}>{plan.user_cancelled_users ?? dash}</TableCell>;
       case "user_cancel_rate":
-        return <TableCell key={id} className={className}>{formatPct(plan.user_cancel_rate)}</TableCell>;
+        return <TableCell key={id} className={className}>{plan.user_cancel_rate != null ? formatPct(plan.user_cancel_rate) : dash}</TableCell>;
       case "auto_cancelled_users":
-        return <TableCell key={id} className={className}>{plan.auto_cancelled_users}</TableCell>;
+        return <TableCell key={id} className={className}>{plan.auto_cancelled_users ?? dash}</TableCell>;
       case "auto_cancel_rate":
-        return <TableCell key={id} className={className}>{formatPct(plan.auto_cancel_rate)}</TableCell>;
+        return <TableCell key={id} className={className}>{plan.auto_cancel_rate != null ? formatPct(plan.auto_cancel_rate) : dash}</TableCell>;
       case "cancellation_rate":
-        return <TableCell key={id} className={className}>{formatPct(plan.cancellation_rate)}</TableCell>;
+        return <TableCell key={id} className={className}>{plan.cancellation_rate != null ? formatPct(plan.cancellation_rate) : dash}</TableCell>;
       case "cancelled_active_users":
         return <TableCell key={id} className={className}>{dash}</TableCell>;
       case "upsell_users":
@@ -4001,6 +4064,12 @@ export default function CohortsPage() {
             <TableBody>
               {cohorts.map((c) => {
                 const expanded = expandedCohortIds.has(c.cohort_id);
+                // Plan rows come from the row itself on the legacy engine and
+                // from the lazily-fetched cohort_details on ClickHouse.
+                const planEntry = planDetails.get(c.cohort_id);
+                const planRows = c.plan_breakdown.length > 0 ? c.plan_breakdown : planEntry?.rows ?? [];
+                const planLoading = c.plan_breakdown.length === 0 && planEntry?.status === "loading";
+                const planFailed = c.plan_breakdown.length === 0 && (planEntry?.status === "error" || (planEntry?.status === "ready" && Boolean(planEntry.error)));
                 return (
                   <Fragment key={c.cohort_id}>
                     <TableRow
@@ -4024,12 +4093,13 @@ export default function CohortsPage() {
                       </TableCell>
                       {visibleColumnOrder.map((id) => renderCohortCell(id, c))}
                     </TableRow>
-                    {expanded && c.plan_breakdown.length === 0 && (
+                    {expanded && planRows.length === 0 && (
                       <TableRow className="bg-muted/10 hover:bg-muted/10 [&>td.sticky]:bg-muted/10">
                         <TableCell
                           className={`${CELL_BASE} sticky left-0 z-10 shadow-[1px_0_0_0_hsl(var(--border))] text-xs italic text-muted-foreground whitespace-nowrap pl-8`}
+                          title={planFailed ? planEntry?.error : undefined}
                         >
-                          No price breakdown
+                          {planLoading ? "Loading price plans…" : planFailed ? "Price plans unavailable" : "No price breakdown"}
                         </TableCell>
                         {visibleColumnOrder.map((id) => (
                           <TableCell key={id} className="py-1.5 px-3" />
@@ -4037,15 +4107,20 @@ export default function CohortsPage() {
                       </TableRow>
                     )}
                     {expanded &&
-                      c.plan_breakdown.map((plan) => (
+                      planRows.map((plan) => (
                         <TableRow
-                          key={`${c.cohort_id}-plan-${plan.price}`}
+                          key={`${c.cohort_id}-plan-${plan.plan_name ?? plan.price}`}
                           className="bg-muted/10 hover:bg-muted/20 [&>td.sticky]:bg-muted/10 [&>td.sticky]:hover:bg-muted/20"
                         >
                           <TableCell
                             className={`${CELL_BASE} sticky left-0 z-10 shadow-[1px_0_0_0_hsl(var(--border))] text-xs font-medium text-muted-foreground whitespace-nowrap tabular-nums pl-8`}
                           >
-                            {formatCurrency(plan.price)}
+                            {plan.plan_name === "Unknown" ? "Unknown" : formatCurrency(plan.price)}
+                            {c.trial_users > 0 && (
+                              <span className="ml-1.5 font-normal text-muted-foreground/70">
+                                {`${((plan.trial_users / c.trial_users) * 100).toFixed(1)}%`}
+                              </span>
+                            )}
                           </TableCell>
                           {visibleColumnOrder.map((id) => renderPlanCell(id, plan, c))}
                         </TableRow>

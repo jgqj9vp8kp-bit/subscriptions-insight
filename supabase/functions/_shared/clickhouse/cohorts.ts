@@ -390,7 +390,19 @@ export function supportEmailsCTE(status: CohortSupportDataStatus = "ready"): str
 
 export function aggregateSelect(memberWhere = ""): string {
   return `
-SELECT c_date cohort_date, c_funnel funnel, c_camp campaign_path, uniqExact(uid) trial_users,
+SELECT c_date cohort_date, c_funnel funnel, c_camp campaign_path, ${AGGREGATE_MEASURES}
+FROM finx
+${memberWhere}
+GROUP BY c_date, c_funnel, c_camp`;
+}
+
+/** The per-group measure list of the cohort aggregate — shared verbatim between
+ * the list query (grouped by cohort) and the details price-plan breakdown
+ * (grouped by plan within one cohort), so a plan row can never disagree with
+ * its parent about what any metric means. Expects the finx column set
+ * (uid/g/nn/rr/d/lvl/slot/lt/statusType/tokenAmt/via_email/u_normalized_email)
+ * plus the support_emails CTE in scope. */
+export const AGGREGATE_MEASURES = `uniqExact(uid) trial_users,
   sum(if(is_success = 1, g, 0)) gross_raw, sum(rr) refund_raw,
   sum(if(is_success = 1 AND d = 0, nn, 0)) d0_raw, sum(if(is_success = 1 AND d <= 7, nn, 0)) d7_raw,
   sum(if(is_success = 1 AND d <= 14, nn, 0)) d14_raw, sum(if(is_success = 1 AND d <= 30, nn, 0)) d30_raw,
@@ -412,11 +424,7 @@ SELECT c_date cohort_date, c_funnel funnel, c_camp campaign_path, uniqExact(uid)
     uid,
     lowerUTF8(trim(BOTH ' ' FROM u_normalized_email)) != ''
     AND lowerUTF8(trim(BOTH ' ' FROM u_normalized_email)) IN (SELECT normalized_email FROM support_emails)
-  ) support_users
-FROM finx
-${memberWhere}
-GROUP BY c_date, c_funnel, c_camp`;
-}
+  ) support_users`;
 
 // Per-user authoritative first-trial utm_source as an IN-subquery over user ids.
 // argMin picks the utm_source OF the first successful trial (not the first
@@ -436,6 +444,13 @@ function firstTrialUtmUserSubquery(utms: string[], prefix: string, params: Recor
 // campaign/traffic and user-level dimensions for its user, so this keeps full
 // lifecycle/revenue rows for matching users and excludes whole non-matching users.
 function memberFilterWhere(filters: CohortFilters, params: Record<string, unknown>): string {
+  const conds = memberFilterConds(filters, params);
+  return conds.length ? `WHERE ${conds.join(" AND ")}` : "";
+}
+
+/** The member-level filter conditions without the WHERE keyword, for callers
+ * that AND them into an existing WHERE (the details cohort scope). */
+function memberFilterConds(filters: CohortFilters, params: Record<string, unknown>): string[] {
   const conds: string[] = [];
   const campaign = inClause("c_campaign_id", filters.campaign_id, "cid", params);
   if (campaign) conds.push(campaign);
@@ -454,7 +469,7 @@ function memberFilterWhere(filters: CohortFilters, params: Record<string, unknow
   if (utms.length) mediaParts.push(`uid IN ${firstTrialUtmUserSubquery(utms, "mbutm", params)}`);
   if (mediaParts.length === 1) conds.push(mediaParts[0]);
   else if (mediaParts.length > 1) conds.push(`(${mediaParts.join(" OR ")})`);
-  return conds.length ? `WHERE ${conds.join(" AND ")}` : "";
+  return conds;
 }
 
 // Cohort-level post-filters (date/funnel/campaign_path/refund) as a HAVING/WHERE
@@ -954,13 +969,25 @@ export async function runCohortDetails(input: {
   if (!key || !key.cohort_date) throw new CohortRequestError("action=details requires cohort_key {cohort_date, funnel, campaign_path}.");
 
   // Details read finx (fin + email-matched token rows) so the expanded row's
-  // token packs / currency mix / net_revenue_1m agree with the list row.
-  const base = (extra: string, params: Record<string, unknown>) => `WITH
+  // token packs / currency mix / net_revenue_1m agree with the list row. The
+  // member filters (country/card/campaign_id/traffic/media buyer) are ANDed
+  // into the cohort scope for the same reason: with a filter active the parent
+  // row counts only matching users, and an unfiltered breakdown would not
+  // reconcile with it. support_emails is in scope because the plan breakdown
+  // reuses the list's full measure set, which includes support_users.
+  const supportStatus: CohortSupportDataStatus = await supportDataStatus(input.clickhouse, input.authUserId)
+    .then((probe) => probe.support_data_status)
+    .catch(() => "unavailable" as const);
+  const base = (extra: string, params: Record<string, unknown>) => {
+    const memberConds = memberFilterConds(nreq.filters, params);
+    return `WITH
+${supportEmailsCTE(supportStatus)},
 ${classifierSQL(`a.auth_user_id = {auth_user_id:String}`, "")}
-, ${emailTokenSQL()}
-, scoped AS (SELECT * FROM finx WHERE ${cohortKeyWhere(key, params)})
+, ${emailTokenSQL(memberFilterWhere(nreq.filters, params))}
+, scoped AS (SELECT * FROM finx WHERE ${cohortKeyWhere(key, params)}${memberConds.length ? ` AND ${memberConds.join(" AND ")}` : ""})
 ${extra}
 FORMAT JSONEachRow`;
+  };
 
   const p1: Record<string, unknown> = { auth_user_id: input.authUserId };
   const summarySql = base(`SELECT
@@ -986,26 +1013,49 @@ FORMAT JSONEachRow`;
     FROM scoped WHERE is_success = 1 AND lt = 'token_purchase' GROUP BY pid, pname, round(amt, 2)`, p3);
 
   const p4: Record<string, unknown> = { auth_user_id: input.authUserId };
-  // sum_g/sum_nn (not "sum(g) g"): ClickHouse substitutes SELECT aliases into
-  // sibling expressions, so aliasing an aggregate back onto its source column
-  // turns the sibling argMin into argMin(round(sum(g),2)) -> ILLEGAL_AGGREGATION.
-  // This silently emptied price_breakdown via the catch below (found 2026-07-23).
-  const planSql = base(`SELECT plan_price price,
-    uniqExact(uid) trial_users, sum(sum_g) gross_revenue, sum(sum_nn) net_revenue FROM (
-      SELECT uid, argMin(round(g, 2), (ets2, tprio2, tid2)) plan_price, sum(g) sum_g, sum(nn) sum_nn FROM (
-        SELECT s.uid uid, s.g g, s.nn nn, p.ets ets2, p.tprio tprio2, p.tid tid2
-        FROM scoped s INNER JOIN pretyped p ON p.uid = s.uid
-        WHERE s.is_success = 1 AND s.lt NOT IN ('upsell','token_purchase')
-      ) GROUP BY uid
-    ) GROUP BY plan_price`, p4);
+  // The price-plan breakdown. plankey assigns each cohort member the price of
+  // their first successful non-upsell, non-token transaction — the SAME rule and
+  // rounding the membership snapshot uses for its price_plan column
+  // (cohortMembership.ts), so these rows agree with the Price Plan filter's
+  // options. One row per uid by construction (GROUP BY uid), so the join fans
+  // nothing out — the previous version joined scoped × pretyped per uid, which
+  // multiplied every revenue sum by the user's transaction count and picked the
+  // plan price nondeterministically among join ties.
+  // Each user lands in exactly one plan bucket, so per-plan uniqExact/sums
+  // partition the cohort: plan rows add up to the parent row by construction.
+  // The measure list is AGGREGATE_MEASURES — shared verbatim with the list
+  // aggregate, never duplicated. Alias-trap note (see 2026-07-23 fix below in
+  // git history): no aggregate here is aliased onto its own source column.
+  const planSql = base(`, plankey AS (
+      SELECT uid,
+        countIf(is_success = 1 AND lt NOT IN ('upsell','token_purchase')) plan_candidates,
+        argMinIf(round(g, 2), (ets, tprio, tid), is_success = 1 AND lt NOT IN ('upsell','token_purchase')) plan_price
+      FROM scoped GROUP BY uid
+    )
+    SELECT
+      if(plan_candidates = 0, 'Unknown', concat('$', toString(plan_price))) plan_name,
+      if(plan_candidates = 0, 0, plan_price) price,
+      ${AGGREGATE_MEASURES}
+    FROM (
+      SELECT s.*, pk.plan_candidates plan_candidates, pk.plan_price plan_price
+      FROM scoped s INNER JOIN plankey pk ON pk.uid = s.uid
+    )
+    GROUP BY plan_name, price
+    ORDER BY plan_name = 'Unknown', price`, p4);
 
   const [sumRes, curRes, tokRes] = await Promise.all([
     input.clickhouse.query({ query: summarySql, query_params: p1, format: "JSONEachRow" }).then((r) => r.json()).catch(() => []),
     input.clickhouse.query({ query: currencySql, query_params: p2, format: "JSONEachRow" }).then((r) => r.json()).catch(() => []),
     input.clickhouse.query({ query: tokenSql, query_params: p3, format: "JSONEachRow" }).then((r) => r.json()).catch(() => []),
   ]);
-  // plan breakdown is best-effort — never fail the whole details response on it.
-  const planRes = await input.clickhouse.query({ query: planSql, query_params: p4, format: "JSONEachRow" }).then((r) => r.json()).catch(() => []);
+  // Plan breakdown stays best-effort (the rest of the panel must not die with
+  // it), but a failure is no longer silent: the message travels in `error` so
+  // the UI can say "unavailable" instead of the misleading "no breakdown".
+  let planError: string | undefined;
+  const planRes = await input.clickhouse.query({ query: planSql, query_params: p4, format: "JSONEachRow" }).then((r) => r.json()).catch((error) => {
+    planError = error instanceof Error ? error.message : String(error);
+    return [];
+  });
 
   const sumRow = ((sumRes as Array<Record<string, unknown>>)[0]) ?? {};
   const trialUsers = n(sumRow.trial_users);
@@ -1019,12 +1069,18 @@ FORMAT JSONEachRow`;
     generated_at: new Date().toISOString(),
     query_duration_ms: Date.now() - started,
     cohort_key: key,
+    // Each plan row reuses toAggregateRow — the exact mapper the list rows go
+    // through — so a plan's gross/net/renewal/CR semantics can never drift from
+    // the parent cohort's.
     price_breakdown: (planRes as Array<Record<string, unknown>>).map((r) => ({
       price: round2(n(r.price)),
-      plan_name: n(r.price) > 0 ? `$${round2(n(r.price)).toFixed(2)}` : "Unknown",
-      trial_users: n(r.trial_users),
-      gross_revenue: round2(n(r.gross_revenue)),
-      net_revenue: round2(n(r.net_revenue)),
+      plan_name: s(r.plan_name) || "Unknown",
+      ...toAggregateRow({
+        ...r,
+        cohort_date: key.cohort_date,
+        funnel: key.funnel,
+        campaign_path: key.campaign_path,
+      } as unknown as RawCohortRow),
     })),
     currency_breakdown: (curRes as Array<Record<string, unknown>>).map((r) => ({
       currency: s(r.currency) || "UNKNOWN",
@@ -1057,6 +1113,7 @@ FORMAT JSONEachRow`;
       available_days: Math.max(0, Math.min(30, ageDays)),
     },
     fx: { missing_transactions: 0, missing_amount: 0 },
+    ...(planError ? { error: `price_breakdown: ${planError}` } : {}),
   };
 }
 

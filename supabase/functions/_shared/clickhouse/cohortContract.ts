@@ -356,6 +356,19 @@ export interface CohortResponse {
   error?: string;
 }
 
+// One price plan of an expanded cohort: the plan identity plus the FULL cohort
+// aggregate computed over only that plan's users. Embedding CohortAggregateRow
+// (rather than a hand-picked subset) means the server maps plan rows through
+// the same toAggregateRow as list rows and the client can reuse
+// mapAggregateToCohortRow — one metric definition end to end. The plan's
+// cohort_date/funnel/campaign_path repeat the parent cohort key.
+export type CohortPlanBreakdownRow = {
+  /** The plan's first-payment price in USD; 0 for the Unknown bucket. */
+  price: number;
+  /** Display label matching the Price Plan filter's option format ("$7.49"); "Unknown" when the member has no successful non-upsell payment. */
+  plan_name: string;
+} & CohortAggregateRow;
+
 // Expanded (lazy) breakdown for one cohort — action=cohort_details.
 export interface CohortDetailsResponse {
   ok: boolean;
@@ -363,7 +376,7 @@ export interface CohortDetailsResponse {
   generated_at: string;
   query_duration_ms: number;
   cohort_key: { cohort_date: string; funnel: string; campaign_path: string };
-  price_breakdown: Array<{ price: number; plan_name: string; trial_users: number; gross_revenue: number; net_revenue: number }>;
+  price_breakdown: CohortPlanBreakdownRow[];
   currency_breakdown: Array<{ currency: string; trial_users: number; transactions: number; gross_original: number; gross_usd: number; net_usd: number; refunds_usd: number }>;
   upsell: { upsell_1_users: number; upsell_2_users: number; upsell_3_users: number; upsell_extra_users: number; upsell_1_revenue: number; upsell_2_revenue: number; upsell_3_revenue: number; upsell_extra_revenue: number };
   token_pack_breakdown: Array<{ product_id: string; product: string; price: number; purchases: number; buyers: number; gross_revenue: number; revenue_share: number }>;
