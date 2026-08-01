@@ -164,8 +164,21 @@ function hash64(value: string): string {
   return hash.toString();
 }
 
+/** ReplacingMergeTree keeps the LARGEST row_version per sorting key, so the
+ * version must be MONOTONIC across re-syncs of the same transaction. It used to
+ * be hash64(updated_at|event_time|transaction_id) — deterministic but randomly
+ * ordered, so after a Postgres repair the re-synced row lost the merge to its
+ * stale predecessor whenever the new hash happened to be smaller (~50% of
+ * rows). updated_at millis moves forward on every import/repair/sync, which is
+ * exactly the ordering the merge needs. rebuildAnalyticsTransactionsRowVersion
+ * (schema.ts) migrates already-written hash versions onto this scale — without
+ * that rebuild every new millis version would lose to the old ~1e19 hashes. */
 export function deterministicRowVersion(row: Pick<SupabaseTransactionRow, "transaction_id" | "updated_at" | "event_time">): string {
-  return hash64(`${row.updated_at ?? ""}|${row.event_time ?? ""}|${row.transaction_id ?? ""}`);
+  const updated = Date.parse(row.updated_at ?? "");
+  if (Number.isFinite(updated) && updated > 0) return String(updated);
+  const event = Date.parse(row.event_time ?? "");
+  if (Number.isFinite(event) && event > 0) return String(event);
+  return "0";
 }
 
 function subscriptionLevel(type: string): number {

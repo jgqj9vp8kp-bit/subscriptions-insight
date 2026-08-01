@@ -21,6 +21,24 @@ export const FX_RATES_TO_USD: Record<string, number> = {
 export const FX_RATES_AS_OF = "2026-07-01";
 export const FX_SOURCE = "static-config";
 
+/** ISO 4217 exponent-0 currencies: the amount's smallest unit IS the major
+ * unit, so a processor's integer amount must NOT be divided by 100. The set is
+ * the standard processor list (Stripe/Adyen); only JPY appears in the
+ * warehouse today, but the rule is currency-driven so KRW/CLP/VND imports
+ * would land correctly the day they show up. Found live: Palmer sent
+ * amount "6415" JPY (= ¥6,415 ≈ $42) and the importer stored 64.15 —
+ * every yen amount was 100× too small. */
+export const ZERO_DECIMAL_CURRENCIES = new Set([
+  "BIF", "CLP", "DJF", "GNF", "JPY", "KMF", "KRW", "MGA", "PYG", "RWF",
+  "UGX", "VND", "VUV", "XAF", "XOF", "XPF",
+]);
+
+/** How many minor units one major unit holds for import-time normalization. */
+export function currencyMinorUnitFactor(currency: string | null | undefined): number {
+  const normalized = String(currency ?? "").trim().toUpperCase();
+  return ZERO_DECIMAL_CURRENCIES.has(normalized) ? 1 : 100;
+}
+
 export function fxRateToUsd(currency: string | null | undefined): number | null {
   const normalized = String(currency ?? "").trim().toUpperCase();
   if (!normalized) return null;

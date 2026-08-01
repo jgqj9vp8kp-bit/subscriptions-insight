@@ -22,6 +22,36 @@ describe("Palmer transformation", () => {
     expect(normalizeAmount("$29.99")).toBe(29.99);
   });
 
+  it("does NOT divide zero-decimal currencies: an integer yen amount IS the amount", () => {
+    // Found live: Palmer sent amount "6415" JPY (¥6,415 ≈ $42) and the importer
+    // stored 64.15 — every palm-reading JPY cohort was 100× too small.
+    expect(normalizeAmount("6415", "JPY")).toBe(6415);
+    expect(normalizeAmount("160", "JPY")).toBe(160);
+    expect(normalizeAmount("160", "jpy")).toBe(160);
+    expect(normalizeAmount("1000", "KRW")).toBe(1000);
+    // Two-decimal currencies keep the minor-units division.
+    expect(normalizeAmount("160", "USD")).toBe(1.6);
+    expect(normalizeAmount("160", "MXN")).toBe(1.6);
+    expect(normalizeAmount("160")).toBe(1.6);
+  });
+
+  it("applies the same rule to JPY rows end to end, refunds included", () => {
+    const [tx] = transformPalmerRows([{
+      id: "jpy-1",
+      customerId: "user-jpy",
+      createdAt: "2026-07-15T12:25:44Z",
+      status: "SETTLED",
+      amount: "6415",
+      amountRefunded: "6415",
+      currencyCode: "JPY",
+    }]);
+    expect(tx.gross_amount_usd).toBe(6415);
+    expect(tx.refund_amount_usd).toBe(6415);
+    expect(tx.net_amount_usd).toBe(0);
+    expect(tx.currency).toBe("JPY");
+    expect(tx.is_refunded).toBe(true);
+  });
+
   it("maps Palmer statuses explicitly", () => {
     expect(normalizeStatus("SETTLED")).toBe("success");
     expect(normalizeStatus("SUCCEEDED")).toBe("success");

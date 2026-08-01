@@ -10,7 +10,7 @@ import {
 } from "../../supabase/functions/_shared/clickhouse/transactionMapper.ts";
 import { normalizeBackfillParams } from "../../supabase/functions/_shared/clickhouse/backfill.ts";
 import { CLICKHOUSE_FINAL_QUERY_STRATEGY, clickHouseCursorWhereClause, compareMetric } from "../../supabase/functions/_shared/clickhouse/validation.ts";
-import { CREATE_ANALYTICS_TRANSACTIONS_SQL } from "../../supabase/functions/_shared/clickhouse/schema.ts";
+import { CREATE_ANALYTICS_TRANSACTIONS_SQL, HASH_ROW_VERSION_THRESHOLD, TX_ROW_VERSION_REBUILD_SELECT } from "../../supabase/functions/_shared/clickhouse/schema.ts";
 
 function row(overrides: Partial<SupabaseTransactionRow> & { normalized_payload?: Record<string, unknown> } = {}): SupabaseTransactionRow {
   const { normalized_payload: normalizedPayloadOverrides, ...rowOverrides } = overrides;
@@ -157,6 +157,33 @@ describe("ClickHouse Phase 2 transaction mapper", () => {
     const basis = { transaction_id: "tx", updated_at: "2026-06-01T00:00:00Z", event_time: "2026-06-01T00:00:00Z" };
     expect(deterministicRowVersion(basis)).toBe(deterministicRowVersion(basis));
     expect(deterministicRowVersion({ ...basis, updated_at: "2026-06-02T00:00:00Z" })).not.toBe(deterministicRowVersion(basis));
+  });
+
+  it("row versions are MONOTONIC in updated_at — a repaired row must win its merge", () => {
+    // ReplacingMergeTree keeps the LARGEST version per key. The old hash-based
+    // version was randomly ordered, so a Postgres repair re-synced into
+    // ClickHouse lost to its own stale row whenever the new hash was smaller.
+    const basis = { transaction_id: "tx", updated_at: "2026-06-01T00:00:00Z", event_time: "2026-05-01T00:00:00Z" };
+    const before = BigInt(deterministicRowVersion(basis));
+    const repaired = BigInt(deterministicRowVersion({ ...basis, updated_at: "2026-07-31T10:00:00Z" }));
+    expect(repaired > before).toBe(true);
+    // And it stays on the timestamp scale the rebuild migrates old rows onto.
+    expect(Number(deterministicRowVersion(basis))).toBe(Date.parse("2026-06-01T00:00:00Z"));
+    expect(Number(deterministicRowVersion(basis))).toBeLessThan(HASH_ROW_VERSION_THRESHOLD);
+    // No updated_at → event_time; nothing at all → 0, never NaN.
+    expect(deterministicRowVersion({ transaction_id: "tx", updated_at: null, event_time: "2026-05-01T00:00:00Z" }))
+      .toBe(String(Date.parse("2026-05-01T00:00:00Z")));
+    expect(deterministicRowVersion({ transaction_id: "tx", updated_at: null, event_time: "" })).toBe("0");
+  });
+
+  it("the row_version rebuild picks the freshest SOURCE row, not the largest stale hash", () => {
+    // FINAL would dedupe by the old hash versions — keeping exactly the stale
+    // rows the rebuild exists to evict — so the copy must not use it.
+    expect(TX_ROW_VERSION_REBUILD_SELECT).not.toMatch(/FINAL/);
+    expect(TX_ROW_VERSION_REBUILD_SELECT).toContain("ORDER BY ifNull(source_updated_at, clickhouse_synced_at) DESC");
+    expect(TX_ROW_VERSION_REBUILD_SELECT).toContain("PARTITION BY auth_user_id, cohort_date, funnel, campaign_path, campaign_id, user_id, event_time, transaction_id");
+    expect(TX_ROW_VERSION_REBUILD_SELECT).toContain("REPLACE (toUInt64(toUnixTimestamp64Milli(ifNull(source_updated_at, clickhouse_synced_at))) AS row_version)");
+    expect(TX_ROW_VERSION_REBUILD_SELECT).toContain("WHERE rn = 1");
   });
 });
 

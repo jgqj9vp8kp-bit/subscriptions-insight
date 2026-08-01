@@ -255,6 +255,65 @@ export async function rebuildFactSupportRequestsSortingKey(client: ClickHouseCli
   return true;
 }
 
+// ---- analytics_transactions row_version migration --------------------------
+//
+// row_version used to be hash64(updated_at|event_time|transaction_id): unique,
+// but randomly ORDERED — and ReplacingMergeTree keeps the largest version per
+// key. A repaired transaction re-synced from Postgres therefore lost the merge
+// to its own stale predecessor whenever the fresh hash came out smaller (~50%
+// of rows; found while repairing the JPY minor-units defect, where the fix
+// visibly did not take for half the rows). The mapper now emits updated_at
+// millis (monotonic), and this rebuild moves already-written hash versions onto
+// the same scale — hashes are uniform over ~[0, 1.8e19] while millis stay below
+// ~2.5e14 until year 9999, so without the rebuild every new version would lose.
+
+/** Any physical row_version above this is a legacy hash, never a timestamp. */
+export const HASH_ROW_VERSION_THRESHOLD = 1_000_000_000_000_000; // 1e15
+
+const TX_REBUILD_TABLE = `${ANALYTICS_TRANSACTIONS_TABLE}_rebuild`;
+const TX_SORTING_KEY = "auth_user_id, cohort_date, funnel, campaign_path, campaign_id, user_id, event_time, transaction_id";
+
+/** The copy that recomputes versions. Per sorting key the SOURCE's freshest row
+ * wins by source_updated_at — deliberately NOT `FROM ... FINAL`, because FINAL
+ * dedupes by the old hash versions and would keep exactly the stale rows this
+ * rebuild exists to evict. */
+export const TX_ROW_VERSION_REBUILD_SELECT = `
+SELECT * REPLACE (toUInt64(toUnixTimestamp64Milli(ifNull(source_updated_at, clickhouse_synced_at))) AS row_version)
+FROM (
+  SELECT * EXCEPT (rn) FROM (
+    SELECT *, row_number() OVER (
+      PARTITION BY ${TX_SORTING_KEY}
+      ORDER BY ifNull(source_updated_at, clickhouse_synced_at) DESC, row_version DESC
+    ) rn
+    FROM ${ANALYTICS_TRANSACTIONS_TABLE}
+  ) WHERE rn = 1
+)`.trim();
+
+export async function rebuildAnalyticsTransactionsRowVersion(client: ClickHouseClientLike): Promise<boolean> {
+  const inspected = await client.query({
+    query: `SELECT max(row_version) AS max_version FROM ${ANALYTICS_TRANSACTIONS_TABLE}`,
+    format: "JSONEachRow",
+  });
+  const rows = (await inspected.json()) as Array<{ max_version?: number | string }>;
+  const maxVersion = Number(rows[0]?.max_version ?? 0);
+  if (!Number.isFinite(maxVersion) || maxVersion <= HASH_ROW_VERSION_THRESHOLD) return false;
+
+  await client.command({ query: `DROP TABLE IF EXISTS ${TX_REBUILD_TABLE}` });
+  await client.command({ query: `CREATE TABLE ${TX_REBUILD_TABLE} AS ${ANALYTICS_TRANSACTIONS_TABLE}` });
+  await client.command({ query: `INSERT INTO ${TX_REBUILD_TABLE} ${TX_ROW_VERSION_REBUILD_SELECT}` });
+  try {
+    await client.command({ query: `EXCHANGE TABLES ${ANALYTICS_TRANSACTIONS_TABLE} AND ${TX_REBUILD_TABLE}` });
+  } catch {
+    await client.command({
+      query: `RENAME TABLE ${ANALYTICS_TRANSACTIONS_TABLE} TO ${ANALYTICS_TRANSACTIONS_TABLE}_legacy, ${TX_REBUILD_TABLE} TO ${ANALYTICS_TRANSACTIONS_TABLE}`,
+    });
+    await client.command({ query: `DROP TABLE IF EXISTS ${ANALYTICS_TRANSACTIONS_TABLE}_legacy` });
+    return true;
+  }
+  await client.command({ query: `DROP TABLE IF EXISTS ${TX_REBUILD_TABLE}` });
+  return true;
+}
+
 export async function ensureFactSupportRequestsSchema(client: ClickHouseClientLike): Promise<void> {
   await client.command({ query: CREATE_FACT_SUPPORT_REQUESTS_SQL });
   for (const query of [...ALTER_FACT_SUPPORT_REQUESTS_ATTRIBUTION_SQL, ...ALTER_FACT_SUPPORT_REQUESTS_CLASSIFICATION_SQL]) {
@@ -392,6 +451,9 @@ export async function initializeClickHouseSchema(input: { client: ClickHouseClie
   const client = input.client;
 
   await client.command({ query: CREATE_ANALYTICS_TRANSACTIONS_SQL });
+  // One-time migration of legacy hash row_versions onto the monotonic
+  // updated_at-millis scale; no-op once the table carries timestamp versions.
+  await rebuildAnalyticsTransactionsRowVersion(client);
   await client.command({ query: CREATE_FACT_USER_COHORTS_SQL });
   await ensureFactSupportRequestsSchema(client);
   await ensureFactFacebookStatsSchema(client);

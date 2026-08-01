@@ -11,6 +11,7 @@ import { buildCohortId } from "./cohortIdentity.ts";
 import { isTokenPurchaseTransaction } from "./monetization.ts";
 import { APP_ADDON_WINDOW_HOURS } from "./monetizationProductMap.ts";
 import { normalizeTrafficSource } from "./fbSourceClassification.ts";
+import { currencyMinorUnitFactor } from "./fxRates.ts";
 
 export type RawPalmerRow = Record<string, unknown>;
 
@@ -121,25 +122,28 @@ function transactionLifecycleSort(a: Transaction, b: Transaction): number {
   return a.transaction_id.localeCompare(b.transaction_id);
 }
 
-export function normalizeAmount(raw: unknown): number {
+export function normalizeAmount(raw: unknown, currency?: string): number {
   const source = String(raw ?? "").trim();
   const cleaned = source.replace(/[^0-9.-]/g, "");
   const amount = Number(cleaned);
   if (!Number.isFinite(amount)) return 0;
-  // Palmer commonly exports integer cents, but some exports already contain
-  // decimal USD values. Decimal-looking values should not be divided again.
-  const normalized = cleaned.includes(".") ? amount : amount / 100;
+  // Palmer commonly exports integer minor units, but some exports already
+  // contain decimal values. Decimal-looking values should not be divided again.
+  // The minor-unit factor is per ISO 4217: for a zero-decimal currency (JPY —
+  // seen live as amount "6415" meaning ¥6,415) the integer IS the major unit,
+  // and the old unconditional /100 shrank every yen amount 100×.
+  const normalized = cleaned.includes(".") ? amount : amount / currencyMinorUnitFactor(currency);
   return Math.round(normalized * 100) / 100;
 }
 
-function normalizeRefundAmount(raw: unknown): number {
+function normalizeRefundAmount(raw: unknown, currency?: string): number {
   const source = String(raw ?? "").trim();
   const cleaned = source.replace(/[^0-9.-]/g, "");
-  const amountInCents = Number(cleaned);
-  if (!Number.isFinite(amountInCents)) return 0;
-  // Palmer `amountRefunded` is exported in cents even when transaction status
-  // remains SETTLED, so refund analytics must use this field directly.
-  return Math.round((amountInCents / 100) * 100) / 100;
+  const amountInMinorUnits = Number(cleaned);
+  if (!Number.isFinite(amountInMinorUnits)) return 0;
+  // Palmer `amountRefunded` is exported in minor units even when transaction
+  // status remains SETTLED, so refund analytics must use this field directly.
+  return Math.round((amountInMinorUnits / currencyMinorUnitFactor(currency)) * 100) / 100;
 }
 
 export function normalizeStatus(raw: unknown): TransactionStatus {
@@ -283,7 +287,9 @@ function rawTransactionMatchKey(row: RawPalmerRow, index: number): string {
   return [
     userIdFrom(row, metadata, index),
     parseEventTime(valueFrom(row, FIELD_ALIASES.event_time)),
-    Math.abs(normalizeAmount(valueFrom(row, FIELD_ALIASES.amount))).toFixed(2),
+    // Same currency-aware normalization as normalizePalmerRows, or a JPY row's
+    // key would never match the transaction built from it.
+    Math.abs(normalizeAmount(valueFrom(row, FIELD_ALIASES.amount), valueFrom(row, FIELD_ALIASES.currency))).toFixed(2),
   ].join("|");
 }
 
@@ -314,8 +320,9 @@ export function normalizePalmerRows(rows: RawPalmerRow[]): Transaction[] {
   return rows.map((row, index) => {
     const metadata = parseMetadata(row);
     const status = normalizeStatus(valueFrom(row, FIELD_ALIASES.status));
-    const grossAmount = Math.abs(normalizeAmount(valueFrom(row, FIELD_ALIASES.amount)));
-    const refundAmount = normalizeRefundAmount(valueFrom(row, FIELD_ALIASES.amount_refunded));
+    const rowCurrency = valueFrom(row, FIELD_ALIASES.currency);
+    const grossAmount = Math.abs(normalizeAmount(valueFrom(row, FIELD_ALIASES.amount), rowCurrency));
+    const refundAmount = normalizeRefundAmount(valueFrom(row, FIELD_ALIASES.amount_refunded), rowCurrency);
     const netAmount = grossAmount - refundAmount;
     const fallbackType = failedType(status);
     const cardType = cardTypeFromSource(row) ?? cardTypeFromSource(metadata);
@@ -330,7 +337,7 @@ export function normalizePalmerRows(rows: RawPalmerRow[]): Transaction[] {
       refund_amount_usd: refundAmount,
       net_amount_usd: netAmount,
       is_refunded: refundAmount > 0,
-      currency: valueFrom(row, FIELD_ALIASES.currency) || "USD",
+      currency: rowCurrency || "USD",
       status,
       transaction_type: fallbackType ?? "unknown",
       funnel: detectFunnel(metadata),
