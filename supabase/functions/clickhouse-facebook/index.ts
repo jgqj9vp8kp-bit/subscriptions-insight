@@ -35,6 +35,7 @@ import {
   seedConfirmedCampaignAliases,
 } from "../_shared/clickhouse/fbCampaignResolution.ts";
 import { listFbReconSnapshots, runFbReconSnapshot } from "../_shared/clickhouse/fbReconSnapshot.ts";
+import { runProjectSpendLedger } from "../_shared/clickhouse/projectSpendLedger.ts";
 import { runFbV2Parity } from "../_shared/clickhouse/fbV2ParityHarness.ts";
 import { backfillFbV2DimsFromV1, fbV2DimsStatus } from "../_shared/clickhouse/fbWarehouseV2Dims.ts";
 import {
@@ -262,6 +263,26 @@ Deno.serve(async (req: Request) => {
         applied = await insertCampaignFunnelSuggestions(auth.supabase, auth.id, suggestions);
       }
       return jsonResponse({ ok: true, action, suggestions, applied });
+    }
+
+    if (action === "spend_ledger") {
+      // Project Forecasting P2: window spend resolved to campaign_path via the
+      // observed-in-window → historical-users ladder, residual classified as
+      // unknown_funnel / other_unallocated (never redistributed), groups by
+      // (channel × account × currency) with commissions deliberately null —
+      // the client must assign them explicitly (rev. 3 correction 4).
+      const result = await withTimeout(
+        runProjectSpendLedger({
+          clickhouse: ch,
+          supabase: auth.supabase,
+          authUserId: auth.id,
+          dateFrom: typeof body.date_from === "string" ? body.date_from : null,
+          dateTo: typeof body.date_to === "string" ? body.date_to : null,
+        }),
+        READ_TIMEOUT_MS,
+        "Project spend ledger",
+      );
+      return jsonResponse({ ok: true, action, ...result });
     }
 
     if (action === "funnel_spend") {
