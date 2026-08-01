@@ -55,6 +55,7 @@ import {
   type ClickHouseValidationProgress,
 } from "@/services/clickhouse";
 import { repairLegacyNormalizedPayloads, type RepairSummary } from "@/services/normalizedPayloadRepair";
+import { repairZeroDecimalAmounts, type ZeroDecimalRepairSummary } from "@/services/zeroDecimalAmountRepair";
 import { campaignIdForTransaction, UNKNOWN_CAMPAIGN_ID } from "@/services/cohortFiltering";
 import { buildFbTrafficDiagnostics, type FbTrafficDiagnosticsResult } from "@/services/fbTrafficDiagnostics";
 import { useTransactions } from "@/services/sheets";
@@ -162,6 +163,25 @@ export default function IntegrationsPage() {
   const [clickHouseLastBackfill, setClickHouseLastBackfill] = useState<ClickHouseBackfillResult | null>(null);
   const [clickHouseValidation, setClickHouseValidation] = useState<ClickHouseValidationProgress | null>(null);
   const [payloadRepair, setPayloadRepair] = useState<{ running: boolean; progress: string | null; result: RepairSummary | null }>({ running: false, progress: null, result: null });
+  const [zeroDecimalRepair, setZeroDecimalRepair] = useState<{ running: boolean; result: ZeroDecimalRepairSummary | null }>({ running: false, result: null });
+
+  // Re-derives amounts for zero-decimal currencies (JPY-class) from raw_payload
+  // via an RLS-scoped RPC. Idempotent; a second click repairs 0 rows. The
+  // ClickHouse sync picks the rows up on its next incremental run.
+  const onRepairZeroDecimalAmounts = async () => {
+    setZeroDecimalRepair({ running: true, result: null });
+    try {
+      const result = await repairZeroDecimalAmounts();
+      setZeroDecimalRepair({ running: false, result });
+      toast({
+        title: "Zero-decimal amount repair finished",
+        description: `${result.repaired.toLocaleString()} rows re-derived from raw_payload (${result.currencies.join(", ")}).`,
+      });
+    } catch (error) {
+      setZeroDecimalRepair({ running: false, result: null });
+      toast({ title: "Zero-decimal repair failed", description: error instanceof Error ? error.message : "Unknown error", variant: "destructive" });
+    }
+  };
 
   const onRepairLegacyPayloads = async () => {
     setPayloadRepair({ running: true, progress: "Scanning…", result: null });
@@ -681,6 +701,15 @@ export default function IntegrationsPage() {
             {(payloadRepair.progress || payloadRepair.result) && (
               <span className="self-center text-xs text-muted-foreground">
                 {payloadRepair.progress ?? `Repair done: ${payloadRepair.result?.repaired.toLocaleString()} of ${payloadRepair.result?.scanned.toLocaleString()} rows updated.`}
+              </span>
+            )}
+            <Button type="button" variant="outline" onClick={() => void onRepairZeroDecimalAmounts()} disabled={zeroDecimalRepair.running}>
+              {zeroDecimalRepair.running ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+              Repair Zero-Decimal Amounts
+            </Button>
+            {zeroDecimalRepair.result && (
+              <span className="self-center text-xs text-muted-foreground">
+                {`${zeroDecimalRepair.result.repaired.toLocaleString()} rows re-derived from raw (JPY-class currencies).`}
               </span>
             )}
             {clickHouseHealth && (
