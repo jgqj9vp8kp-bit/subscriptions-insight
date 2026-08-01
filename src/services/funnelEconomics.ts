@@ -6,3 +6,6 @@ export * from "../../supabase/functions/_shared/clickhouse/funnelEconomicsAssump
 export * from "../../supabase/functions/_shared/clickhouse/funnelEconomicsComparison.ts";
 export * from "../../supabase/functions/_shared/clickhouse/funnelEconomicsSnapshot.ts";
 export * from "../../supabase/functions/_shared/clickhouse/financialPrimitives.ts";
+export * from "../../supabase/functions/_shared/clickhouse/funnelEconomicsDayGrid.ts";
+export * from "../../supabase/functions/_shared/clickhouse/funnelEconomicsProject.ts";
+export * from "../../supabase/functions/_shared/clickhouse/funnelEconomicsProjectAggregate.ts";
