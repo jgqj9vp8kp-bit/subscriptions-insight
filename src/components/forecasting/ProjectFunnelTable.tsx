@@ -6,12 +6,15 @@
 // most rows need operator input early in a month, so the blocked state is a
 // first-class row, not a hidden error. The checkbox is SCOPING (moves spend
 // between in-project and out-of-project), never editing.
+import { Fragment, useState } from "react";
+import { ChevronDown, ChevronRight } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Card } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { cn } from "@/lib/utils";
 import { fmtInt, fmtMoney, fmtPctValue } from "@/components/forecasting/forecastFormat";
+import { ProjectFunnelRowDetail, type ProjectEntryEdits } from "@/components/forecasting/ProjectFunnelRowDetail";
 import type {
   ProjectEntryResolution,
   ProjectRowEconomics,
@@ -44,14 +47,23 @@ function RowChips({ resolution }: { resolution: ProjectEntryResolution }) {
   );
 }
 
-export function ProjectFunnelTable({ resolved, run, onToggle }: {
+export function ProjectFunnelTable({ resolved, run, onToggle, edits, onEdit }: {
   resolved: ResolvedProject;
   run: ProjectRunResult;
   onToggle: (funnelId: string) => void;
+  edits: Record<string, ProjectEntryEdits>;
+  onEdit: (funnelId: string, patch: Partial<ProjectEntryEdits>) => void;
 }) {
   const economicsById = new Map<string, ProjectRowEconomics>(run.rows.map((row) => [row.funnelId, row]));
   const { totals } = run;
   const overheadGateBroken = totals.gates.some((gate) => gate.code === "overhead_identity");
+  const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
+  const toggleExpanded = (funnelId: string) => setExpanded((current) => {
+    const next = new Set(current);
+    if (next.has(funnelId)) next.delete(funnelId);
+    else next.add(funnelId);
+    return next;
+  });
 
   return (
     <Card className="p-0 shadow-card">
@@ -79,8 +91,10 @@ export function ProjectFunnelTable({ resolved, run, onToggle }: {
               const economics = economicsById.get(entry.funnelId);
               const excluded = status.kind !== "ok";
               const cpa = resolution.frozen?.assumptions.traffic.targetCpa ?? null;
+              const isExpanded = expanded.has(entry.funnelId);
               return (
-                <TableRow key={entry.funnelId} className={cn(excluded && "opacity-60")}>
+                <Fragment key={entry.funnelId}>
+                <TableRow className={cn(excluded && "opacity-60")}>
                   <TableCell className="py-1.5">
                     <Checkbox
                       checked={entry.enabled}
@@ -89,7 +103,10 @@ export function ProjectFunnelTable({ resolved, run, onToggle }: {
                     />
                   </TableCell>
                   <TableCell className="py-1.5 font-medium">
-                    {entry.funnelId}
+                    <button type="button" className="inline-flex items-center gap-1 hover:text-primary" onClick={() => toggleExpanded(entry.funnelId)} aria-expanded={isExpanded}>
+                      {isExpanded ? <ChevronDown className="h-3.5 w-3.5 shrink-0" /> : <ChevronRight className="h-3.5 w-3.5 shrink-0" />}
+                      {entry.funnelId}
+                    </button>
                     <RowChips resolution={resolution} />
                   </TableCell>
                   <TableCell className="py-1.5 text-right tabular-nums">{money(ledger?.funnelResolvedSpend)}</TableCell>
@@ -116,6 +133,18 @@ export function ProjectFunnelTable({ resolved, run, onToggle }: {
                     {economics?.paybackDay != null ? `D${economics.paybackDay}` : dash}
                   </TableCell>
                 </TableRow>
+                {isExpanded && (
+                  <TableRow className="hover:bg-transparent">
+                    <TableCell colSpan={12} className="p-0">
+                      <ProjectFunnelRowDetail
+                        resolution={resolution}
+                        edits={edits[entry.funnelId] ?? {}}
+                        onEdit={(patch) => onEdit(entry.funnelId, patch)}
+                      />
+                    </TableCell>
+                  </TableRow>
+                )}
+                </Fragment>
               );
             })}
           </TableBody>

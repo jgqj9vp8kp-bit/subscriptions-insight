@@ -6,26 +6,39 @@
 // out-of-project without touching any assumption; editing (budgets, cadences,
 // commissions, overrides) is the next phase. The window ledger is always
 // reconciled in full; the P&L consumes only the scoped subset.
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Info, RefreshCw } from "lucide-react";
 import { KpiCard } from "@/components/KpiCard";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { FunnelMultiSelect } from "@/components/forecasting/FunnelMultiSelect";
 import { ProjectCashFlowChart } from "@/components/forecasting/ProjectCashFlowChart";
 import { ProjectFunnelTable } from "@/components/forecasting/ProjectFunnelTable";
+import { type ProjectEntryEdits } from "@/components/forecasting/ProjectFunnelRowDetail";
 import { fmtInt, fmtMoney, fmtPctValue, fmtRatio } from "@/components/forecasting/forecastFormat";
 import { loadProjectSeedData, type ProjectSeedData } from "@/services/projectForecastSeeding";
 import {
   buildProjectEntries,
   resolveProject,
   runResolvedProject,
+  spendGroupKey,
   workbookGlobalDefaults,
   type ProjectAggregationPolicy,
   type SharedCostPool,
+  type SpendBasisMode,
+  type SpendGroup,
 } from "@/services/funnelEconomics";
+
+function parseNum(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const parsed = Number(value.replace(/[\s,]/g, ""));
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+type ProrationMode = SharedCostPool["proration"]["mode"];
 
 /** Previous full calendar month — the natural "review the month that just ended". */
 function previousMonthWindow(): { from: string; to: string } {
@@ -75,12 +88,20 @@ export function ProjectMode() {
   const [asOf] = useState(() => new Date().toISOString());
   const [seed, setSeed] = useState<SeedState>({ kind: "idle" });
   const [deselected, setDeselected] = useState<ReadonlySet<string>>(new Set());
+  // P6 edits — raw input strings, parsed at resolve time; reset on window reload.
+  const [entryEdits, setEntryEdits] = useState<Record<string, ProjectEntryEdits>>({});
+  const [spendBasis, setSpendBasis] = useState<SpendBasisMode>("full_funnel_spend");
+  const [commissionByGroup, setCommissionByGroup] = useState<Record<string, string>>({});
+  const [prorationMode, setProrationMode] = useState<ProrationMode>("calendar_prorated");
+  const [prorationManual, setProrationManual] = useState("");
   const loadGenRef = useRef(0);
 
   const load = useCallback((window: { from: string; to: string }) => {
     const generation = ++loadGenRef.current;
     setSeed({ kind: "loading" });
     setDeselected(new Set());
+    setEntryEdits({});
+    setCommissionByGroup({});
     loadProjectSeedData(window)
       .then((data) => {
         if (loadGenRef.current !== generation) return;
@@ -97,14 +118,69 @@ export function ProjectMode() {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only initial load
   }, []);
 
-  const sharedCosts = useMemo(defaultSharedCosts, []);
+  // Deferred so typing in a budget/CPA/commission field never janks the table —
+  // the resolve re-runs against the settled value.
+  const deferredEdits = useDeferredValue(entryEdits);
+  const deferredCommissions = useDeferredValue(commissionByGroup);
+
+  const policy = useMemo<ProjectAggregationPolicy>(() => {
+    const manual: Record<string, number> = {};
+    for (const [key, raw] of Object.entries(deferredCommissions)) {
+      const pct = parseNum(raw);
+      if (pct !== undefined && pct >= 0 && pct < 100) manual[key] = pct / 100;
+    }
+    return { ...P5_POLICY, spendBasis, manualCommissionByGroup: manual };
+  }, [spendBasis, deferredCommissions]);
+
+  const sharedCosts = useMemo<SharedCostPool>(() => ({
+    ...defaultSharedCosts(),
+    proration: prorationMode === "manual"
+      ? { mode: "manual", manualAmount: parseNum(prorationManual) ?? 0 }
+      : { mode: prorationMode },
+  }), [prorationMode, prorationManual]);
+
   const project = useMemo(() => {
     if (seed.kind !== "ready") return null;
+    const horizonByCadence = workbookGlobalDefaults().horizonByCadence;
     const entries = buildProjectEntries({
       rows: seed.data.rows,
       funnelLedgers: seed.data.funnelLedgers,
-      policy: P5_POLICY,
-    }).map((entry) => (deselected.has(entry.funnelId) ? { ...entry, enabled: false } : entry));
+      policy,
+    }).map((entry) => {
+      const edits = deferredEdits[entry.funnelId] ?? {};
+      const cadence = edits.cadence ?? entry.cadence;
+      const budget = parseNum(edits.plannedBudget);
+      const manualCpa = parseNum(edits.manualCpa);
+      const trialPrice = parseNum(edits.trialPrice);
+      const periodPrice = parseNum(edits.periodPrice);
+      const firstPaidCr = parseNum(edits.firstPaidCrPct);
+      const renewalCr = parseNum(edits.renewalCrPct);
+      const manualSeeds = { ...entry.manualSeeds };
+      if (manualCpa !== undefined) manualSeeds.targetCpa = manualCpa;
+      if (trialPrice !== undefined) manualSeeds.trialPrice = trialPrice;
+      if (periodPrice !== undefined) manualSeeds.periodPrice = periodPrice;
+      // Retention escape hatch: [1, c1] or [1, c1, c1×c2]; the extrapolation
+      // policy grows the tail. This is what unblocks young funnels whose
+      // mature cohorts cannot show a first billing period yet.
+      if (firstPaidCr !== undefined && firstPaidCr > 0) {
+        const c1 = firstPaidCr / 100;
+        manualSeeds.survival = renewalCr !== undefined && renewalCr > 0
+          ? [1, c1, c1 * (renewalCr / 100)]
+          : [1, c1];
+      }
+      return {
+        ...entry,
+        enabled: !deselected.has(entry.funnelId),
+        cadence,
+        // A cadence change re-derives the horizon, or weekly would keep the
+        // monthly 12 periods (= 84 days) and silently truncate the forecast.
+        horizonPeriods: cadence === entry.cadence ? entry.horizonPeriods : horizonByCadence[cadence] ?? entry.horizonPeriods,
+        cadenceConfirmed: edits.cadenceConfirmed ?? entry.cadenceConfirmed,
+        bonusEnabled: edits.bonusEnabled ?? entry.bonusEnabled,
+        plannedBudget: budget ?? entry.plannedBudget,
+        manualSeeds,
+      };
+    });
     const resolved = resolveProject({
       window: seed.data.window,
       asOf,
@@ -113,10 +189,34 @@ export function ProjectMode() {
       funnelLedgers: seed.data.funnelLedgers,
       entries,
       sharedCosts,
-      policy: P5_POLICY,
+      policy,
     });
     return { resolved, run: runResolvedProject(resolved) };
-  }, [seed, deselected, asOf, sharedCosts]);
+  }, [seed, deselected, deferredEdits, asOf, sharedCosts, policy]);
+
+  const onEntryEdit = useCallback((funnelId: string, patch: Partial<ProjectEntryEdits>) => {
+    setEntryEdits((current) => ({ ...current, [funnelId]: { ...current[funnelId], ...patch } }));
+  }, []);
+
+  /** Unresolved commission groups from the RAW seed (before manual assignment),
+   * deduped by group key with summed spend — the operator's worklist. */
+  const unresolvedGroups = useMemo(() => {
+    if (seed.kind !== "ready") return [];
+    const byKey = new Map<string, { key: string; group: SpendGroup; spend: number }>();
+    const collect = (groups: ReadonlyArray<SpendGroup>) => {
+      for (const group of groups) {
+        if (group.trafficCommission !== null) continue;
+        const key = spendGroupKey(group);
+        const existing = byKey.get(key);
+        if (existing) existing.spend += group.spend;
+        else byKey.set(key, { key, group, spend: group.spend });
+      }
+    };
+    for (const ledger of Object.values(seed.data.funnelLedgers)) collect(ledger.groups);
+    collect(seed.data.windowLedger.unknownFunnel.groups);
+    collect(seed.data.windowLedger.otherUnallocated.groups);
+    return [...byKey.values()].sort((a, b) => b.spend - a.spend);
+  }, [seed]);
 
   const toggleFunnel = useCallback((funnelId: string) => {
     setDeselected((current) => {
@@ -201,6 +301,79 @@ export function ProjectMode() {
 
       {project && totals && (
         <>
+          {/* -------- Project settings (P6) -------- */}
+          <Card className="p-4 shadow-card">
+            <h3 className="mb-3 text-sm font-semibold">Project settings</h3>
+            <div className="flex flex-wrap items-end gap-4">
+              <div className="space-y-1">
+                <Label className="text-xs text-muted-foreground">Spend basis</Label>
+                <Select value={spendBasis} onValueChange={(value) => setSpendBasis(value as SpendBasisMode)}>
+                  <SelectTrigger className="h-8 w-56"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="full_funnel_spend">Full funnel spend</SelectItem>
+                    <SelectItem value="attributed_only">Attributed only (provisional)</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs text-muted-foreground">Shared-cost pool ({fmtMoney(project.resolved.proratedPool)})</Label>
+                <Select value={prorationMode} onValueChange={(value) => setProrationMode(value as ProrationMode)}>
+                  <SelectTrigger className="h-8 w-56"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="calendar_prorated">Prorated by window days</SelectItem>
+                    <SelectItem value="full_month">Full month regardless</SelectItem>
+                    <SelectItem value="manual">Manual amount</SelectItem>
+                    <SelectItem value="excluded">Excluded</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              {prorationMode === "manual" && (
+                <div className="space-y-1">
+                  <Label className="text-xs text-muted-foreground">Pool amount (USD)</Label>
+                  <Input className="h-8 w-32" value={prorationManual} placeholder="16271.36" onChange={(event) => setProrationManual(event.target.value)} />
+                </div>
+              )}
+            </div>
+            {spendBasis === "attributed_only" && (
+              <p className="mt-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-xs">
+                Provisional: costs include only spend attributed through converting campaigns. This is not complete project profitability.
+              </p>
+            )}
+            {unresolvedGroups.length > 0 && (
+              <div className="mt-3 space-y-2">
+                <div className="flex items-center gap-3">
+                  <Label className="text-xs font-medium">Traffic commissions ({unresolvedGroups.length} unresolved groups)</Label>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 px-2 text-xs"
+                    onClick={() => setCommissionByGroup((current) => {
+                      const next = { ...current };
+                      for (const item of unresolvedGroups) if (!next[item.key]) next[item.key] = "4";
+                      return next;
+                    })}
+                  >
+                    Set 4% for all
+                  </Button>
+                </div>
+                <div className="flex flex-wrap gap-x-5 gap-y-2">
+                  {unresolvedGroups.map((item) => (
+                    <div key={item.key} className="flex items-center gap-1.5 text-xs">
+                      <span className="text-muted-foreground">{item.group.adAccountId} {item.group.currency} · {fmtMoney(item.spend)}</span>
+                      <Input
+                        className="h-7 w-16 text-right"
+                        placeholder="%"
+                        value={commissionByGroup[item.key] ?? ""}
+                        onChange={(event) => setCommissionByGroup((current) => ({ ...current, [item.key]: event.target.value }))}
+                      />
+                      <span className="text-muted-foreground">%</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </Card>
+
           {/* -------- Gates & provisional banners -------- */}
           {(totals.gates.length > 0 || blockedSummary) && (
             <div className="space-y-1.5">
@@ -262,7 +435,13 @@ export function ProjectMode() {
 
           {/* -------- Combined curve + table -------- */}
           <ProjectCashFlowChart totals={totals} />
-          <ProjectFunnelTable resolved={project.resolved} run={project.run} onToggle={toggleFunnel} />
+          <ProjectFunnelTable
+            resolved={project.resolved}
+            run={project.run}
+            onToggle={toggleFunnel}
+            edits={entryEdits}
+            onEdit={onEntryEdit}
+          />
         </>
       )}
     </div>
