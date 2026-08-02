@@ -9,3 +9,4 @@ export * from "../../supabase/functions/_shared/clickhouse/financialPrimitives.t
 export * from "../../supabase/functions/_shared/clickhouse/funnelEconomicsDayGrid.ts";
 export * from "../../supabase/functions/_shared/clickhouse/funnelEconomicsProject.ts";
 export * from "../../supabase/functions/_shared/clickhouse/funnelEconomicsProjectAggregate.ts";
+export * from "../../supabase/functions/_shared/clickhouse/projectSeeding.ts";
