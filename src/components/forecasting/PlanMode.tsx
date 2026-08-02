@@ -6,19 +6,19 @@
 // input carries a provenance badge (auto / manual / config / extrapolated).
 import { useEffect, useMemo, useState } from "react";
 import { RotateCcw } from "lucide-react";
-import { CartesianGrid, ComposedChart, Line, ReferenceLine, XAxis, YAxis } from "recharts";
 import { KpiCard } from "@/components/KpiCard";
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
-import { ChartContainer, ChartTooltip, ChartTooltipContent, type ChartConfig } from "@/components/ui/chart";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { cn } from "@/lib/utils";
+import { ForecastCashFlowChart } from "@/components/forecasting/ForecastCashFlowChart";
+import { ForecastPeriodTable } from "@/components/forecasting/ForecastPeriodTable";
+import { ProvenanceBadge } from "@/components/forecasting/ProvenanceBadge";
+import { fmtInt, fmtMoney, fmtPctValue, fmtRatio } from "@/components/forecasting/forecastFormat";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
 import { useTransactions } from "@/services/sheets";
 import { useDataStore } from "@/store/dataStore";
@@ -89,21 +89,6 @@ function parsePct(value: string): number | undefined {
   return parsed === undefined ? undefined : parsed / 100;
 }
 
-const PROVENANCE_META: Record<Provenance, { label: string; className: string }> = {
-  actual: { label: "actual", className: "bg-success/15 text-success" },
-  auto_derived: { label: "auto", className: "bg-primary/10 text-primary" },
-  manual_override: { label: "manual", className: "bg-warning/15 text-warning" },
-  config: { label: "config", className: "bg-muted text-muted-foreground" },
-  extrapolated: { label: "extrapolated", className: "bg-accent/15 text-accent-foreground" },
-  calculated: { label: "calculated", className: "bg-muted text-muted-foreground" },
-};
-
-function ProvenanceBadge({ provenance }: { provenance: Provenance | undefined }) {
-  if (!provenance) return null;
-  const meta = PROVENANCE_META[provenance];
-  return <span className={cn("inline-flex rounded-full px-1.5 py-0 text-[10px] font-medium", meta.className)}>{meta.label}</span>;
-}
-
 function PlanInput({ label, value, seeded, provenance, onChange, suffix }: {
   label: string;
   value: string;
@@ -125,61 +110,6 @@ function PlanInput({ label, value, seeded, provenance, onChange, suffix }: {
     </div>
   );
 }
-
-// Export the projection table (period rows + totals) as CSV/XLSX, mirroring the
-// Cohorts-page export pattern (BOM for Excel, dynamic xlsx import).
-function buildPlanExportTable(result: ForecastResult): { headers: string[]; rows: Array<Array<string | number>> } {
-  const headers = [
-    "Period", "Users", "Cumulative retention", "Trial revenue", "Subscription revenue", "Upsell revenue",
-    "Token revenue", "Gross revenue", "Stripe", "Refunds", "Provider", "Payment-net", "Cumulative payment-net", "Cash flow",
-  ];
-  const rows = result.timeline.periods.map((row) => [
-    row.label, row.users, row.cumulativeRetention, row.revenue.trial, row.revenue.subscription, row.revenue.upsell,
-    row.revenue.token, row.revenue.gross, row.costs.stripe, row.costs.refund, row.costs.provider,
-    row.paymentNetRevenue, row.cumulativePaymentNetRevenue, row.cashFlowBalance,
-  ]);
-  rows.push([
-    "TOTAL", result.metrics.trials, "", result.revenue.trialTotal, result.revenue.subscriptionTotal, result.revenue.upsellTotal,
-    result.revenue.tokenTotal, result.revenue.grossTotal, result.costs.stripeTotal, result.costs.refundTotal,
-    result.costs.providerTotal, result.profitability.paymentNetRevenueTotal, result.profitability.paymentNetRevenueTotal,
-    result.payback.finalCashFlowBalance,
-  ]);
-  return { headers, rows };
-}
-
-async function exportPlanTable(result: ForecastResult, format: "csv" | "xlsx"): Promise<void> {
-  const table = buildPlanExportTable(result);
-  const stamp = new Date().toISOString().slice(0, 10);
-  if (format === "csv") {
-    const escape = (value: string | number) => {
-      const text = String(value);
-      return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
-    };
-    const csv = [table.headers, ...table.rows].map((row) => row.map(escape).join(",")).join("\n");
-    const blob = new Blob(["﻿", csv], { type: "text/csv;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `forecast-plan-${stamp}.csv`;
-    link.click();
-    URL.revokeObjectURL(url);
-    return;
-  }
-  const XLSX = await import("xlsx");
-  const sheet = XLSX.utils.aoa_to_sheet([table.headers, ...table.rows]);
-  const book = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(book, sheet, "Forecast");
-  XLSX.writeFile(book, `forecast-plan-${stamp}.xlsx`);
-}
-
-const fmtMoney = (value: number | null | undefined) => (value == null ? "—" : formatCurrency(value));
-const fmtInt = (value: number) => Math.round(value).toLocaleString("en-US");
-const fmtPctValue = (value: number | null | undefined, digits = 1) => (value == null ? "—" : `${(value * 100).toFixed(digits)}%`);
-const fmtRatio = (value: number | null | undefined) => (value == null ? "—" : value.toFixed(2));
-
-const CHART_CONFIG: ChartConfig = {
-  cumulative: { label: "Cumulative payment-net", color: "hsl(var(--primary))" },
-};
 
 /** Save the frozen snapshot as a named scenario and/or push it into the Compare tab's
  * working set. The snapshot is fully serializable — what you save is what re-runs. */
@@ -430,13 +360,6 @@ export function PlanMode() {
   const assumptions = plan.assumptions;
   const provenance = plan.provenance;
 
-  const chartData = useMemo(
-    () => result
-      ? result.timeline.periods.map((row) => ({ label: row.label, cumulative: row.cumulativePaymentNetRevenue }))
-      : [],
-    [result],
-  );
-
   const seededCpa = seed.actuals?.cpaActual;
   const seededTrialPrice = seed.actuals?.trialPriceActual;
   const seededPeriodPrice = seed.actuals?.subPriceActual;
@@ -560,21 +483,8 @@ export function PlanMode() {
             <KpiCard label="Contribution margin" value={fmtPctValue(result.metrics.contributionMargin)} />
           </div>
 
-          {/* -------- Cash-flow chart -------- */}
-          <Card className="p-4 shadow-card">
-            <h3 className="mb-1 text-sm font-semibold">Cumulative payment-net vs traffic cost</h3>
-            <p className="mb-2 text-xs text-muted-foreground">Payback = the period where the cumulative line crosses the traffic-cost reference.</p>
-            <ChartContainer config={CHART_CONFIG} className="h-64 w-full">
-              <ComposedChart data={chartData} margin={{ left: 12, right: 12, top: 8 }}>
-                <CartesianGrid vertical={false} strokeDasharray="3 3" />
-                <XAxis dataKey="label" tickLine={false} axisLine={false} fontSize={11} />
-                <YAxis tickLine={false} axisLine={false} fontSize={11} tickFormatter={(value: number) => formatCurrency(value)} width={90} />
-                <ChartTooltip content={<ChartTooltipContent />} />
-                <ReferenceLine y={result.costs.trafficCashOutflow} stroke="hsl(var(--destructive))" strokeDasharray="4 4" label={{ value: "traffic cost", fontSize: 10, position: "insideTopRight" }} />
-                <Line type="monotone" dataKey="cumulative" stroke="var(--color-cumulative)" strokeWidth={2} dot={false} />
-              </ComposedChart>
-            </ChartContainer>
-          </Card>
+          {/* -------- Cash-flow chart (shared component, P4) -------- */}
+          <ForecastCashFlowChart result={result} />
 
           {/* -------- Assumption panels (progressive disclosure) -------- */}
           <Card className="p-4 shadow-card">
@@ -691,51 +601,8 @@ export function PlanMode() {
             <KpiCard label="Token revenue" value={fmtMoney(result.revenue.tokenTotal)} />
           </div>
 
-          {/* -------- Period table -------- */}
-          <Card className="p-4 shadow-card">
-            <div className="mb-3 flex items-center justify-between">
-              <h3 className="text-sm font-semibold">Projection by period</h3>
-              <div className="flex gap-2">
-                <Button variant="outline" size="sm" onClick={() => void exportPlanTable(result, "csv")}>Export CSV</Button>
-                <Button variant="outline" size="sm" onClick={() => void exportPlanTable(result, "xlsx")}>Export XLSX</Button>
-              </div>
-            </div>
-            <div className="overflow-x-auto">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Period</TableHead>
-                    <TableHead className="text-right">Users</TableHead>
-                    <TableHead className="text-right">Retention</TableHead>
-                    <TableHead className="text-right">Gross</TableHead>
-                    <TableHead className="text-right">Payment costs</TableHead>
-                    <TableHead className="text-right">Payment-net</TableHead>
-                    <TableHead className="text-right">Cumulative</TableHead>
-                    <TableHead className="text-right">Cash flow</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {result.timeline.periods.map((row) => (
-                    <TableRow key={row.index}>
-                      <TableCell className="font-medium">
-                        {row.label}
-                        {provenance[`retention.survival[${row.index}]`] === "extrapolated" && (
-                          <span className="ml-1.5 align-middle"><ProvenanceBadge provenance="extrapolated" /></span>
-                        )}
-                      </TableCell>
-                      <TableCell className="text-right">{fmtInt(row.users)}</TableCell>
-                      <TableCell className="text-right">{fmtPctValue(row.cumulativeRetention)}</TableCell>
-                      <TableCell className="text-right">{fmtMoney(row.revenue.gross)}</TableCell>
-                      <TableCell className="text-right">{fmtMoney(row.costs.paymentTotal)}</TableCell>
-                      <TableCell className="text-right">{fmtMoney(row.paymentNetRevenue)}</TableCell>
-                      <TableCell className="text-right">{fmtMoney(row.cumulativePaymentNetRevenue)}</TableCell>
-                      <TableCell className={cn("text-right", row.cashFlowBalance >= 0 ? "text-success" : "text-destructive")}>{fmtMoney(row.cashFlowBalance)}</TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </div>
-          </Card>
+          {/* -------- Period table (shared component, P4) -------- */}
+          <ForecastPeriodTable result={result} provenance={provenance} />
         </>
       )}
     </div>
