@@ -19,6 +19,17 @@ import { ProjectCashFlowChart } from "@/components/forecasting/ProjectCashFlowCh
 import { ProjectFunnelTable } from "@/components/forecasting/ProjectFunnelTable";
 import { type ProjectEntryEdits } from "@/components/forecasting/ProjectFunnelRowDetail";
 import { ProjectExcludedPanel } from "@/components/forecasting/ProjectExcludedPanel";
+import {
+  loadProjectColumnPrefs,
+  persistProjectColumnPrefs,
+  PROJECT_COLUMN_DEFAULTS,
+  PROJECT_COLUMN_ORDER,
+  PROJECT_COLUMNS,
+  type ProjectColumnPrefs,
+} from "@/components/forecasting/projectTableColumns";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { sanitizeColumnVisibility } from "@/services/cohortsUiSettings";
 import { exportProjectTable } from "@/services/projectExport";
 import { fmtInt, fmtMoney, fmtPctValue, fmtRatio } from "@/components/forecasting/forecastFormat";
 import { loadProjectSeedData, type ProjectSeedData } from "@/services/projectForecastSeeding";
@@ -156,6 +167,20 @@ export function ProjectMode() {
   const [persistBusy, setPersistBusy] = useState(false);
   const [persistNote, setPersistNote] = useState<string | null>(null);
   const [pendingRefresh, setPendingRefresh] = useState<PendingRefresh | null>(null);
+  // P9: column visibility + named views, persisted locally (no cloud sync).
+  const [columnPrefs, setColumnPrefs] = useState<ProjectColumnPrefs>(loadProjectColumnPrefs);
+  const [viewName, setViewName] = useState("");
+  const updateColumnPrefs = useCallback((updater: (current: ProjectColumnPrefs) => ProjectColumnPrefs) => {
+    setColumnPrefs((current) => {
+      const next = updater(current);
+      persistProjectColumnPrefs(next);
+      return next;
+    });
+  }, []);
+  const visibleColumns = useMemo(
+    () => new Set(PROJECT_COLUMN_ORDER.filter((id) => columnPrefs.visibility[id] !== false)),
+    [columnPrefs.visibility],
+  );
   const loadGenRef = useRef(0);
 
   const refreshSavedList = useCallback(() => {
@@ -728,6 +753,107 @@ export function ProjectMode() {
 
           {/* -------- Combined curve + table -------- */}
           <div className="flex items-center justify-end gap-2">
+            {columnPrefs.activeViewId && (
+              <span className="text-xs text-muted-foreground">
+                View: {columnPrefs.savedViews.find((view) => view.id === columnPrefs.activeViewId)?.name ?? "Default"}
+              </span>
+            )}
+            <Popover>
+              <PopoverTrigger asChild>
+                <Button variant="outline" size="sm" className="h-8">Columns</Button>
+              </PopoverTrigger>
+              <PopoverContent align="end" className="w-72 p-0">
+                <div className="border-b px-3 py-2 text-sm font-medium">Columns</div>
+                <div className="max-h-56 overflow-auto py-1">
+                  {PROJECT_COLUMNS.map((column) => (
+                    <label key={column.id} className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted/60">
+                      <Checkbox
+                        checked={columnPrefs.visibility[column.id] !== false}
+                        onCheckedChange={(checked) => updateColumnPrefs((current) => ({
+                          ...current,
+                          visibility: sanitizeColumnVisibility(
+                            { ...current.visibility, [column.id]: checked === true },
+                            PROJECT_COLUMN_DEFAULTS.defaultColumnVisibility,
+                            PROJECT_COLUMN_ORDER,
+                          ),
+                          // A manual tweak leaves the named view: label and columns must agree.
+                          activeViewId: null,
+                        }))}
+                      />
+                      <span>{column.label}</span>
+                    </label>
+                  ))}
+                </div>
+                <div className="space-y-2 border-t px-3 py-2">
+                  <div className="text-xs font-medium">Saved views</div>
+                  {columnPrefs.savedViews.map((view) => (
+                    <div key={view.id} className="flex items-center gap-2 text-xs">
+                      <button
+                        type="button"
+                        className={`truncate hover:text-primary ${columnPrefs.activeViewId === view.id ? "font-semibold" : ""}`}
+                        onClick={() => updateColumnPrefs((current) => ({
+                          ...current,
+                          visibility: sanitizeColumnVisibility(view.columnVisibility, PROJECT_COLUMN_DEFAULTS.defaultColumnVisibility, PROJECT_COLUMN_ORDER),
+                          activeViewId: view.id,
+                        }))}
+                      >
+                        {view.name}
+                      </button>
+                      <button
+                        type="button"
+                        className="ml-auto text-muted-foreground hover:text-destructive"
+                        title="Delete view"
+                        onClick={() => updateColumnPrefs((current) => ({
+                          ...current,
+                          savedViews: current.savedViews.filter((candidate) => candidate.id !== view.id),
+                          activeViewId: current.activeViewId === view.id ? null : current.activeViewId,
+                        }))}
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  ))}
+                  <div className="flex items-center gap-1.5">
+                    <Input className="h-7 text-xs" placeholder="View name…" value={viewName} onChange={(event) => setViewName(event.target.value)} />
+                    <Button
+                      size="sm"
+                      className="h-7 px-2 text-xs"
+                      disabled={!viewName.trim()}
+                      onClick={() => {
+                        const name = viewName.trim();
+                        updateColumnPrefs((current) => {
+                          const id = `view_${current.savedViews.length + 1}_${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
+                          return {
+                            ...current,
+                            savedViews: [...current.savedViews, {
+                              id,
+                              name,
+                              columnOrder: [...PROJECT_COLUMN_ORDER],
+                              columnVisibility: { ...current.visibility },
+                            }],
+                            activeViewId: id,
+                          };
+                        });
+                        setViewName("");
+                      }}
+                    >
+                      Save
+                    </Button>
+                  </div>
+                  <button
+                    type="button"
+                    className="text-xs text-muted-foreground hover:text-primary"
+                    onClick={() => updateColumnPrefs((current) => ({
+                      ...current,
+                      visibility: { ...PROJECT_COLUMN_DEFAULTS.defaultColumnVisibility },
+                      activeViewId: null,
+                    }))}
+                  >
+                    Reset to default
+                  </button>
+                </div>
+              </PopoverContent>
+            </Popover>
             <Button variant="outline" size="sm" className="h-8" onClick={() => void exportProjectTable(active.resolved, active.run, "csv")}>Export CSV</Button>
             <Button variant="outline" size="sm" className="h-8" onClick={() => void exportProjectTable(active.resolved, active.run, "xlsx")}>Export XLSX</Button>
           </div>
@@ -738,6 +864,7 @@ export function ProjectMode() {
             onToggle={isReplay ? () => undefined : toggleFunnel}
             edits={isReplay ? {} : entryEdits}
             onEdit={isReplay ? () => undefined : onEntryEdit}
+            visibleColumns={visibleColumns}
           />
         </>
       )}

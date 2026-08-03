@@ -6,7 +6,7 @@
 // most rows need operator input early in a month, so the blocked state is a
 // first-class row, not a hidden error. The checkbox is SCOPING (moves spend
 // between in-project and out-of-project), never editing.
-import { Fragment, useState } from "react";
+import { Fragment, useState, type ReactNode } from "react";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Card } from "@/components/ui/card";
@@ -15,6 +15,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { cn } from "@/lib/utils";
 import { fmtInt, fmtMoney, fmtPctValue } from "@/components/forecasting/forecastFormat";
 import { ProjectFunnelRowDetail, type ProjectEntryEdits } from "@/components/forecasting/ProjectFunnelRowDetail";
+import { PROJECT_COLUMNS } from "@/components/forecasting/projectTableColumns";
 import type {
   ProjectEntryResolution,
   ProjectRowEconomics,
@@ -47,12 +48,13 @@ function RowChips({ resolution }: { resolution: ProjectEntryResolution }) {
   );
 }
 
-export function ProjectFunnelTable({ resolved, run, onToggle, edits, onEdit }: {
+export function ProjectFunnelTable({ resolved, run, onToggle, edits, onEdit, visibleColumns }: {
   resolved: ResolvedProject;
   run: ProjectRunResult;
   onToggle: (funnelId: string) => void;
   edits: Record<string, ProjectEntryEdits>;
   onEdit: (funnelId: string, patch: Partial<ProjectEntryEdits>) => void;
+  visibleColumns: ReadonlySet<string>;
 }) {
   const economicsById = new Map<string, ProjectRowEconomics>(run.rows.map((row) => [row.funnelId, row]));
   const { totals } = run;
@@ -65,6 +67,58 @@ export function ProjectFunnelTable({ resolved, run, onToggle, edits, onEdit }: {
     return next;
   });
 
+  // P9: canonical order filtered by the caller's visibility preferences.
+  const columns = PROJECT_COLUMNS.filter((column) => visibleColumns.has(column.id));
+
+  const rowCell = (columnId: string, resolution: ProjectEntryResolution): ReactNode => {
+    const { entry, ledger } = resolution;
+    const economics = economicsById.get(entry.funnelId);
+    const cpa = resolution.frozen?.assumptions.traffic.targetCpa ?? null;
+    switch (columnId) {
+      case "spend": return money(ledger?.funnelResolvedSpend);
+      case "coverage": return ledger?.spendCoverage == null ? dash : fmtPctValue(ledger.spendCoverage, 0);
+      case "trials": return economics ? fmtInt(economics.trials) : dash;
+      case "cpa": return economics && cpa != null ? fmtMoney(cpa) : dash;
+      case "outflow": return economics ? money(economics.trafficCashOutflow) : dash;
+      case "gross": return economics && entry.kind === "forecast" ? fmtMoney(economics.grossRevenue) : dash;
+      case "contribution": return economics ? money(economics.trafficCashOutflow === null && entry.kind === "spend_only" ? null : economics.contributionProfit) : dash;
+      case "overhead": return economics ? (
+        <span title={`${fmtPctValue(economics.overheadShare, 1)} of the pool`}>
+          {fmtMoney(economics.allocatedOverhead)}
+          <span className="ml-1 text-[10px] text-muted-foreground">{fmtPctValue(economics.overheadShare, 0)}</span>
+        </span>
+      ) : dash;
+      case "net": return economics ? fmtMoney(economics.netProfit) : dash;
+      case "payback": return economics?.paybackDay != null ? `D${economics.paybackDay}` : dash;
+      default: return dash;
+    }
+  };
+
+  const rowCellClass = (columnId: string, resolution: ProjectEntryResolution): string => {
+    const economics = economicsById.get(resolution.entry.funnelId);
+    return cn(
+      "py-1.5 text-right tabular-nums",
+      columnId === "contribution" && economics && economics.contributionProfit < 0 && "text-destructive",
+      columnId === "net" && economics && economics.netProfit < 0 && "text-destructive",
+    );
+  };
+
+  const totalCell = (columnId: string): ReactNode => {
+    switch (columnId) {
+      case "spend": return fmtMoney(totals.projectScopedSpend);
+      case "coverage": return fmtPctValue(totals.spendCoverage, 0);
+      case "trials": return fmtInt(totals.trials);
+      case "cpa": return <span title="Recomputed: project-scoped spend / Σ trials — never an average of row CPAs">{money(totals.blendedCpa)}</span>;
+      case "outflow": return <span title="Σ row outflows + included unresolved spend outflow">{money(totals.trafficCashOutflow)}</span>;
+      case "gross": return fmtMoney(totals.grossRevenue);
+      case "contribution": return fmtMoney(totals.contributionProfit);
+      case "overhead": return overheadGateBroken ? dash : fmtMoney(totals.allocatedOverhead);
+      case "net": return overheadGateBroken ? dash : fmtMoney(totals.netProfit);
+      case "payback": return <span title="From the combined day-axis curve — never a min or a mean of row paybacks">{totals.headlinePaybackDay != null ? `D${totals.headlinePaybackDay}` : dash}</span>;
+      default: return dash;
+    }
+  };
+
   return (
     <Card className="p-0 shadow-card">
       <div className="overflow-x-auto">
@@ -73,24 +127,15 @@ export function ProjectFunnelTable({ resolved, run, onToggle, edits, onEdit }: {
             <TableRow>
               <TableHead className="w-8" />
               <TableHead>Funnel</TableHead>
-              <TableHead className="text-right">Spend</TableHead>
-              <TableHead className="text-right" title="userAttributedSpend / funnelResolvedSpend — how much of this funnel's spend reached users">Cov.</TableHead>
-              <TableHead className="text-right">Trials</TableHead>
-              <TableHead className="text-right" title="Seeded on the project's spend basis — waste included (§5a)">CPA</TableHead>
-              <TableHead className="text-right" title="Budget grossed up by traffic commission">Outflow</TableHead>
-              <TableHead className="text-right">Gross</TableHead>
-              <TableHead className="text-right">Contribution</TableHead>
-              <TableHead className="text-right" title="Prorated shared pool × this row's spend share">Overhead</TableHead>
-              <TableHead className="text-right">Net profit</TableHead>
-              <TableHead className="text-right" title="Per-funnel traffic-only payback (engine semantics)">Payback</TableHead>
+              {columns.map((column) => (
+                <TableHead key={column.id} className="text-right" title={column.title}>{column.label}</TableHead>
+              ))}
             </TableRow>
           </TableHeader>
           <TableBody>
             {resolved.resolutions.map((resolution) => {
-              const { entry, status, ledger } = resolution;
-              const economics = economicsById.get(entry.funnelId);
+              const { entry, status } = resolution;
               const excluded = status.kind !== "ok";
-              const cpa = resolution.frozen?.assumptions.traffic.targetCpa ?? null;
               const isExpanded = expanded.has(entry.funnelId);
               return (
                 <Fragment key={entry.funnelId}>
@@ -109,33 +154,13 @@ export function ProjectFunnelTable({ resolved, run, onToggle, edits, onEdit }: {
                     </button>
                     <RowChips resolution={resolution} />
                   </TableCell>
-                  <TableCell className="py-1.5 text-right tabular-nums">{money(ledger?.funnelResolvedSpend)}</TableCell>
-                  <TableCell className="py-1.5 text-right tabular-nums">{ledger?.spendCoverage == null ? dash : fmtPctValue(ledger.spendCoverage, 0)}</TableCell>
-                  <TableCell className="py-1.5 text-right tabular-nums">{economics ? fmtInt(economics.trials) : dash}</TableCell>
-                  <TableCell className="py-1.5 text-right tabular-nums">{economics && cpa != null ? fmtMoney(cpa) : dash}</TableCell>
-                  <TableCell className="py-1.5 text-right tabular-nums">{economics ? money(economics.trafficCashOutflow) : dash}</TableCell>
-                  <TableCell className="py-1.5 text-right tabular-nums">{economics && entry.kind === "forecast" ? fmtMoney(economics.grossRevenue) : dash}</TableCell>
-                  <TableCell className={cn("py-1.5 text-right tabular-nums", economics && economics.contributionProfit < 0 && "text-destructive")}>
-                    {economics ? money(economics.trafficCashOutflow === null && entry.kind === "spend_only" ? null : economics.contributionProfit) : dash}
-                  </TableCell>
-                  <TableCell className="py-1.5 text-right tabular-nums">
-                    {economics ? (
-                      <span title={`${fmtPctValue(economics.overheadShare, 1)} of the pool`}>
-                        {fmtMoney(economics.allocatedOverhead)}
-                        <span className="ml-1 text-[10px] text-muted-foreground">{fmtPctValue(economics.overheadShare, 0)}</span>
-                      </span>
-                    ) : dash}
-                  </TableCell>
-                  <TableCell className={cn("py-1.5 text-right tabular-nums", economics && economics.netProfit < 0 && "text-destructive")}>
-                    {economics ? fmtMoney(economics.netProfit) : dash}
-                  </TableCell>
-                  <TableCell className="py-1.5 text-right tabular-nums">
-                    {economics?.paybackDay != null ? `D${economics.paybackDay}` : dash}
-                  </TableCell>
+                  {columns.map((column) => (
+                    <TableCell key={column.id} className={rowCellClass(column.id, resolution)}>{rowCell(column.id, resolution)}</TableCell>
+                  ))}
                 </TableRow>
                 {isExpanded && (
                   <TableRow className="hover:bg-transparent">
-                    <TableCell colSpan={12} className="p-0">
+                    <TableCell colSpan={columns.length + 2} className="p-0">
                       <ProjectFunnelRowDetail
                         resolution={resolution}
                         edits={edits[entry.funnelId] ?? {}}
@@ -152,18 +177,15 @@ export function ProjectFunnelTable({ resolved, run, onToggle, edits, onEdit }: {
             <TableRow className="border-t-2 bg-muted font-semibold hover:bg-muted">
               <TableCell className="py-2" />
               <TableCell className="py-2">TOTAL ({totals.funnelsIncluded + totals.spendOnlyIncluded} rows{totals.spendOnlyIncluded > 0 ? `, ${totals.spendOnlyIncluded} spend-only` : ""})</TableCell>
-              <TableCell className="py-2 text-right tabular-nums">{fmtMoney(totals.projectScopedSpend)}</TableCell>
-              <TableCell className="py-2 text-right tabular-nums">{fmtPctValue(totals.spendCoverage, 0)}</TableCell>
-              <TableCell className="py-2 text-right tabular-nums">{fmtInt(totals.trials)}</TableCell>
-              <TableCell className="py-2 text-right tabular-nums" title="Recomputed: project-scoped spend / Σ trials — never an average of row CPAs">{money(totals.blendedCpa)}</TableCell>
-              <TableCell className="py-2 text-right tabular-nums" title="Σ row outflows + included unresolved spend outflow">{money(totals.trafficCashOutflow)}</TableCell>
-              <TableCell className="py-2 text-right tabular-nums">{fmtMoney(totals.grossRevenue)}</TableCell>
-              <TableCell className={cn("py-2 text-right tabular-nums", totals.contributionProfit < 0 && "text-destructive")}>{fmtMoney(totals.contributionProfit)}</TableCell>
-              <TableCell className="py-2 text-right tabular-nums">{overheadGateBroken ? dash : fmtMoney(totals.allocatedOverhead)}</TableCell>
-              <TableCell className={cn("py-2 text-right tabular-nums", totals.netProfit < 0 && "text-destructive")}>{overheadGateBroken ? dash : fmtMoney(totals.netProfit)}</TableCell>
-              <TableCell className="py-2 text-right tabular-nums" title="From the combined day-axis curve — never a min or a mean of row paybacks">
-                {totals.headlinePaybackDay != null ? `D${totals.headlinePaybackDay}` : dash}
-              </TableCell>
+              {columns.map((column) => (
+                <TableCell key={column.id} className={cn(
+                  "py-2 text-right tabular-nums",
+                  column.id === "contribution" && totals.contributionProfit < 0 && "text-destructive",
+                  column.id === "net" && totals.netProfit < 0 && "text-destructive",
+                )}>
+                  {totalCell(column.id)}
+                </TableCell>
+              ))}
             </TableRow>
           </tfoot>
         </Table>
