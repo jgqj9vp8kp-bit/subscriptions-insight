@@ -14,7 +14,7 @@ import { Switch } from "@/components/ui/switch";
 import { ForecastCashFlowChart } from "@/components/forecasting/ForecastCashFlowChart";
 import { ForecastPeriodTable } from "@/components/forecasting/ForecastPeriodTable";
 import { fmtMoney, fmtPctValue } from "@/components/forecasting/forecastFormat";
-import type { Cadence, ProjectEntryResolution } from "@/services/funnelEconomics";
+import { extrapolatedRevenueShare, type Cadence, type ProjectEntryResolution } from "@/services/funnelEconomics";
 
 export interface ProjectEntryEdits {
   plannedBudget?: string;
@@ -132,6 +132,12 @@ export function ProjectFunnelRowDetail({ resolution, edits, onEdit }: {
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
         <span>Seed: {evidence.coverage.cohorts} cohorts · {evidence.observedTrials} trials · maturity {evidence.coverage.maturityDays}d · retention observed to c{evidence.coverage.observedRetentionDepth}</span>
         <span>CPA basis: {evidence.cpaBasis}</span>
+        {(() => {
+          const exposure = extrapolatedRevenueShare(resolution);
+          return exposure?.share != null
+            ? <span title={`${fmtMoney(exposure.extrapolatedGross)} of ${fmtMoney(exposure.grossTotal)} projected gross rests on extrapolated retention`}>extrapolated revenue: {fmtPctValue(exposure.share, 1)}</span>
+            : null;
+        })()}
         {ledger && (
           <span>
             Spend: resolved {fmtMoney(ledger.funnelResolvedSpend)} = users {fmtMoney(ledger.userAttributedSpend)} + no-users {fmtMoney(ledger.noUserSpend)}

@@ -515,6 +515,48 @@ export function resolveProjectFromCohortRows(input: Omit<ResolveProjectInput, "e
   return resolveProject({ ...input, entries });
 }
 
+// ---- Extrapolation exposure (P8) -------------------------------------------------
+
+export interface ExtrapolationExposure {
+  /** Gross revenue projected in periods whose survival is EXTRAPOLATED. */
+  extrapolatedGross: number;
+  grossTotal: number;
+  /** extrapolatedGross / grossTotal; null when there is no gross at all. */
+  share: number | null;
+}
+
+/** How much of a funnel's projected revenue rests on extrapolated retention.
+ * A period is extrapolated when its survival provenance says so — the same tag
+ * the period table renders as a badge. */
+export function extrapolatedRevenueShare(resolution: Pick<ProjectEntryResolution, "frozen" | "result">): ExtrapolationExposure | null {
+  if (!resolution.frozen || !resolution.result) return null;
+  const provenance = resolution.frozen.provenance;
+  let extrapolatedGross = 0;
+  let grossTotal = 0;
+  for (const period of resolution.result.timeline.periods) {
+    grossTotal += period.revenue.gross;
+    if (provenance[`retention.survival[${period.index}]`] === "extrapolated") {
+      extrapolatedGross += period.revenue.gross;
+    }
+  }
+  return { extrapolatedGross, grossTotal, share: grossTotal > 0 ? extrapolatedGross / grossTotal : null };
+}
+
+/** Project-level exposure: Σ extrapolated gross / Σ gross over ok forecast rows —
+ * weighted by construction, never an average of shares. */
+export function projectExtrapolationSummary(resolutions: ReadonlyArray<ProjectEntryResolution>): ExtrapolationExposure {
+  let extrapolatedGross = 0;
+  let grossTotal = 0;
+  for (const resolution of resolutions) {
+    if (resolution.status.kind !== "ok") continue;
+    const exposure = extrapolatedRevenueShare(resolution);
+    if (!exposure) continue;
+    extrapolatedGross += exposure.extrapolatedGross;
+    grossTotal += exposure.grossTotal;
+  }
+  return { extrapolatedGross, grossTotal, share: grossTotal > 0 ? extrapolatedGross / grossTotal : null };
+}
+
 // ---- Run: resolved project → rows, series, totals --------------------------------
 
 export interface ProjectRunResult {

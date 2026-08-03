@@ -18,12 +18,15 @@ import { FunnelMultiSelect } from "@/components/forecasting/FunnelMultiSelect";
 import { ProjectCashFlowChart } from "@/components/forecasting/ProjectCashFlowChart";
 import { ProjectFunnelTable } from "@/components/forecasting/ProjectFunnelTable";
 import { type ProjectEntryEdits } from "@/components/forecasting/ProjectFunnelRowDetail";
+import { ProjectExcludedPanel } from "@/components/forecasting/ProjectExcludedPanel";
+import { exportProjectTable } from "@/services/projectExport";
 import { fmtInt, fmtMoney, fmtPctValue, fmtRatio } from "@/components/forecasting/forecastFormat";
 import { loadProjectSeedData, type ProjectSeedData } from "@/services/projectForecastSeeding";
 import {
   buildProjectEntries,
   buildProjectForecastSnapshot,
   diffProjectFrozen,
+  projectExtrapolationSummary,
   replayProjectForecast,
   resolveProject,
   runResolvedProject,
@@ -707,9 +710,27 @@ export function ProjectMode() {
             />
             <KpiCard label="ROMI" value={(totals.romi == null ? "—" : fmtRatio(totals.romi)) + provisionalMark} hint="Σ contribution / project traffic outflow." />
             <KpiCard label="ROI" value={(totals.roi == null ? "—" : fmtRatio(totals.roi)) + provisionalMark} hint="Σ net profit / (outflow + bonus + overhead + extras)." />
+            {(() => {
+              const exposure = projectExtrapolationSummary(active.resolved.resolutions);
+              return (
+                <KpiCard
+                  label="Extrapolated revenue"
+                  value={exposure.share == null ? "—" : fmtPctValue(exposure.share, 1)}
+                  hint={`${fmtMoney(exposure.extrapolatedGross)} of ${fmtMoney(exposure.grossTotal)} projected gross rests on extrapolated retention.`}
+                  accent={exposure.share != null && exposure.share > 0.5 ? "warning" : "primary"}
+                />
+              );
+            })()}
           </div>
 
+          {/* -------- Excluded worklist (P8) -------- */}
+          <ProjectExcludedPanel resolutions={active.resolved.resolutions} />
+
           {/* -------- Combined curve + table -------- */}
+          <div className="flex items-center justify-end gap-2">
+            <Button variant="outline" size="sm" className="h-8" onClick={() => void exportProjectTable(active.resolved, active.run, "csv")}>Export CSV</Button>
+            <Button variant="outline" size="sm" className="h-8" onClick={() => void exportProjectTable(active.resolved, active.run, "xlsx")}>Export XLSX</Button>
+          </div>
           <ProjectCashFlowChart totals={totals} />
           <ProjectFunnelTable
             resolved={active.resolved}
