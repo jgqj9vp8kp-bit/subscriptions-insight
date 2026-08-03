@@ -12,7 +12,7 @@ import type { CohortFilters } from "../../supabase/functions/_shared/clickhouse/
 
 const NO_FILTERS: CohortFilters = {
   funnel: [], campaign_path: [], campaign_id: [], traffic_source: [], price_plan: [],
-  media_buyer: [], country: [], card_type: [], currency: [], transaction_type: [], refund_status: "all",
+  media_buyer: [], country: [], card_type: [], platform: [], currency: [], transaction_type: [], refund_status: "all",
 };
 
 describe("FB Cohorts source classification", () => {

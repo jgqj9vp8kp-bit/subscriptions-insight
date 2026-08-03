@@ -29,6 +29,7 @@ export interface CohortFilterSelection {
   currencyFilter: string;
   selectedCountries: string[];
   selectedCardTypes: CardType[];
+  selectedPlatforms: string[];
   selectedMediaBuyers: Array<MediaBuyer | string>;
   selectedCampaignIds: string[];
 }
@@ -40,6 +41,7 @@ export interface CohortFilterSelectionPatch {
   currencyFilter?: string;
   selectedCountries?: string[];
   selectedCardTypes?: CardType[];
+  selectedPlatforms?: string[];
   selectedMediaBuyers?: Array<MediaBuyer | string>;
   selectedCampaignIds?: string[];
   /** Legacy single-select mirrors, reset whenever their multi-select is pruned. */
@@ -92,6 +94,11 @@ export function pruneInvalidCohortSelections(
   if (countries) patch.selectedCountries = countries;
   const cardTypes = pruneMulti(selection.selectedCardTypes, new Set(options.card_type.map((o) => o.card_type)));
   if (cardTypes) patch.selectedCardTypes = cardTypes;
+  // `?? []` like utm_source below: responses cached before the platform
+  // dimension shipped deserialize without the key, and an empty list must mean
+  // "nothing known", never a crash or a wiped selection.
+  const platforms = pruneMulti(selection.selectedPlatforms, new Set((options.platform ?? []).map((o) => o.platform)));
+  if (platforms) patch.selectedPlatforms = platforms;
   // The Media Buyer dropdown carries buyer names AND "utm:<value>" entries;
   // both lists together define what is currently selectable.
   const mediaBuyers = pruneMulti(

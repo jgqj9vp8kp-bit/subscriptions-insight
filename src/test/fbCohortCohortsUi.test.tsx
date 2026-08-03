@@ -36,7 +36,7 @@ import { useInvalidateFbWarehouse } from "@/hooks/useFbWarehouse";
 const CAMPAIGN_A = "120249115818080040";
 const NO_FILTERS: CohortFilters = {
   funnel: [], campaign_path: [], campaign_id: [], traffic_source: [], price_plan: [],
-  media_buyer: [], country: [], card_type: [], currency: [], transaction_type: [], refund_status: "all",
+  media_buyer: [], country: [], card_type: [], platform: [], currency: [], transaction_type: [], refund_status: "all",
 };
 
 // ---- Production-shaped fixtures ---------------------------------------------

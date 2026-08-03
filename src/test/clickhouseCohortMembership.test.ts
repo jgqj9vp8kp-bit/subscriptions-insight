@@ -106,6 +106,7 @@ const request: CohortRequest = {
     media_buyer: ["Ivan"],
     country: ["US"],
     card_type: ["credit"],
+    platform: ["android"],
     currency: ["USD"],
     transaction_type: [],
     refund_status: "all",
@@ -124,6 +125,7 @@ describe("ClickHouse cohort membership materialization", () => {
     expect(sql).toContain("u_media_buyer media_buyer");
     expect(sql).toContain("u_country country");
     expect(sql).toContain("u_card_type card_type");
+    expect(sql).toContain("u_platform platform");
     expect(sql).not.toContain("any(c_campaign_id)");
     expect(sql).toContain("GROUP BY uid, c_date");
     expect(sql).not.toContain("raw_payload");
@@ -138,6 +140,7 @@ describe("ClickHouse cohort membership materialization", () => {
     expect(sql).toContain("fc.traffic_source IN ({p_mtsrc_0:String})");
     expect(sql).toContain("fc.country IN ({p_mcountry_0:String})");
     expect(sql).toContain("fc.card_type IN ({p_mcard_0:String})");
+    expect(sql).toContain("fc.platform IN ({p_mplat_0:String})");
     expect(sql).toContain("fc.price_plan IN ({p_mplan_0:String})");
     expect(sql).toContain("tid = trial_transaction_id, 'trial'");
     expect(params.p_mcid_0).toBe("cmp-1");

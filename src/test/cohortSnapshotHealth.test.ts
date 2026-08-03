@@ -15,7 +15,7 @@ import type { CohortResponse } from "../../supabase/functions/_shared/clickhouse
 
 const FILTERS_APPLIED = {
   date_range: false, funnel: false, campaign_path: false, refund_status: false,
-  media_buyer: false, currency: false, country: false, card_type: false,
+  media_buyer: false, currency: false, country: false, card_type: false, platform: false,
   campaign_id: false, traffic_source: false, price_plan: false,
 };
 

@@ -30,6 +30,7 @@ export interface CohortFiltersApplied {
   currency: boolean;
   country: boolean;
   card_type: boolean;
+  platform: boolean;
   campaign_id: boolean;
   traffic_source: boolean;
   price_plan: boolean;
@@ -44,6 +45,7 @@ export interface CohortFilters {
   media_buyer: string[];
   country: string[];
   card_type: string[];
+  platform: string[];
   currency: string[];
   transaction_type: string[];
   refund_status: CohortRefundStatus;
@@ -232,6 +234,7 @@ export interface CohortFilterOptions {
   campaign_id: Array<{ campaign_id: string; campaign_name: string | null; trial_count: number }>;
   country: Array<{ country_code: string; user_count: number }>;
   card_type: Array<{ card_type: string; trial_count: number }>;
+  platform: Array<{ platform: string; trial_count: number }>;
   media_buyer: Array<{ media_buyer: string; trial_count: number }>;
   /** Authoritative first-trial utm_source values NOT already represented by a
    * media buyer name. Rendered inside the Media Buyer dropdown as "UTM: <value>"
@@ -248,6 +251,7 @@ export type CohortOptionDimension =
   | "media_buyer"
   | "country"
   | "card_type"
+  | "platform"
   | "currency"
   | "price_plan";
 

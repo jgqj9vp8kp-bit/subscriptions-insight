@@ -57,7 +57,8 @@ CREATE TABLE IF NOT EXISTS ${ANALYTICS_TRANSACTIONS_TABLE}
     row_version UInt64,
     amount_usd Decimal(20, 6) DEFAULT 0,
     fx_status LowCardinality(String) DEFAULT '',
-    classification_reason String DEFAULT ''
+    classification_reason String DEFAULT '',
+    platform LowCardinality(String) DEFAULT ''
 )
 ENGINE = ReplacingMergeTree(row_version)
 PARTITION BY toYYYYMM(event_time)
@@ -97,7 +98,8 @@ CREATE TABLE IF NOT EXISTS ${FACT_USER_COHORTS_TABLE}
     warehouse_version String,
     classification_version String,
     generated_at DateTime64(3, 'UTC'),
-    row_version UInt64
+    row_version UInt64,
+    platform LowCardinality(String) DEFAULT ''
 )
 ENGINE = ReplacingMergeTree(row_version)
 PARTITION BY toYYYYMM(cohort_date)
@@ -113,6 +115,17 @@ ORDER BY
     canonical_user_id
 )
 `;
+
+// CREATE TABLE IF NOT EXISTS does not evolve an already-created production
+// table. The platform dimension (Cohorts Platform filter, 2026-08-03) is
+// appended at the tail — same discipline as amount_usd/fx_status above — so a
+// bare ADD COLUMN lands existing tables in the same position as a fresh CREATE.
+// The membership INSERT in cohortMembership.ts is positional and lists platform
+// last for exactly this reason.
+export const ALTER_PLATFORM_COLUMNS_SQL = [
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS platform LowCardinality(String) DEFAULT ''`,
+  `ALTER TABLE ${FACT_USER_COHORTS_TABLE} ADD COLUMN IF NOT EXISTS platform LowCardinality(String) DEFAULT ''`,
+];
 
 // Sorting key note (load-bearing): it must contain ONLY stable identity
 // columns. It used to include category/urgency, and ReplacingMergeTree collapses
@@ -455,6 +468,9 @@ export async function initializeClickHouseSchema(input: { client: ClickHouseClie
   // updated_at-millis scale; no-op once the table carries timestamp versions.
   await rebuildAnalyticsTransactionsRowVersion(client);
   await client.command({ query: CREATE_FACT_USER_COHORTS_SQL });
+  for (const query of ALTER_PLATFORM_COLUMNS_SQL) {
+    await client.command({ query });
+  }
   await ensureFactSupportRequestsSchema(client);
   await ensureFactFacebookStatsSchema(client);
   // Warehouse V2 Phase 0: additive, idempotent, zero readers until later phases.

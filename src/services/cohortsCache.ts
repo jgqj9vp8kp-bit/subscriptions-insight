@@ -34,6 +34,7 @@ export interface NormalizedCohortRequest {
   media_buyer: string[];
   country: string[];
   card_type: string[];
+  platform: string[];
   currency: string[];
   transaction_type: string[];
   fb_allocation_diagnostics: NormalizedFbAllocationDiagnosticsRequest | null;
@@ -59,6 +60,7 @@ export function normalizeCohortRequest(req: CohortRequest, opts: { includeSort?:
     media_buyer: sortUniq(f.media_buyer),
     country: sortUniq(f.country),
     card_type: sortUniq(f.card_type),
+    platform: sortUniq(f.platform),
     currency: sortUniq(f.currency),
     transaction_type: sortUniq(f.transaction_type),
     fb_allocation_diagnostics: req.fb_allocation_diagnostics

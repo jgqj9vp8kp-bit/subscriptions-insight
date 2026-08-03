@@ -16,6 +16,7 @@ function selection(over: Partial<CohortFilterSelection> = {}): CohortFilterSelec
     currencyFilter: "all",
     selectedCountries: [],
     selectedCardTypes: [],
+    selectedPlatforms: [],
     selectedMediaBuyers: [],
     selectedCampaignIds: [],
     ...over,
@@ -53,6 +54,24 @@ describe("pruneInvalidCohortSelections", () => {
         selection({ selectedCampaignPaths: ["soulmate-sketch"], selectedCountries: ["US"], selectedCardTypes: ["visa" as CardType] }),
         options(),
       ),
+    ).toBeNull();
+  });
+
+  it("prunes a stranded platform selection; a missing or empty platform list never wipes it", () => {
+    // ios survives, android (absent from the scoped list) is cleared.
+    expect(
+      pruneInvalidCohortSelections(
+        selection({ selectedPlatforms: ["ios", "android"] }),
+        options({ platform: [{ platform: "ios", trial_count: 7 }] }),
+      ),
+    ).toEqual({ selectedPlatforms: ["ios"] });
+    // Empty list = "nothing known for this scope" — selection preserved.
+    expect(
+      pruneInvalidCohortSelections(selection({ selectedPlatforms: ["ios"] }), options({ platform: [] })),
+    ).toBeNull();
+    // Responses cached before the dimension shipped have no platform key at all.
+    expect(
+      pruneInvalidCohortSelections(selection({ selectedPlatforms: ["ios"] }), options()),
     ).toBeNull();
   });
 

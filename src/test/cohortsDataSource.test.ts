@@ -167,7 +167,7 @@ describe("filtersFullyReproduced", () => {
   const fa = (over: Partial<CohortResponse["diagnostics"]["filters_applied"]>): CohortResponse["diagnostics"] => ({
     transactions_scanned: 0, users_scanned: 0, missing_identity: 0, missing_fx: 0, unknown_products: 0,
     subscription_data_status: "empty_source",
-    filters_applied: { date_range: true, funnel: true, campaign_path: true, refund_status: true, media_buyer: true, currency: true, country: false, card_type: false, campaign_id: false, traffic_source: false, price_plan: false, ...over },
+    filters_applied: { date_range: true, funnel: true, campaign_path: true, refund_status: true, media_buyer: true, currency: true, country: false, card_type: false, platform: false, campaign_id: false, traffic_source: false, price_plan: false, ...over },
   });
 
   it("is true when no unreproduced filter is active", () => {
@@ -179,6 +179,15 @@ describe("filtersFullyReproduced", () => {
     expect(filtersFullyReproduced(fa({}), { country: false, card_type: false, campaign_id: true })).toBe(false);
     expect(filtersFullyReproduced(fa({}), { country: false, card_type: false, campaign_id: false, traffic_source: true })).toBe(false);
     expect(filtersFullyReproduced(fa({}), { country: false, card_type: false, campaign_id: false, price_plan: true })).toBe(false);
+  });
+
+  it("platform gates the fallback: active + unreproduced blocks, server-applied passes", () => {
+    // Decision 3 (2026-08-03): with a platform filter active the legacy engine
+    // must never serve unfiltered rows — platform is server-only.
+    expect(filtersFullyReproduced(fa({}), { country: false, card_type: false, campaign_id: false, platform: true })).toBe(false);
+    const status = cohortFilterReproductionStatus(fa({}), { country: false, card_type: false, campaign_id: false, platform: true });
+    expect(status.unsupportedFilters).toEqual(["platform"]);
+    expect(filtersFullyReproduced(fa({ platform: true }), { country: false, card_type: false, campaign_id: false, platform: true })).toBe(true);
   });
 
   it("is true when an unreproduced dimension is reproduced", () => {

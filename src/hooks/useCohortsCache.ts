@@ -28,6 +28,7 @@ function activeFilterFlags(request: CohortRequest) {
   return {
     country: (f.country?.length ?? 0) > 0,
     card_type: (f.card_type?.length ?? 0) > 0,
+    platform: (f.platform?.length ?? 0) > 0,
     campaign_id: (f.campaign_id?.length ?? 0) > 0,
     traffic_source: (f.traffic_source?.length ?? 0) > 0,
     price_plan: (f.price_plan?.length ?? 0) > 0,

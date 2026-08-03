@@ -115,6 +115,7 @@ import {
 } from "@/services/mediaBuyerSelection";
 import { normalizeCountryCode } from "@/services/userCountry";
 import { CARD_TYPE_VALUES, cardTypeLabel } from "@/services/userCardType";
+import { PLATFORM_VALUES, platformLabel, type Platform } from "@/services/userPlatform";
 import { MEDIA_BUYER_VALUES, mediaBuyerLabel } from "@/services/userMediaBuyer";
 
 /** Dropdown/summary label for one Media Buyer selection value. */
@@ -156,6 +157,7 @@ const DEFAULT_COHORTS_UI_STATE = {
   campaignIdFilter: "all",
   selectedCountries: [] as string[],
   selectedCardTypes: [] as CardType[],
+  selectedPlatforms: [] as string[],
   selectedMediaBuyers: [] as Array<MediaBuyer | string>,
   cohortDateFrom: "",
   cohortDateTo: "",
@@ -670,6 +672,7 @@ type CohortTraffic = {
 
 const TRAFFIC_GEO_NOTE = "Traffic spend is not GEO-split";
 const TRAFFIC_CARD_TYPE_NOTE = "Traffic spend is not split by card type.";
+const TRAFFIC_PLATFORM_NOTE = "Traffic spend is not split by platform.";
 const TRAFFIC_CAMPAIGN_ID_NOTE = "Traffic spend is cohort-level and is not split by Campaign ID.";
 const TRAFFIC_MEDIA_BUYER_NOTE = "Spend is not split by Media Buyer";
 const TRAFFIC_DERIVED_COLUMN_PREFIXES = ["traffic_", "roas_", "profit"] as const;
@@ -1142,6 +1145,7 @@ export default function CohortsPage() {
     campaignIdFilter: legacyCampaignIdFilter,
     selectedCountries: rawSelectedCountries,
     selectedCardTypes: rawSelectedCardTypes,
+    selectedPlatforms: rawSelectedPlatforms,
     selectedMediaBuyers: rawSelectedMediaBuyers,
     cohortDateFrom,
     cohortDateTo,
@@ -1170,6 +1174,13 @@ export default function CohortsPage() {
         ? rawSelectedCardTypes.filter((value): value is CardType => CARD_TYPE_VALUES.includes(value as CardType))
         : [],
     [rawSelectedCardTypes],
+  );
+  const selectedPlatforms = useMemo<string[]>(
+    () =>
+      Array.isArray(rawSelectedPlatforms)
+        ? rawSelectedPlatforms.filter((value) => PLATFORM_VALUES.includes(value as Platform))
+        : [],
+    [rawSelectedPlatforms],
   );
   const selectedMediaBuyers = useMemo(
     () =>
@@ -1213,6 +1224,7 @@ export default function CohortsPage() {
   }, [rawSelectedCampaignIds, legacyCampaignIdFilter]);
   const hasGeoFilter = selectedCountries.length > 0;
   const hasCardTypeFilter = selectedCardTypes.length > 0;
+  const hasPlatformFilter = selectedPlatforms.length > 0;
   const hasMediaBuyerFilter = selectedMediaBuyers.length > 0;
   const hasCampaignIdFilter = selectedCampaignIds.length > 0;
 
@@ -1225,8 +1237,8 @@ export default function CohortsPage() {
   // it must stay in lockstep with the live value. Settled applied values equal the live ones, so no
   // metric changes — only the timing of the recompute.
   const heavyFilters = useMemo(
-    () => ({ trafficSourceFilter, selectedCampaignIds, selectedCountries, selectedCardTypes, selectedMediaBuyers }),
-    [trafficSourceFilter, selectedCampaignIds, selectedCountries, selectedCardTypes, selectedMediaBuyers],
+    () => ({ trafficSourceFilter, selectedCampaignIds, selectedCountries, selectedCardTypes, selectedPlatforms, selectedMediaBuyers }),
+    [trafficSourceFilter, selectedCampaignIds, selectedCountries, selectedCardTypes, selectedPlatforms, selectedMediaBuyers],
   );
   const [appliedHeavyFilters, isRecomputing] = useDebouncedValue(heavyFilters, COHORT_FILTER_DEBOUNCE_MS);
   const {
@@ -1234,11 +1246,16 @@ export default function CohortsPage() {
     selectedCampaignIds: appliedSelectedCampaignIds,
     selectedCountries: appliedSelectedCountries,
     selectedCardTypes: appliedSelectedCardTypes,
+    selectedPlatforms: appliedSelectedPlatforms,
     selectedMediaBuyers: appliedSelectedMediaBuyers,
   } = appliedHeavyFilters;
   const effectiveSelectedCardTypes = useMemo(
     () => (appliedSelectedCardTypes.length === CARD_TYPE_VALUES.length ? [] : appliedSelectedCardTypes),
     [appliedSelectedCardTypes],
+  );
+  const effectiveSelectedPlatforms = useMemo(
+    () => (appliedSelectedPlatforms.length === PLATFORM_VALUES.length ? [] : appliedSelectedPlatforms),
+    [appliedSelectedPlatforms],
   );
   const effectiveSelectedMediaBuyers = useMemo(() => {
     const hasUtmSelection = appliedSelectedMediaBuyers.some((value) => isUtmMediaBuyerSelection(value));
@@ -1575,6 +1592,7 @@ export default function CohortsPage() {
         media_buyer: effectiveSelectedMediaBuyers ?? [],
         country: appliedSelectedCountries ?? [],
         card_type: effectiveSelectedCardTypes ?? [],
+        platform: effectiveSelectedPlatforms ?? [],
         currency: selectedCurrencies ?? [],
         transaction_type: [],
         refund_status: refundFilter === "has" ? "has" : refundFilter === "none" ? "none" : "all",
@@ -1594,7 +1612,7 @@ export default function CohortsPage() {
         },
       },
     }),
-    [cohortDateFrom, cohortDateTo, selectedFunnels, selectedCampaignPaths, appliedSelectedCampaignIds, appliedTrafficSourceFilter, effectiveSelectedMediaBuyers, appliedSelectedCountries, effectiveSelectedCardTypes, selectedCurrencies, refundFilter, maxRenewalColumns, fbAllocationDiagnosticsUi],
+    [cohortDateFrom, cohortDateTo, selectedFunnels, selectedCampaignPaths, appliedSelectedCampaignIds, appliedTrafficSourceFilter, effectiveSelectedMediaBuyers, appliedSelectedCountries, effectiveSelectedCardTypes, effectiveSelectedPlatforms, selectedCurrencies, refundFilter, maxRenewalColumns, fbAllocationDiagnosticsUi],
   );
   const {
     chResult,
@@ -1886,6 +1904,20 @@ export default function CohortsPage() {
           }),
     [clickHouseDriving, chResult, sourceFilteredTxs, subscriptions, cohortRowFilters, appliedSelectedCountries, effectiveSelectedMediaBuyers, maxRenewalColumns],
   );
+  // Platform is a server-only dimension: the cached client transaction model
+  // carries no payment-session metadata, so there is NO legacy option builder —
+  // the list simply stays empty when ClickHouse is not driving, and the
+  // reproduction gate keeps the legacy fallback from serving a platform-filtered
+  // request (the page shows its unavailable state instead of unfiltered rows).
+  const platformOptions = useMemo(
+    () =>
+      clickHouseDriving && chResult?.filterOptions
+        // `?? []`: results cached before the platform dimension shipped
+        // deserialize without the key.
+        ? chResult.filterOptions.platform ?? []
+        : [],
+    [clickHouseDriving, chResult],
+  );
   const mediaBuyerOptions = useMemo(
     () =>
       clickHouseDriving && chResult?.filterOptions
@@ -1967,10 +1999,11 @@ export default function CohortsPage() {
       currencyFilter,
       selectedCountries,
       selectedCardTypes,
+      selectedPlatforms,
       selectedMediaBuyers,
       selectedCampaignIds,
     }),
-    [selectedFunnels, selectedCampaignPaths, trafficSourceFilter, currencyFilter, selectedCountries, selectedCardTypes, selectedMediaBuyers, selectedCampaignIds],
+    [selectedFunnels, selectedCampaignPaths, trafficSourceFilter, currencyFilter, selectedCountries, selectedCardTypes, selectedPlatforms, selectedMediaBuyers, selectedCampaignIds],
   );
   useEffect(() => {
     const patch = pruneInvalidCohortSelections(liveSelection, scopedOptions);
@@ -2425,6 +2458,14 @@ export default function CohortsPage() {
     updateUiState({ selectedCardTypes: next });
   };
   const clearCardTypes = () => updateUiState({ selectedCardTypes: [] });
+  const platformSummary = selectedPlatforms.length ? selectedPlatforms.map(platformLabel).join(", ") : "All platforms";
+  const togglePlatform = (platform: string) => {
+    const next = selectedPlatforms.includes(platform)
+      ? selectedPlatforms.filter((value) => value !== platform)
+      : [...selectedPlatforms, platform];
+    updateUiState({ selectedPlatforms: next });
+  };
+  const clearPlatforms = () => updateUiState({ selectedPlatforms: [] });
   const toggleMediaBuyer = (selectionValue: MediaBuyer | string) => {
     const next = selectedMediaBuyers.includes(selectionValue)
       ? selectedMediaBuyers.filter((value) => value !== selectionValue)
@@ -2518,6 +2559,7 @@ export default function CohortsPage() {
   const trafficNotes = [
     hasGeoFilter ? TRAFFIC_GEO_NOTE : null,
     hasCardTypeFilter ? TRAFFIC_CARD_TYPE_NOTE : null,
+    hasPlatformFilter ? TRAFFIC_PLATFORM_NOTE : null,
     hasCampaignIdFilter ? TRAFFIC_CAMPAIGN_ID_NOTE : null,
     hasMediaBuyerFilter ? TRAFFIC_MEDIA_BUYER_NOTE : null,
   ].filter(Boolean);
@@ -3370,6 +3412,41 @@ export default function CohortsPage() {
           </Popover>
           <Popover>
             <PopoverTrigger asChild>
+              <Button type="button" variant="outline" size="sm" className="h-9 max-w-[230px] justify-between gap-2">
+                <span className="text-xs text-muted-foreground">Platform</span>
+                <span className="truncate">{platformSummary}</span>
+                <ChevronDown className="h-3.5 w-3.5 shrink-0 opacity-60" />
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent align="start" className="w-60 p-0">
+              <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
+                <div>
+                  <div className="text-xs font-medium text-muted-foreground">Platform</div>
+                  <div className="text-xs text-muted-foreground">All platforms by default</div>
+                </div>
+                <Button type="button" variant="ghost" size="sm" className="h-7 text-xs" onClick={clearPlatforms} disabled={!selectedPlatforms.length}>
+                  Clear
+                </Button>
+              </div>
+              <div className="py-1">
+                {platformOptions.length === 0 && (
+                  <div className="px-3 py-3 text-sm text-muted-foreground">No platform data</div>
+                )}
+                {platformOptions.map((option) => (
+                  <label key={option.platform} className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted/50">
+                    <Checkbox
+                      checked={selectedPlatforms.includes(option.platform)}
+                      onCheckedChange={() => togglePlatform(option.platform)}
+                    />
+                    <span>{platformLabel(option.platform)}</span>
+                    <span className="ml-auto text-xs tabular-nums text-muted-foreground">{option.trial_count}</span>
+                  </label>
+                ))}
+              </div>
+            </PopoverContent>
+          </Popover>
+          <Popover>
+            <PopoverTrigger asChild>
               <Button type="button" variant="outline" size="sm" className="h-9 max-w-[250px] justify-between gap-2">
                 <span className="text-xs text-muted-foreground">Media Buyer</span>
                 <span className="truncate">{mediaBuyerSummary}</span>
@@ -3402,7 +3479,7 @@ export default function CohortsPage() {
               </div>
             </PopoverContent>
           </Popover>
-          {(hasGeoFilter || hasCardTypeFilter || hasMediaBuyerFilter) && (
+          {(hasGeoFilter || hasCardTypeFilter || hasPlatformFilter || hasMediaBuyerFilter) && (
             <span className="text-xs text-muted-foreground" title={trafficCellTitle}>
               Spend is cohort-level
             </span>

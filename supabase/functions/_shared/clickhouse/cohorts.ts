@@ -143,6 +143,7 @@ export function normalizeCohortRequest(req: CohortRequest): NormalizedCohortRequ
       media_buyer: stringArray(f.media_buyer, "media_buyer"),
       country: stringArray(f.country, "country"),
       card_type: stringArray(f.card_type, "card_type"),
+      platform: stringArray(f.platform, "platform"),
       currency: stringArray(f.currency, "currency"),
       transaction_type: stringArray(f.transaction_type, "transaction_type"),
       refund_status: normalizeRefundStatus(f.refund_status),
@@ -180,6 +181,7 @@ export function filtersApplied(filters: CohortFilters, dateFrom: string | null, 
     currency: filters.currency.length > 0,
     country: filters.country.length > 0,
     card_type: filters.card_type.length > 0,
+    platform: filters.platform.length > 0,
     campaign_id: filters.campaign_id.length > 0,
     traffic_source: filters.traffic_source.length > 0,
     price_plan: false,
@@ -219,7 +221,7 @@ base AS (
     a.funnel funnel, a.campaign_path campaign_path,
     a.campaign_id campaign_id,
     ifNull(nullIf(JSONExtractString(a.normalized_payload, 'traffic_source'), ''), 'unknown') traffic_source,
-    a.country_code country_code, a.card_type card_type, a.media_buyer media_buyer,
+    a.country_code country_code, a.card_type card_type, a.platform platform, a.media_buyer media_buyer,
     multiIf(a.transaction_type = 'trial', 0, a.transaction_type = 'upsell', 1, a.transaction_type = 'first_subscription', 2,
       a.transaction_type IN ('renewal_2','renewal_3','renewal'), 3, 4) tprio,
     a.status status, a.is_success is_success, a.transaction_type ttype,
@@ -248,6 +250,7 @@ userdim AS (
   SELECT uid,
     argMin(country_code, (multiIf(country_code = '', 2, is_success = 1, 0, 1), ets, tid)) u_country,
     argMin(if(card_type = '', 'unknown', card_type), (multiIf(card_type = '', 2, is_success = 1, 0, 1), ets, tid)) u_card_type,
+    argMin(if(platform = '', 'unknown', platform), (multiIf(platform = '', 2, is_success = 1, 0, 1), ets, tid)) u_platform,
     argMin(if(media_buyer = '', 'Unknown', media_buyer), (ets, tid)) u_media_buyer,
     argMin(normalized_email, (multiIf(normalized_email = '', 2, is_success = 1, 0, 1), ets, tid)) u_normalized_email,
     max(source_updated_at) u_source_updated_at
@@ -263,7 +266,7 @@ cl AS (
     e.cur cur, e.amt amt, e.pid pid, e.pname pname, e.lifeelig lifeelig,
     tr.trial_ts trial_ts, tr.trial_key trial_key, tr.c_date c_date, tr.c_funnel c_funnel, tr.c_camp c_camp,
 	    tr.c_campaign_id c_campaign_id, tr.c_traffic_source c_traffic_source,
-	    userdim.u_country u_country, userdim.u_card_type u_card_type, userdim.u_media_buyer u_media_buyer,
+	    userdim.u_country u_country, userdim.u_card_type u_card_type, userdim.u_platform u_platform, userdim.u_media_buyer u_media_buyer,
 	    userdim.u_normalized_email u_normalized_email, userdim.u_source_updated_at u_source_updated_at
   FROM elig e INNER JOIN tr USING(uid)
   INNER JOIN userdim USING(uid)
@@ -286,7 +289,7 @@ fin AS (
     p.cur cur, p.amt amt, p.pid pid, p.pname pname,
     p.c_date c_date, p.c_funnel c_funnel, p.c_camp c_camp,
     p.c_campaign_id c_campaign_id, p.c_traffic_source c_traffic_source,
-    p.u_country u_country, p.u_card_type u_card_type, p.u_media_buyer u_media_buyer,
+    p.u_country u_country, p.u_card_type u_card_type, p.u_platform u_platform, p.u_media_buyer u_media_buyer,
     p.u_normalized_email u_normalized_email, p.u_source_updated_at u_source_updated_at,
     ifNull(li.lvl, 0) lvl, ifNull(ui.slot, 0) slot,
     multiIf(p.pretype != 'lifecycle', p.pretype, li.lvl = 1, 'first_subscription', li.lvl = 2, 'renewal_2', li.lvl = 3, 'renewal_3', 'renewal') lt
@@ -317,7 +320,7 @@ cemail AS (
   FROM (
     SELECT DISTINCT b.uid uid, b.normalized_email normalized_email, tr.trial_ts trial_ts,
       tr.c_campaign_id c_campaign_id, tr.c_traffic_source c_traffic_source,
-      ud.u_country u_country, ud.u_card_type u_card_type, ud.u_media_buyer u_media_buyer
+      ud.u_country u_country, ud.u_card_type u_card_type, ud.u_platform u_platform, ud.u_media_buyer u_media_buyer
     FROM base b
     INNER JOIN tr ON tr.uid = b.uid
     INNER JOIN userdim ud ON ud.uid = b.uid
@@ -333,7 +336,7 @@ etok AS (
     b.cur cur, b.amt amt, b.pid pid, b.pname pname,
     tr.c_date c_date, tr.c_funnel c_funnel, tr.c_camp c_camp,
     tr.c_campaign_id c_campaign_id, tr.c_traffic_source c_traffic_source,
-    ud.u_country u_country, ud.u_card_type u_card_type, ud.u_media_buyer u_media_buyer,
+    ud.u_country u_country, ud.u_card_type u_card_type, ud.u_platform u_platform, ud.u_media_buyer u_media_buyer,
     ud.u_normalized_email u_normalized_email, ud.u_source_updated_at u_source_updated_at,
     0 lvl, 0 slot,
     if(b.statusType != '', b.statusType, 'token_purchase') lt
@@ -348,13 +351,13 @@ etok AS (
 finx AS (
   SELECT uid, tid, et, ets, tprio, trial_ts, is_success, g, nn, rr, d, statusType, tokenAmt,
     cur, amt, pid, pname, c_date, c_funnel, c_camp, c_campaign_id, c_traffic_source,
-    u_country, u_card_type, u_media_buyer, u_normalized_email, u_source_updated_at,
+    u_country, u_card_type, u_platform, u_media_buyer, u_normalized_email, u_source_updated_at,
     lvl, slot, lt, 0 via_email
   FROM fin
   UNION ALL
   SELECT uid, tid, et, ets, tprio, trial_ts, is_success, g, nn, rr, d, statusType, tokenAmt,
     cur, amt, pid, pname, c_date, c_funnel, c_camp, c_campaign_id, c_traffic_source,
-    u_country, u_card_type, u_media_buyer, u_normalized_email, u_source_updated_at,
+    u_country, u_card_type, u_platform, u_media_buyer, u_normalized_email, u_source_updated_at,
     lvl, slot, lt, 1 via_email
   FROM etok
 )`;
@@ -460,6 +463,8 @@ function memberFilterConds(filters: CohortFilters, params: Record<string, unknow
   if (country) conds.push(country);
   const card = inClause("u_card_type", filters.card_type, "card", params);
   if (card) conds.push(card);
+  const platform = inClause("u_platform", filters.platform, "plat", params);
+  if (platform) conds.push(platform);
   // Media Buyer dropdown: names filter u_media_buyer exactly as before;
   // "utm:<value>" selections admit users by first-trial utm_source (union).
   const { buyers, utms } = splitMediaBuyerSelections(filters.media_buyer);
@@ -870,7 +875,7 @@ ${classifierSQL(`a.auth_user_id = {auth_user_id:String}`, "")}
   SELECT uid canonical_user_id, c_date cohort_date,
     c_funnel funnel, c_camp campaign_path,
     c_campaign_id campaign_id, c_traffic_source traffic_source,
-    u_country country, u_card_type card_type, u_media_buyer media_buyer,
+    u_country country, u_card_type card_type, u_platform platform, u_media_buyer media_buyer,
     argMin(cur, (ets, tprio, tid)) currency,
     if(
       countIf(is_success = 1 AND lt NOT IN ('upsell','token_purchase')) = 0,
@@ -879,7 +884,7 @@ ${classifierSQL(`a.auth_user_id = {auth_user_id:String}`, "")}
     ) price_plan
   FROM fin
   GROUP BY uid, c_date, c_funnel, c_camp, c_campaign_id, c_traffic_source,
-    u_country, u_card_type, u_media_buyer
+    u_country, u_card_type, u_platform, u_media_buyer
 ),
 futm AS (
   SELECT user_id, argMin(utm_source, (event_time, transaction_id)) trial_utm
@@ -891,7 +896,7 @@ members AS (
   SELECT trialrow.canonical_user_id canonical_user_id, trialrow.funnel funnel, trialrow.campaign_path campaign_path,
     trialrow.campaign_id campaign_id, trialrow.traffic_source traffic_source,
     trialrow.media_buyer media_buyer, trialrow.country country, trialrow.card_type card_type,
-    trialrow.currency currency, trialrow.price_plan price_plan,
+    trialrow.platform platform, trialrow.currency currency, trialrow.price_plan price_plan,
     ifNull(futm.trial_utm, '') trial_utm,
     ${optionFlagColumns(filters, params, "ifNull(futm.trial_utm, '')")}
   FROM trialrow LEFT JOIN futm ON futm.user_id = trialrow.canonical_user_id${dateConds.length ? `\n  WHERE ${dateConds.join(" AND ")}` : ""}

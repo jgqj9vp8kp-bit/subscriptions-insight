@@ -57,6 +57,7 @@ export const OPTION_DIMENSIONS: OptionDimensionSpec[] = [
   { dim: "media_buyer", column: "media_buyer", values: (f) => f.media_buyer },
   { dim: "country", column: "country", values: (f) => f.country },
   { dim: "card_type", column: "card_type", values: (f) => f.card_type },
+  { dim: "platform", column: "platform", values: (f) => f.platform },
   { dim: "currency", column: "currency", values: (f) => f.currency },
   { dim: "price_plan", column: "price_plan", values: (f) => f.price_plan },
 ];
@@ -170,6 +171,7 @@ export function emptyFilterOptions(): CohortFilterOptions {
     campaign_id: [],
     country: [],
     card_type: [],
+    platform: [],
     media_buyer: [],
     utm_source: [],
   };
@@ -205,6 +207,7 @@ export function filterOptionsFromRows(
     else if (dim === "currency") opts.currency.push(value);
     else if (dim === "country") opts.country.push({ country_code: value, user_count: cnt });
     else if (dim === "card_type") opts.card_type.push({ card_type: value, trial_count: cnt });
+    else if (dim === "platform") opts.platform.push({ platform: value, trial_count: cnt });
     else if (dim === "media_buyer") opts.media_buyer.push({ media_buyer: value, trial_count: cnt });
     else if (dim === "utm_source") opts.utm_source.push({ utm_source: value, trial_count: cnt });
   }
@@ -217,6 +220,7 @@ export function filterOptionsFromRows(
   opts.campaign_id.sort((a, b) => b.trial_count - a.trial_count);
   opts.country.sort((a, b) => a.country_code.localeCompare(b.country_code));
   opts.card_type.sort((a, b) => b.trial_count - a.trial_count);
+  opts.platform.sort((a, b) => b.trial_count - a.trial_count);
   opts.media_buyer.sort((a, b) => b.trial_count - a.trial_count);
   opts.utm_source.sort((a, b) => b.trial_count - a.trial_count || a.utm_source.localeCompare(b.utm_source));
 

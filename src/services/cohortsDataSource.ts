@@ -43,6 +43,7 @@ export interface CohortFilterOptionsView {
   campaign_id: CampaignIdOption[];
   country: CountryUserCount[];
   card_type: CohortCardTypeOption[];
+  platform: Array<{ platform: string; trial_count: number }>;
   media_buyer: MediaBuyerOption[];
   /** UTM entries of the Media Buyer dropdown (unmapped first-trial utm_source values). */
   utm_source: UtmSourceOption[];
@@ -253,6 +254,7 @@ export function mapFilterOptions(fo: CohortResponse["filter_options"]): CohortFi
     campaign_id: fo.campaign_id ?? [],
     country: fo.country ?? [],
     card_type: (fo.card_type ?? []).map((o) => ({ card_type: o.card_type as CardType, trial_count: o.trial_count })),
+    platform: (fo.platform ?? []).map((o) => ({ platform: o.platform, trial_count: o.trial_count })),
     media_buyer: (fo.media_buyer ?? []).map((o) => ({ media_buyer: o.media_buyer as MediaBuyer, trial_count: o.trial_count })),
     utm_source: (fo.utm_source ?? []).map((o) => ({ utm_source: o.utm_source, trial_count: o.trial_count })),
   };
@@ -473,14 +475,14 @@ export function compareCohortResults(
 // active but not reproduced, shadow parity is NOT_APPLICABLE (comparing
 // different populations would be a false mismatch).
 export function filtersFullyReproduced(diagnostics: CohortResponse["diagnostics"] | undefined, active: {
-  country: boolean; card_type: boolean; campaign_id: boolean; traffic_source?: boolean; price_plan?: boolean;
+  country: boolean; card_type: boolean; platform?: boolean; campaign_id: boolean; traffic_source?: boolean; price_plan?: boolean;
 }): boolean {
   return cohortFilterReproductionStatus(diagnostics, active).applicable;
 }
 
 export function cohortFilterReproductionStatus(
   diagnostics: CohortResponse["diagnostics"] | undefined,
-  active: { country: boolean; card_type: boolean; campaign_id: boolean; traffic_source?: boolean; price_plan?: boolean },
+  active: { country: boolean; card_type: boolean; platform?: boolean; campaign_id: boolean; traffic_source?: boolean; price_plan?: boolean },
 ): { applicable: boolean; unsupportedFilters: string[]; reason: string; filtersApplied: CohortResponse["diagnostics"]["filters_applied"] | null } {
   if (!diagnostics) {
     return {
@@ -494,6 +496,11 @@ export function cohortFilterReproductionStatus(
   const unsupportedFilters = [
     active.country && !fa.country ? "country" : null,
     active.card_type && !fa.card_type ? "card_type" : null,
+    // Platform is server-only by design: the cached client transaction model
+    // carries no payment-session metadata, so the legacy fallback can never
+    // reproduce it. An active platform filter therefore always gates the
+    // fallback off (the diagnostics of a server that DID apply it satisfy this).
+    active.platform && !fa.platform ? "platform" : null,
     active.campaign_id && !fa.campaign_id ? "campaign_id" : null,
     active.traffic_source && !fa.traffic_source ? "traffic_source" : null,
     active.price_plan && !fa.price_plan ? "price_plan" : null,

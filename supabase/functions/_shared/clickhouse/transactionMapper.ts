@@ -1,6 +1,7 @@
 import { convertAmountToUsd } from "./currencyNormalization.ts";
 import { declineDetailsForTransaction } from "./paymentFailures.ts";
 import { cardTypeForUserTransactions, cardTypeFromTransaction } from "./userCardType.ts";
+import { platformForUserTransactions, platformFromTransaction, type Platform } from "./userPlatform.ts";
 import { countryCodeForUserTransactions, countryCodeFromTransaction } from "./userCountry.ts";
 import { mediaBuyerForUserTransactions, utmSourceFromTransaction } from "./userMediaBuyer.ts";
 import { isTokenPurchaseTransaction, productIdForTransaction } from "./monetization.ts";
@@ -83,6 +84,7 @@ export type ClickHouseTransactionRow = {
   amount_usd: number;
   fx_status: string;
   classification_reason: string;
+  platform: Platform;
 };
 
 export interface MapperDiagnostics {
@@ -350,6 +352,7 @@ export function mapSupabaseTransactionToClickHouse(input: {
   const campaignId = tx.campaign_id || text(tx.metadata?.utm_campaign) || text(tx.raw?.utm_campaign);
   const country = input.row.country_code || countryCodeFromTransaction(tx) || countryCodeForUserTransactions(userTxs) || "";
   const cardType = cardTypeFromTransaction(tx) ?? cardTypeForUserTransactions(userTxs);
+  const platform = platformFromTransaction(tx) ?? platformForUserTransactions(userTxs);
   const media = mediaBuyerForUserTransactions(userTxs);
 
   if (!tx.user_id && !tx.email) diagnostics.missing_user_identity += 1;
@@ -419,6 +422,7 @@ export function mapSupabaseTransactionToClickHouse(input: {
     amount_usd: amountUsdValue,
     fx_status: conversion.conversion_status,
     classification_reason: tx.classification_reason ?? "",
+    platform,
   };
 }
 

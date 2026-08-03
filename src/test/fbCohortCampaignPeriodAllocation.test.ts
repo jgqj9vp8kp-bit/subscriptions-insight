@@ -15,7 +15,7 @@ const DATE_A = "2026-06-01";
 const DATE_B = "2026-06-02";
 const NO_FILTERS: CohortFilters = {
   funnel: [], campaign_path: [], campaign_id: [], traffic_source: [], price_plan: [],
-  media_buyer: [], country: [], card_type: [], currency: [], transaction_type: [], refund_status: "all",
+  media_buyer: [], country: [], card_type: [], platform: [], currency: [], transaction_type: [], refund_status: "all",
 };
 
 function user(id: string, overrides: Partial<FbAuthoritativeUserRow> = {}): FbAuthoritativeUserRow {

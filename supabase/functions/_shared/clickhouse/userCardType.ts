@@ -19,7 +19,7 @@ function normalizeKey(key: string): string {
   return key.toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
 
-function valueAtPath(source: unknown, path: readonly string[]): unknown {
+export function valueAtPath(source: unknown, path: readonly string[]): unknown {
   let current = source;
   for (const segment of path) {
     if (!current || typeof current !== "object" || Array.isArray(current)) return undefined;

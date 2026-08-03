@@ -43,7 +43,10 @@ export const COHORT_SNAPSHOT_NAME = "fact_user_cohorts";
 // v2 makes the authoritative attribution columns explicit members of the
 // per-user grain (no any(campaign_id) copy step). Bumping forces a validated
 // snapshot rebuild on rollout instead of silently reusing the v1 materialization.
-export const COHORT_CLASSIFICATION_VERSION = "cohort_classifier_v2_authoritative_attribution";
+// v3: adds the user-level platform dimension (Cohorts Platform filter). The
+// bump forces a snapshot rebuild so existing fact rows (platform = '') are
+// replaced by classified ones — the filter must never run on a half-built dim.
+export const COHORT_CLASSIFICATION_VERSION = "cohort_classifier_v3_platform";
 
 export type CohortSnapshotStatus = "never_started" | "building" | "completed" | "failed";
 
@@ -239,6 +242,7 @@ ${classifierSQL(`a.auth_user_id = {auth_user_id:String}`, "")}
     u_media_buyer media_buyer,
     u_country country,
     u_card_type card_type,
+    u_platform platform,
     argMin(cur, (ets, tprio, tid)) currency,
     argMin(g, (ets, tprio, tid)) trial_amount_usd,
     max(u_source_updated_at) source_updated_at,
@@ -246,7 +250,7 @@ ${classifierSQL(`a.auth_user_id = {auth_user_id:String}`, "")}
     argMinIf(round(g, 2), (ets, tprio, tid), is_success = 1 AND lt NOT IN ('upsell','token_purchase')) plan_price
   FROM fin
   GROUP BY uid, c_date, u_normalized_email, c_funnel, c_camp,
-    c_campaign_id, c_traffic_source, u_media_buyer, u_country, u_card_type
+    c_campaign_id, c_traffic_source, u_media_buyer, u_country, u_card_type, u_platform
 )
 SELECT
   {auth_user_id:String} auth_user_id,
@@ -269,7 +273,8 @@ SELECT
   {warehouse_version:String} warehouse_version,
   {classification_version:String} classification_version,
   parseDateTime64BestEffort({generated_at:String}, 3, 'UTC') generated_at,
-  toUInt64(toUnixTimestamp64Milli(parseDateTime64BestEffort({generated_at:String}, 3, 'UTC'))) row_version
+  toUInt64(toUnixTimestamp64Milli(parseDateTime64BestEffort({generated_at:String}, 3, 'UTC'))) row_version,
+  platform
 FROM membership`;
 }
 
@@ -360,6 +365,7 @@ async function compareVersions(input: {
            AND old.media_buyer = neu.media_buyer
            AND old.country = neu.country
            AND old.card_type = neu.card_type
+           AND old.platform = neu.platform
            AND old.currency = neu.currency
            AND old.price_plan = neu.price_plan
          ) AS unchanged_users
@@ -574,6 +580,7 @@ export function activeCohortMemberWhere(filters: CohortFilters, params: Record<s
   }
   addIn("fc.country", filters.country, "mcountry");
   addIn("fc.card_type", filters.card_type, "mcard");
+  addIn("fc.platform", filters.platform, "mplat");
   addIn("fc.currency", filters.currency, "mcur");
   addIn("fc.price_plan", filters.price_plan, "mplan");
   return clauses.length ? `AND ${clauses.join(" AND ")}` : "";
@@ -756,7 +763,7 @@ export function buildMaterializedFilterOptionsQuery(
   // flag for "utm:<value>" selections and the extra utm_source option branch.
   return `WITH fcm AS (
   SELECT canonical_user_id, funnel, campaign_path, campaign_id, traffic_source,
-    media_buyer, country, card_type, currency, price_plan, trial_transaction_id
+    media_buyer, country, card_type, platform, currency, price_plan, trial_transaction_id
   FROM ${FACT_USER_COHORTS_TABLE} FINAL
   WHERE auth_user_id = {auth_user_id:String}
     AND warehouse_version = {warehouse_version:String}
@@ -770,7 +777,7 @@ tutm AS (
 members AS (
   SELECT fcm.canonical_user_id canonical_user_id, fcm.funnel funnel, fcm.campaign_path campaign_path,
     fcm.campaign_id campaign_id, fcm.traffic_source traffic_source, fcm.media_buyer media_buyer,
-    fcm.country country, fcm.card_type card_type, fcm.currency currency, fcm.price_plan price_plan,
+    fcm.country country, fcm.card_type card_type, fcm.platform platform, fcm.currency currency, fcm.price_plan price_plan,
     ifNull(tutm.utm_source, '') trial_utm,
     ${optionFlagColumns(filters, params, "ifNull(tutm.utm_source, '')")}
   FROM fcm LEFT JOIN tutm ON tutm.transaction_id = fcm.trial_transaction_id
@@ -1027,6 +1034,7 @@ ${classifierSQL(`a.auth_user_id = {auth_user_id:String}`, "")}
     u_media_buyer media_buyer,
     u_country country,
     u_card_type card_type,
+    u_platform platform,
     argMin(cur, (ets, tprio, tid)) currency,
     if(
       countIf(is_success = 1 AND lt NOT IN ('upsell','token_purchase')) = 0,
@@ -1035,11 +1043,11 @@ ${classifierSQL(`a.auth_user_id = {auth_user_id:String}`, "")}
     ) price_plan
   FROM fin
   GROUP BY uid, c_date, c_funnel, c_camp, c_campaign_id, c_traffic_source,
-    u_media_buyer, u_country, u_card_type
+    u_media_buyer, u_country, u_card_type, u_platform
 ),
 materialized AS (
   SELECT canonical_user_id, toString(cohort_date) cohort_date, trial_event_time, trial_transaction_id,
-    funnel, campaign_path, campaign_id, traffic_source, media_buyer, country, card_type, currency, price_plan
+    funnel, campaign_path, campaign_id, traffic_source, media_buyer, country, card_type, platform, currency, price_plan
   FROM ${FACT_USER_COHORTS_TABLE} FINAL
   WHERE auth_user_id = {auth_user_id:String}
     AND warehouse_version = {warehouse_version:String}
@@ -1049,7 +1057,7 @@ joined AS (
   SELECT d.*, m.canonical_user_id materialized_user_id,
     m.cohort_date m_cohort_date, m.trial_event_time m_trial_event_time, m.trial_transaction_id m_trial_transaction_id,
     m.funnel m_funnel, m.campaign_path m_campaign_path, m.campaign_id m_campaign_id, m.traffic_source m_traffic_source,
-    m.media_buyer m_media_buyer, m.country m_country, m.card_type m_card_type, m.currency m_currency, m.price_plan m_price_plan
+    m.media_buyer m_media_buyer, m.country m_country, m.card_type m_card_type, m.platform m_platform, m.currency m_currency, m.price_plan m_price_plan
   FROM dynamic d LEFT JOIN materialized m USING(canonical_user_id)
 )
 SELECT
@@ -1068,6 +1076,7 @@ SELECT
   countIf(media_buyer != m_media_buyer) media_buyer_mismatches,
   countIf(country != m_country) country_mismatches,
   countIf(card_type != m_card_type) card_type_mismatches,
+  countIf(platform != m_platform) platform_mismatches,
   countIf(currency != m_currency) currency_mismatches,
   countIf(price_plan != m_price_plan) price_plan_mismatches
 FROM joined
@@ -1085,6 +1094,7 @@ FORMAT JSONEachRow`,
     media_buyer: n(row?.media_buyer_mismatches),
     country: n(row?.country_mismatches),
     card_type: n(row?.card_type_mismatches),
+    platform: n(row?.platform_mismatches),
     currency: n(row?.currency_mismatches),
     price_plan: n(row?.price_plan_mismatches),
   };

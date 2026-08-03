@@ -484,6 +484,7 @@ function authoritativeScopeWhere(input: {
   where += inClause("media_buyer", filters.media_buyer, `${prefix}_mb`, params);
   where += inClause("country", filters.country, `${prefix}_geo`, params);
   where += inClause("card_type", filters.card_type, `${prefix}_card`, params);
+  where += inClause("platform", filters.platform, `${prefix}_plat`, params);
   where += inClause("currency", filters.currency, `${prefix}_cur`, params);
   where += inClause("price_plan", filters.price_plan, `${prefix}_plan`, params);
   return where + visibleRowsClause(input.visibleRows);
@@ -523,6 +524,7 @@ export function fbAuthoritativeUsersSql(input: {
   where += inClause("media_buyer", filters.media_buyer, "mb", params);
   where += inClause("country", filters.country, "geo", params);
   where += inClause("card_type", filters.card_type, "card", params);
+  where += inClause("platform", filters.platform, "plat", params);
   where += inClause("currency", filters.currency, "cur", params);
   where += inClause("price_plan", filters.price_plan, "plan", params);
   return `SELECT canonical_user_id,
