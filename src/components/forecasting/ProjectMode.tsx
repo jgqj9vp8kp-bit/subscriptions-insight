@@ -22,15 +22,30 @@ import { fmtInt, fmtMoney, fmtPctValue, fmtRatio } from "@/components/forecastin
 import { loadProjectSeedData, type ProjectSeedData } from "@/services/projectForecastSeeding";
 import {
   buildProjectEntries,
+  buildProjectForecastSnapshot,
+  diffProjectFrozen,
+  replayProjectForecast,
   resolveProject,
   runResolvedProject,
   spendGroupKey,
   workbookGlobalDefaults,
   type ProjectAggregationPolicy,
+  type ProjectFrozenDiff,
+  type ProjectForecast,
+  type ProjectFunnelEntry,
+  type ResolvedProject,
   type SharedCostPool,
   type SpendBasisMode,
   type SpendGroup,
 } from "@/services/funnelEconomics";
+import {
+  deleteProjectForecast,
+  duplicateProjectForecast,
+  listProjectForecasts,
+  loadProjectForecast,
+  saveProjectForecast,
+  type ProjectForecastListItem,
+} from "@/services/projectForecasts";
 
 function parseNum(value: string | undefined): number | undefined {
   if (!value) return undefined;
@@ -79,6 +94,42 @@ type SeedState =
   | { kind: "error"; message: string }
   | { kind: "ready"; data: ProjectSeedData };
 
+type ViewMode =
+  | { kind: "live" }
+  | { kind: "replay"; saved: ProjectForecast; resolved: ResolvedProject; shareDrift: string[] }
+  | { kind: "archived"; saved: ProjectForecast; reason: string };
+
+interface PendingRefresh {
+  saved: ProjectForecast;
+  freshData: ProjectSeedData;
+  freshResolved: ResolvedProject;
+  diff: ProjectFrozenDiff;
+}
+
+/** Map saved lineage entries back onto the edit-string model, so "Apply
+ * refresh" drops the operator into live mode with every prior choice intact. */
+function editsFromEntries(entries: ProjectFunnelEntry[]): { edits: Record<string, ProjectEntryEdits>; deselected: Set<string> } {
+  const edits: Record<string, ProjectEntryEdits> = {};
+  const deselected = new Set<string>();
+  for (const entry of entries) {
+    if (!entry.enabled) deselected.add(entry.funnelId);
+    const seeds = entry.manualSeeds;
+    const survival = seeds.survival;
+    edits[entry.funnelId] = {
+      plannedBudget: String(entry.plannedBudget),
+      manualCpa: seeds.targetCpa !== undefined ? String(seeds.targetCpa) : undefined,
+      cadence: entry.cadence,
+      cadenceConfirmed: entry.cadenceConfirmed,
+      bonusEnabled: entry.bonusEnabled,
+      trialPrice: seeds.trialPrice !== undefined ? String(seeds.trialPrice) : undefined,
+      periodPrice: seeds.periodPrice !== undefined ? String(seeds.periodPrice) : undefined,
+      firstPaidCrPct: survival && survival.length >= 2 ? (survival[1] * 100).toFixed(2) : undefined,
+      renewalCrPct: survival && survival.length >= 3 && survival[1] > 0 ? ((survival[2] / survival[1]) * 100).toFixed(2) : undefined,
+    };
+  }
+  return { edits, deselected };
+}
+
 export function ProjectMode() {
   const defaultWindow = useMemo(previousMonthWindow, []);
   const [fromInput, setFromInput] = useState(defaultWindow.from);
@@ -94,7 +145,20 @@ export function ProjectMode() {
   const [commissionByGroup, setCommissionByGroup] = useState<Record<string, string>>({});
   const [prorationMode, setProrationMode] = useState<ProrationMode>("calendar_prorated");
   const [prorationManual, setProrationManual] = useState("");
+  // P7 persistence state.
+  const [viewMode, setViewMode] = useState<ViewMode>({ kind: "live" });
+  const [savedList, setSavedList] = useState<ProjectForecastListItem[]>([]);
+  const [selectedSavedId, setSelectedSavedId] = useState("");
+  const [saveName, setSaveName] = useState("");
+  const [persistBusy, setPersistBusy] = useState(false);
+  const [persistNote, setPersistNote] = useState<string | null>(null);
+  const [pendingRefresh, setPendingRefresh] = useState<PendingRefresh | null>(null);
   const loadGenRef = useRef(0);
+
+  const refreshSavedList = useCallback(() => {
+    listProjectForecasts().then(setSavedList).catch(() => setSavedList([]));
+  }, []);
+  useEffect(() => { refreshSavedList(); }, [refreshSavedList]);
 
   const load = useCallback((window: { from: string; to: string }) => {
     const generation = ++loadGenRef.current;
@@ -227,6 +291,127 @@ export function ProjectMode() {
     });
   }, []);
 
+  // ---- Persistence actions (P7) ----
+  const replayActive = useMemo(
+    () => (viewMode.kind === "replay" ? { resolved: viewMode.resolved, run: runResolvedProject(viewMode.resolved) } : null),
+    [viewMode],
+  );
+  const active = viewMode.kind === "replay" ? replayActive : project;
+  const isReplay = viewMode.kind === "replay";
+
+  const onSave = useCallback(() => {
+    if (!project || !saveName.trim()) return;
+    setPersistBusy(true);
+    setPersistNote(null);
+    const snapshot = buildProjectForecastSnapshot({
+      resolved: project.resolved,
+      name: saveName.trim(),
+      now: new Date().toISOString(),
+    });
+    saveProjectForecast(snapshot)
+      .then((id) => {
+        setPersistNote(`Saved "${snapshot.name}".`);
+        setSelectedSavedId(id);
+        setSaveName("");
+        refreshSavedList();
+      })
+      .catch((error) => setPersistNote(error instanceof Error ? error.message : String(error)))
+      .finally(() => setPersistBusy(false));
+  }, [project, saveName, refreshSavedList]);
+
+  const onLoadSaved = useCallback((id: string) => {
+    if (!id) return;
+    setPersistBusy(true);
+    setPersistNote(null);
+    setPendingRefresh(null);
+    loadProjectForecast(id)
+      .then((saved) => {
+        const replay = replayProjectForecast(saved);
+        if (replay.kind === "archived") {
+          setViewMode({ kind: "archived", saved, reason: replay.reason });
+        } else {
+          setViewMode({ kind: "replay", saved, resolved: replay.resolved, shareDrift: replay.shareDrift });
+        }
+      })
+      .catch((error) => setPersistNote(error instanceof Error ? error.message : String(error)))
+      .finally(() => setPersistBusy(false));
+  }, []);
+
+  const onDeleteSaved = useCallback((id: string) => {
+    if (!id) return;
+    setPersistBusy(true);
+    deleteProjectForecast(id)
+      .then(() => {
+        setPersistNote("Deleted.");
+        setSelectedSavedId("");
+        if (viewMode.kind !== "live") setViewMode({ kind: "live" });
+        refreshSavedList();
+      })
+      .catch((error) => setPersistNote(error instanceof Error ? error.message : String(error)))
+      .finally(() => setPersistBusy(false));
+  }, [refreshSavedList, viewMode.kind]);
+
+  const onDuplicateSaved = useCallback((id: string) => {
+    if (!id) return;
+    setPersistBusy(true);
+    duplicateProjectForecast(id, new Date().toISOString())
+      .then(() => { setPersistNote("Duplicated."); refreshSavedList(); })
+      .catch((error) => setPersistNote(error instanceof Error ? error.message : String(error)))
+      .finally(() => setPersistBusy(false));
+  }, [refreshSavedList]);
+
+  /** Re-fetch the saved window, re-resolve with the SAVED lineage, and stage the
+   * field-level diff. Nothing is overwritten until Apply. */
+  const onRefreshFromSources = useCallback(() => {
+    if (viewMode.kind !== "replay") return;
+    const { saved } = viewMode;
+    setPersistBusy(true);
+    setPersistNote(null);
+    loadProjectSeedData(saved.source.window)
+      .then((freshData) => {
+        const freshResolved = resolveProject({
+          window: saved.source.window,
+          asOf: new Date().toISOString(),
+          rows: freshData.rows,
+          windowLedger: freshData.windowLedger,
+          funnelLedgers: freshData.funnelLedgers,
+          entries: saved.entries,
+          sharedCosts: saved.sharedCosts,
+          policy: saved.policy,
+        });
+        const frozenMap: ProjectForecast["frozen"] = {};
+        for (const resolution of freshResolved.resolutions) {
+          if (resolution.frozen) frozenMap[resolution.entry.funnelId] = resolution.frozen;
+        }
+        setPendingRefresh({ saved, freshData, freshResolved, diff: diffProjectFrozen(saved.frozen, frozenMap) });
+      })
+      .catch((error) => setPersistNote(error instanceof Error ? error.message : String(error)))
+      .finally(() => setPersistBusy(false));
+  }, [viewMode]);
+
+  /** Apply = drop into LIVE mode with the fresh data and every saved choice
+   * mapped back onto the editors. The saved row itself is untouched. */
+  const onApplyRefresh = useCallback(() => {
+    if (!pendingRefresh) return;
+    const { saved, freshData } = pendingRefresh;
+    const mapped = editsFromEntries(saved.entries);
+    setFromInput(saved.source.window.from);
+    setToInput(saved.source.window.to);
+    setSpendBasis(saved.policy.spendBasis);
+    setProrationMode(saved.sharedCosts.proration.mode);
+    setProrationManual(saved.sharedCosts.proration.manualAmount != null ? String(saved.sharedCosts.proration.manualAmount) : "");
+    setCommissionByGroup(Object.fromEntries(
+      Object.entries(saved.policy.manualCommissionByGroup ?? {}).map(([key, value]) => [key, String(value * 100)]),
+    ));
+    setEntryEdits(mapped.edits);
+    setDeselected(mapped.deselected);
+    setSeed({ kind: "ready", data: freshData });
+    setPendingRefresh(null);
+    setViewMode({ kind: "live" });
+    setPersistNote(`Refreshed "${saved.name}" against fresh data — now editing live; save under a new name to keep it.`);
+  }, [pendingRefresh]);
+
+
   const funnelOptions = useMemo(() => {
     if (!project) return [];
     return project.resolved.resolutions.map((resolution) => ({
@@ -243,15 +428,16 @@ export function ProjectMode() {
   }, [project]);
 
   const blockedSummary = useMemo(() => {
-    if (!project) return null;
-    const blocked = project.resolved.resolutions.filter((r) => r.status.kind === "blocked" && r.entry.enabled);
+    const source = viewMode.kind === "replay" ? replayActive : project;
+    if (!source) return null;
+    const blocked = source.resolved.resolutions.filter((r) => r.status.kind === "blocked" && r.entry.enabled);
     if (blocked.length === 0) return null;
     const excludedSpend = blocked.reduce((sum, r) => sum + (r.ledger?.funnelResolvedSpend ?? 0), 0);
     return { count: blocked.length, excludedSpend };
-  }, [project]);
+  }, [project, replayActive, viewMode.kind]);
 
-  const totals = project?.run.totals ?? null;
-  const provisional = project?.resolved.provisional ?? null;
+  const totals = active?.run.totals ?? null;
+  const provisional = active?.resolved.provisional ?? null;
   // ᵖ marker: the value is displayable but rests on incomplete inputs.
   const provisionalMark = provisional && (provisional.spendIncomplete || provisional.attributedOnlyMode || provisional.unconfirmedCadenceBudgetShare > 0.5) ? "ᵖ" : "";
 
@@ -272,7 +458,7 @@ export function ProjectMode() {
             <RefreshCw className={seed.kind === "loading" ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
             {seed.kind === "loading" ? "Loading…" : "Load window"}
           </Button>
-          {project && (
+          {project && viewMode.kind === "live" && (
             <FunnelMultiSelect
               label="Funnels"
               options={funnelOptions}
@@ -287,7 +473,94 @@ export function ProjectMode() {
           <Info className="h-3.5 w-3.5 shrink-0" />
           Acquisition-cohort payback from a common Day&nbsp;0 — not a calendar-month P&amp;L. Deselecting a funnel moves its spend to out-of-project; it never silently changes the remaining rows.
         </p>
+
+        {/* -------- Saved projects (P7) -------- */}
+        <div className="mt-3 flex flex-wrap items-end gap-2 border-t pt-3">
+          <div className="space-y-1">
+            <Label className="text-xs text-muted-foreground">Saved projects</Label>
+            <Select value={selectedSavedId} onValueChange={setSelectedSavedId}>
+              <SelectTrigger className="h-8 w-72"><SelectValue placeholder={savedList.length ? "Choose…" : "None saved yet"} /></SelectTrigger>
+              <SelectContent>
+                {savedList.map((item) => (
+                  <SelectItem key={item.id} value={item.id}>
+                    {item.name} · {item.source_window_from}…{item.source_window_to}
+                    {item.provisional_reasons.length > 0 ? " ᵖ" : ""}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <Button variant="outline" size="sm" className="h-8" disabled={!selectedSavedId || persistBusy} onClick={() => onLoadSaved(selectedSavedId)}>Load</Button>
+          <Button variant="outline" size="sm" className="h-8" disabled={!selectedSavedId || persistBusy} onClick={() => onDuplicateSaved(selectedSavedId)}>Duplicate</Button>
+          <Button variant="outline" size="sm" className="h-8 text-destructive" disabled={!selectedSavedId || persistBusy} onClick={() => onDeleteSaved(selectedSavedId)}>Delete</Button>
+          {viewMode.kind === "live" && project && (
+            <>
+              <div className="ml-4 space-y-1">
+                <Label className="text-xs text-muted-foreground">Save current as</Label>
+                <Input className="h-8 w-60" placeholder={`July acquisition cohort`} value={saveName} onChange={(event) => setSaveName(event.target.value)} />
+              </div>
+              <Button size="sm" className="h-8" disabled={!saveName.trim() || persistBusy} onClick={onSave}>Save</Button>
+            </>
+          )}
+          {viewMode.kind !== "live" && (
+            <Button variant="outline" size="sm" className="h-8" onClick={() => { setViewMode({ kind: "live" }); setPendingRefresh(null); }}>Back to live</Button>
+          )}
+          {persistNote && <span className="pb-1.5 text-xs text-muted-foreground">{persistNote}</span>}
+        </div>
       </Card>
+
+      {viewMode.kind === "archived" && (
+        <Card className="border-warning/50 p-4 text-sm">
+          <p className="font-medium">“{viewMode.saved.name}” is an archived snapshot.</p>
+          <p className="mt-1 text-xs text-muted-foreground">{viewMode.reason} The numbers cannot be replayed by the current engine; re-resolve against fresh data to continue.</p>
+        </Card>
+      )}
+
+      {viewMode.kind === "replay" && (
+        <Card className="border-primary/40 bg-primary/5 p-4 text-xs">
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="font-medium">Saved snapshot “{viewMode.saved.name}”</span>
+            <span className="text-muted-foreground">window {viewMode.saved.source.window.from}…{viewMode.saved.source.window.to} · resolved {viewMode.saved.resolvedAt.slice(0, 10)} · replayed with zero network</span>
+            <Button variant="outline" size="sm" className="h-7" disabled={persistBusy} onClick={onRefreshFromSources}>
+              <RefreshCw className={persistBusy ? "h-3.5 w-3.5 animate-spin" : "h-3.5 w-3.5"} />
+              Refresh from sources
+            </Button>
+          </div>
+          {viewMode.shareDrift.length > 0 && (
+            <p className="mt-2 text-destructive">⚠ Share drift detected — the saved row is internally inconsistent: {viewMode.shareDrift.join("; ")}</p>
+          )}
+        </Card>
+      )}
+
+      {pendingRefresh && (
+        <Card className="border-warning/50 p-4">
+          <h3 className="text-sm font-semibold">Refresh diff — nothing is overwritten until you apply</h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Fresh resolve of “{pendingRefresh.saved.name}” against today’s data: {pendingRefresh.diff.unchangedCount} funnels unchanged, {pendingRefresh.diff.funnels.length} differ.
+          </p>
+          <div className="mt-2 max-h-56 space-y-1.5 overflow-auto text-xs">
+            {pendingRefresh.diff.funnels.map((funnel) => (
+              <div key={funnel.funnelId} className="rounded border border-border/60 px-2 py-1.5">
+                <span className="font-medium">{funnel.funnelId}</span>
+                <span className="ml-2 text-muted-foreground">{funnel.kind}</span>
+                {funnel.headline.length > 0 && (
+                  <span className="ml-2 text-muted-foreground">
+                    {funnel.headline.map((change) => `${change.label}: ${change.before} → ${change.after}`).join(" · ")}
+                  </span>
+                )}
+                {funnel.kind === "changed" && funnel.headline.length === 0 && (
+                  <span className="ml-2 text-muted-foreground">{funnel.changedPaths.length} field(s) changed</span>
+                )}
+              </div>
+            ))}
+            {pendingRefresh.diff.funnels.length === 0 && <p className="text-muted-foreground">No differences — the saved snapshot matches fresh data.</p>}
+          </div>
+          <div className="mt-3 flex gap-2">
+            <Button size="sm" className="h-8" onClick={onApplyRefresh}>Apply — edit live with fresh data</Button>
+            <Button variant="outline" size="sm" className="h-8" onClick={() => setPendingRefresh(null)}>Keep the saved snapshot</Button>
+          </div>
+        </Card>
+      )}
 
       {seed.kind === "error" && (
         <Card className="border-destructive/50 p-4 text-sm">
@@ -299,9 +572,11 @@ export function ProjectMode() {
         <Card className="p-6 text-center text-sm text-muted-foreground">Loading window data…</Card>
       )}
 
-      {project && totals && (
+      {active && totals && (
         <>
-          {/* -------- Project settings (P6) -------- */}
+          {/* -------- Project settings (P6; live mode only — a replayed snapshot
+               is immutable, Refresh from sources is the editing path) -------- */}
+          {!isReplay && (
           <Card className="p-4 shadow-card">
             <h3 className="mb-3 text-sm font-semibold">Project settings</h3>
             <div className="flex flex-wrap items-end gap-4">
@@ -316,7 +591,7 @@ export function ProjectMode() {
                 </Select>
               </div>
               <div className="space-y-1">
-                <Label className="text-xs text-muted-foreground">Shared-cost pool ({fmtMoney(project.resolved.proratedPool)})</Label>
+                <Label className="text-xs text-muted-foreground">Shared-cost pool ({fmtMoney(active.resolved.proratedPool)})</Label>
                 <Select value={prorationMode} onValueChange={(value) => setProrationMode(value as ProrationMode)}>
                   <SelectTrigger className="h-8 w-56"><SelectValue /></SelectTrigger>
                   <SelectContent>
@@ -373,6 +648,7 @@ export function ProjectMode() {
               </div>
             )}
           </Card>
+          )}
 
           {/* -------- Gates & provisional banners -------- */}
           {(totals.gates.length > 0 || blockedSummary) && (
@@ -396,21 +672,21 @@ export function ProjectMode() {
           <Card className="p-4 shadow-card">
             <h3 className="mb-2 text-sm font-semibold">Window spend reconciliation</h3>
             <div className="grid gap-x-8 gap-y-1 text-xs sm:grid-cols-2">
-              <ReconRow label="Window source spend" value={project.resolved.windowLedger.windowSourceSpend} bold />
-              <ReconRow label="├ via users" value={project.resolved.windowLedger.userAttributed.spend} />
-              <ReconRow label="Resolved to funnels" value={project.resolved.windowLedger.funnelResolved.spend} />
-              <ReconRow label="├ no users (real cost, zero trials)" value={project.resolved.windowLedger.noUser.spend} />
-              <ReconRow label="├ in project (drives the P&L)" value={project.resolved.scope.inProjectResolvedSpend} accent="text-primary" />
-              <ReconRow label="Unknown funnel (in P&L by policy)" value={project.resolved.windowLedger.unknownFunnel.spend} />
-              <ReconRow label="└ out of project (deselected / blocked)" value={project.resolved.scope.outOfProjectSpend} />
-              <ReconRow label="Other unallocated" value={project.resolved.windowLedger.otherUnallocated.spend} />
+              <ReconRow label="Window source spend" value={active.resolved.windowLedger.windowSourceSpend} bold />
+              <ReconRow label="├ via users" value={active.resolved.windowLedger.userAttributed.spend} />
+              <ReconRow label="Resolved to funnels" value={active.resolved.windowLedger.funnelResolved.spend} />
+              <ReconRow label="├ no users (real cost, zero trials)" value={active.resolved.windowLedger.noUser.spend} />
+              <ReconRow label="├ in project (drives the P&L)" value={active.resolved.scope.inProjectResolvedSpend} accent="text-primary" />
+              <ReconRow label="Unknown funnel (in P&L by policy)" value={active.resolved.windowLedger.unknownFunnel.spend} />
+              <ReconRow label="└ out of project (deselected / blocked)" value={active.resolved.scope.outOfProjectSpend} />
+              <ReconRow label="Other unallocated" value={active.resolved.windowLedger.otherUnallocated.spend} />
             </div>
             <p className="mt-2 text-xs text-muted-foreground">
-              {project.resolved.windowIdentity.ok
-                ? `✓ window reconciles ±$${Math.max(Math.abs(project.resolved.windowIdentity.sourceDelta), Math.abs(project.resolved.windowIdentity.resolvedDelta)).toFixed(2)}`
+              {active.resolved.windowIdentity.ok
+                ? `✓ window reconciles ±$${Math.max(Math.abs(active.resolved.windowIdentity.sourceDelta), Math.abs(active.resolved.windowIdentity.resolvedDelta)).toFixed(2)}`
                 : "⛔ window does NOT reconcile — spend figures are untrustworthy"}
-              {" · "}project-scoped {fmtMoney(project.resolved.scope.projectScopedSpend)} · coverage {fmtPctValue(project.resolved.scope.spendCoverage, 1)}
-              {project.resolved.windowLedger.spendIncomplete && ` · ⚠ known warehouse gaps overlap this window (${project.resolved.windowLedger.knownGapDays.length} days)`}
+              {" · "}project-scoped {fmtMoney(active.resolved.scope.projectScopedSpend)} · coverage {fmtPctValue(active.resolved.scope.spendCoverage, 1)}
+              {active.resolved.windowLedger.spendIncomplete && ` · ⚠ known warehouse gaps overlap this window (${active.resolved.windowLedger.knownGapDays.length} days)`}
             </p>
           </Card>
 
@@ -436,11 +712,11 @@ export function ProjectMode() {
           {/* -------- Combined curve + table -------- */}
           <ProjectCashFlowChart totals={totals} />
           <ProjectFunnelTable
-            resolved={project.resolved}
-            run={project.run}
-            onToggle={toggleFunnel}
-            edits={entryEdits}
-            onEdit={onEntryEdit}
+            resolved={active.resolved}
+            run={active.run}
+            onToggle={isReplay ? () => undefined : toggleFunnel}
+            edits={isReplay ? {} : entryEdits}
+            onEdit={isReplay ? () => undefined : onEntryEdit}
           />
         </>
       )}
