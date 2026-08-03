@@ -71,6 +71,17 @@ type RefundFilter = "all" | "has" | "none";
 type PaymentFailedFilter = "all" | "has" | "none";
 type FailedAttemptsFilter = "all" | "gte1" | "gte3" | "gte5";
 type CohortExplorerSortKey = "date" | "trial_users" | "net_revenue";
+
+/** What the cohort explorer needs from a cohort, whichever engine produced it —
+ * the server option list and the legacy CohortRow both satisfy it. */
+interface CohortExplorerRow {
+  cohort_id: string;
+  cohort_date: string;
+  funnel: string;
+  campaign_path: string;
+  trial_users: number;
+  net_revenue: number;
+}
 type UsersPageMode = "users_table" | "decline_analytics";
 type DeclineSortKey = "reason" | "failed_users" | "failed_transactions" | "share" | "avg_attempts" | "latest_failed_date";
 // Sort fields of the server-computed Decline Analytics country breakdown
@@ -491,19 +502,24 @@ export default function UsersPage() {
       country: countryFilter,
       cardTypes: selectedCardTypes,
       declineReasons: selectedDeclineReasons,
+      cohortIds: selectedCohortIds,
       sortField: sortKey,
       sortDir,
       page,
       pageSize: USERS_PAGE_SIZE,
     }),
-    [appliedSearch, firstTrialFrom, firstTrialTo, firstSubFilter, refundFilter, paymentFailedFilter, failedAttemptsFilter, campaignPathFilter, countryFilter, selectedCardTypes, selectedDeclineReasons, sortKey, sortDir, page],
+    [appliedSearch, firstTrialFrom, firstTrialTo, firstSubFilter, refundFilter, paymentFailedFilter, failedAttemptsFilter, campaignPathFilter, countryFilter, selectedCardTypes, selectedDeclineReasons, selectedCohortIds, sortKey, sortDir, page],
   );
   const hasSelectedCohortsRaw = Array.isArray(rawSelectedCohortIds) && rawSelectedCohortIds.length > 0;
-  const usersServerEligible = usersSource === "clickhouse" && !hasSelectedCohortsRaw && mode !== "decline_analytics";
+  // Cohort selections used to force the legacy client path. That path computes
+  // from the transaction store, which this route deliberately never hydrates, so
+  // both the cohort list and any cohort-scoped user count came out empty. The
+  // selection is now a server filter (filters.cohort_ids) like every other one.
+  const usersServerEligible = usersSource === "clickhouse" && mode !== "decline_analytics";
   // Decline Analytics ClickHouse path: the bundle (totals + reason/stage rows +
   // country breakdown) is computed server-side over the SAME filtered user set.
   // Cohort selections are still a legacy boundary (not reproduced server-side).
-  const declineServerEligible = usersSource === "clickhouse" && !hasSelectedCohortsRaw && mode === "decline_analytics";
+  const declineServerEligible = usersSource === "clickhouse" && mode === "decline_analytics";
   const declineQuery = useMemo<UsersDeclineQuery>(
     () => ({
       search: appliedSearch,
@@ -517,12 +533,13 @@ export default function UsersPage() {
       country: countryFilter,
       cardTypes: selectedCardTypes,
       declineReasons: selectedDeclineReasons,
+      cohortIds: selectedCohortIds,
       analyticsReasons: declineAnalyticsReasons,
       analyticsStages: declineAnalyticsStages,
       countrySortField: declineCountrySortKey,
       countrySortDir: declineCountrySortDir,
     }),
-    [appliedSearch, firstTrialFrom, firstTrialTo, firstSubFilter, refundFilter, paymentFailedFilter, failedAttemptsFilter, campaignPathFilter, countryFilter, selectedCardTypes, selectedDeclineReasons, declineAnalyticsReasons, declineAnalyticsStages, declineCountrySortKey, declineCountrySortDir],
+    [appliedSearch, firstTrialFrom, firstTrialTo, firstSubFilter, refundFilter, paymentFailedFilter, failedAttemptsFilter, campaignPathFilter, countryFilter, selectedCardTypes, selectedDeclineReasons, selectedCohortIds, declineAnalyticsReasons, declineAnalyticsStages, declineCountrySortKey, declineCountrySortDir],
   );
   const {
     chUsers,
@@ -623,11 +640,29 @@ export default function UsersPage() {
   const selectedCohortIdSet = useMemo(() => new Set(selectedCohortIds), [selectedCohortIds]);
   const selectedCohortMatchIdSet = useMemo(() => cohortSelectionMatchIds(selectedCohortIds), [selectedCohortIds]);
   const hasSelectedCohorts = selectedCohortIds.length > 0;
+  // The explorer's cohorts come from the server whenever it drives the page —
+  // the legacy list is computed from the transaction store, which this route
+  // never hydrates, so it is empty here by construction (that is the bug this
+  // replaces). Shape is identical, so the filter/sort below is unchanged.
+  const explorerCohorts = useMemo<CohortExplorerRow[]>(
+    () =>
+      usersAnyServerDriving && chOptions
+        ? (chOptions.cohort ?? []).map((option) => ({
+            cohort_id: option.cohort_id,
+            cohort_date: option.cohort_date,
+            funnel: option.funnel,
+            campaign_path: option.campaign_path,
+            trial_users: option.trial_users,
+            net_revenue: option.net_revenue,
+          }))
+        : cohorts,
+    [usersAnyServerDriving, chOptions, cohorts],
+  );
   const visibleCohorts = useMemo(() => {
     const q = cohortSearch.trim().toLowerCase();
     const fromDateKey = toDateKey(cohortDateFrom);
     const toDateKeyValue = toDateKey(cohortDateTo);
-    const list = cohorts.filter((cohort) => {
+    const list = explorerCohorts.filter((cohort) => {
       if (campaignPathFilter !== "all" && cohort.campaign_path !== campaignPathFilter) return false;
       if (q && !`${cohort.campaign_path} ${cohort.funnel}`.toLowerCase().includes(q)) return false;
       const cohortDateKey = toDateKey(cohort.cohort_date);
@@ -642,7 +677,7 @@ export default function UsersPage() {
       return cohortSortDir === "asc" ? cmp : -cmp;
     });
     return list;
-  }, [cohorts, campaignPathFilter, cohortSearch, cohortDateFrom, cohortDateTo, cohortSortKey, cohortSortDir]);
+  }, [explorerCohorts, campaignPathFilter, cohortSearch, cohortDateFrom, cohortDateTo, cohortSortKey, cohortSortDir]);
 
   const cohortScopedUserCount = useMemo(
     () => usersWithCampaignPath.filter((user) => userMatchesSelectedCohorts(user, selectedCohortMatchIdSet, cohortMembership)).length,
@@ -745,7 +780,13 @@ export default function UsersPage() {
   }, [usersFilterKey, usersServerEligible]);
   // ClickHouse drives the rendered table + pagination when active; else legacy.
   const tableRows = usersClickHouseDriving && chUsers ? chUsers.rows : pagedUsers;
-  const displayTotal = usersClickHouseDriving && chUsers ? chUsers.total : filtered.length;
+  // Decline Analytics disables the list query, so its scoped user count comes
+  // from the decline bundle instead — otherwise the header reads 0 on that tab.
+  const displayTotal = usersClickHouseDriving && chUsers
+    ? chUsers.total
+    : declineClickHouseDriving && chDecline
+      ? chDecline.totals.selected_users
+      : filtered.length;
   const displayTotalPages = usersClickHouseDriving && chUsers ? chUsers.totalPages : totalPages;
   const displaySafePage = usersClickHouseDriving && chUsers ? Math.min(page, displayTotalPages) : safePage;
   useEffect(() => {
@@ -1100,7 +1141,7 @@ export default function UsersPage() {
   });
 
   return (
-    <AppLayout title="Users" description={`${filtered.length} users`}>
+    <AppLayout title="Users" description={`${displayTotal} users`}>
       <div className="grid gap-4 lg:grid-cols-[320px_minmax(0,1fr)]">
         <Card className="p-4 shadow-card lg:sticky lg:top-4 lg:self-start">
           <div className="space-y-3">
@@ -1738,7 +1779,7 @@ export default function UsersPage() {
               <div className="rounded-md border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">
                 <div className="space-y-3">
                   <div>
-                    {selectedCohortIds.length && cohortScopedUserCount > 0
+                    {selectedCohortIds.length > 0 && (usersAnyServerDriving || cohortScopedUserCount > 0)
                       ? "No users match selected cohorts and filters."
                       : "No users selected."}
                   </div>

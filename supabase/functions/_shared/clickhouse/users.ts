@@ -22,6 +22,7 @@ import type {
   UsersDeclineReasonRow,
   UsersDeclineResponse,
   UsersDeclineStageRow,
+  UsersCohortOption,
   UsersDetailsResponse,
   UsersFilters,
   UsersRequest,
@@ -182,6 +183,7 @@ export function normalizeUsersRequest(req: UsersRequest): NormalizedUsersRequest
       card_type: stringArray(f.card_type, "card_type"),
       currency: stringArray(f.currency, "currency"),
       decline_reason: stringArray(f.decline_reason, "decline_reason"),
+      cohort_ids: stringArray(f.cohort_ids, "cohort_ids"),
       search: s(f.search).trim().slice(0, 200),
     },
     sortField,
@@ -341,6 +343,17 @@ useragg AS (
 )`;
 }
 
+// A user's cohort identity, built in ONE place. `toRow` stamps it onto every
+// UsersRow, the options query groups by its three parts, and USER_COHORT_ID_SQL
+// reproduces it in ClickHouse for the cohort filter. All three must agree, or a
+// selected cohort would match no users — keep them edited together.
+export function userCohortId(cohortFunnel: string, campaignPath: string, cohortDate: string): string {
+  return `${cohortFunnel || "unknown"}_${campaignPath || "unknown"}_${cohortDate}`;
+}
+
+const USER_COHORT_ID_SQL =
+  `concat(if(cohort_funnel = '', 'unknown', cohort_funnel), '_', if(campaign_path = '', 'unknown', campaign_path), '_', ifNull(cohort_date, ''))`;
+
 // Build the WHERE clause from the normalized filters (parameter-safe).
 function userWhere(nreq: NormalizedUsersRequest, params: Record<string, unknown>): string {
   const c: string[] = [];
@@ -363,6 +376,7 @@ function userWhere(nreq: NormalizedUsersRequest, params: Record<string, unknown>
   const mb = inClause("media_buyer", f.media_buyer, "mb", params); if (mb) c.push(mb);
   const cur = inClause("first_trial_currency", f.currency, "cur", params); if (cur) c.push(cur);
   const dr = inClause("latest_decline_reason", f.decline_reason, "dr", params); if (dr) c.push(dr);
+  const coh = inClause(USER_COHORT_ID_SQL, f.cohort_ids, "coh", params); if (coh) c.push(coh);
   if (f.search) {
     params.search = f.search;
     c.push(`(positionCaseInsensitive(email, {search:String}) > 0 OR positionCaseInsensitive(user_id, {search:String}) > 0)`);
@@ -380,7 +394,7 @@ function toRow(r: Record<string, unknown>): UsersRow {
     utm_source: r.utm_source == null || r.utm_source === "" ? null : s(r.utm_source),
     funnel: s(r.funnel),
     campaign_path: s(r.campaign_path) || "unknown",
-    cohort_id: `${s(r.cohort_funnel) || "unknown"}_${s(r.campaign_path) || "unknown"}_${s(r.cohort_date)}`,
+    cohort_id: userCohortId(s(r.cohort_funnel), s(r.campaign_path), s(r.cohort_date)),
     cohort_date: r.cohort_date ? s(r.cohort_date) : null,
     cohort_funnel: s(r.cohort_funnel),
     first_trial_date: r.first_trial_date ? s(r.first_trial_date) : null,
@@ -555,20 +569,43 @@ export async function runUsersOptions(input: { authUserId: string; clickhouse: C
   // with no attributed country) is a first-class option. Other dimensions keep
   // their original global (unfiltered) behavior.
   const countryScopeWhere = userWhere({ ...nreq, filters: { ...nreq.filters, country: [] } }, params);
+  // The cohort branch is DEPENDENT the same way country is: it respects every
+  // active filter EXCEPT the cohort selection, so picking a cohort never empties
+  // the list you picked it from. It rides this one query on purpose — the
+  // classifier CTE is the expensive part, and the Users route must not pay for a
+  // second scan (nor for hydrating transactions, which is why the legacy
+  // client-side cohort list this replaces was always empty here).
+  const cohortScopeWhere = userWhere({ ...nreq, filters: { ...nreq.filters, cohort_ids: [] } }, params);
   const sql = `${cte}
-SELECT 'funnel' dim, cohort_funnel value, '' label, count() cnt FROM useragg WHERE cohort_funnel != '' GROUP BY cohort_funnel
-UNION ALL SELECT 'campaign_path' dim, campaign_path value, '' label, count() FROM useragg WHERE campaign_path != '' GROUP BY campaign_path
-UNION ALL SELECT 'country' dim, ifNull(country_code, '${UNKNOWN_COUNTRY}') value, '' label, countIf(first_trial_date IS NOT NULL) FROM useragg ${countryScopeWhere} GROUP BY ifNull(country_code, '${UNKNOWN_COUNTRY}')
-UNION ALL SELECT 'card_type' dim, card_type value, '' label, count() FROM useragg WHERE card_type != '' GROUP BY card_type
-UNION ALL SELECT 'media_buyer' dim, media_buyer value, '' label, count() FROM useragg WHERE media_buyer != '' GROUP BY media_buyer
-UNION ALL SELECT 'currency' dim, first_trial_currency value, '' label, count() FROM useragg WHERE first_trial_currency != '' GROUP BY first_trial_currency
+SELECT 'funnel' dim, cohort_funnel value, '' label, count() cnt, 0 num, '' aux FROM useragg WHERE cohort_funnel != '' GROUP BY cohort_funnel
+UNION ALL SELECT 'campaign_path' dim, campaign_path value, '' label, count(), 0, '' FROM useragg WHERE campaign_path != '' GROUP BY campaign_path
+UNION ALL SELECT 'country' dim, ifNull(country_code, '${UNKNOWN_COUNTRY}') value, '' label, countIf(first_trial_date IS NOT NULL), 0, '' FROM useragg ${countryScopeWhere} GROUP BY ifNull(country_code, '${UNKNOWN_COUNTRY}')
+UNION ALL SELECT 'card_type' dim, card_type value, '' label, count(), 0, '' FROM useragg WHERE card_type != '' GROUP BY card_type
+UNION ALL SELECT 'media_buyer' dim, media_buyer value, '' label, count(), 0, '' FROM useragg WHERE media_buyer != '' GROUP BY media_buyer
+UNION ALL SELECT 'currency' dim, first_trial_currency value, '' label, count(), 0, '' FROM useragg WHERE first_trial_currency != '' GROUP BY first_trial_currency
+UNION ALL SELECT 'cohort' dim, ifNull(cohort_date, '') value, campaign_path label, count(), round(sum(net_revenue_usd), 2), cohort_funnel aux
+  FROM useragg ${cohortScopeWhere ? `${cohortScopeWhere} AND cohort_date IS NOT NULL` : "WHERE cohort_date IS NOT NULL"}
+  GROUP BY cohort_funnel, campaign_path, cohort_date
 FORMAT JSONEachRow`;
   const rs = await input.clickhouse.query({ query: sql, query_params: params, format: "JSONEachRow" });
-  const rows = (await rs.json()) as Array<{ dim: string; value: string; cnt: number | string }>;
-  const fo = { funnel: [] as string[], campaign_path: [] as string[], campaign_id: [] as Array<{ campaign_id: string; campaign_name: string | null; trial_count: number }>, media_buyer: [] as Array<{ media_buyer: string; user_count: number }>, country: [] as Array<{ country_code: string; user_count: number }>, card_type: [] as Array<{ card_type: string; user_count: number }>, currency: [] as string[] };
+  const rows = (await rs.json()) as Array<{ dim: string; value: string; label?: string; cnt: number | string; num?: number | string; aux?: string }>;
+  const fo = { funnel: [] as string[], campaign_path: [] as string[], campaign_id: [] as Array<{ campaign_id: string; campaign_name: string | null; trial_count: number }>, media_buyer: [] as Array<{ media_buyer: string; user_count: number }>, country: [] as Array<{ country_code: string; user_count: number }>, card_type: [] as Array<{ card_type: string; user_count: number }>, currency: [] as string[], cohort: [] as UsersCohortOption[] };
   for (const row of rows) {
     const v = s(row.value); const cnt = n(row.cnt);
     if (!v) continue;
+    if (row.dim === "cohort") {
+      const funnel = s(row.aux);
+      const campaignPath = s(row.label);
+      fo.cohort.push({
+        cohort_id: userCohortId(funnel, campaignPath, v),
+        cohort_date: v,
+        funnel: funnel || "unknown",
+        campaign_path: campaignPath || "unknown",
+        trial_users: cnt,
+        net_revenue: n(row.num),
+      });
+      continue;
+    }
     if (row.dim === "funnel") fo.funnel.push(v);
     else if (row.dim === "campaign_path") fo.campaign_path.push(v);
     else if (row.dim === "country") fo.country.push({ country_code: v, user_count: cnt });
@@ -577,6 +614,8 @@ FORMAT JSONEachRow`;
     else if (row.dim === "currency") fo.currency.push(v);
   }
   fo.funnel.sort(); fo.campaign_path.sort(); fo.currency.sort();
+  // Newest cohort first — the page's own sort control re-sorts from here.
+  fo.cohort.sort((x, y) => (x.cohort_date < y.cohort_date ? 1 : x.cohort_date > y.cohort_date ? -1 : x.cohort_id.localeCompare(y.cohort_id)));
   // A→Z with Unknown pinned last (mirrors the Unknown-last sort of the table).
   fo.country.sort((x, y) =>
     Number(x.country_code === UNKNOWN_COUNTRY) - Number(y.country_code === UNKNOWN_COUNTRY) || x.country_code.localeCompare(y.country_code));

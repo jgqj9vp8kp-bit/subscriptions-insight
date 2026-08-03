@@ -22,6 +22,7 @@ export interface NormalizedUsersRequest {
   country: string | null;
   card_type: string[];
   decline_reason: string[];
+  cohort_ids: string[];
   funnel: string[];
   media_buyer: string[];
   currency: string[];
@@ -46,6 +47,7 @@ export function normalizeUsersRequest(q: UsersQuery, opts: { includePage?: boole
     country: single(q.country),
     card_type: sortUniq(q.cardTypes),
     decline_reason: sortUniq(q.declineReasons),
+    cohort_ids: sortUniq(q.cohortIds),
     funnel: sortUniq(q.funnel),
     media_buyer: sortUniq(q.mediaBuyer),
     currency: sortUniq(q.currency),

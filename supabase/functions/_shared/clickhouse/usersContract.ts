@@ -27,6 +27,9 @@ export interface UsersFilters {
   card_type: string[];
   currency: string[];
   decline_reason: string[];
+  /** Cohort explorer selection. Each id is `${cohort_funnel}_${campaign_path}_${cohort_date}`
+   * — the SAME string UsersRow.cohort_id carries (see userCohortId in users.ts). */
+  cohort_ids: string[];
   search: string;
 }
 
@@ -140,6 +143,18 @@ export interface UsersSummary {
   net_revenue_usd: number;
 }
 
+/** One selectable cohort for the Users page cohort explorer. Aggregated over the
+ * SAME per-user CTE every other Users option list uses, so its counts describe
+ * exactly the users this page can show. */
+export interface UsersCohortOption {
+  cohort_id: string;
+  cohort_date: string;
+  funnel: string;
+  campaign_path: string;
+  trial_users: number;
+  net_revenue: number;
+}
+
 export interface UsersFilterOptions {
   funnel: string[];
   campaign_path: string[];
@@ -148,6 +163,7 @@ export interface UsersFilterOptions {
   country: Array<{ country_code: string; user_count: number }>;
   card_type: Array<{ card_type: string; user_count: number }>;
   currency: string[];
+  cohort: UsersCohortOption[];
 }
 
 export interface UsersDiagnostics {

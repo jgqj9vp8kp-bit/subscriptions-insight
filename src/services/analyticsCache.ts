@@ -36,7 +36,12 @@ import type { ClickHouseSummary } from "@/services/clickhouse";
 // cohort showed more Active Subscriptions than trials), and carry the per-cohort
 // subscription/user id arrays so the total row dedups instead of showing 0.
 // Discard v12 bundles whose rows carry the inflated counts and empty id arrays.
-export const ANALYTICS_CACHE_SCHEMA_VERSION = 13;
+// v14: two option lists gained a dimension — Cohorts filter_options.platform and
+// Users filter_options.cohort. Both are keyed by scopes that do not include the
+// new field, so a v13 bundle would keep serving a response that simply lacks it:
+// an empty Platform dropdown and an empty Users cohort explorer, with no refetch
+// to correct them. Discard v13 bundles so both lists populate on first load.
+export const ANALYTICS_CACHE_SCHEMA_VERSION = 14;
 
 export const WAREHOUSE_VERSION_KEY = ["clickhouse", "warehouse-version"] as const;
 export const SUPPORT_WAREHOUSE_VERSION_KEY = ["clickhouse", "support-warehouse-version"] as const;

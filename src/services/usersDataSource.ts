@@ -61,6 +61,8 @@ export interface UsersQuery {
   country?: string | null;
   cardTypes?: string[];
   declineReasons?: string[];
+  /** Cohort explorer selection — scopes users to these cohorts server-side. */
+  cohortIds?: string[];
   funnel?: string[];
   mediaBuyer?: string[];
   currency?: string[];
@@ -90,6 +92,7 @@ export function buildUsersRequest(q: UsersQuery): UsersRequest {
       country: q.country && q.country !== "all" ? [q.country] : [],
       card_type: q.cardTypes ?? [],
       decline_reason: q.declineReasons ?? [],
+      cohort_ids: q.cohortIds ?? [],
       funnel: q.funnel ?? [],
       media_buyer: q.mediaBuyer ?? [],
       currency: q.currency ?? [],
