@@ -1,10 +1,12 @@
 import { ReactNode, useEffect, useState } from "react";
+import { useLocation } from "react-router-dom";
 import { LogOut, TriangleAlert } from "lucide-react";
 import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import { AppSidebar } from "@/components/AppSidebar";
 import { Button } from "@/components/ui/button";
 import { useAuth } from "@/hooks/useAuth";
 import { useDataStore } from "@/store/dataStore";
+import { shouldShowSampleDataBanner } from "@/services/transactionAutoLoadPolicy";
 
 interface AppLayoutProps {
   title: string;
@@ -15,8 +17,13 @@ interface AppLayoutProps {
 
 export function AppLayout({ title, description, actions, children }: AppLayoutProps) {
   const { signOut, user } = useAuth();
+  const location = useLocation();
   const [signingOut, setSigningOut] = useState(false);
-  const isSampleData = useDataStore((state) => state.meta.source === "mock");
+  const dataStoreSource = useDataStore((state) => state.meta.source);
+  // Routes that defer transaction hydration render real ClickHouse aggregates
+  // while the store legitimately stays on "mock" — the banner would call real
+  // numbers demo data there. See shouldShowSampleDataBanner.
+  const isSampleData = shouldShowSampleDataBanner(dataStoreSource, location.pathname);
 
   useEffect(() => {
     document.title = title ? `${title} • Subengine` : "Subengine";

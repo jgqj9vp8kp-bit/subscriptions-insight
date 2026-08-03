@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { shouldAutoLoadTransactionsForPath } from "@/services/transactionAutoLoadPolicy";
+import { shouldAutoLoadTransactionsForPath, shouldShowSampleDataBanner } from "@/services/transactionAutoLoadPolicy";
 
 function storageWith(value: string | null): Storage {
   return {
@@ -26,5 +26,24 @@ describe("protected route transaction warehouse autoload policy", () => {
     expect(shouldAutoLoadTransactionsForPath("/transactions", storageWith(JSON.stringify({ mode: "list" })))).toBe(true);
     expect(shouldAutoLoadTransactionsForPath("/transactions", storageWith(null))).toBe(true);
     expect(shouldAutoLoadTransactionsForPath("/fb-analytics", storageWith(null))).toBe(true);
+  });
+});
+
+describe("sample-data banner policy", () => {
+  it("suppresses the banner on hydration-deferred routes — they render real ClickHouse data", () => {
+    expect(shouldShowSampleDataBanner("mock", "/cohorts", storageWith(null))).toBe(false);
+    expect(shouldShowSampleDataBanner("mock", "/users", storageWith(null))).toBe(false);
+    expect(shouldShowSampleDataBanner("mock", "/transactions", storageWith(JSON.stringify({ mode: "pass" })))).toBe(false);
+  });
+
+  it("keeps the banner where hydration is attempted and the store is still mock", () => {
+    expect(shouldShowSampleDataBanner("mock", "/", storageWith(null))).toBe(true);
+    expect(shouldShowSampleDataBanner("mock", "/fb-analytics", storageWith(null))).toBe(true);
+    expect(shouldShowSampleDataBanner("mock", "/transactions", storageWith(JSON.stringify({ mode: "list" })))).toBe(true);
+  });
+
+  it("never shows the banner once real data is loaded, on any route", () => {
+    expect(shouldShowSampleDataBanner("transaction_warehouse", "/", storageWith(null))).toBe(false);
+    expect(shouldShowSampleDataBanner("palmer_import", "/fb-analytics", storageWith(null))).toBe(false);
   });
 });
