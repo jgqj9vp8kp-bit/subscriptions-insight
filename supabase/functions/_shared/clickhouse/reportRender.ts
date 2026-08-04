@@ -135,7 +135,11 @@ export function renderReportMarkdown(input: RenderInput): string {
 
   for (const section of SECTION_ORDER) {
     if (section === "highlights") {
-      if (input.highlights.length) {
+      // A visible block in this section is the model's rephrasing of the same
+      // ranked findings — printing both would say everything twice. Hiding the
+      // block brings the deterministic list back, which is also what happens
+      // when there is no model at all.
+      if (input.highlights.length && !proseFor(input.blocks, "highlights").length) {
         out.push("", `## ${SECTION_LABELS.highlights}`, "");
         for (const line of input.highlights) out.push(`- ${line}`);
       }
@@ -197,6 +201,40 @@ export function renderReportMarkdown(input: RenderInput): string {
 // HTML
 // ---------------------------------------------------------------------------
 
+/**
+ * A block body as HTML.
+ *
+ * The supported markdown is exactly one construct: a line starting with "- " is
+ * a list item. That is the whole "constrained subset" — the narrative writes
+ * bullet lists and paragraphs and nothing else, and every character still goes
+ * through escapeHtml, so this cannot become a way to emit markup.
+ */
+function proseParagraphs(content: string): string[] {
+  const out: string[] = [];
+  let list: string[] = [];
+  const flush = () => {
+    if (!list.length) return;
+    out.push(`<ul>${list.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`);
+    list = [];
+  };
+
+  for (const rawBlock of content.split(/\n{2,}/)) {
+    for (const rawLine of rawBlock.split("\n")) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      if (line.startsWith("- ")) {
+        list.push(line.slice(2).trim());
+      } else {
+        flush();
+        out.push(`<p>${escapeHtml(line)}</p>`);
+      }
+    }
+    flush();
+  }
+  flush();
+  return out;
+}
+
 function htmlTable(headers: readonly string[], rows: readonly (readonly string[])[]): string {
   const head = headers.map((h) => `<th>${escapeHtml(h)}</th>`).join("");
   const body = rows
@@ -249,16 +287,14 @@ export function renderReportHtml(input: RenderInput): string {
   const htmlProse = (section: ReportSectionKey) => {
     for (const block of proseFor(input.blocks, section)) {
       out.push(`<section><h2>${escapeHtml(block.title)}</h2>`);
-      for (const paragraph of block.content.split(/\n{2,}/)) {
-        if (paragraph.trim()) out.push(`<p>${escapeHtml(paragraph.trim())}</p>`);
-      }
+      out.push(...proseParagraphs(block.content));
       out.push("</section>");
     }
   };
 
   for (const section of SECTION_ORDER) {
     if (section === "highlights") {
-      if (input.highlights.length) {
+      if (input.highlights.length && !proseFor(input.blocks, "highlights").length) {
         out.push(`<section><h2>${escapeHtml(SECTION_LABELS.highlights)}</h2><ul>`);
         for (const line of input.highlights) out.push(`<li>${escapeHtml(line)}</li>`);
         out.push("</ul></section>");

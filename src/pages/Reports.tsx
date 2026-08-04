@@ -6,7 +6,7 @@
 // is involved at this phase, and the page is designed so that stays true: the
 // prose blocks arriving in R9 sit alongside these tables, never instead of them.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, ArrowLeft, ClipboardCopy, Download, FileText, Loader2, Plus, Printer, RefreshCw, Save } from "lucide-react";
+import { AlertTriangle, ArrowLeft, ClipboardCopy, Download, FileText, Loader2, Plus, Printer, RefreshCw, Save, Sparkles } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -27,6 +27,9 @@ import {
 import { BlockEditor, type BlockSaveState } from "@/components/reports/BlockEditor";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import type { ReportBlock } from "@/services/reportContract";
+import { generateNarrative } from "@/services/reportAi";
+import { buildNarrativeInput, narrativeToBlocks, type NarrativeViolation } from "@/services/reportNarrative";
+import { listReportNotes } from "@/services/reportWorkItems";
 import { collectReport, lastCompletedWeek, weekWindows } from "@/services/reportCollect";
 import { UNAVAILABLE_RENDER } from "@/services/reportBuilder";
 import type { Finding } from "@/services/reportRules";
@@ -266,6 +269,10 @@ export default function ReportsPage() {
   const [blocks, setBlocks] = useState<ReportBlock[]>([]);
   const [blocksDebounced, blocksPending] = useDebouncedValue(blocks, 800);
   const [saveState, setSaveState] = useState<BlockSaveState>({ kind: "idle" });
+  // AI is strictly additive: the page must be complete without it, so its state
+  // is a note next to a button, never a blocker on rendering.
+  const [violations, setViolations] = useState<NarrativeViolation[]>([]);
+  const [aiUnavailable, setAiUnavailable] = useState<string | null>(null);
   // What is known to be on the server. Comparing against it is what stops the
   // debounce from writing the same blocks again every time the page re-renders,
   // and stops opening a report from counting as an edit.
@@ -445,6 +452,72 @@ export default function ReportsPage() {
     }
   }
 
+  /**
+   * Ask the model to phrase what the rules already found.
+   *
+   * Everything the model sees was computed before this call; everything it
+   * returns has been checked against that input by the edge function. A
+   * rejected fragment is reported here rather than quietly dropped, because the
+   * operator needs to know the report is one paragraph shorter and why.
+   */
+  async function onGenerate() {
+    if (!open?.snapshot) return;
+    setBusy("ai");
+    setViolations([]);
+    try {
+      // Notes are the operator's own context ("шторм ФБ") and are the untrusted
+      // half of the prompt; only the ones marked for AI use are sent.
+      const notes = (await listReportNotes(open.period)).filter((note) => note.useInAi);
+      const narrativeInput = buildNarrativeInput({
+        snapshot: open.snapshot,
+        findings,
+        notes,
+        tasks,
+        language: open.language,
+      });
+      const outcome = await generateNarrative({ input: narrativeInput, reportId: open.id });
+
+      if (outcome.kind === "unavailable") {
+        setAiUnavailable(outcome.reason);
+        toast({ title: "Формулировки недоступны", description: outcome.reason });
+        return;
+      }
+      if (outcome.kind === "error") {
+        toast({ title: "Генерация не удалась", description: outcome.message, variant: "destructive" });
+        return;
+      }
+
+      setBlocks((current) => narrativeToBlocks({
+        accepted: outcome.response,
+        existing: current,
+        now: new Date().toISOString(),
+        ids: () => crypto.randomUUID(),
+      }));
+      setViolations(outcome.violations);
+
+      if (outcome.kind === "partial") {
+        toast({
+          title: `Часть текста отклонена (${outcome.violations.length})`,
+          description: "Проверка чисел и ссылок не пропустила эти фрагменты — они не сохранены.",
+          variant: "destructive",
+        });
+      } else {
+        toast({
+          title: "Формулировки готовы",
+          description: "Каждое число сверено с данными отчёта. Правьте как обычный текст.",
+        });
+      }
+    } catch (error) {
+      toast({
+        title: "Генерация не удалась",
+        description: error instanceof Error ? error.message : "Неизвестная ошибка",
+        variant: "destructive",
+      });
+    } finally {
+      setBusy(null);
+    }
+  }
+
   function renderInput(): RenderInput | null {
     if (!open?.snapshot) return null;
     return {
@@ -499,6 +572,13 @@ export default function ReportsPage() {
             <Button type="button" variant="outline" size="sm" title="Скачать Markdown"
               onClick={() => { const p = renderInput(); if (p) downloadReportMarkdown(p); }} disabled={!snapshot}>
               <Download className="h-4 w-4" />
+            </Button>
+            <Button type="button" variant="outline" size="sm"
+              onClick={() => void onGenerate()}
+              disabled={busy !== null || !snapshot || aiUnavailable !== null}
+              title={aiUnavailable ?? "Модель переформулирует найденное правилами. Числа она не считает."}>
+              {busy === "ai" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
+              Сформулировать
             </Button>
             <Button type="button" size="sm" onClick={() => void onPublish()} disabled={busy !== null || !snapshot}>
               {busy === "publish" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
@@ -562,6 +642,26 @@ export default function ReportsPage() {
                   </span>
                 )}
               </div>
+              {aiUnavailable && (
+                <p className="text-xs text-muted-foreground">
+                  Формулировки от модели недоступны: {aiUnavailable} Отчёт, таблицы и экспорт работают как обычно.
+                </p>
+              )}
+              {violations.length > 0 && (
+                <Card className="border-destructive/40 p-3">
+                  <div className="flex items-center gap-2 text-xs font-medium text-destructive">
+                    <AlertTriangle className="h-3.5 w-3.5" />
+                    Проверка отклонила {violations.length} фрагмент(ов) — они не попали в отчёт
+                  </div>
+                  <ul className="mt-2 space-y-1 text-xs text-muted-foreground">
+                    {violations.map((violation, index) => (
+                      <li key={`${violation.where}-${index}`}>
+                        <span className="text-foreground">{violation.where}</span> — {violation.detail}
+                      </li>
+                    ))}
+                  </ul>
+                </Card>
+              )}
               <BlockEditor
                 blocks={blocks}
                 onChange={setBlocks}
