@@ -19,6 +19,7 @@
 import type {
   ReportBlock, ReportFunnelRow, ReportMetric, ReportSectionKey, ReportSnapshot, ReportTask,
 } from "./reportContract.ts";
+import { provisionalReasonLabel } from "./reportContract.ts";
 import { UNAVAILABLE_RENDER } from "./reportBuilder.ts";
 import { isProseBlock, orderedBlocks, SECTION_LABELS, SECTION_ORDER } from "./reportBlocks.ts";
 
@@ -120,7 +121,8 @@ export function renderReportMarkdown(input: RenderInput): string {
     (snapshot.compare ? ` (сравнение: ${snapshot.compare.from} — ${snapshot.compare.to})` : ""));
 
   if (snapshot.dataIncomplete) {
-    out.push("", "> Данные неполные: " + snapshot.provisionalReasons.join(", "));
+    out.push("", "> Данные неполные: "
+      + snapshot.provisionalReasons.map(provisionalReasonLabel).join("; "));
   }
 
   // One pass over the editorial order, deterministic content injected where it
@@ -279,7 +281,8 @@ export function renderReportHtml(input: RenderInput): string {
       : "") + `</p>`);
 
   if (snapshot.dataIncomplete) {
-    out.push(`<div class="warn">Данные неполные: ${escapeHtml(snapshot.provisionalReasons.join(", "))}</div>`);
+    out.push(`<div class="warn">Данные неполные: `
+      + `${escapeHtml(snapshot.provisionalReasons.map(provisionalReasonLabel).join("; "))}</div>`);
   }
 
   // Same editorial pass as the Markdown renderer, so the two formats can never

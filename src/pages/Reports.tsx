@@ -17,7 +17,9 @@ import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "@/components/ui/table";
 import { useToast } from "@/hooks/use-toast";
-import { REPORT_ENGINE_VERSION, REPORT_SCHEMA_VERSION, emptyReportBindings } from "@/services/reportContract";
+import {
+  REPORT_ENGINE_VERSION, REPORT_SCHEMA_VERSION, emptyReportBindings, provisionalReasonLabel,
+} from "@/services/reportContract";
 import type {
   Report, ReportListItem, ReportMetric, ReportSnapshot, ReportFunnelRow,
 } from "@/services/reportContract";
@@ -236,7 +238,9 @@ function DataQualityPanel({ snapshot }: { snapshot: ReportSnapshot }) {
       </div>
       {snapshot.provisionalReasons.length > 0 && (
         <ul className="ml-5 list-disc space-y-0.5 text-xs">
-          {snapshot.provisionalReasons.map((reason) => <li key={reason}>{reason}</li>)}
+          {snapshot.provisionalReasons.map((reason) => (
+            <li key={reason}>{provisionalReasonLabel(reason)}</li>
+          ))}
         </ul>
       )}
       {snapshot.gaps.length > 0 && (

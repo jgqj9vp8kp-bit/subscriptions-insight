@@ -267,6 +267,29 @@ export interface ReportSnapshot {
   provisionalReasons: string[];
 }
 
+/**
+ * Why a report is provisional, in words.
+ *
+ * The reasons are stored as keys, not sentences: they live in a jsonb snapshot
+ * and in a `provisional_reasons` column that older reports already carry, so
+ * rewording one must not rewrite history. This map is the display layer, and
+ * every surface that shows a reason — the page, the Markdown export, the
+ * printed PDF — goes through it, because "immature_cohorts_present" printed at
+ * the top of a management report is not a warning, it is noise.
+ */
+export const PROVISIONAL_REASON_LABELS: Record<string, string> = {
+  spend_unavailable: "спенд недоступен — метрики с CPA не считаются",
+  spend_incomplete: "в периоде есть дни с известной дырой в спенде FB",
+  conversion_immature: "конверсия считается только по когортам, у которых закончился триал",
+  immature_cohorts_present: "часть когорт периода ещё не прошла триал",
+  warehouse_moved_during_collection: "склад обновился во время сбора — цифры могли разъехаться",
+  no_age_matched_window: "нет окна равного возраста — накопительные метрики не сравниваются",
+};
+
+export function provisionalReasonLabel(reason: string): string {
+  return PROVISIONAL_REASON_LABELS[reason] ?? reason;
+}
+
 // ---------------------------------------------------------------------------
 // Blocks (the editor's content)
 // ---------------------------------------------------------------------------
