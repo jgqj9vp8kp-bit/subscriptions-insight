@@ -31,6 +31,7 @@ import {
 import { useToast } from "@/hooks/use-toast";
 import {
   importFunnelFoxFunnels,
+  isPassportComplete,
   listFunnelFoxFunnels,
   listFunnels,
   listTags,
@@ -40,6 +41,7 @@ import {
   type FunnelRecord,
   type TagRecord,
 } from "@/services/funnels";
+import { FunnelPassportDialog } from "@/components/funnels/FunnelPassportDialog";
 
 const ACTIVE_WINDOW_DAYS = 30;
 
@@ -72,6 +74,9 @@ export default function FunnelsPage() {
   const [importing, setImporting] = useState(false);
   const [candidates, setCandidates] = useState<FunnelFoxImportCandidate[]>([]);
   const [selectedImportIds, setSelectedImportIds] = useState<string[]>([]);
+
+  // Funnel passport (Reports R4): the block header every weekly report prints.
+  const [passportFunnel, setPassportFunnel] = useState<FunnelRecord | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -390,6 +395,9 @@ export default function FunnelsPage() {
                   </button>
                 </TableHead>
                 <TableHead>Tags</TableHead>
+                <TableHead className="w-[150px]" title="Прайс, длительность триала, апсейлы и локализация — шапка блока воронки в недельном отчёте">
+                  Паспорт
+                </TableHead>
                 <TableHead className="w-[120px]">
                   <button
                     type="button"
@@ -449,13 +457,28 @@ export default function FunnelsPage() {
                         <span className="text-xs text-muted-foreground">—</span>
                       )}
                     </TableCell>
+                    <TableCell>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="h-7 px-2 text-xs"
+                        onClick={() => setPassportFunnel(funnel)}
+                      >
+                        {isPassportComplete(funnel) ? (
+                          <Badge variant="secondary" className="text-xs font-normal">Заполнен</Badge>
+                        ) : (
+                          <Badge variant="outline" className="text-xs font-normal text-warning">Не заполнен</Badge>
+                        )}
+                      </Button>
+                    </TableCell>
                     <TableCell className="text-xs text-muted-foreground">{formatDateTime(funnel.created_at)}</TableCell>
                     <TableCell className="text-xs text-muted-foreground">{formatDateTime(funnel.updated_at)}</TableCell>
                   </TableRow>
                 ))
               ) : (
                 <TableRow>
-                  <TableCell colSpan={6} className="h-24 text-center text-muted-foreground">
+                  <TableCell colSpan={7} className="h-24 text-center text-muted-foreground">
                     {loading ? (
                       <span className="inline-flex items-center gap-2">
                         <Loader2 className="h-4 w-4 animate-spin" />
@@ -593,6 +616,13 @@ export default function FunnelsPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <FunnelPassportDialog
+        funnel={passportFunnel}
+        open={passportFunnel !== null}
+        onOpenChange={(open) => { if (!open) setPassportFunnel(null); }}
+        onSaved={() => { void refresh(); }}
+      />
     </AppLayout>
   );
 }

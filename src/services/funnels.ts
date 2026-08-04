@@ -11,7 +11,42 @@ export interface TagRecord {
   created_at: string;
 }
 
-export interface FunnelRecord {
+/** One upsell as the weekly report prints it: "Апсейл 1 Zodiac Report 14.98$". */
+export interface FunnelUpsell {
+  name: string;
+  price: number | null;
+  currency: string | null;
+  ordinal: number;
+}
+
+/**
+ * The funnel passport — the header every weekly report opens a funnel block
+ * with. None of it is derivable: cohorts' price_plan is a rounded USD string
+ * with NO interval, so it cannot tell a monthly $29.99 from a weekly one, and
+ * trial length, upsell names and localisation exist nowhere in the warehouse.
+ * Filled once per funnel here, then substituted into every report.
+ */
+export interface FunnelPassportFields {
+  trial_price: number | null;
+  trial_currency: string | null;
+  trial_duration_days: number | null;
+  subscription_price: number | null;
+  subscription_currency: string | null;
+  billing_period: string | null;
+  upsells: FunnelUpsell[];
+  default_language: string | null;
+  default_currency: string | null;
+  geo_localization: string[];
+  destination: string | null;
+  product: string | null;
+  traffic_sources: string[];
+  passport_notes: string | null;
+}
+
+export const BILLING_PERIODS = ["weekly", "biweekly", "monthly", "quarterly", "annual", "custom"] as const;
+export const FUNNEL_DESTINATIONS = ["web_app", "ios", "android", "content"] as const;
+
+export interface FunnelRecord extends FunnelPassportFields {
   id: string;
   funnel_path: string;
   display_name: string;
@@ -21,6 +56,21 @@ export interface FunnelRecord {
   created_at: string;
   updated_at: string;
   tags: TagRecord[];
+}
+
+/**
+ * Whether the passport carries enough to print a funnel block header.
+ *
+ * Trial price, trial length and the subscription price with its period are the
+ * four the report cannot fake — the rest degrade quietly. `trial_duration_days`
+ * is load-bearing beyond display: without it no cohort can be proved mature,
+ * so the funnel's conversion rate stays unmeasurable.
+ */
+export function isPassportComplete(funnel: FunnelPassportFields): boolean {
+  return funnel.trial_price !== null &&
+    funnel.trial_duration_days !== null &&
+    funnel.subscription_price !== null &&
+    funnel.billing_period !== null;
 }
 
 /** One funnel as FunnelFox reports it (see supabase/functions/funnelfox-funnels). */
@@ -41,8 +91,13 @@ export interface FunnelFoxImportCandidate extends FunnelFoxFunnel {
   alreadyRegistered: boolean;
 }
 
+const PASSPORT_COLUMNS =
+  "trial_price,trial_currency,trial_duration_days,subscription_price,subscription_currency," +
+  "billing_period,upsells,default_language,default_currency,geo_localization,destination," +
+  "product,traffic_sources,passport_notes";
 const FUNNEL_COLUMNS =
-  "id,funnel_path,display_name,is_active,funnelfox_funnel_id,created_by,created_at,updated_at";
+  "id,funnel_path,display_name,is_active,funnelfox_funnel_id,created_by,created_at,updated_at," +
+  PASSPORT_COLUMNS;
 const TAG_COLUMNS = "id,name,created_by,created_at";
 
 function ensureSupabase() {
@@ -93,7 +148,7 @@ export async function createFunnel(input: { funnel_path: string; display_name: s
     .select(FUNNEL_COLUMNS)
     .single();
   if (error) throw new Error(friendlyConflictMessage(error, `A funnel with path "${funnelPath}"`));
-  return { ...(data as Omit<FunnelRecord, "tags">), tags: [] };
+  return { ...(data as unknown as Omit<FunnelRecord, "tags">), tags: [] };
 }
 
 // funnel_path is deliberately not part of the update surface in v1 — the
@@ -107,7 +162,30 @@ export async function updateFunnelDisplayName(id: string, displayName: string): 
     .select(FUNNEL_COLUMNS)
     .single();
   if (error) throw new Error(`Could not update funnel: ${error.message}`);
-  return { ...(data as Omit<FunnelRecord, "tags">), tags: [] };
+  return { ...(data as unknown as Omit<FunnelRecord, "tags">), tags: [] };
+}
+
+/**
+ * Save the passport.
+ *
+ * Only the keys the caller passes are written, so a form that edits pricing
+ * cannot silently blank the localisation list. Numbers arriving as empty
+ * strings from the form become null rather than 0 — an unset trial price and a
+ * free trial are different facts.
+ */
+export async function updateFunnelPassport(
+  id: string,
+  patch: Partial<FunnelPassportFields>,
+): Promise<void> {
+  const client = ensureSupabase();
+  const row: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === undefined) continue;
+    row[key] = value === "" ? null : value;
+  }
+  if (!Object.keys(row).length) return;
+  const { error } = await client.from("funnels").update(row).eq("id", id);
+  if (error) throw new Error(`Could not update funnel passport: ${error.message}`);
 }
 
 // No deleteFunnel: is_active is the sole retirement mechanism in v1. A manual
@@ -273,7 +351,7 @@ export async function importFunnelFoxFunnels(funnels: FunnelFoxFunnel[]): Promis
     .select(FUNNEL_COLUMNS);
   if (error) throw new Error(`Could not import funnels: ${error.message}`);
 
-  const inserted = (data ?? []) as Array<Omit<FunnelRecord, "tags">>;
+  const inserted = (data ?? []) as unknown as Array<Omit<FunnelRecord, "tags">>;
   const idByFunnelFoxId = new Map(inserted.map((row) => [row.funnelfox_funnel_id, row.id]));
 
   // Tag links go through the atomic RPC, one call per funnel. Sequential on
