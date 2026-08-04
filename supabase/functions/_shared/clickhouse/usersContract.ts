@@ -25,6 +25,17 @@ export interface UsersFilters {
   media_buyer: string[];
   country: string[];
   card_type: string[];
+  /**
+   * User OS: the same six codes as PLATFORM_VALUES (ios|android|windows|macos|
+   * other|unknown).
+   *
+   * The verdict is not recomputed here — it is read from the materialized
+   * analytics_transactions.platform column that the import classifier writes,
+   * which is the same column and the same per-user aggregate the Cohorts
+   * Platform filter uses. Deriving it a second time in this query is exactly
+   * how the two pages would come to disagree.
+   */
+  platform: string[];
   currency: string[];
   decline_reason: string[];
   /** Cohort explorer selection. Each id is `${cohort_funnel}_${campaign_path}_${cohort_date}`

@@ -35,6 +35,8 @@ import { formatDateKey, toDateKey } from "@/services/dateKeys";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { CARD_TYPE_VALUES, cardTypeLabel } from "@/services/userCardType";
+import { PLATFORM_VALUES, platformLabel, type Platform } from "@/services/userPlatform";
+import { MEDIA_BUYER_VALUES } from "@/services/userMediaBuyer";
 import { backfillTransactionCardTypesFromRawRows } from "@/services/palmerTransform";
 import {
   DECLINE_REASON_VALUES,
@@ -48,7 +50,7 @@ import {
 } from "@/services/paymentFailures";
 import { useDataStore } from "@/store/dataStore";
 import { cn } from "@/lib/utils";
-import type { CardType, CohortRow, DeclineReason, DeclineStage, Transaction, UserAggregate } from "@/services/types";
+import type { CardType, CohortRow, DeclineReason, DeclineStage, MediaBuyer, Transaction, UserAggregate } from "@/services/types";
 import { buildCohortId } from "@/services/cohortIdentity";
 import { traceEvent, traceMark, traceMeasure } from "@/services/performanceTrace";
 
@@ -161,6 +163,8 @@ const DEFAULT_USERS_UI_STATE = {
   campaignPathFilter: "all",
   countryFilter: "all",
   selectedCardTypes: [] as CardType[],
+  selectedPlatforms: [] as string[],
+  selectedMediaBuyers: [] as string[],
   paymentFailedFilter: "all" as PaymentFailedFilter,
   selectedDeclineReasons: [] as DeclineReason[],
   failedAttemptsFilter: "all" as FailedAttemptsFilter,
@@ -410,6 +414,8 @@ export default function UsersPage() {
     campaignPathFilter,
     countryFilter,
     selectedCardTypes: rawSelectedCardTypes,
+    selectedPlatforms: rawSelectedPlatforms,
+    selectedMediaBuyers: rawSelectedMediaBuyers,
     paymentFailedFilter,
     selectedDeclineReasons: rawSelectedDeclineReasons,
     failedAttemptsFilter,
@@ -440,6 +446,24 @@ export default function UsersPage() {
         ? rawSelectedCardTypes.filter((value): value is CardType => CARD_TYPE_VALUES.includes(value as CardType))
         : [],
     [rawSelectedCardTypes],
+  );
+  // Both new dimensions are closed vocabularies, so the saved selection is
+  // validated against the vocabulary rather than against whatever the server
+  // last returned: a value that is no longer meaningful is dropped instead of
+  // travelling into a SQL IN () that would silently match nothing.
+  const selectedPlatforms = useMemo(
+    () =>
+      Array.isArray(rawSelectedPlatforms)
+        ? rawSelectedPlatforms.filter((value) => PLATFORM_VALUES.includes(value as Platform))
+        : [],
+    [rawSelectedPlatforms],
+  );
+  const selectedMediaBuyers = useMemo(
+    () =>
+      Array.isArray(rawSelectedMediaBuyers)
+        ? rawSelectedMediaBuyers.filter((value) => MEDIA_BUYER_VALUES.includes(value as MediaBuyer))
+        : [],
+    [rawSelectedMediaBuyers],
   );
   const selectedDeclineReasons = useMemo(
     () =>
@@ -501,6 +525,8 @@ export default function UsersPage() {
       campaignPath: campaignPathFilter,
       country: countryFilter,
       cardTypes: selectedCardTypes,
+      platform: selectedPlatforms,
+      mediaBuyer: selectedMediaBuyers,
       declineReasons: selectedDeclineReasons,
       cohortIds: selectedCohortIds,
       sortField: sortKey,
@@ -508,7 +534,7 @@ export default function UsersPage() {
       page,
       pageSize: USERS_PAGE_SIZE,
     }),
-    [appliedSearch, firstTrialFrom, firstTrialTo, firstSubFilter, refundFilter, paymentFailedFilter, failedAttemptsFilter, campaignPathFilter, countryFilter, selectedCardTypes, selectedDeclineReasons, selectedCohortIds, sortKey, sortDir, page],
+    [appliedSearch, firstTrialFrom, firstTrialTo, firstSubFilter, refundFilter, paymentFailedFilter, failedAttemptsFilter, campaignPathFilter, countryFilter, selectedCardTypes, selectedPlatforms, selectedMediaBuyers, selectedDeclineReasons, selectedCohortIds, sortKey, sortDir, page],
   );
   const hasSelectedCohortsRaw = Array.isArray(rawSelectedCohortIds) && rawSelectedCohortIds.length > 0;
   // Cohort selections used to force the legacy client path. That path computes
@@ -532,6 +558,8 @@ export default function UsersPage() {
       campaignPath: campaignPathFilter,
       country: countryFilter,
       cardTypes: selectedCardTypes,
+      platform: selectedPlatforms,
+      mediaBuyer: selectedMediaBuyers,
       declineReasons: selectedDeclineReasons,
       cohortIds: selectedCohortIds,
       analyticsReasons: declineAnalyticsReasons,
@@ -539,7 +567,7 @@ export default function UsersPage() {
       countrySortField: declineCountrySortKey,
       countrySortDir: declineCountrySortDir,
     }),
-    [appliedSearch, firstTrialFrom, firstTrialTo, firstSubFilter, refundFilter, paymentFailedFilter, failedAttemptsFilter, campaignPathFilter, countryFilter, selectedCardTypes, selectedDeclineReasons, selectedCohortIds, declineAnalyticsReasons, declineAnalyticsStages, declineCountrySortKey, declineCountrySortDir],
+    [appliedSearch, firstTrialFrom, firstTrialTo, firstSubFilter, refundFilter, paymentFailedFilter, failedAttemptsFilter, campaignPathFilter, countryFilter, selectedCardTypes, selectedPlatforms, selectedMediaBuyers, selectedDeclineReasons, selectedCohortIds, declineAnalyticsReasons, declineAnalyticsStages, declineCountrySortKey, declineCountrySortDir],
   );
   const {
     chUsers,
@@ -580,6 +608,17 @@ export default function UsersPage() {
     (declineServerEligible && chDeclineStatus.error !== null && chDecline == null);
   const usersClickHouseDriving = usersServerEligible && chUsers != null;
   const declineClickHouseDriving = declineServerEligible && chDecline != null;
+  // Platform is a server-only filter. The legacy fallback builds its users from
+  // the browser transaction store, which no longer carries raw_payload (and so
+  // no user_agent) since the lazy-payload work — there is nothing client-side to
+  // classify. Showing an unfiltered list while a Platform chip is lit would be
+  // the same defect twice fixed on this page already: a widget quietly computing
+  // on the legacy path while the user believes a filter applied.
+  //
+  // Keyed off usersNeedLegacy, not "the server has not answered yet": during the
+  // first load ClickHouse is simply pending, and treating that as unavailable
+  // would blank the page on every cold start with a saved Platform selection.
+  const platformFilterUnavailable = selectedPlatforms.length > 0 && usersNeedLegacy;
   useEffect(() => {
     traceEvent("users.legacy_state", {
       need_legacy: usersNeedLegacy,
@@ -693,6 +732,11 @@ export default function UsersPage() {
   // EXCEPT Country (this scope also feeds the dependent country options, like
   // the Cohorts page country filter), and `filtered` applies Country + sort.
   const filteredExceptCountry = useMemo(() => {
+    // One gate at the source: summary cards, country options, pagination, the
+    // table and the Decline tab all derive from this list, so zeroing it here
+    // keeps every one of them consistent instead of leaving a filtered table
+    // above unfiltered totals.
+    if (platformFilterUnavailable) return [];
     const q = appliedSearch.trim().toLowerCase();
     const fromDateKey = toDateKey(firstTrialFrom);
     const toDateKeyValue = toDateKey(firstTrialTo);
@@ -703,6 +747,7 @@ export default function UsersPage() {
       if (q && !u.email.toLowerCase().includes(q) && !u.user_id.toLowerCase().includes(q)) return false;
       if (!hasSelectedCohorts && campaignPathFilter !== "all" && u.campaign_path !== campaignPathFilter) return false;
       if (selectedCardTypes.length > 0 && !selectedCardTypes.includes(u.card_type)) return false;
+      if (selectedMediaBuyers.length > 0 && !selectedMediaBuyers.includes(u.media_buyer)) return false;
       if (paymentFailedFilter === "has" && !u.has_failed_payment) return false;
       if (paymentFailedFilter === "none" && u.has_failed_payment) return false;
       if (selectedDeclineReasons.length > 0 && (!u.latest_decline_reason || !selectedDeclineReasons.includes(u.latest_decline_reason))) return false;
@@ -720,7 +765,7 @@ export default function UsersPage() {
       }
       return true;
     });
-  }, [usersWithCampaignPath, hasSelectedCohorts, selectedCohortMatchIdSet, cohortMembership, appliedSearch, campaignPathFilter, selectedCardTypes, paymentFailedFilter, selectedDeclineReasons, failedAttemptsFilter, firstSubFilter, refundFilter, firstTrialFrom, firstTrialTo]);
+  }, [usersWithCampaignPath, hasSelectedCohorts, selectedCohortMatchIdSet, cohortMembership, appliedSearch, campaignPathFilter, selectedCardTypes, selectedMediaBuyers, platformFilterUnavailable, paymentFailedFilter, selectedDeclineReasons, failedAttemptsFilter, firstSubFilter, refundFilter, firstTrialFrom, firstTrialTo]);
 
   const filtered = useMemo(() => {
     const list = filteredExceptCountry.filter((u) => {
@@ -1022,6 +1067,8 @@ export default function UsersPage() {
     sortKey !== key ? <ArrowUpDown className="h-3 w-3 opacity-40" /> :
     sortDir === "asc" ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />;
   const cardTypeSummary = selectedCardTypes.length ? selectedCardTypes.map(cardTypeLabel).join(", ") : "All card types";
+  const platformSummary = selectedPlatforms.length ? selectedPlatforms.map(platformLabel).join(", ") : "All platforms";
+  const mediaBuyerSummary = selectedMediaBuyers.length ? selectedMediaBuyers.join(", ") : "All media buyers";
   const declineReasonSummary = selectedDeclineReasons.length ? selectedDeclineReasons.join(", ") : "All reasons";
   const declineAnalyticsReasonSummary = declineAnalyticsReasons.length ? declineAnalyticsReasons.join(", ") : "All reasons";
   const declineAnalyticsStageSummary = declineAnalyticsStages.length ? declineAnalyticsStages.map(declineStageLabel).join(", ") : "All stages";
@@ -1032,6 +1079,20 @@ export default function UsersPage() {
     updateUiState({ selectedCardTypes: next });
   };
   const clearCardTypes = () => updateUiState({ selectedCardTypes: [] });
+  const togglePlatform = (platform: Platform) => {
+    const next = selectedPlatforms.includes(platform)
+      ? selectedPlatforms.filter((value) => value !== platform)
+      : [...selectedPlatforms, platform];
+    updateUiState({ selectedPlatforms: next });
+  };
+  const clearPlatforms = () => updateUiState({ selectedPlatforms: [] });
+  const toggleMediaBuyer = (mediaBuyer: MediaBuyer) => {
+    const next = selectedMediaBuyers.includes(mediaBuyer)
+      ? selectedMediaBuyers.filter((value) => value !== mediaBuyer)
+      : [...selectedMediaBuyers, mediaBuyer];
+    updateUiState({ selectedMediaBuyers: next });
+  };
+  const clearMediaBuyers = () => updateUiState({ selectedMediaBuyers: [] });
   const toggleDeclineReason = (reason: DeclineReason) => {
     const next = selectedDeclineReasons.includes(reason)
       ? selectedDeclineReasons.filter((value) => value !== reason)
@@ -1115,6 +1176,8 @@ export default function UsersPage() {
     selectedCohortIdSet.size === 0 && campaignPathFilter !== "all" ? `Campaign: ${campaignPathFilter}` : null,
     countryFilter !== "all" ? `Country: ${countryFilter}` : null,
     selectedCardTypes.length ? `Card Type: ${selectedCardTypes.map(cardTypeLabel).join(", ")}` : null,
+    selectedPlatforms.length ? `Platform: ${selectedPlatforms.map(platformLabel).join(", ")}` : null,
+    selectedMediaBuyers.length ? `Media Buyer: ${selectedMediaBuyers.join(", ")}` : null,
     paymentFailedFilter !== "all" ? `Payment Failed: ${paymentFailedFilter === "has" ? "Has failed payments" : "No failed payments"}` : null,
     selectedDeclineReasons.length ? `Decline Reason: ${selectedDeclineReasons.join(", ")}` : null,
     failedAttemptsFilter !== "all" ? `Failed Attempts: ${failedAttemptsFilter.replace("gte", ">= ")}` : null,
@@ -1129,6 +1192,8 @@ export default function UsersPage() {
     search: "",
     countryFilter: "all",
     selectedCardTypes: [],
+    selectedPlatforms: [],
+    selectedMediaBuyers: [],
     paymentFailedFilter: "all",
     selectedDeclineReasons: [],
     failedAttemptsFilter: "all",
@@ -1310,6 +1375,69 @@ export default function UsersPage() {
                       onCheckedChange={() => toggleCardType(cardType)}
                     />
                     <span>{cardTypeLabel(cardType)}</span>
+                  </label>
+                ))}
+              </div>
+            </PopoverContent>
+          </Popover>
+          {/* Platform and Media Buyer are closed vocabularies, so both lists are
+              rendered from their constants exactly like Card Type above — the
+              choices are the same whether or not the options request has landed,
+              and they survive the legacy path where no server options exist. */}
+          <Popover>
+            <PopoverTrigger asChild>
+              <Button type="button" variant="outline" size="sm" className="h-9 max-w-[220px] justify-between gap-2">
+                <span className="text-xs text-muted-foreground">Platform</span>
+                <span className="truncate">{platformSummary}</span>
+                <ChevronDown className="h-3.5 w-3.5 shrink-0 opacity-60" />
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent align="start" className="w-60 p-0">
+              <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
+                <div className="text-xs font-medium text-muted-foreground">Platform</div>
+                <Button type="button" variant="ghost" size="sm" className="h-7 text-xs" onClick={clearPlatforms} disabled={!selectedPlatforms.length}>
+                  All platforms
+                </Button>
+              </div>
+              <div className="py-1">
+                {PLATFORM_VALUES.map((platform) => (
+                  <label key={platform} className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted/50">
+                    <Checkbox
+                      checked={selectedPlatforms.includes(platform)}
+                      onCheckedChange={() => togglePlatform(platform)}
+                    />
+                    <span>{platformLabel(platform)}</span>
+                  </label>
+                ))}
+              </div>
+              <div className="border-t border-border px-3 py-2 text-xs text-muted-foreground">
+                ОС берётся из той же колонки, что и фильтр Platform на Cohorts.
+              </div>
+            </PopoverContent>
+          </Popover>
+          <Popover>
+            <PopoverTrigger asChild>
+              <Button type="button" variant="outline" size="sm" className="h-9 max-w-[220px] justify-between gap-2">
+                <span className="text-xs text-muted-foreground">Media Buyer</span>
+                <span className="truncate">{mediaBuyerSummary}</span>
+                <ChevronDown className="h-3.5 w-3.5 shrink-0 opacity-60" />
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent align="start" className="w-60 p-0">
+              <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
+                <div className="text-xs font-medium text-muted-foreground">Media Buyer</div>
+                <Button type="button" variant="ghost" size="sm" className="h-7 text-xs" onClick={clearMediaBuyers} disabled={!selectedMediaBuyers.length}>
+                  All media buyers
+                </Button>
+              </div>
+              <div className="py-1">
+                {MEDIA_BUYER_VALUES.map((mediaBuyer) => (
+                  <label key={mediaBuyer} className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted/50">
+                    <Checkbox
+                      checked={selectedMediaBuyers.includes(mediaBuyer)}
+                      onCheckedChange={() => toggleMediaBuyer(mediaBuyer)}
+                    />
+                    <span>{mediaBuyer}</span>
                   </label>
                 ))}
               </div>
@@ -1618,7 +1746,11 @@ export default function UsersPage() {
                 <TableRow>
                   <TableCell colSpan={19} className="text-center text-sm text-muted-foreground py-10">
                     <div className="space-y-3">
-                      <div>{selectedCohortIds.length ? "No users match selected cohorts and filters." : "No users match your filters."}</div>
+                      <div>
+                        {platformFilterUnavailable
+                          ? "Фильтр Platform работает только на серверном пути (ClickHouse). Легаси-расчёт в браузере не знает ОС пользователя, поэтому строки не показываются — снимите фильтр Platform или дождитесь ClickHouse."
+                          : selectedCohortIds.length ? "No users match selected cohorts and filters." : "No users match your filters."}
+                      </div>
                       {activeUserFilterLabels.length > 0 && (
                         <div className="mx-auto max-w-2xl text-xs">
                           Active filters: {activeUserFilterLabels.join("; ")}
@@ -1779,9 +1911,11 @@ export default function UsersPage() {
               <div className="rounded-md border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">
                 <div className="space-y-3">
                   <div>
-                    {selectedCohortIds.length > 0 && (usersAnyServerDriving || cohortScopedUserCount > 0)
-                      ? "No users match selected cohorts and filters."
-                      : "No users selected."}
+                    {platformFilterUnavailable
+                      ? "Фильтр Platform работает только на серверном пути (ClickHouse). Легаси-расчёт в браузере не знает ОС пользователя, поэтому вкладка пуста — снимите фильтр Platform или дождитесь ClickHouse."
+                      : selectedCohortIds.length > 0 && (usersAnyServerDriving || cohortScopedUserCount > 0)
+                        ? "No users match selected cohorts and filters."
+                        : "No users selected."}
                   </div>
                   {activeUserFilterLabels.length > 0 && (
                     <div className="mx-auto max-w-2xl text-xs">

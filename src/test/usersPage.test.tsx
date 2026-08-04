@@ -493,6 +493,67 @@ describe("Users page", () => {
     expect(screen.queryByText("No users match your filters.")).not.toBeInTheDocument();
   });
 
+  it("filters users by media buyer from persisted UI state", () => {
+    // The legacy path can reproduce this filter honestly: the media buyer is
+    // derived from utm_source, which the browser rows carry.
+    localStorage.setItem("ui_state_users", JSON.stringify({ selectedMediaBuyers: ["Ivan"] }));
+    vi.mocked(useTransactions).mockReturnValue([
+      tx({
+        transaction_id: "ivan_tx",
+        user_id: "ivan_user",
+        email: "ivan@example.com",
+        metadata: { ff_country_code: "us", utm_source: "4" },
+      }),
+      tx({
+        transaction_id: "artem_tx",
+        user_id: "artem_user",
+        email: "artem@example.com",
+        metadata: { ff_country_code: "us", utm_source: "19" },
+      }),
+    ]);
+
+    renderPage();
+
+    expect(screen.getByText("ivan@example.com")).toBeInTheDocument();
+    expect(screen.queryByText("artem@example.com")).not.toBeInTheDocument();
+  });
+
+  it("says the Platform filter is unavailable in legacy rather than showing an unfiltered list", () => {
+    // The browser rows carry no user agent (payloads are fetched lazily), so
+    // there is nothing client-side to classify. Showing every user while a
+    // Platform chip is lit would be a lie the page has told before.
+    localStorage.setItem("ui_state_users", JSON.stringify({ selectedPlatforms: ["ios"] }));
+    vi.mocked(useTransactions).mockReturnValue([
+      tx({ transaction_id: "a", user_id: "user_a", email: "a@example.com" }),
+      tx({ transaction_id: "b", user_id: "user_b", email: "b@example.com" }),
+    ]);
+
+    renderPage();
+
+    expect(screen.queryByText("a@example.com")).not.toBeInTheDocument();
+    expect(screen.queryByText("b@example.com")).not.toBeInTheDocument();
+    expect(screen.getByText(/Фильтр Platform работает только на серверном пути/)).toBeInTheDocument();
+    expect(screen.getByText(/Active filters:.*Platform: iOS/)).toBeInTheDocument();
+  });
+
+  it("resets the platform and media buyer filters with the others", () => {
+    localStorage.setItem(
+      "ui_state_users",
+      JSON.stringify({ selectedPlatforms: ["ios"], selectedMediaBuyers: ["Ivan"] }),
+    );
+    vi.mocked(useTransactions).mockReturnValue([
+      tx({ transaction_id: "a", user_id: "user_a", email: "a@example.com", metadata: { ff_country_code: "us", utm_source: "4" } }),
+    ]);
+
+    renderPage();
+
+    expect(screen.getByText(/Active filters:.*Platform: iOS.*Media Buyer: Ivan/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Reset user filters" }));
+
+    expect(screen.queryByText(/Active filters:/)).not.toBeInTheDocument();
+    expect(screen.getByText("a@example.com")).toBeInTheDocument();
+  });
+
   it("shows active user filters and resets them without clearing selected cohorts", () => {
     localStorage.setItem(
       "ui_state_users",

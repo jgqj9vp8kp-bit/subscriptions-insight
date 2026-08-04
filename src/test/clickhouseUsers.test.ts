@@ -85,6 +85,44 @@ describe("clickhouse-users SQL scoping + safety", () => {
     expect(params.fa_min).toBe(5);
   });
 
+  it("reads the platform verdict from the materialized column, exactly as Cohorts does", () => {
+    // The Users and Cohorts pages must never disagree about a user's OS. They
+    // agree only because both read analytics_transactions.platform with the same
+    // aggregate — the moment one of them re-derives the verdict from a user
+    // agent, the two pages start answering the same question differently.
+    const sql = userAggCTE("u", {}, "2026-07-11 00:00:00.000");
+    expect(sql).toContain("argMin(if(platform = '', 'unknown', platform), (multiIf(platform = '', 2, is_success = 1, 0, 1), event_time, transaction_id)) pplatform");
+    // Aliasing the aggregate `platform` would let ClickHouse substitute the
+    // sibling alias for the source column — the trap that silently emptied
+    // price_breakdown twice in this codebase.
+    expect(sql).not.toMatch(/\)\s+platform,/);
+    expect(sql).toContain("ar.pplatform platform,");
+  });
+
+  it("binds the platform filter and gives it its own placeholder prefix", () => {
+    // runUsersOptions calls userWhere twice into ONE params object, so a prefix
+    // shared with another filter would rebind that filter's values.
+    const nreq = normalizeUsersRequest({ filters: { platform: ["ios", "android"], card_type: ["debit"] } });
+    const params: Record<string, unknown> = {};
+    const where = userWhere(nreq, params);
+    expect(where).toContain("platform IN ({p_plt_0:String}, {p_plt_1:String})");
+    expect(params.p_plt_0).toBe("ios");
+    expect(params.p_plt_1).toBe("android");
+    expect(params.p_ct_0).toBe("debit");
+  });
+
+  it("applies media_buyer over the same column the table displays", () => {
+    const nreq = normalizeUsersRequest({ filters: { media_buyer: ["Ivan"] } });
+    const params: Record<string, unknown> = {};
+    expect(userWhere(nreq, params)).toContain("media_buyer IN ({p_mb_0:String})");
+    expect(params.p_mb_0).toBe("Ivan");
+  });
+
+  it("validates the platform filter like every other list filter", () => {
+    expect(() => normalizeUsersRequest({ filters: { platform: "ios" as never } })).toThrow(UsersRequestError);
+    expect(normalizeUsersRequest({ filters: { platform: [" ios ", "ios"] } }).filters.platform).toEqual(["ios"]);
+  });
+
   it("date filter excludes users without a first trial", () => {
     const nreq = normalizeUsersRequest({ date_from: "2026-06-01" });
     const where = userWhere(nreq, {});

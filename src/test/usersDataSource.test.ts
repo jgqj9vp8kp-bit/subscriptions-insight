@@ -19,6 +19,16 @@ describe("buildUsersRequest", () => {
     expect(req.pagination).toEqual({ page: 3, page_size: 50 });
   });
 
+  it("forwards platform and media buyer, defaulting each to an empty list", () => {
+    const req = buildUsersRequest({ ...baseQuery, platform: ["ios", "android"], mediaBuyer: ["Ivan"] });
+    expect(req.filters?.platform).toEqual(["ios", "android"]);
+    expect(req.filters?.media_buyer).toEqual(["Ivan"]);
+
+    const empty = buildUsersRequest(baseQuery);
+    expect(empty.filters?.platform).toEqual([]);
+    expect(empty.filters?.media_buyer).toEqual([]);
+  });
+
   it("omits 'all' single-select filters and forwards multi-selects + search", () => {
     const req = buildUsersRequest({ ...baseQuery, campaignPath: "all", country: "US", cardTypes: ["debit"], search: " a@b.com " });
     expect(req.filters?.campaign_path).toEqual([]);

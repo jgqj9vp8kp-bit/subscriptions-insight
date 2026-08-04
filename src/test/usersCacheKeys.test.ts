@@ -60,6 +60,29 @@ describe("users cache keys", () => {
     expect(hashKey(usersOptionsKey(parts(q({ firstSub: "has" }))))).not.toBe(hashKey(k1));
   });
 
+  it("platform and media buyer reach every key — a filter absent from the key is a filter that does nothing", () => {
+    // The keys enumerate their fields by hand, so a new filter that is not added
+    // here produces no error at all: TanStack simply returns the previous
+    // answer, and the filter looks broken with nothing to debug.
+    const base = q();
+    const ios = q({ platform: ["ios"] });
+    const ivan = q({ mediaBuyer: ["Ivan"] });
+
+    expect(hashKey(usersListKey(parts(ios)))).not.toBe(hashKey(usersListKey(parts(base))));
+    expect(hashKey(usersSummaryKey(parts(ios)))).not.toBe(hashKey(usersSummaryKey(parts(base))));
+    expect(hashKey(usersListKey(parts(ivan)))).not.toBe(hashKey(usersListKey(parts(base))));
+    expect(hashKey(usersSummaryKey(parts(ivan)))).not.toBe(hashKey(usersSummaryKey(parts(base))));
+
+    // Both are part of userWhere, so they narrow the DEPENDENT option branches
+    // (country, cohort) of the same response and belong in the options scope.
+    expect(hashKey(usersOptionsKey(parts(ios)))).not.toBe(hashKey(usersOptionsKey(parts(base))));
+    expect(hashKey(usersOptionsKey(parts(ivan)))).not.toBe(hashKey(usersOptionsKey(parts(base))));
+
+    // Order and duplicates must not matter, like every other list filter.
+    expect(normalizeUsersRequest(q({ platform: ["android", "ios", "ios"] })))
+      .toEqual(normalizeUsersRequest(q({ platform: ["ios", "android"] })));
+  });
+
   it("isolated by user; busted by warehouse version", () => {
     const a = { userScopeHash: hashUserScope("a"), warehouseVersion: "whv_x", request: q() };
     const b = { userScopeHash: hashUserScope("b"), warehouseVersion: "whv_x", request: q() };

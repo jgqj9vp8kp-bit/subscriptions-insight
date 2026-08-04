@@ -181,6 +181,7 @@ export function normalizeUsersRequest(req: UsersRequest): NormalizedUsersRequest
       media_buyer: stringArray(f.media_buyer, "media_buyer"),
       country: countryArray(f.country),
       card_type: stringArray(f.card_type, "card_type"),
+      platform: stringArray(f.platform, "platform"),
       currency: stringArray(f.currency, "currency"),
       decline_reason: stringArray(f.decline_reason, "decline_reason"),
       cohort_ids: stringArray(f.cohort_ids, "cohort_ids"),
@@ -266,6 +267,15 @@ allrows AS (
     argMin(utm_source, event_time) putm,
     argMin(country_code, (multiIf(country_code = '', 2, is_success = 1, 0, 1), event_time)) pcountry,
     argMin(card_type, (multiIf(card_type = '', 2, is_success = 1, 0, 1), event_time)) pcard,
+    -- Platform: a verbatim copy of the Cohorts expression (cohorts.ts, userdim
+    -- u_platform), with this CTE's column names substituted. Copied, not
+    -- re-derived: the column is written by the import classifier, and the two
+    -- pages agree only for as long as they read it the same way. The empty
+    -- string is de-prioritised because the column was added by ALTER with
+    -- DEFAULT '' — rows imported before 2026-08-03 carry no verdict at all.
+    -- transaction_id breaks the tie, so two rows sharing a timestamp cannot
+    -- resolve differently here than they do on Cohorts.
+    argMin(if(platform = '', 'unknown', platform), (multiIf(platform = '', 2, is_success = 1, 0, 1), event_time, transaction_id)) pplatform,
     round(sumIf(floor(net_amount_usd * 100 + 0.5) / 100, status != 'failed'), 2) net_rev,
     round(sumIf(gross_amount_usd, is_success = 1), 2) gross_rev,
     round(sum(floor(refund_amount_usd * 100 + 0.5) / 100), 2) refund_amt,
@@ -293,6 +303,7 @@ useragg AS (
     ar.pemail email,
     if(ar.pcountry = '', NULL, ar.pcountry) country_code,
     if(ar.pcard = '', 'unknown', ar.pcard) card_type,
+    ar.pplatform platform,
     ar.pmedia_buyer media_buyer,
     ar.putm utm_source,
     ar.pfunnel funnel,
@@ -371,6 +382,10 @@ function userWhere(nreq: NormalizedUsersRequest, params: Record<string, unknown>
   if (f.failed_attempts_min > 0) { params.fa_min = f.failed_attempts_min; c.push(`failed_payment_count >= {fa_min:UInt32}`); }
   const country = countryClause(f.country, params); if (country) c.push(country);
   const card = inClause("card_type", f.card_type, "ct", params); if (card) c.push(card);
+  // Placeholder prefix "plt" is new and unique: runUsersOptions calls userWhere
+  // twice into the SAME params object, so a reused prefix would rebind the
+  // other call's values.
+  const plat = inClause("platform", f.platform, "plt", params); if (plat) c.push(plat);
   const cpath = inClause("campaign_path", f.campaign_path, "cp", params); if (cpath) c.push(cpath);
   const fun = inClause("cohort_funnel", f.funnel, "fn", params); if (fun) c.push(fun);
   const mb = inClause("media_buyer", f.media_buyer, "mb", params); if (mb) c.push(mb);

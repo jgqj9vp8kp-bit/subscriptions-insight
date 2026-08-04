@@ -60,6 +60,7 @@ export interface UsersQuery {
   campaignPath?: string | null;
   country?: string | null;
   cardTypes?: string[];
+  platform?: string[];
   declineReasons?: string[];
   /** Cohort explorer selection — scopes users to these cohorts server-side. */
   cohortIds?: string[];
@@ -91,6 +92,7 @@ export function buildUsersRequest(q: UsersQuery): UsersRequest {
       campaign_path: q.campaignPath && q.campaignPath !== "all" ? [q.campaignPath] : [],
       country: q.country && q.country !== "all" ? [q.country] : [],
       card_type: q.cardTypes ?? [],
+      platform: q.platform ?? [],
       decline_reason: q.declineReasons ?? [],
       cohort_ids: q.cohortIds ?? [],
       funnel: q.funnel ?? [],

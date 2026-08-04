@@ -21,6 +21,7 @@ export interface NormalizedUsersRequest {
   campaign_path: string | null;
   country: string | null;
   card_type: string[];
+  platform: string[];
   decline_reason: string[];
   cohort_ids: string[];
   funnel: string[];
@@ -46,6 +47,7 @@ export function normalizeUsersRequest(q: UsersQuery, opts: { includePage?: boole
     campaign_path: single(q.campaignPath),
     country: single(q.country),
     card_type: sortUniq(q.cardTypes),
+    platform: sortUniq(q.platform),
     decline_reason: sortUniq(q.declineReasons),
     cohort_ids: sortUniq(q.cohortIds),
     funnel: sortUniq(q.funnel),
@@ -88,6 +90,7 @@ export interface UsersOptionsScope {
   active_subscription: string;
   campaign_path: string | null;
   card_type: string[];
+  platform: string[];
   decline_reason: string[];
   funnel: string[];
   media_buyer: string[];
@@ -107,6 +110,10 @@ export function usersOptionsScope(q: UsersQuery): UsersOptionsScope {
     active_subscription: norm.active_subscription,
     campaign_path: norm.campaign_path,
     card_type: norm.card_type,
+    // In the options scope even though the Platform list itself is a fixed enum:
+    // platform is part of userWhere, so it narrows the DEPENDENT branches
+    // (country, cohort) of the same response.
+    platform: norm.platform,
     decline_reason: norm.decline_reason,
     funnel: norm.funnel,
     media_buyer: norm.media_buyer,
