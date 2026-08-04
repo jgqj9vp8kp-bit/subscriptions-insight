@@ -6,7 +6,7 @@
 // is involved at this phase, and the page is designed so that stays true: the
 // prose blocks arriving in R9 sit alongside these tables, never instead of them.
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { AlertTriangle, ArrowLeft, FileText, Loader2, Plus, RefreshCw, Save } from "lucide-react";
+import { AlertTriangle, ArrowLeft, ClipboardCopy, Download, FileText, Loader2, Plus, Printer, RefreshCw, Save } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -24,11 +24,16 @@ import type {
 import {
   listReports, loadReport, newReport, publishReport, saveReport,
 } from "@/services/reports";
-import { collectReport, lastCompletedWeek } from "@/services/reportCollect";
+import { collectReport, lastCompletedWeek, weekWindows } from "@/services/reportCollect";
 import { UNAVAILABLE_RENDER } from "@/services/reportBuilder";
 import type { Finding } from "@/services/reportRules";
 import { COHORT_CLASSIFICATION_VERSION } from "../../supabase/functions/_shared/clickhouse/cohortMembership";
 import { FX_RATES_AS_OF } from "@/services/fxRates";
+import { PlanFactPanel } from "@/components/reports/PlanFactPanel";
+import {
+  copyReportForDocs, downloadReportMarkdown, printReport, type RenderInput,
+} from "@/services/reportExport";
+import type { ReportTask } from "@/services/reportContract";
 
 const STATUS_LABELS: Record<string, string> = {
   scale: "Масштабировать",
@@ -245,6 +250,7 @@ export default function ReportsPage() {
   const [findings, setFindings] = useState<Finding[]>([]);
   const [highlights, setHighlights] = useState<Finding[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
+  const [tasks, setTasks] = useState<{ closed: ReportTask[]; open: ReportTask[] }>({ closed: [], open: [] });
 
   const defaultWeek = useMemo(() => lastCompletedWeek(new Date().toISOString().slice(0, 10)), []);
   const [from, setFrom] = useState(defaultWeek.period.from);
@@ -271,7 +277,10 @@ export default function ReportsPage() {
     setBusy("create");
     try {
       const period = { from, to };
-      const compare = lastCompletedWeek(from).compare;
+      // weekWindows(from), not lastCompletedWeek(from): the latter first steps
+      // back a week and would hand us the week BEFORE the one we want to
+      // compare against.
+      const compare = weekWindows(from).compare;
       const bindings = { ...emptyReportBindings(period, compare) };
       const now = new Date().toISOString();
       const collected = await collectReport({ bindings, engineVersions: engineVersions(), now });
@@ -379,6 +388,32 @@ export default function ReportsPage() {
     }
   }
 
+  function renderInput(): RenderInput | null {
+    if (!open?.snapshot) return null;
+    return {
+      title: open.title,
+      snapshot: open.snapshot,
+      blocks: open.blocks,
+      highlights: highlights.map((finding) => finding.claim),
+      tasks,
+    };
+  }
+
+  async function onCopyForDocs() {
+    const payload = renderInput();
+    if (!payload) return;
+    try {
+      await copyReportForDocs(payload);
+      toast({ title: "Скопировано", description: "Вставьте в Google Docs — таблицы и заголовки сохранятся." });
+    } catch (error) {
+      toast({
+        title: "Не удалось скопировать",
+        description: error instanceof Error ? error.message : "Неизвестная ошибка",
+        variant: "destructive",
+      });
+    }
+  }
+
   if (open) {
     const snapshot = open.snapshot;
     return (
@@ -394,6 +429,18 @@ export default function ReportsPage() {
               onClick={() => void onRecollect()} disabled={busy !== null}>
               {busy === "recollect" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
               Пересобрать
+            </Button>
+            <Button type="button" variant="outline" size="sm" title="Скопировать для Google Docs"
+              onClick={() => void onCopyForDocs()} disabled={!snapshot}>
+              <ClipboardCopy className="h-4 w-4" />
+            </Button>
+            <Button type="button" variant="outline" size="sm" title="Печать / PDF"
+              onClick={() => { const p = renderInput(); if (p) printReport(p); }} disabled={!snapshot}>
+              <Printer className="h-4 w-4" />
+            </Button>
+            <Button type="button" variant="outline" size="sm" title="Скачать Markdown"
+              onClick={() => { const p = renderInput(); if (p) downloadReportMarkdown(p); }} disabled={!snapshot}>
+              <Download className="h-4 w-4" />
             </Button>
             <Button type="button" size="sm" onClick={() => void onPublish()} disabled={busy !== null || !snapshot}>
               {busy === "publish" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
@@ -443,6 +490,11 @@ export default function ReportsPage() {
                   <FunnelBlock key={funnel.funnelPath} funnel={funnel} />
                 ))}
               </div>
+            </section>
+
+            <section className="space-y-2">
+              <h2 className="text-sm font-semibold">План / Факт и задачи на следующую неделю</h2>
+              <PlanFactPanel period={open.period} reportId={open.id} onTasksChange={setTasks} />
             </section>
 
             {findings.length > highlights.length && (

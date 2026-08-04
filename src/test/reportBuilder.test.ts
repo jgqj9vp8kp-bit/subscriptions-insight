@@ -22,6 +22,7 @@ import {
   UNAVAILABLE_RENDER,
   type ReportBuilderInput,
 } from "@/services/reportBuilder";
+import { lastCompletedWeek, weekWindows } from "@/services/reportCollect";
 
 function row(over: Partial<CohortAggregateRow> = {}): CohortAggregateRow {
   return {
@@ -301,6 +302,21 @@ describe("buildReportSnapshot", () => {
   it("is deterministic — the same input twice produces the same snapshot", () => {
     expect(JSON.stringify(buildReportSnapshot(input())))
       .toBe(JSON.stringify(buildReportSnapshot(input())));
+  });
+});
+
+describe("weekWindows", () => {
+  it("gives the Monday–Sunday week and the week immediately before it", () => {
+    // 2026-07-29 is a Wednesday.
+    const windows = weekWindows("2026-07-29");
+    expect(windows.period).toEqual({ from: "2026-07-27", to: "2026-08-02" });
+    // Adjacent, not two weeks back — the wizard got this wrong once by
+    // composing lastCompletedWeek() with itself.
+    expect(windows.compare).toEqual({ from: "2026-07-20", to: "2026-07-26" });
+  });
+
+  it("lastCompletedWeek steps back exactly one week from today", () => {
+    expect(lastCompletedWeek("2026-08-04").period).toEqual({ from: "2026-07-27", to: "2026-08-02" });
   });
 });
 
