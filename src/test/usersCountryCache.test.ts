@@ -87,9 +87,13 @@ describe("users list/summary keys with country", () => {
 });
 
 describe("options key (dependent country options scope)", () => {
-  it("ignores country, sort and page — same key when only those change", () => {
+  it("ignores sort and page, but not country — the cohort branch narrows with it", () => {
+    // Country used to be excluded from this key, back when the country list was
+    // the only dependent branch and excluded itself anyway. The cohort branch
+    // added later respects country, so a country change must refetch: otherwise
+    // the cohort panel keeps counts computed over every country.
     const a = JSON.stringify(usersOptionsKey({ ...keyParts, request: baseQuery() }));
-    expect(JSON.stringify(usersOptionsKey({ ...keyParts, request: baseQuery({ country: "US" }) }))).toBe(a);
+    expect(JSON.stringify(usersOptionsKey({ ...keyParts, request: baseQuery({ country: "US" }) }))).not.toBe(a);
     expect(JSON.stringify(usersOptionsKey({ ...keyParts, request: baseQuery({ sortField: "country_code", sortDir: "asc" }) }))).toBe(a);
     expect(JSON.stringify(usersOptionsKey({ ...keyParts, request: baseQuery({ page: 5 }) }))).toBe(a);
   });

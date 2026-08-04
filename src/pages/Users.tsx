@@ -608,12 +608,17 @@ export default function UsersPage() {
     (declineServerEligible && chDeclineStatus.error !== null && chDecline == null);
   const usersClickHouseDriving = usersServerEligible && chUsers != null;
   const declineClickHouseDriving = declineServerEligible && chDecline != null;
-  // Platform is a server-only filter. The legacy fallback builds its users from
-  // the browser transaction store, which no longer carries raw_payload (and so
-  // no user_agent) since the lazy-payload work — there is nothing client-side to
-  // classify. Showing an unfiltered list while a Platform chip is lit would be
-  // the same defect twice fixed on this page already: a widget quietly computing
-  // on the legacy path while the user believes a filter applied.
+  // Platform is a server-only filter, by the same rule the Cohorts page already
+  // follows. The classifier has two tiers — the user agent, then the payment
+  // wallet as a fallback — and the wallet evidence lives in raw_payload, which
+  // the browser deliberately never fetches. A client-side verdict would
+  // therefore answer "unknown" exactly where the server answers ios or android,
+  // and one chip would mean two different populations depending on whether
+  // ClickHouse happened to be up.
+  //
+  // So the filter is not reproduced here, and the page says so rather than
+  // showing an unfiltered list under a lit Platform chip — the defect this page
+  // has already been fixed for twice.
   //
   // Keyed off usersNeedLegacy, not "the server has not answered yet": during the
   // first load ClickHouse is simply pending, and treating that as unavailable

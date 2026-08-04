@@ -1,8 +1,8 @@
 // Users query-cache keys + filter normalization (mirrors cohortsCache). Shared
 // analytics primitives come from analyticsCache. Two logically-identical filter
 // sets produce the same key; the summary key excludes pagination so paging does
-// not refetch the summary, and options are keyed by version only (shared across
-// all filters).
+// not refetch the summary, and the options key carries the filter scope the
+// dependent option branches are computed over.
 
 import { sortUniq } from "@/services/analyticsCache";
 import type { UsersDeclineQuery, UsersQuery } from "@/services/usersDataSource";
@@ -75,10 +75,13 @@ export function usersSummaryKey(parts: UsersKeyParts): [string, "summary", strin
   return [USERS_QUERY_ROOT, "summary", parts.userScopeHash, parts.warehouseVersion, normalizeUsersRequest(parts.request, { includePage: false })];
 }
 
-// Options now carry the filter scope (country options are dependent on every
-// active filter EXCEPT country), so the key includes the normalized filters
-// minus country/sort/pagination. Changing only the country selection or the
-// sort/page therefore never refetches options.
+// Options carry the filter scope, because two of the branches the server
+// returns are DEPENDENT: the country list respects every filter except country,
+// and the cohort list respects every filter except the cohort selection. Each
+// branch excludes only ITSELF, so country still narrows the cohort list and the
+// cohort selection still narrows the country list — which is why both belong in
+// this key even though each is excluded from its own branch. Sort and pagination
+// stay out: they cannot change what the lists contain.
 export interface UsersOptionsScope {
   search: string;
   date_from: string | null;
@@ -89,6 +92,8 @@ export interface UsersOptionsScope {
   failed_attempts: string;
   active_subscription: string;
   campaign_path: string | null;
+  country: string | null;
+  cohort_ids: string[];
   card_type: string[];
   platform: string[];
   decline_reason: string[];
@@ -109,6 +114,8 @@ export function usersOptionsScope(q: UsersQuery): UsersOptionsScope {
     failed_attempts: norm.failed_attempts,
     active_subscription: norm.active_subscription,
     campaign_path: norm.campaign_path,
+    country: norm.country,
+    cohort_ids: norm.cohort_ids,
     card_type: norm.card_type,
     // In the options scope even though the Platform list itself is a fixed enum:
     // platform is part of userWhere, so it narrows the DEPENDENT branches

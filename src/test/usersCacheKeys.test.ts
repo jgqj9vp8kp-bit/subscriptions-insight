@@ -46,14 +46,28 @@ describe("users cache keys", () => {
     expect(hashKey(usersListKey(parts(q())))).not.toBe(hashKey(usersListKey(parts(q({ search: "abc" })))));
   });
 
-  it("options key follows the filter scope minus country/sort/page (dependent country options)", () => {
+  it("options key follows every filter that narrows a dependent branch", () => {
+    // Two branches of the options response are dependent, and each excludes only
+    // ITSELF: the country list respects the cohort selection, and the cohort list
+    // respects the country. So both belong in the key — leaving them out meant
+    // picking a country left the cohort panel showing counts for every country,
+    // with no error and nothing to debug.
+    const base = q();
+    expect(hashKey(usersOptionsKey(parts(q({ country: "US" }))))).not.toBe(hashKey(usersOptionsKey(parts(base))));
+    expect(hashKey(usersOptionsKey(parts(q({ cohortIds: ["soulmate_path_2026-07-01"] })))))
+      .not.toBe(hashKey(usersOptionsKey(parts(base))));
+    // Sort and pagination still cannot change what the lists contain.
+    expect(hashKey(usersOptionsKey(parts(q({ sortField: "country_code", sortDir: "asc" }))))).toBe(hashKey(usersOptionsKey(parts(base))));
+    expect(hashKey(usersOptionsKey(parts(q({ page: 4 }))))).toBe(hashKey(usersOptionsKey(parts(base))));
+  });
+
+  it("options key ignores sort and pagination", () => {
     const k1 = usersOptionsKey(parts(q()));
     const k2 = usersOptionsKey(parts(q()));
     expect(hashKey(k1)).toBe(hashKey(k2));
     expect(k1[0]).toBe("users");
     expect(k1[1]).toBe("options");
-    // Country / sort / page changes never refetch options…
-    expect(hashKey(usersOptionsKey(parts(q({ country: "US" }))))).toBe(hashKey(k1));
+    // Sort / page changes never refetch options…
     expect(hashKey(usersOptionsKey(parts(q({ sortField: "country_code", sortDir: "asc" }))))).toBe(hashKey(k1));
     expect(hashKey(usersOptionsKey(parts(q({ page: 4 }))))).toBe(hashKey(k1));
     // …but a scoping filter change does (the country list narrows with it).

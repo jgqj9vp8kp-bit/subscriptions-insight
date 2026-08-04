@@ -84,17 +84,23 @@ describe("useUsersData — SWR", () => {
     expect(result.current.chUsers?.rows[0].user_id).toBe("kept");
   });
 
-  it("options ignore country/page changes but refetch when a scoping filter changes (dependent country options)", async () => {
+  it("options ignore paging but refetch for any filter that narrows a dependent branch", async () => {
     loadList.mockResolvedValue(listResult([{ user_id: "x" }]));
     loadOptions.mockResolvedValue({ funnel: ["a"] });
     const { rerender } = mount(q());
     await waitFor(() => expect(loadOptions).toHaveBeenCalledTimes(1));
-    rerender({ query: q({ country: "US" }) }); // country change → new list, SAME options key
+
+    rerender({ query: q({ page: 3 }) }); // paging → new list, SAME options
     await waitFor(() => expect(loadList).toHaveBeenCalledTimes(2));
-    expect(loadOptions).toHaveBeenCalledTimes(1); // options NOT refetched for country/page
-    expect(client.getQueryData(usersOptionsKey({ userScopeHash: SCOPE, warehouseVersion: WHV, request: q({ country: "US" }) }))).toEqual({ funnel: ["a"] });
-    rerender({ query: q({ country: "US", firstSub: "has" }) }); // scoping filter → options scope changes
+    expect(loadOptions).toHaveBeenCalledTimes(1);
+
+    // Country narrows the cohort branch of the options response, so it must
+    // refetch — the panel would otherwise keep counts from every country.
+    rerender({ query: q({ page: 3, country: "US" }) });
     await waitFor(() => expect(loadOptions).toHaveBeenCalledTimes(2));
+
+    rerender({ query: q({ page: 3, country: "US", firstSub: "has" }) });
+    await waitFor(() => expect(loadOptions).toHaveBeenCalledTimes(3));
   });
 
   it("disabled (legacy mode) never fetches and drives no rows", async () => {
