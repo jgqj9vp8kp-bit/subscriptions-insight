@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import type { CohortAggregateRow } from "../../supabase/functions/_shared/clickhouse/cohortContract";
 import type { ReportFunnelPassport, ReportTarget } from "@/services/reportContract";
 import {
+  ageMatchedWindow,
   buildReportSnapshot,
   computeDelta,
   isCohortMature,
@@ -300,5 +301,85 @@ describe("buildReportSnapshot", () => {
   it("is deterministic — the same input twice produces the same snapshot", () => {
     expect(JSON.stringify(buildReportSnapshot(input())))
       .toBe(JSON.stringify(buildReportSnapshot(input())));
+  });
+});
+
+describe("age matching — the comparison correctness rule", () => {
+  it("picks the largest window both periods have completed", () => {
+    // Period ends 27.07, compare ends 20.07, collected 04.08:
+    // the younger side has lived 8 days, so D7 is the widest fair window.
+    expect(ageMatchedWindow(
+      { from: "2026-07-21", to: "2026-07-27" },
+      { from: "2026-07-14", to: "2026-07-20" },
+      "2026-08-04",
+    )).toBe(7);
+
+    // A month later both sides are past 30.
+    expect(ageMatchedWindow(
+      { from: "2026-07-21", to: "2026-07-27" },
+      { from: "2026-07-14", to: "2026-07-20" },
+      "2026-09-01",
+    )).toBe(30);
+  });
+
+  it("returns null when even D0 is not complete on both sides", () => {
+    expect(ageMatchedWindow(
+      { from: "2026-08-03", to: "2026-08-09" },
+      { from: "2026-07-27", to: "2026-08-02" },
+      "2026-08-04",
+    )).toBeNull();
+  });
+
+  it("compares revenue at the same age instead of two different ages", () => {
+    // Both weeks earn the same D7 revenue, but the older week has accumulated
+    // far more lifetime. A lifetime comparison would report a collapse; the
+    // age-matched one correctly reports no change.
+    const snapshot = buildReportSnapshot(input({
+      periodRows: [row({ revenue_d7: 400, gross_revenue: 500 })],
+      compareRows: [row({ cohort_date: "2026-07-14", revenue_d7: 400, gross_revenue: 4000 })],
+    }));
+    const matched = snapshot.kpi.revenue_matched;
+    expect(matched.label).toBe("Выручка когорт (D7)");
+    expect(matched.current.value).toBe(400);
+    expect(matched.delta?.absolute).toBe(0);
+    expect(matched.delta?.direction).toBe("flat");
+  });
+
+  it("shows accumulated revenue but refuses to put a delta on it", () => {
+    const snapshot = buildReportSnapshot(input());
+    expect(snapshot.kpi.gross_revenue.current.value).toBe(1780);
+    expect(snapshot.kpi.gross_revenue.delta).toBeNull();
+    expect(snapshot.kpi.net_revenue.delta).toBeNull();
+    expect(snapshot.kpi.refund_amount.delta).toBeNull();
+  });
+
+  it("withholds monthly LTV until the cohorts are actually a month old", () => {
+    const early = buildReportSnapshot(input());
+    expect(early.kpi.ltv_1m.current.value).toBeNull();
+    expect(early.kpi.ltv_1m.current.unavailable?.reason).toBe("not_mature");
+
+    const later = buildReportSnapshot(input({ collectedAt: "2026-09-01T09:00:00Z" }));
+    expect(later.kpi.ltv_1m.current.value).not.toBeNull();
+  });
+
+  it("shows conversion as an early signal but withholds the comparison until both weeks are observed equally", () => {
+    // Eight days after the period ended: the trial has finished, so the value
+    // is real — but this week's cohorts have had one post-trial day to convert
+    // against the comparison week's eight, so the delta would be an artefact.
+    const early = buildReportSnapshot(input());
+    expect(early.kpi.trial_to_sub_cr.current.value).toBe(40);
+    expect(early.kpi.trial_to_sub_cr.delta).toBeNull();
+    expect(early.kpi.first_subscriptions.delta).toBeNull();
+
+    // Two weeks of observation on both sides: now the comparison is fair.
+    const settled = buildReportSnapshot(input({ collectedAt: "2026-08-12T09:00:00Z" }));
+    expect(settled.kpi.trial_to_sub_cr.delta).not.toBeNull();
+  });
+
+  it("keeps funnel-level evidence paths pointing at the funnel", () => {
+    const snapshot = buildReportSnapshot(input());
+    const funnel = snapshot.funnels[0];
+    expect(funnel.metrics.trials.current.evidence).toBe("funnels[soulmate-sketch].trials");
+    expect(funnel.metrics.revenue_matched.current.evidence).toBe("funnels[soulmate-sketch].revenue_matched");
   });
 });

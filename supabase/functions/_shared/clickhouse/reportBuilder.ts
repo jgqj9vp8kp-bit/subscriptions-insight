@@ -249,12 +249,60 @@ export interface CohortRollup {
   renewalRevenue: number;
   tokenNetRevenue: number;
   addonRevenue: number;
+  revenueD0: number;
+  revenueD7: number;
+  revenueD14: number;
   revenueD30: number;
   revenueD60: number;
   /** null when no row carried spend at all — the difference between "no spend"
    * and "spend not measured" is exactly what the FB path can lose. */
   fbSpend: number | null;
   rowsWithSpend: number;
+}
+
+/** The observation windows AGGREGATE_MEASURES actually materialises. */
+export const AGE_MATCH_DAYS = [0, 7, 14, 30, 60] as const;
+
+export function revenueAtDay(rollup: CohortRollup, day: number): number | null {
+  switch (day) {
+    case 0: return rollup.revenueD0;
+    case 7: return rollup.revenueD7;
+    case 14: return rollup.revenueD14;
+    case 30: return rollup.revenueD30;
+    case 60: return rollup.revenueD60;
+    default: return null;
+  }
+}
+
+function daysBetween(from: string, to: string): number {
+  const a = Date.parse(`${from}T00:00:00Z`);
+  const b = Date.parse(`${to}T00:00:00Z`);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return 0;
+  return Math.floor((b - a) / 86_400_000);
+}
+
+/**
+ * The largest observation window BOTH periods have completed.
+ *
+ * This is the correctness centre of the whole comparison. Cohort revenue
+ * accumulates with age, so last week's cohorts have had two to eight days to
+ * earn while the comparison week's have had nine to fifteen. Putting those two
+ * lifetime sums side by side manufactures a 60% collapse out of nothing but the
+ * calendar — the single fastest way to destroy trust in the report.
+ *
+ * Comparing revenue_dN for the same N on both sides removes the age entirely:
+ * every cohort in the frame is measured over the same number of days.
+ */
+export function ageMatchedWindow(
+  period: ReportWindow,
+  compare: ReportWindow | null,
+  asOfDate: string,
+): number | null {
+  const youngestInPeriod = daysBetween(period.to, asOfDate);
+  const youngestInCompare = compare ? daysBetween(compare.to, asOfDate) : youngestInPeriod;
+  const usable = Math.min(youngestInPeriod, youngestInCompare);
+  const fits = AGE_MATCH_DAYS.filter((day) => day <= usable);
+  return fits.length ? Math.max(...fits) : null;
 }
 
 function addLevels(into: Record<number, number>, from: Record<number, number> | undefined): void {
@@ -293,7 +341,7 @@ export function rollupCohorts(rows: readonly CohortAggregateRow[]): CohortRollup
     firstSubscriptionUsers: 0, renewalUsers: 0, supportUsers: 0, tokenPurchases: 0,
     grossRevenue: 0, netRevenue: 0, amountRefunded: 0, trialRevenue: 0, upsellRevenue: 0,
     firstSubscriptionRevenue: 0, renewalRevenue: 0, tokenNetRevenue: 0, addonRevenue: 0,
-    revenueD30: 0, revenueD60: 0,
+    revenueD0: 0, revenueD7: 0, revenueD14: 0, revenueD30: 0, revenueD60: 0,
   };
 
   for (const row of rows) {
@@ -315,6 +363,9 @@ export function rollupCohorts(rows: readonly CohortAggregateRow[]): CohortRollup
     acc.renewalRevenue += n(row.renewal_revenue);
     acc.tokenNetRevenue += n(row.token_net_revenue);
     acc.addonRevenue += n(row.addon_revenue);
+    acc.revenueD0 += n(row.revenue_d0);
+    acc.revenueD7 += n(row.revenue_d7);
+    acc.revenueD14 += n(row.revenue_d14);
     acc.revenueD30 += n(row.revenue_d30);
     acc.revenueD60 += n(row.revenue_d60);
     addLevels(renewalUsersByLevel, row.renewal_users_by_level);
@@ -346,6 +397,9 @@ export function rollupCohorts(rows: readonly CohortAggregateRow[]): CohortRollup
     renewalRevenue: round2(acc.renewalRevenue),
     tokenNetRevenue: round2(acc.tokenNetRevenue),
     addonRevenue: round2(acc.addonRevenue),
+    revenueD0: round2(acc.revenueD0),
+    revenueD7: round2(acc.revenueD7),
+    revenueD14: round2(acc.revenueD14),
     revenueD30: round2(acc.revenueD30),
     revenueD60: round2(acc.revenueD60),
     renewalUsersByLevel,
@@ -487,16 +541,36 @@ interface MetricSpec {
   needsSpend?: boolean;
   /** True when the metric is only meaningful on matured cohorts. */
   needsMaturity?: boolean;
+  /** Reads revenue at the age-matched day instead of a lifetime sum. */
+  ageMatched?: (r: CohortRollup, day: number) => number | null;
+  /** Suppress the period comparison: the value is real but not comparable
+   * across periods whose cohorts differ in age. */
+  noDelta?: boolean;
+  /** Overrides the label once the matched window is known. */
+  labelWithDay?: (day: number) => string;
+  /** Needs a full 30-day observation window on both sides. */
+  needsMonth?: boolean;
+  /**
+   * Suppress the comparison until both periods have been observed for at least
+   * this many days. Conversion keeps arriving after the trial ends, so a cohort
+   * observed for one post-trial day and one observed for eight are not
+   * comparable even though both are "mature" — the value is an early signal,
+   * the delta would be an artefact.
+   */
+  deltaNeedsDays?: number;
 }
 
 /** The MVP KPI table. Order is the order the report renders. */
 export const KPI_SPECS: readonly MetricSpec[] = [
-  { key: "gross_revenue", label: "Gross Revenue", unit: "money", polarity: "higher_better",
-    pick: (r) => r.grossRevenue },
-  { key: "net_revenue", label: "Net Revenue", unit: "money", polarity: "higher_better",
-    pick: (r) => r.netRevenue },
+  { key: "revenue_matched", label: "Выручка когорт", unit: "money", polarity: "higher_better",
+    pick: () => null, ageMatched: (r, day) => revenueAtDay(r, day),
+    labelWithDay: (day) => `Выручка когорт (D${day})`, sample: (r) => r.trialUsers },
+  { key: "gross_revenue", label: "Gross Revenue (накоплено)", unit: "money", polarity: "higher_better",
+    pick: (r) => r.grossRevenue, noDelta: true },
+  { key: "net_revenue", label: "Net Revenue (накоплено)", unit: "money", polarity: "higher_better",
+    pick: (r) => r.netRevenue, noDelta: true },
   { key: "refund_amount", label: "Refunds", unit: "money", polarity: "lower_better",
-    pick: (r) => r.amountRefunded },
+    pick: (r) => r.amountRefunded, noDelta: true },
   { key: "refund_rate", label: "Refund rate", unit: "percent", polarity: "lower_better",
     pick: (r) => percent(r.amountRefunded, r.grossRevenue), sample: (r) => r.trialUsers },
   { key: "spend", label: "Spend", unit: "money", polarity: "neutral",
@@ -504,13 +578,13 @@ export const KPI_SPECS: readonly MetricSpec[] = [
   { key: "trials", label: "Триалы", unit: "count", polarity: "higher_better",
     pick: (r) => r.trialUsers },
   { key: "first_subscriptions", label: "Первые подписки", unit: "count", polarity: "higher_better",
-    pick: (_r, m) => m.firstSubscriptionUsers, needsMaturity: true },
+    pick: (_r, m) => m.firstSubscriptionUsers, needsMaturity: true, deltaNeedsDays: 14 },
   { key: "blended_cpa", label: "Blended CPA", unit: "money", polarity: "lower_better",
     pick: (r) => (r.fbSpend === null ? null : ratio(r.fbSpend, r.trialUsers)),
     sample: (r) => r.trialUsers, needsSpend: true },
   { key: "trial_to_sub_cr", label: "Trial → Subscription CR", unit: "percent", polarity: "higher_better",
     pick: (_r, m) => percent(m.firstSubscriptionUsers, m.trialUsers),
-    sample: (_r, m) => m.trialUsers, needsMaturity: true },
+    sample: (_r, m) => m.trialUsers, needsMaturity: true, deltaNeedsDays: 14 },
   { key: "upsell_cr", label: "Upsell CR", unit: "percent", polarity: "higher_better",
     pick: (r) => percent(r.upsellUsers, r.trialUsers), sample: (r) => r.trialUsers },
   { key: "token_cr", label: "Token purchase CR", unit: "percent", polarity: "higher_better",
@@ -518,9 +592,9 @@ export const KPI_SPECS: readonly MetricSpec[] = [
   { key: "support_rate", label: "Support rate", unit: "percent", polarity: "lower_better",
     pick: (r) => percent(r.supportUsers, r.trialUsers), sample: (r) => r.trialUsers },
   { key: "ltv_1m", label: "LTV 1 мес", unit: "money", polarity: "higher_better",
-    pick: (r) => ratio(r.revenueD30, r.trialUsers), sample: (r) => r.trialUsers },
+    pick: (r) => ratio(r.revenueD30, r.trialUsers), sample: (r) => r.trialUsers, needsMonth: true },
   { key: "active_subscriptions", label: "Активные подписки", unit: "count", polarity: "higher_better",
-    pick: (r) => r.activeSubscriptions },
+    pick: (r) => r.activeSubscriptions, noDelta: true },
 ];
 
 function buildMetric(
@@ -533,19 +607,45 @@ function buildMetric(
   periodEnd: string,
   spendGap: ReportUnavailable | null,
   maturityGap: ReportUnavailable | null,
+  matchedDay: number | null,
+  monthGap: ReportUnavailable | null,
+  evidencePrefix = "kpi",
 ): ReportMetric {
-  const evidence = `kpi.${spec.key}`;
-  const gap = (spec.needsSpend && spendGap) || (spec.needsMaturity && maturityGap) || undefined;
-  const raw = gap ? null : spec.pick(current, currentMature);
-  const sampleSize = spec.sample ? spec.sample(current, currentMature) : null;
+  const evidence = `${evidencePrefix}.${spec.key}`;
 
-  const previousRaw = gap || !previous || !previousMature ? null : spec.pick(previous, previousMature);
+  // An age-matched metric with no common window is not a zero — there is simply
+  // no span over which both periods have been observed yet.
+  const ageGap: ReportUnavailable | null = spec.ageMatched && matchedDay === null
+    ? unavailable(
+        "not_mature",
+        "Нет общего окна наблюдения: когорты периода и периода сравнения прожили разное число дней.",
+        "Дождаться, пока обе недели проживут хотя бы 7 дней.",
+      )
+    : null;
+
+  const gap = (spec.needsSpend && spendGap)
+    || (spec.needsMaturity && maturityGap)
+    || (spec.needsMonth && monthGap)
+    || ageGap
+    || undefined;
+
+  const read = (rollup: CohortRollup, mature: CohortRollup): number | null =>
+    spec.ageMatched && matchedDay !== null ? spec.ageMatched(rollup, matchedDay) : spec.pick(rollup, mature);
+
+  const raw = gap ? null : read(current, currentMature);
+  const sampleSize = spec.sample ? spec.sample(current, currentMature) : null;
+  const previousRaw = gap || !previous || !previousMature ? null : read(previous, previousMature);
 
   return {
     key: spec.key,
-    label: spec.label,
+    label: spec.labelWithDay && matchedDay !== null ? spec.labelWithDay(matchedDay) : spec.label,
     current: value(raw, spec.unit, evidence, gap ?? undefined),
-    delta: computeDelta(raw, previousRaw, spec.unit, {
+    // A suppressed delta is not an oversight: these values accumulate with
+    // cohort age, so comparing last week's two-day-old sum with the previous
+    // week's nine-day-old sum reports the calendar, not the business.
+    delta: spec.noDelta || (spec.deltaNeedsDays !== undefined && (matchedDay ?? 0) < spec.deltaNeedsDays)
+      ? null
+      : computeDelta(raw, previousRaw, spec.unit, {
       polarity: spec.polarity,
       sampleSize,
       minSample: spec.sample ? DEFAULT_MIN_SAMPLE : undefined,
@@ -588,8 +688,8 @@ function groupByFunnel(
 /** Per-funnel metrics. A subset of the KPI list: the numbers the weekly report
  * actually prints under each funnel URL. */
 export const FUNNEL_METRIC_KEYS: readonly string[] = [
-  "spend", "trials", "blended_cpa", "trial_to_sub_cr", "upsell_cr",
-  "token_cr", "support_rate", "refund_rate", "ltv_1m",
+  "spend", "trials", "blended_cpa", "trial_to_sub_cr", "revenue_matched",
+  "upsell_cr", "token_cr", "support_rate", "refund_rate",
 ];
 
 export function buildReportSnapshot(input: ReportBuilderInput): ReportSnapshot {
@@ -609,6 +709,18 @@ export function buildReportSnapshot(input: ReportBuilderInput): ReportSnapshot {
     : null;
 
   const spendGap = spendUnavailable(input.snapshotStatus, periodRollup);
+  const matchedDay = ageMatchedWindow(input.period, input.compare, asOfDate);
+
+  // LTV over 30 days needs 30 days of observation on BOTH sides. Dividing a
+  // two-day-old cohort's revenue by its trials and calling it "LTV 1 месяц" is
+  // arithmetic, not a measurement.
+  const monthGap: ReportUnavailable | null = (matchedDay ?? 0) >= 30
+    ? null
+    : unavailable(
+        "not_mature",
+        "LTV за месяц не считается: когортам периода ещё нет 30 дней.",
+        "Отчёт за неделю месячной давности покажет её.",
+      );
 
   // A cohort with no known trial length can never be proved mature, so a
   // conversion rate over it would be a guess. Say so instead of guessing.
@@ -631,12 +743,13 @@ export function buildReportSnapshot(input: ReportBuilderInput): ReportSnapshot {
     provisionalReasons.push("warehouse_moved_during_collection");
   }
   if (periodMatureRows.immature.length > 0) provisionalReasons.push("immature_cohorts_present");
+  if (matchedDay === null) provisionalReasons.push("no_age_matched_window");
 
   const kpi: Record<string, ReportMetric> = {};
   for (const spec of KPI_SPECS) {
     kpi[spec.key] = buildMetric(
       spec, periodRollup, periodMature, compareRollup, compareMature,
-      input.targets, input.period.to, spendGap, maturityGap,
+      input.targets, input.period.to, spendGap, maturityGap, matchedDay, monthGap,
     );
   }
 
@@ -663,9 +776,10 @@ export function buildReportSnapshot(input: ReportBuilderInput): ReportSnapshot {
       if (!spec) continue;
       const metric = buildMetric(
         spec, rollup, mature, previousRollup, previousMature,
-        input.targets, input.period.to, funnelSpendGap, funnelMaturityGap,
+        input.targets, input.period.to, funnelSpendGap, funnelMaturityGap, matchedDay, monthGap,
+        `funnels[${funnelPath}]`,
       );
-      metrics[key] = { ...metric, current: { ...metric.current, evidence: `funnels[${funnelPath}].${key}` } };
+      metrics[key] = metric;
     }
 
     funnels.push({

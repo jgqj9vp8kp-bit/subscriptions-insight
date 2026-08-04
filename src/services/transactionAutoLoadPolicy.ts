@@ -22,7 +22,7 @@ function safeLocalStorage(): Storage | null {
 
 export function shouldAutoLoadTransactionsForPath(pathname: string, storage: Storage | null = safeLocalStorage()): boolean {
   const normalized = pathname.replace(/\/+$/, "") || "/";
-  if (normalized === "/cohorts" || normalized === "/users") return false;
+  if (normalized === "/cohorts" || normalized === "/users" || normalized === "/reports") return false;
   if (normalized === "/transactions") return readPersistedTransactionsMode(storage) !== "pass";
   return true;
 }

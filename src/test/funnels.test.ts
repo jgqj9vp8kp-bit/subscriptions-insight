@@ -98,8 +98,14 @@ describe("funnels service", () => {
     const result = await listFunnels();
 
     expect(fromMock).toHaveBeenCalledWith("funnels");
+    // Identity columns, then the passport block the weekly report prints as a
+    // funnel header (Reports R4), then the embedded tags.
     expect(builder.select).toHaveBeenCalledWith(
-      "id,funnel_path,display_name,is_active,funnelfox_funnel_id,created_by,created_at,updated_at,funnel_tags(tags(id,name,created_by,created_at))",
+      "id,funnel_path,display_name,is_active,funnelfox_funnel_id,created_by,created_at,updated_at," +
+      "trial_price,trial_currency,trial_duration_days,subscription_price,subscription_currency," +
+      "billing_period,upsells,default_language,default_currency,geo_localization,destination," +
+      "product,traffic_sources,passport_notes," +
+      "funnel_tags(tags(id,name,created_by,created_at))",
     );
     expect(builder.order).toHaveBeenCalledWith("created_at", { ascending: false });
     expect(result).toHaveLength(2);
