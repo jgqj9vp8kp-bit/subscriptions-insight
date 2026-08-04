@@ -17,9 +17,10 @@
 // neutralise. escapeHtml below is the whole defence, and it is enough BECAUSE
 // the model can only ever fill in text — never tags.
 import type {
-  ReportBlock, ReportFunnelRow, ReportMetric, ReportSnapshot, ReportTask,
+  ReportBlock, ReportFunnelRow, ReportMetric, ReportSectionKey, ReportSnapshot, ReportTask,
 } from "./reportContract.ts";
 import { UNAVAILABLE_RENDER } from "./reportBuilder.ts";
+import { isProseBlock, orderedBlocks, SECTION_LABELS, SECTION_ORDER } from "./reportBlocks.ts";
 
 export interface RenderInput {
   title: string;
@@ -47,6 +48,20 @@ const TASK_STATUS_RU: Record<string, string> = {
   moved: "Перенесена",
   cancelled: "Отменена",
 };
+
+/**
+ * Prose that belongs beside a given section, in the operator's arrangement.
+ *
+ * Blocks are placed next to the numbers they talk about rather than in one pile
+ * at the top: the conclusion about the funnels reads directly under the funnel
+ * table, which is how the weekly reports are actually written. Hidden blocks and
+ * non-prose types never reach a rendered document.
+ */
+function proseFor(blocks: readonly ReportBlock[], section: ReportSectionKey): ReportBlock[] {
+  return orderedBlocks(blocks).filter(
+    (block) => block.section === section && !block.hidden && isProseBlock(block),
+  );
+}
 
 export function escapeHtml(value: string): string {
   return value
@@ -108,57 +123,66 @@ export function renderReportMarkdown(input: RenderInput): string {
     out.push("", "> Данные неполные: " + snapshot.provisionalReasons.join(", "));
   }
 
-  if (input.highlights.length) {
-    out.push("", "## Главное за неделю", "");
-    for (const line of input.highlights) out.push(`- ${line}`);
-  }
+  // One pass over the editorial order, deterministic content injected where it
+  // belongs and the operator's prose following it. A section with neither is
+  // simply absent — an empty "Email-маркетинг" heading would read as a claim
+  // that there was nothing to say, rather than nothing to measure.
+  const mdProse = (section: ReportSectionKey) => {
+    for (const block of proseFor(input.blocks, section)) {
+      out.push("", `## ${block.title}`, "", block.content);
+    }
+  };
 
-  const prose = input.blocks.filter((block) => !block.hidden && block.type === "text" || block.type === "ai_summary");
-  for (const block of prose) {
-    if (block.hidden) continue;
-    out.push("", `## ${block.title}`, "", block.content);
-  }
-
-  out.push("", "## Ключевые показатели недели", "");
-  out.push(mdTable(
-    ["Показатель", "Период", "Прошлый", "Изменение", "Цель", "Выборка"],
-    Object.values(snapshot.kpi).map((metric) => [
-      metric.label,
-      metric.current.rendered,
-      metric.delta?.previousRendered ?? UNAVAILABLE_RENDER,
-      deltaText(metric),
-      metric.target?.rendered ?? UNAVAILABLE_RENDER,
-      metric.sampleSize === null ? UNAVAILABLE_RENDER : String(metric.sampleSize),
-    ]),
-  ));
-
-  if (snapshot.funnels.length) {
-    out.push("", "## Результаты по воронкам");
-    for (const funnel of snapshot.funnels) {
-      out.push("", `### ${funnel.funnelPath}${funnel.isNew ? " (новая)" : ""}`);
-      out.push(passportText(funnel));
-      out.push("", `**${FUNNEL_STATUS_RU[funnel.status.status] ?? funnel.status.status}** — ${funnel.status.because}`);
-      const metrics = Object.values(funnel.metrics);
-      if (metrics.length) {
-        out.push("", mdTable(
-          metrics.map((m) => m.label),
-          [metrics.map((m) => m.current.rendered)],
+  for (const section of SECTION_ORDER) {
+    if (section === "highlights") {
+      if (input.highlights.length) {
+        out.push("", `## ${SECTION_LABELS.highlights}`, "");
+        for (const line of input.highlights) out.push(`- ${line}`);
+      }
+    } else if (section === "kpi") {
+      out.push("", "## Ключевые показатели недели", "");
+      out.push(mdTable(
+        ["Показатель", "Период", "Прошлый", "Изменение", "Цель", "Выборка"],
+        Object.values(snapshot.kpi).map((metric) => [
+          metric.label,
+          metric.current.rendered,
+          metric.delta?.previousRendered ?? UNAVAILABLE_RENDER,
+          deltaText(metric),
+          metric.target?.rendered ?? UNAVAILABLE_RENDER,
+          metric.sampleSize === null ? UNAVAILABLE_RENDER : String(metric.sampleSize),
+        ]),
+      ));
+    } else if (section === "funnels") {
+      if (snapshot.funnels.length) {
+        out.push("", "## Результаты по воронкам");
+        for (const funnel of snapshot.funnels) {
+          out.push("", `### ${funnel.funnelPath}${funnel.isNew ? " (новая)" : ""}`);
+          out.push(passportText(funnel));
+          out.push("", `**${FUNNEL_STATUS_RU[funnel.status.status] ?? funnel.status.status}** — ${funnel.status.because}`);
+          const metrics = Object.values(funnel.metrics);
+          if (metrics.length) {
+            out.push("", mdTable(
+              metrics.map((m) => m.label),
+              [metrics.map((m) => m.current.rendered)],
+            ));
+          }
+        }
+      }
+    } else if (section === "plan_fact") {
+      if (input.tasks && (input.tasks.closed.length || input.tasks.open.length)) {
+        out.push("", "## План / Факт", "");
+        out.push(mdTable(
+          ["Задача", "Статус", "Приоритет", "Комментарий"],
+          [...input.tasks.closed, ...input.tasks.open].map((task) => [
+            task.title,
+            TASK_STATUS_RU[task.status] ?? task.status,
+            task.priority,
+            task.movedReason || task.comment || "",
+          ]),
         ));
       }
     }
-  }
-
-  if (input.tasks && (input.tasks.closed.length || input.tasks.open.length)) {
-    out.push("", "## План / Факт", "");
-    out.push(mdTable(
-      ["Задача", "Статус", "Приоритет", "Комментарий"],
-      [...input.tasks.closed, ...input.tasks.open].map((task) => [
-        task.title,
-        TASK_STATUS_RU[task.status] ?? task.status,
-        task.priority,
-        task.movedReason || task.comment || "",
-      ]),
-    ));
+    mdProse(section);
   }
 
   if (snapshot.gaps.length) {
@@ -220,63 +244,70 @@ export function renderReportHtml(input: RenderInput): string {
     out.push(`<div class="warn">Данные неполные: ${escapeHtml(snapshot.provisionalReasons.join(", "))}</div>`);
   }
 
-  if (input.highlights.length) {
-    out.push("<section><h2>Главное за неделю</h2><ul>");
-    for (const line of input.highlights) out.push(`<li>${escapeHtml(line)}</li>`);
-    out.push("</ul></section>");
-  }
-
-  for (const block of input.blocks) {
-    if (block.hidden) continue;
-    if (block.type !== "text" && block.type !== "ai_summary") continue;
-    out.push(`<section><h2>${escapeHtml(block.title)}</h2>`);
-    for (const paragraph of block.content.split(/\n{2,}/)) {
-      if (paragraph.trim()) out.push(`<p>${escapeHtml(paragraph.trim())}</p>`);
-    }
-    out.push("</section>");
-  }
-
-  out.push("<section><h2>Ключевые показатели недели</h2>");
-  out.push(htmlTable(
-    ["Показатель", "Период", "Прошлый", "Изменение", "Цель", "Выборка"],
-    Object.values(snapshot.kpi).map((metric) => [
-      metric.label,
-      metric.current.rendered,
-      metric.delta?.previousRendered ?? UNAVAILABLE_RENDER,
-      deltaText(metric),
-      metric.target?.rendered ?? UNAVAILABLE_RENDER,
-      metric.sampleSize === null ? UNAVAILABLE_RENDER : String(metric.sampleSize),
-    ]),
-  ));
-  out.push("</section>");
-
-  if (snapshot.funnels.length) {
-    out.push("<section><h2>Результаты по воронкам</h2>");
-    for (const funnel of snapshot.funnels) {
-      out.push(`<section><h3>${escapeHtml(funnel.funnelPath)}${funnel.isNew ? " (новая)" : ""}</h3>`);
-      out.push(`<p class="passport">${escapeHtml(passportText(funnel))}</p>`);
-      out.push(`<p><span class="status">${escapeHtml(FUNNEL_STATUS_RU[funnel.status.status] ?? funnel.status.status)}</span> — ${escapeHtml(funnel.status.because)}</p>`);
-      const metrics = Object.values(funnel.metrics);
-      if (metrics.length) {
-        out.push(htmlTable(metrics.map((m) => m.label), [metrics.map((m) => m.current.rendered)]));
+  // Same editorial pass as the Markdown renderer, so the two formats can never
+  // disagree about where a paragraph belongs.
+  const htmlProse = (section: ReportSectionKey) => {
+    for (const block of proseFor(input.blocks, section)) {
+      out.push(`<section><h2>${escapeHtml(block.title)}</h2>`);
+      for (const paragraph of block.content.split(/\n{2,}/)) {
+        if (paragraph.trim()) out.push(`<p>${escapeHtml(paragraph.trim())}</p>`);
       }
       out.push("</section>");
     }
-    out.push("</section>");
-  }
+  };
 
-  if (input.tasks && (input.tasks.closed.length || input.tasks.open.length)) {
-    out.push("<section><h2>План / Факт</h2>");
-    out.push(htmlTable(
-      ["Задача", "Статус", "Приоритет", "Комментарий"],
-      [...input.tasks.closed, ...input.tasks.open].map((task) => [
-        task.title,
-        TASK_STATUS_RU[task.status] ?? task.status,
-        task.priority,
-        task.movedReason || task.comment || "",
-      ]),
-    ));
-    out.push("</section>");
+  for (const section of SECTION_ORDER) {
+    if (section === "highlights") {
+      if (input.highlights.length) {
+        out.push(`<section><h2>${escapeHtml(SECTION_LABELS.highlights)}</h2><ul>`);
+        for (const line of input.highlights) out.push(`<li>${escapeHtml(line)}</li>`);
+        out.push("</ul></section>");
+      }
+    } else if (section === "kpi") {
+      out.push("<section><h2>Ключевые показатели недели</h2>");
+      out.push(htmlTable(
+        ["Показатель", "Период", "Прошлый", "Изменение", "Цель", "Выборка"],
+        Object.values(snapshot.kpi).map((metric) => [
+          metric.label,
+          metric.current.rendered,
+          metric.delta?.previousRendered ?? UNAVAILABLE_RENDER,
+          deltaText(metric),
+          metric.target?.rendered ?? UNAVAILABLE_RENDER,
+          metric.sampleSize === null ? UNAVAILABLE_RENDER : String(metric.sampleSize),
+        ]),
+      ));
+      out.push("</section>");
+    } else if (section === "funnels") {
+      if (snapshot.funnels.length) {
+        out.push("<section><h2>Результаты по воронкам</h2>");
+        for (const funnel of snapshot.funnels) {
+          out.push(`<section><h3>${escapeHtml(funnel.funnelPath)}${funnel.isNew ? " (новая)" : ""}</h3>`);
+          out.push(`<p class="passport">${escapeHtml(passportText(funnel))}</p>`);
+          out.push(`<p><span class="status">${escapeHtml(FUNNEL_STATUS_RU[funnel.status.status] ?? funnel.status.status)}</span> — ${escapeHtml(funnel.status.because)}</p>`);
+          const metrics = Object.values(funnel.metrics);
+          if (metrics.length) {
+            out.push(htmlTable(metrics.map((m) => m.label), [metrics.map((m) => m.current.rendered)]));
+          }
+          out.push("</section>");
+        }
+        out.push("</section>");
+      }
+    } else if (section === "plan_fact") {
+      if (input.tasks && (input.tasks.closed.length || input.tasks.open.length)) {
+        out.push("<section><h2>План / Факт</h2>");
+        out.push(htmlTable(
+          ["Задача", "Статус", "Приоритет", "Комментарий"],
+          [...input.tasks.closed, ...input.tasks.open].map((task) => [
+            task.title,
+            TASK_STATUS_RU[task.status] ?? task.status,
+            task.priority,
+            task.movedReason || task.comment || "",
+          ]),
+        ));
+        out.push("</section>");
+      }
+    }
+    htmlProse(section);
   }
 
   if (snapshot.gaps.length) {

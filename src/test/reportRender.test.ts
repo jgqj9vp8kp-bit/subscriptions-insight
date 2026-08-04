@@ -116,6 +116,37 @@ describe("renderReportMarkdown", () => {
   });
 });
 
+describe("block placement", () => {
+  function prose(id: string, section: ReportBlock["section"], title: string): ReportBlock {
+    return {
+      id, type: "text", section, title, content: `тело ${id}`,
+      hidden: false, pinned: false, generatedBy: "human", editedByHuman: false,
+      evidence: [], updatedAt: "",
+    };
+  }
+
+  it("puts each block beside the numbers it talks about, not in one pile at the top", () => {
+    const md = renderReportMarkdown(input({
+      // Deliberately out of editorial order: the renderer, not the array, decides.
+      blocks: [prose("b2", "product", "Продукт"), prose("b1", "executive_summary", "Главный вывод")],
+    }));
+    const summaryAt = md.indexOf("Главный вывод");
+    const kpiAt = md.indexOf("Ключевые показатели недели");
+    const funnelsAt = md.indexOf("Результаты по воронкам");
+    const productAt = md.indexOf("Продукт");
+
+    expect(summaryAt).toBeGreaterThan(-1);
+    expect(summaryAt).toBeLessThan(kpiAt);
+    expect(productAt).toBeGreaterThan(funnelsAt);
+  });
+
+  it("renders a section heading only when that section has something to say", () => {
+    const md = renderReportMarkdown(input());
+    expect(md).not.toContain("Email-маркетинг");
+    expect(md).not.toContain("Риски и решения");
+  });
+});
+
 describe("renderReportHtml", () => {
   it("emits real tables so a paste into Google Docs keeps its structure", () => {
     const html = renderReportHtml(input());

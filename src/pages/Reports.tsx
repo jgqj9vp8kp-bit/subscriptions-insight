@@ -5,7 +5,7 @@
 // targets, funnel blocks with their passports and rule-engine statuses. No AI
 // is involved at this phase, and the page is designed so that stays true: the
 // prose blocks arriving in R9 sit alongside these tables, never instead of them.
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, ArrowLeft, ClipboardCopy, Download, FileText, Loader2, Plus, Printer, RefreshCw, Save } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { Badge } from "@/components/ui/badge";
@@ -22,8 +22,11 @@ import type {
   Report, ReportListItem, ReportMetric, ReportSnapshot, ReportFunnelRow,
 } from "@/services/reportContract";
 import {
-  listReports, loadReport, newReport, publishReport, saveReport,
+  listReports, loadReport, newReport, publishReport, saveReport, saveReportBlocks,
 } from "@/services/reports";
+import { BlockEditor, type BlockSaveState } from "@/components/reports/BlockEditor";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
+import type { ReportBlock } from "@/services/reportContract";
 import { collectReport, lastCompletedWeek, weekWindows } from "@/services/reportCollect";
 import { UNAVAILABLE_RENDER } from "@/services/reportBuilder";
 import type { Finding } from "@/services/reportRules";
@@ -256,6 +259,52 @@ export default function ReportsPage() {
   const [from, setFrom] = useState(defaultWeek.period.from);
   const [to, setTo] = useState(defaultWeek.period.to);
 
+  // --- prose blocks and their autosave -------------------------------------
+  // The editor's working copy is held here rather than inside the editor so the
+  // export and the preview read exactly what is on screen, including edits that
+  // have not been written yet.
+  const [blocks, setBlocks] = useState<ReportBlock[]>([]);
+  const [blocksDebounced, blocksPending] = useDebouncedValue(blocks, 800);
+  const [saveState, setSaveState] = useState<BlockSaveState>({ kind: "idle" });
+  // What is known to be on the server. Comparing against it is what stops the
+  // debounce from writing the same blocks again every time the page re-renders,
+  // and stops opening a report from counting as an edit.
+  const savedBlocksRef = useRef("[]");
+
+  const adoptReport = useCallback((report: Report) => {
+    setOpen(report);
+    setBlocks(report.blocks);
+    savedBlocksRef.current = JSON.stringify(report.blocks);
+    setSaveState({ kind: "idle" });
+  }, []);
+
+  useEffect(() => {
+    const reportId = open?.id;
+    if (!reportId) return undefined;
+    const serialized = JSON.stringify(blocksDebounced);
+    if (serialized === savedBlocksRef.current) return undefined;
+
+    let cancelled = false;
+    setSaveState({ kind: "saving" });
+    // Only the blocks column is written: a full save would re-send the ~150 KB
+    // snapshot on every keystroke pause, and would push this tab's copy of the
+    // snapshot over a re-collect that happened elsewhere.
+    saveReportBlocks(reportId, blocksDebounced)
+      .then(() => {
+        if (cancelled) return;
+        savedBlocksRef.current = serialized;
+        setSaveState({ kind: "saved", at: new Date().toLocaleTimeString() });
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setSaveState({
+          kind: "error",
+          message: error instanceof Error ? error.message : "неизвестная ошибка",
+        });
+      });
+    return () => { cancelled = true; };
+  }, [blocksDebounced, open?.id]);
+
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
@@ -297,8 +346,7 @@ export default function ReportsPage() {
       draft.provisionalReasons = collected.snapshot.provisionalReasons;
 
       const id = await saveReport(draft);
-      const saved = await loadReport(id);
-      setOpen(saved);
+      adoptReport(await loadReport(id));
       setFindings(collected.findings);
       setHighlights(collected.highlights);
       await refresh();
@@ -317,7 +365,7 @@ export default function ReportsPage() {
     setBusy(id);
     try {
       const report = await loadReport(id);
-      setOpen(report);
+      adoptReport(report);
       // Findings are derived, never stored: re-running the rules over the FROZEN
       // snapshot keeps them in step with the engine without touching the data
       // the report was published with.
@@ -348,13 +396,16 @@ export default function ReportsPage() {
       });
       const next: Report = {
         ...open,
+        // The working copy, not open.blocks: a re-collect replaces the numbers
+        // and must not roll back a paragraph typed a second ago.
+        blocks,
         snapshot: collected.snapshot,
         resolvedAt: now,
         dataIncomplete: collected.snapshot.dataIncomplete,
         provisionalReasons: collected.snapshot.provisionalReasons,
       };
       await saveReport(next);
-      setOpen(next);
+      adoptReport(next);
       setFindings(collected.findings);
       setHighlights(collected.highlights);
       await refresh();
@@ -373,9 +424,15 @@ export default function ReportsPage() {
     if (!open?.id) return;
     setBusy("publish");
     try {
+      // Flush the prose first. publish_report() copies the row as it stands in
+      // Postgres, so publishing while the debounce is still pending would freeze
+      // a version missing the last thing that was typed — and the version is
+      // append-only, so there would be no fixing it afterwards.
+      await saveReportBlocks(open.id, blocks);
+      savedBlocksRef.current = JSON.stringify(blocks);
       const versionNo = await publishReport(open.id);
       toast({ title: `Опубликована версия ${versionNo}`, description: "Данные этой версии больше не изменятся." });
-      setOpen(await loadReport(open.id));
+      adoptReport(await loadReport(open.id));
       await refresh();
     } catch (error) {
       toast({
@@ -393,7 +450,8 @@ export default function ReportsPage() {
     return {
       title: open.title,
       snapshot: open.snapshot,
-      blocks: open.blocks,
+      // The working copy, so an export always matches what is on screen.
+      blocks,
       highlights: highlights.map((finding) => finding.claim),
       tasks,
     };
@@ -490,6 +548,25 @@ export default function ReportsPage() {
                   <FunnelBlock key={funnel.funnelPath} funnel={funnel} />
                 ))}
               </div>
+            </section>
+
+            <section className="space-y-2">
+              <div className="flex flex-wrap items-baseline gap-2">
+                <h2 className="text-sm font-semibold">Выводы и решения</h2>
+                <span className="text-xs text-muted-foreground">
+                  текст рядом с цифрами; таблицы выше остаются нетронутыми
+                </span>
+                {open.publishedVersionNo !== null && (
+                  <span className="text-xs text-muted-foreground">
+                    — правки войдут в следующую версию, версия {open.publishedVersionNo} заморожена
+                  </span>
+                )}
+              </div>
+              <BlockEditor
+                blocks={blocks}
+                onChange={setBlocks}
+                saveState={blocksPending && saveState.kind !== "saving" ? { kind: "pending" } : saveState}
+              />
             </section>
 
             <section className="space-y-2">

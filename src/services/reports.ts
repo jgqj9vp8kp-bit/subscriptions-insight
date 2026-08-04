@@ -23,6 +23,7 @@ import type {
   ReportValue,
 } from "@/services/reportContract";
 import { REPORT_ENGINE_VERSION, REPORT_SCHEMA_VERSION } from "@/services/reportContract";
+import { sanitizeBlocks } from "@/services/reportBlocks";
 
 function ensureSupabase() {
   if (!supabase) throw new Error("Supabase is not configured.");
@@ -119,7 +120,7 @@ export function rowToReport(row: ReportRow): Report {
     bindings: row.bindings,
     manualInputs: row.manual_inputs ?? {},
     snapshot: rowSnapshot(row.snapshot),
-    blocks: row.blocks ?? [],
+    blocks: sanitizeBlocks(row.blocks),
     dataIncomplete: row.data_incomplete,
     provisionalReasons: row.provisional_reasons ?? [],
     aiStatus: row.ai_status,
@@ -210,6 +211,21 @@ export async function loadReport(id: string): Promise<Report> {
   const { data, error } = await client.from("reports").select("*").eq("id", id).single();
   if (error) throw new Error(`Could not load report: ${error.message}`);
   return rowToReport(data as ReportRow);
+}
+
+/**
+ * Autosave path for the editor: writes the prose and nothing else.
+ *
+ * Deliberately not `saveReport`. A full save re-sends the snapshot, which is the
+ * ~150 KB half of the row, on every debounce tick — and, worse, it would write
+ * back whatever snapshot the open tab happens to hold, so an autosave firing
+ * after a re-collect in another tab would quietly restore the old numbers. The
+ * prose is the only thing the editor owns.
+ */
+export async function saveReportBlocks(id: string, blocks: ReportBlock[]): Promise<void> {
+  const client = ensureSupabase();
+  const { error } = await client.from("reports").update({ blocks }).eq("id", id);
+  if (error) throw new Error(`Could not save report blocks: ${error.message}`);
 }
 
 /** Insert or update. Returns the row id. */
@@ -339,7 +355,7 @@ export async function loadReportVersion(versionId: string): Promise<ReportVersio
     bindings: row.bindings,
     manualInputs: row.manual_inputs ?? {},
     snapshot: row.snapshot,
-    blocks: row.blocks ?? [],
+    blocks: sanitizeBlocks(row.blocks),
     publishedAt: row.published_at,
   };
 }
