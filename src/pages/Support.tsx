@@ -15,7 +15,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { AlertCircle, FileSpreadsheet, Inbox, Loader2, MailCheck, RefreshCw, Search, Sparkles } from "lucide-react";
+import { AlertCircle, Download, FileSpreadsheet, Inbox, Loader2, MailCheck, RefreshCw, Search, Sparkles } from "lucide-react";
 import { Progress } from "@/components/ui/progress";
 import { AppLayout } from "@/components/AppLayout";
 import { Button } from "@/components/ui/button";
@@ -75,9 +75,19 @@ import {
 import {
   EMPTY_CAMPAIGN_PATH,
   loadSupportDetails,
+  loadSupportExportPage,
+  loadSupportSyncStatus,
   syncSupportToClickHouse,
   type SupportQuery,
 } from "@/services/supportDataSource";
+import {
+  buildSupportExportTable,
+  collectSupportExportRows,
+  downloadSupportCsv,
+  downloadSupportXlsx,
+  MAX_EXPORT_ROWS,
+  type SupportExportMeta,
+} from "@/services/supportExport";
 
 const PAGE_SIZE = 50;
 const CATEGORY_COLORS = ["#2563eb", "#dc2626", "#f59e0b", "#059669", "#7c3aed", "#0891b2", "#be123c", "#64748b"];
@@ -142,6 +152,38 @@ const DEFAULT_FILTERS: SupportAnalyticsFilters = {
   funnel: [],
   campaignPath: [],
 };
+
+/** Human-readable list of the filters that are actually narrowing the view.
+ * Stamped into the export so a file found later still says what it covers. */
+function describeSupportFilters(filters: SupportAnalyticsFilters): string[] {
+  const out: string[] = [];
+  const push = (label: string, value: unknown) => {
+    if (value === undefined || value === null) return;
+    if (value === "" || value === "all") return;
+    if (Array.isArray(value)) {
+      if (value.length) out.push(`${label}: ${value.join(", ")}`);
+      return;
+    }
+    out.push(`${label}: ${String(value)}`);
+  };
+  push("Дата с", filters.dateFrom);
+  push("Дата по", filters.dateTo);
+  push("Категория", filters.category);
+  push("Подкатегория", filters.subcategory);
+  push("Язык", filters.language);
+  push("Приоритет", filters.urgency);
+  push("Сопоставление", filters.matchStatus);
+  push("Отмена", filters.requiresCancellation);
+  push("Возврат", filters.requiresRefund);
+  push("Платёж", filters.paymentRelated);
+  push("Доставка", filters.deliveryRelated);
+  push("Правки", filters.manualStatus);
+  push("Поиск", filters.search);
+  push("Батч", filters.importBatchId);
+  push("Воронка", filters.funnel);
+  push("Campaign path", filters.campaignPath);
+  return out;
+}
 
 type SupportSortState = Pick<SupportQuery, "sortBy" | "sortDir">;
 
@@ -313,6 +355,66 @@ export default function SupportPage() {
     warehouseVersion,
     enabled: Boolean(user?.id) && warehouseVersionReady,
   });
+  // --- export -------------------------------------------------------------
+  // Exports what the filter panel currently selects, which with no filters set
+  // is every email. The request is assembled by the same buildSupportRequest the
+  // table uses, so the file cannot cover a different set than the screen.
+  const [exportState, setExportState] = useState<{ busy: "csv" | "xlsx" | null; loaded: number; total: number }>(
+    { busy: null, loaded: 0, total: 0 });
+
+  async function onExport(format: "csv" | "xlsx") {
+    setExportState({ busy: format, loaded: 0, total: 0 });
+    try {
+      // How far the mirror lags Postgres. Read first so the file can say it,
+      // rather than presenting a snapshot as the whole mailbox.
+      const pendingSync = await loadSupportSyncStatus()
+        .then((status) => Math.max(0, status.source_total - status.clickhouse_total))
+        .catch(() => null);
+
+      const collected = await collectSupportExportRows(
+        (pageNumber) => loadSupportExportPage(supportQuery, pageNumber),
+        (progress) => setExportState({ busy: format, loaded: progress.loaded, total: progress.total }),
+      );
+      const table = buildSupportExportTable(collected.rows);
+      const meta: SupportExportMeta = {
+        generatedAt: collected.generatedAt,
+        totalRows: collected.totalRows,
+        exportedRows: collected.rows.length,
+        truncatedCells: table.truncatedCells,
+        filterSummary: describeSupportFilters(filters).join("; ") || "без фильтров — все письма",
+        sortSummary: `${sortState.sortBy} ${sortState.sortDir}`,
+        pendingSync,
+      };
+
+      if (format === "csv") downloadSupportCsv(table, meta);
+      else await downloadSupportXlsx(table, meta);
+
+      // Everything the file is NOT is said out loud: a short file, cells cut to
+      // Excel's limit, or a mirror that has not caught up.
+      const notes: string[] = [];
+      if (collected.hitCeiling) notes.push(`выгрузка ограничена ${MAX_EXPORT_ROWS} письмами`);
+      else if (collected.rows.length < collected.totalRows) {
+        notes.push(`под фильтром ${collected.totalRows}, выгружено ${collected.rows.length} — склад менялся во время выгрузки`);
+      }
+      if (table.truncatedCells > 0) notes.push(`${table.truncatedCells} ячеек обрезано под лимит Excel`);
+      if (pendingSync) notes.push(`${pendingSync} писем ещё не доехали из Postgres`);
+
+      toast({
+        title: `Выгружено писем: ${collected.rows.length}`,
+        description: notes.length ? notes.join(". ") : "Файл содержит все письма под текущим фильтром.",
+        variant: notes.length ? "destructive" : undefined,
+      });
+    } catch (error) {
+      toast({
+        title: "Выгрузка не удалась",
+        description: error instanceof Error ? error.message : "Неизвестная ошибка",
+        variant: "destructive",
+      });
+    } finally {
+      setExportState({ busy: null, loaded: 0, total: 0 });
+    }
+  }
+
   const dashboard = supportData.bundle?.summary ?? EMPTY_DASHBOARD;
   const pageData = supportData.page;
   const batchesQuery = useQuery({
@@ -1264,7 +1366,24 @@ export default function SupportPage() {
               <h2 className="text-sm font-semibold text-foreground">Support Requests</h2>
               <p className="mt-1 text-xs text-muted-foreground">{totalRows} requests · page {page} of {totalPages}</p>
             </div>
-            <div className="flex gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              {exportState.busy && (
+                <span className="text-xs text-muted-foreground">
+                  {exportState.loaded}{exportState.total ? ` / ${exportState.total}` : ""} писем…
+                </span>
+              )}
+              <Button type="button" variant="outline" size="sm"
+                onClick={() => void onExport("xlsx")} disabled={exportState.busy !== null || totalRows === 0}
+                title="Все письма под текущим фильтром, вместе с текстом. XLSX — читаемее для длинных писем.">
+                {exportState.busy === "xlsx" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+                Выгрузить XLSX
+              </Button>
+              <Button type="button" variant="outline" size="sm"
+                onClick={() => void onExport("csv")} disabled={exportState.busy !== null || totalRows === 0}
+                title="Тот же набор писем в CSV (RFC 4180, разделитель — запятая).">
+                {exportState.busy === "csv" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+                CSV
+              </Button>
               <Button type="button" variant="outline" size="sm" onClick={() => setPage((value) => Math.max(1, value - 1))} disabled={page <= 1}>Previous</Button>
               <Button type="button" variant="outline" size="sm" onClick={() => setPage((value) => Math.min(totalPages, value + 1))} disabled={page >= totalPages}>Next</Button>
             </div>

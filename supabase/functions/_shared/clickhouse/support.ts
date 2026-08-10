@@ -10,6 +10,7 @@ import {
   EMPTY_CAMPAIGN_PATH,
   type SupportAnalyticsBundle,
   type SupportDetailsResponse,
+  type SupportExportResponse,
   type SupportFilterOptions,
   type SupportFilters,
   type SupportListResponse,
@@ -24,6 +25,14 @@ import {
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const DEFAULT_PAGE_SIZE = 50;
 const MAX_PAGE_SIZE = 500;
+// One export page. Deliberately smaller than it could be: message bodies are an
+// unbounded String (the IMAP sync caps them at 100 000 characters, the
+// spreadsheet import caps them at nothing), and the whole response is
+// JSON.stringify'd in one piece inside the edge function. This project has
+// already had an invocation OOM-killed before its own try/catch could log
+// anything (see exportCampaignSource.ts), which surfaces as an unexplained 502
+// rather than an error message. Rows are cheap to page; bytes are not.
+const EXPORT_PAGE_SIZE = 200;
 const MAX_IN_VALUES = 500;
 const SYNC_NAME = "fact_support_requests_sync";
 const DEFAULT_SYNC_BATCH_SIZE = 2000;
@@ -41,7 +50,7 @@ const SUPPORT_SELECT = [
   "classification_source,classification_version,classification_model,classification_confidence,classification_reason",
 ].join(",");
 
-type SupportAction = "bundle" | "list" | "details" | "options" | "sync" | "status";
+type SupportAction = "bundle" | "list" | "details" | "options" | "sync" | "status" | "export";
 type SortDirection = "asc" | "desc";
 
 type NormalizedRequest = {
@@ -226,6 +235,7 @@ function normalizeAction(action: unknown): SupportAction {
     case "options":
     case "sync":
     case "status":
+    case "export":
     case "bundle": return action;
     case undefined:
     case null: return "bundle";
@@ -488,6 +498,67 @@ export async function runSupportList(input: { authUserId: string; clickhouse: Cl
     query_duration_ms: Date.now() - started,
     pagination: { page: req.page, page_size: req.pageSize, total_rows: total, total_pages: Math.max(1, Math.ceil(total / req.pageSize)) },
     rows: rows.map(row),
+  };
+}
+
+/**
+ * One page of the export.
+ *
+ * Shares `whereClause` and the ORDER BY with runSupportList on purpose: the file
+ * has to contain the emails the operator is looking at, in the order they are
+ * looking at them, and any second copy of that logic is a licence for the two to
+ * drift. The only differences are the message body — which the list omits to
+ * keep its payload small — and the page size.
+ *
+ * FINAL is not optional. fact_support_requests is a ReplacingMergeTree and holds
+ * several versions per email (the classifier and manual corrections both rewrite
+ * rows); reading without FINAL would return every superseded version too, so the
+ * file would have more rows than the screen AND would carry stale categories.
+ */
+export async function runSupportExport(input: { authUserId: string; clickhouse: ClickHouseClientLike; request: SupportRequest }): Promise<SupportExportResponse> {
+  const started = Date.now();
+  const req = normalizeSupportRequest({ ...input.request, action: "export" });
+  const params: Record<string, unknown> = {};
+  const where = whereClause(input.authUserId, req, params);
+  const pageSize = EXPORT_PAGE_SIZE;
+  const page = Math.max(1, req.page);
+  params.limit = pageSize;
+  params.offset = (page - 1) * pageSize;
+
+  const [countRow] = await jsonRows<{ count?: number | string }>(
+    input.clickhouse,
+    `SELECT count() AS count FROM ${FACT_SUPPORT_REQUESTS_TABLE} FINAL WHERE ${where}`,
+    params,
+  );
+  const total = n(countRow?.count);
+  const direction = req.sortDir === "asc" ? "ASC" : "DESC";
+  const order = req.sortField === "funnel"
+    ? `if(funnel = '${UNKNOWN_FUNNEL}' OR funnel = '', 1, 0) ASC, lowerUTF8(funnel) ${direction}`
+    : req.sortField === "campaign_path"
+      ? `if(campaign_path = '', 1, 0) ASC, lowerUTF8(campaign_path) ${direction}`
+      : `${req.sortField} ${direction}`;
+
+  const rows = await jsonRows<Record<string, unknown>>(
+    input.clickhouse,
+    `SELECT ${ROW_SELECT}, message_body
+     FROM ${FACT_SUPPORT_REQUESTS_TABLE} FINAL
+     WHERE ${where}
+     ORDER BY ${order}, request_id ASC
+     LIMIT {limit:UInt32} OFFSET {offset:UInt32}`,
+    params,
+  );
+
+  return {
+    ok: true,
+    source: "clickhouse",
+    action: "export",
+    generated_at: new Date().toISOString(),
+    query_duration_ms: Date.now() - started,
+    total_rows: total,
+    page,
+    page_size: pageSize,
+    has_more: page * pageSize < total,
+    rows: rows.map((raw) => ({ ...row(raw), message_body: s(raw.message_body) || null })),
   };
 }
 

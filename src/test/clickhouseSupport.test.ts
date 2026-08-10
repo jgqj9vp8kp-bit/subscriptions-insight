@@ -10,6 +10,7 @@ import {
   normalizeSupportRequest,
   runSupportBundle,
   runSupportDetails,
+  runSupportExport,
   runSupportList,
   runSupportOptions,
   supportAttributionStatus,
@@ -156,6 +157,71 @@ describe("clickhouse-support architecture", () => {
     expect(listSql).toContain("lowerUTF8(funnel) ASC");
     expect(listSql).toContain("LIMIT {limit:UInt32} OFFSET {offset:UInt32}");
     expect(queries.at(-1)?.params).toMatchObject({ auth_user_id: "owner-1", funnel_0: "Soulmate", funnel_1: "Unknown", limit: 50, offset: 50 });
+  });
+
+  it("exports through the SAME filter and order as the list, with the body and FINAL", async () => {
+    // Two invariants live here. FINAL: fact_support_requests is a
+    // ReplacingMergeTree holding several versions per email (the classifier and
+    // manual corrections rewrite rows), so a read without it returns superseded
+    // versions too — more rows than the screen shows, carrying stale
+    // categories. And the same WHERE/ORDER BY as runSupportList, because a file
+    // that covers a different set than the screen is worse than no file.
+    const queries: Array<{ sql: string; params: Record<string, unknown> }> = [];
+    const clickhouse: ClickHouseClientLike = {
+      command: async () => undefined,
+      insert: async () => undefined,
+      query: async ({ query, query_params }) => {
+        queries.push({ sql: query, params: query_params ?? {} });
+        return { json: async () => query.includes("SELECT count() AS count") ? [{ count: 450 }] : [] };
+      },
+    };
+    const request = {
+      action: "export" as const,
+      filters: { funnel: ["Soulmate"] },
+      sort: { field: "funnel", direction: "asc" as const },
+      pagination: { page: 2, page_size: 200 },
+    };
+    const response = await runSupportExport({ authUserId: "owner-1", clickhouse, request });
+
+    const sql = queries.at(-1)?.sql ?? "";
+    expect(sql).toContain("FINAL");
+    expect(sql).toContain("message_body");
+    expect(sql).toContain("funnel IN ({funnel_0:String})");
+    expect(sql).toContain("if(funnel = 'Unknown' OR funnel = '', 1, 0) ASC");
+    expect(sql).toContain("request_id ASC");
+    expect(queries.at(-1)?.params).toMatchObject({ auth_user_id: "owner-1", funnel_0: "Soulmate" });
+
+    // The discriminator the client checks: without it a fallthrough to the
+    // analytics bundle would be written out as an empty file.
+    expect(response.action).toBe("export");
+    expect(response.total_rows).toBe(450);
+    expect(response.page).toBe(2);
+    expect(response.has_more).toBe(true);
+  });
+
+  it("caps the export page size regardless of what the caller asks for", async () => {
+    // The body is an unbounded String; the ceiling is about response bytes, not
+    // rows, and a caller must not be able to raise it.
+    const queries: Array<{ params: Record<string, unknown> }> = [];
+    const clickhouse: ClickHouseClientLike = {
+      command: async () => undefined,
+      insert: async () => undefined,
+      query: async ({ query, query_params }) => {
+        queries.push({ params: query_params ?? {} });
+        return { json: async () => query.includes("SELECT count() AS count") ? [{ count: 10_000 }] : [] };
+      },
+    };
+    const response = await runSupportExport({
+      authUserId: "owner-1",
+      clickhouse,
+      request: { action: "export", pagination: { page: 1, page_size: 5000 } },
+    });
+    expect(response.page_size).toBeLessThanOrEqual(500);
+    expect(queries.at(-1)?.params.limit).toBe(response.page_size);
+  });
+
+  it("accepts export as an action rather than falling back to bundle", () => {
+    expect(normalizeSupportRequest({ action: "export" }).action).toBe("export");
   });
 
   it("supports descending server-side funnel sort", async () => {

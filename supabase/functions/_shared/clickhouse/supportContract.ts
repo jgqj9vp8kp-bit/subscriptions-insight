@@ -2,7 +2,7 @@
 // The browser receives aggregate bundles, paged request rows, and one opened
 // detail only. Filtering/search/sorting/pagination happen in ClickHouse.
 
-export type SupportAction = "bundle" | "list" | "details" | "options" | "sync" | "status";
+export type SupportAction = "bundle" | "list" | "details" | "options" | "sync" | "status" | "export";
 export type SupportSortDirection = "asc" | "desc";
 export type SupportTriState = "all" | "yes" | "no";
 export const EMPTY_CAMPAIGN_PATH = "—";
@@ -234,6 +234,31 @@ export interface SupportDetailsResponse {
   error?: string;
 }
 
+/**
+ * One page of the raw export: the same rows the list returns, plus the message
+ * body the list deliberately leaves out.
+ *
+ * `action` is echoed back on purpose. The edge router ends with an
+ * unconditional `return bundle`, so a missing or misplaced branch would answer
+ * a perfectly valid analytics bundle — `ok: true`, no `rows` — and the client
+ * would happily write a file with nothing but headers. Checking the
+ * discriminator turns that silence into an error.
+ */
+export interface SupportExportResponse {
+  ok: boolean;
+  source: "clickhouse";
+  action: "export";
+  generated_at: string;
+  query_duration_ms: number;
+  /** Total rows matching the filter, independent of this page. */
+  total_rows: number;
+  page: number;
+  page_size: number;
+  has_more: boolean;
+  rows: SupportRequestDetailRow[];
+  error?: string;
+}
+
 export interface SupportOptionsResponse {
   ok: boolean;
   source: "clickhouse";
@@ -243,4 +268,4 @@ export interface SupportOptionsResponse {
   error?: string;
 }
 
-export type SupportResponse = SupportAnalyticsBundle | SupportListResponse | SupportDetailsResponse | SupportOptionsResponse | SupportSyncResult;
+export type SupportResponse = SupportAnalyticsBundle | SupportListResponse | SupportDetailsResponse | SupportOptionsResponse | SupportSyncResult | SupportExportResponse;

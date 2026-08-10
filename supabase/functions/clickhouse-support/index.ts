@@ -11,6 +11,7 @@ import {
   normalizeSupportRequest,
   runSupportBundle,
   runSupportDetails,
+  runSupportExport,
   runSupportList,
   runSupportOptions,
   runSupportStatus,
@@ -58,6 +59,10 @@ Deno.serve(async (req: Request) => {
     if (action === "options") return jsonResponse(await withTimeout(runSupportOptions(common), QUERY_TIMEOUT_MS));
     if (action === "list") return jsonResponse(await withTimeout(runSupportList({ ...common, request }), QUERY_TIMEOUT_MS));
     if (action === "details") return jsonResponse(await withTimeout(runSupportDetails({ ...common, request }), QUERY_TIMEOUT_MS));
+    // Must stay ABOVE the bundle line below: that one is an unconditional
+    // fallthrough, so a missing branch here would answer an analytics bundle —
+    // ok: true and no rows — and the export would quietly write an empty file.
+    if (action === "export") return jsonResponse(await withTimeout(runSupportExport({ ...common, request }), QUERY_TIMEOUT_MS));
     return jsonResponse(await withTimeout(runSupportBundle({ ...common, supabase: auth.supabase, request }), QUERY_TIMEOUT_MS));
   } catch (error) {
     const status = error instanceof SupportRequestError ? 400 : 502;

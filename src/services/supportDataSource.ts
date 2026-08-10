@@ -4,6 +4,7 @@ import {
   EMPTY_CAMPAIGN_PATH,
   type SupportAnalyticsBundle,
   type SupportDetailsResponse,
+  type SupportExportResponse,
   type SupportListResponse,
   type SupportOptionsResponse,
   type SupportRequest,
@@ -63,6 +64,25 @@ export async function loadSupportPage(query: SupportQuery): Promise<SupportListR
   return response;
 }
 
+/**
+ * One page of the export, built from the SAME SupportQuery the table uses.
+ *
+ * buildSupportRequest is not optional here: the normalisation between the filter
+ * panel and the request is not trivial ("all" becomes an empty list, matched
+ * becomes yes/no, arrays get trimmed, de-duplicated and sorted), and a second
+ * copy of it would hand back a file covering a different set of emails than the
+ * screen shows, silently.
+ */
+export async function loadSupportExportPage(query: SupportQuery, page: number): Promise<SupportExportResponse> {
+  const request = buildSupportRequest(query, "export");
+  const response = await runClickHouseSupport<SupportExportResponse>({
+    ...request,
+    pagination: { page, page_size: request.pagination?.page_size ?? 200 },
+  });
+  if (!response.ok) throw new Error(response.error || "ClickHouse support export failed.");
+  return response;
+}
+
 export async function loadSupportDetails(requestId: string): Promise<SupportDetailsResponse> {
   const response = await runClickHouseSupport<SupportDetailsResponse>({ action: "details", request_id: requestId });
   if (!response.ok) throw new Error(response.error || "ClickHouse support details failed.");
@@ -72,6 +92,17 @@ export async function loadSupportDetails(requestId: string): Promise<SupportDeta
 export async function loadSupportOptions(): Promise<SupportOptionsResponse> {
   const response = await runClickHouseSupport<SupportOptionsResponse>({ action: "options" });
   if (!response.ok) throw new Error(response.error || "ClickHouse support options failed.");
+  return response;
+}
+
+/**
+ * Read-only sync state: how many emails Postgres holds versus the ClickHouse
+ * mirror the page (and the export) reads. The export quotes the difference so
+ * the file never claims to be the whole mailbox when the mirror is behind.
+ */
+export async function loadSupportSyncStatus(): Promise<SupportSyncResult> {
+  const response = await runClickHouseSupport<SupportSyncResult>({ action: "status" });
+  if (!response.ok) throw new Error(response.error || "ClickHouse support status failed.");
   return response;
 }
 
@@ -91,6 +122,7 @@ export async function syncSupportToClickHouse(fullResetCursor = false): Promise<
 export type {
   SupportAnalyticsBundle,
   SupportDetailsResponse,
+  SupportExportResponse,
   SupportListResponse,
   SupportOptionsResponse,
   SupportSyncResult,
