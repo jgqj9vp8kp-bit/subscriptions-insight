@@ -591,6 +591,12 @@ export async function runClickHousePaymentAnalytics<T = unknown>(request: Record
   return clickHouseRequest<T>(CLICKHOUSE_PAYMENT_ANALYTICS_FUNCTION, request, { breakerGated: true });
 }
 
+// Banks tab: same edge function, its own action — and the same circuit breaker,
+// so a downed warehouse fails the tab instantly instead of hanging it.
+export async function runClickHouseBankAnalytics<T = unknown>(request: Record<string, unknown>): Promise<T> {
+  return clickHouseRequest<T>(CLICKHOUSE_PAYMENT_ANALYTICS_FUNCTION, request, { breakerGated: true });
+}
+
 // --- Support Analytics read path + sync (clickhouse-support) --------------
 
 // --- FB Analytics warehouse (clickhouse-facebook Edge Function) ------------

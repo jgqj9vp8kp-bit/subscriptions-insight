@@ -22,6 +22,7 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { FunnelBadge, StatusBadge, TypeBadge } from "@/components/StatusBadges";
 import { PaymentPassAnalytics } from "@/components/PaymentPassAnalytics";
+import { BankAnalytics } from "@/components/BankAnalytics";
 import { useTransactions } from "@/services/sheets";
 import { formatCurrency } from "@/services/analytics";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
@@ -39,7 +40,7 @@ const FUNNELS = ["past_life", "soulmate", "starseed", "unknown"] as const;
 const PAGE_SIZE = 25;
 
 const DEFAULT_TRANSACTIONS_UI_STATE = {
-  mode: "list" as "list" | "pass",
+  mode: "list" as "list" | "pass" | "banks",
   search: "",
   typeFilter: "all",
   funnelFilter: "all",
@@ -66,7 +67,9 @@ export default function TransactionsPage() {
 
   useEffect(() => {
     if (mode !== "list") {
-      traceEvent("warehouse.transactions_lazy_load_skipped", { reason: "payment_pass_tab" });
+      // Both analytics tabs are fully server-side; neither reads the client
+      // transaction store, so the 45k-row warehouse hydration is skipped.
+      traceEvent("warehouse.transactions_lazy_load_skipped", { reason: mode === "banks" ? "banks_tab" : "payment_pass_tab" });
       return;
     }
     traceEvent("warehouse.transactions_lazy_load_requested", { reason: "transaction_list_tab" });
@@ -119,10 +122,11 @@ export default function TransactionsPage() {
 
   return (
     <AppLayout title="Transactions" description={`${filtered.length} of ${txs.length} transactions`}>
-      <Tabs value={mode} onValueChange={(v) => updateUiState({ mode: v as "list" | "pass" })} className="space-y-4">
+      <Tabs value={mode} onValueChange={(v) => updateUiState({ mode: v as "list" | "pass" | "banks" })} className="space-y-4">
         <TabsList>
           <TabsTrigger value="list">Transaction List</TabsTrigger>
           <TabsTrigger value="pass">Payment Pass Analytics</TabsTrigger>
+          <TabsTrigger value="banks">Banks</TabsTrigger>
         </TabsList>
         <TabsContent value="list">
       <Card className="p-4 shadow-card">
@@ -263,6 +267,9 @@ export default function TransactionsPage() {
         </TabsContent>
         <TabsContent value="pass">
           <PaymentPassAnalytics txs={txs} />
+        </TabsContent>
+        <TabsContent value="banks">
+          <BankAnalytics />
         </TabsContent>
       </Tabs>
     </AppLayout>
