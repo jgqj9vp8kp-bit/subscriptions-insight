@@ -2,6 +2,8 @@ import { convertAmountToUsd } from "./currencyNormalization.ts";
 import { declineDetailsForTransaction } from "./paymentFailures.ts";
 import { cardTypeForUserTransactions, cardTypeFromTransaction } from "./userCardType.ts";
 import { platformForUserTransactions, platformFromTransaction, type Platform } from "./userPlatform.ts";
+import { issuerCountryFromTransaction, issuerIdentityFromTransaction } from "./cardIssuer.ts";
+import { cardNetworkFromTransaction, paymentMethodFromTransaction } from "./cardNetwork.ts";
 import { countryCodeForUserTransactions, countryCodeFromTransaction } from "./userCountry.ts";
 import { mediaBuyerForUserTransactions, utmSourceFromTransaction } from "./userMediaBuyer.ts";
 import { isTokenPurchaseTransaction, productIdForTransaction } from "./monetization.ts";
@@ -85,6 +87,12 @@ export type ClickHouseTransactionRow = {
   fx_status: string;
   classification_reason: string;
   platform: Platform;
+  issuer_key: string;
+  issuer_name: string;
+  issuer_group: string;
+  issuer_country: string;
+  card_network: string;
+  payment_method: string;
 };
 
 export interface MapperDiagnostics {
@@ -353,6 +361,13 @@ export function mapSupabaseTransactionToClickHouse(input: {
   const country = input.row.country_code || countryCodeFromTransaction(tx) || countryCodeForUserTransactions(userTxs) || "";
   const cardType = cardTypeFromTransaction(tx) ?? cardTypeForUserTransactions(userTxs);
   const platform = platformFromTransaction(tx) ?? platformForUserTransactions(userTxs);
+  // Issuer/network/method are PER-TRANSACTION with no user-level fallback: a
+  // user can pay with several cards, and inheriting a neighbour transaction's
+  // issuer would attribute one bank's declines to another. Absent stays ''.
+  const issuer = issuerIdentityFromTransaction(tx);
+  const issuerCountry = issuerCountryFromTransaction(tx) ?? "";
+  const cardNetwork = cardNetworkFromTransaction(tx) ?? "";
+  const paymentMethod = paymentMethodFromTransaction(tx) ?? "";
   const media = mediaBuyerForUserTransactions(userTxs);
 
   if (!tx.user_id && !tx.email) diagnostics.missing_user_identity += 1;
@@ -423,6 +438,12 @@ export function mapSupabaseTransactionToClickHouse(input: {
     fx_status: conversion.conversion_status,
     classification_reason: tx.classification_reason ?? "",
     platform,
+    issuer_key: issuer?.key ?? "",
+    issuer_name: issuer?.name ?? "",
+    issuer_group: issuer?.group ?? "",
+    issuer_country: issuerCountry,
+    card_network: cardNetwork,
+    payment_method: paymentMethod,
   };
 }
 

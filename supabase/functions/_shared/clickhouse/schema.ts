@@ -58,7 +58,13 @@ CREATE TABLE IF NOT EXISTS ${ANALYTICS_TRANSACTIONS_TABLE}
     amount_usd Decimal(20, 6) DEFAULT 0,
     fx_status LowCardinality(String) DEFAULT '',
     classification_reason String DEFAULT '',
-    platform LowCardinality(String) DEFAULT ''
+    platform LowCardinality(String) DEFAULT '',
+    issuer_key LowCardinality(String) DEFAULT '',
+    issuer_name LowCardinality(String) DEFAULT '',
+    issuer_group LowCardinality(String) DEFAULT '',
+    issuer_country LowCardinality(String) DEFAULT '',
+    card_network LowCardinality(String) DEFAULT '',
+    payment_method LowCardinality(String) DEFAULT ''
 )
 ENGINE = ReplacingMergeTree(row_version)
 PARTITION BY toYYYYMM(event_time)
@@ -125,6 +131,20 @@ ORDER BY
 export const ALTER_PLATFORM_COLUMNS_SQL = [
   `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS platform LowCardinality(String) DEFAULT ''`,
   `ALTER TABLE ${FACT_USER_COHORTS_TABLE} ADD COLUMN IF NOT EXISTS platform LowCardinality(String) DEFAULT ''`,
+];
+
+// Bank/issuer dimensions (Banks tab, 2026-08). Same tail-append discipline as
+// platform above. PER-TRANSACTION columns: a user can pay with more than one
+// card, and attributing an issuer at user level would credit a successful card
+// with the declines of the card it replaced. fact_user_cohorts deliberately
+// gets nothing here — cohort attributes are per-user by construction.
+export const ALTER_ISSUER_COLUMNS_SQL = [
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS issuer_key LowCardinality(String) DEFAULT ''`,
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS issuer_name LowCardinality(String) DEFAULT ''`,
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS issuer_group LowCardinality(String) DEFAULT ''`,
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS issuer_country LowCardinality(String) DEFAULT ''`,
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS card_network LowCardinality(String) DEFAULT ''`,
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS payment_method LowCardinality(String) DEFAULT ''`,
 ];
 
 // Sorting key note (load-bearing): it must contain ONLY stable identity
@@ -468,7 +488,7 @@ export async function initializeClickHouseSchema(input: { client: ClickHouseClie
   // updated_at-millis scale; no-op once the table carries timestamp versions.
   await rebuildAnalyticsTransactionsRowVersion(client);
   await client.command({ query: CREATE_FACT_USER_COHORTS_SQL });
-  for (const query of ALTER_PLATFORM_COLUMNS_SQL) {
+  for (const query of [...ALTER_PLATFORM_COLUMNS_SQL, ...ALTER_ISSUER_COLUMNS_SQL]) {
     await client.command({ query });
   }
   await ensureFactSupportRequestsSchema(client);
