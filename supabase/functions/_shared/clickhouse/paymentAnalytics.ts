@@ -49,6 +49,7 @@ export interface PaymentAnalyticsFilters {
   date_from: string | null; date_to: string | null;
   funnel: string[]; campaign_path: string[]; campaign_id: string[]; media_buyer: string[];
   country: string[]; card_type: string[]; stage: string[]; decline_reason: string[]; transaction_type: string[];
+  issuer: string[]; issuer_group: string[]; card_network: string[]; payment_method: string[]; issuer_country: string[];
   outcome: "all" | "success" | "failed";
 }
 export interface PaymentAnalyticsRequest {
@@ -95,6 +96,9 @@ export function normalizePaymentAnalyticsRequest(req: PaymentAnalyticsRequest): 
       funnel: arr(f.funnel, "funnel"), campaign_path: arr(f.campaign_path, "campaign_path"), campaign_id: arr(f.campaign_id, "campaign_id"),
       media_buyer: arr(f.media_buyer, "media_buyer"), country: arr(f.country, "country"), card_type: arr(f.card_type, "card_type"),
       stage: arr(f.stage, "stage"), decline_reason: arr(f.decline_reason, "decline_reason"), transaction_type: arr(f.transaction_type, "transaction_type"),
+      issuer: arr(f.issuer, "issuer"), issuer_group: arr(f.issuer_group, "issuer_group"),
+      card_network: arr(f.card_network, "card_network"), payment_method: arr(f.payment_method, "payment_method"),
+      issuer_country: arr(f.issuer_country, "issuer_country"),
       outcome: f.outcome === "success" || f.outcome === "failed" ? f.outcome : "all",
     },
     groupBy: dim(req.group_by, "country"),
@@ -127,6 +131,7 @@ export function stagedWith(authUserId: string, _filters: PaymentAnalyticsFilters
 allrows AS (
   SELECT user_id uid, transaction_id tid, event_time et, toUnixTimestamp64Milli(event_time) ets,
     is_success, is_failed, status, decline_reason, funnel, campaign_path, campaign_id, media_buyer, country_code, card_type,
+    issuer_key, issuer_name, issuer_group, issuer_country, card_network, payment_method,
     toString(toDate(event_time)) event_day_tx, toString(cohort_date) event_day_cohort
   FROM ${CH} FINAL WHERE auth_user_id = {auth_user_id:String}
 ),
@@ -144,6 +149,9 @@ uattr AS (
 joined AS (
   SELECT a.uid uid, a.tid tid, a.ets ets, a.is_success is_success, a.is_failed is_failed, a.decline_reason draw,
     a.event_day_tx event_day_tx, a.event_day_cohort event_day_cohort,
+    a.issuer_key issuer_key, a.issuer_name issuer_name, a.issuer_group issuer_group,
+    a.issuer_country issuer_country, a.card_network card_network, a.payment_method payment_method,
+    a.card_type card_type_tx,
     f.lt lt, ifNull(f.lvl,0) lvl
   FROM allrows a LEFT JOIN fin f ON f.uid=a.uid AND f.tid=a.tid
 ),
@@ -160,6 +168,9 @@ staged AS (
     ifNull(s.lt,'') ttype,
     if(s.is_failed=1, s.draw, '') decline_key,
     ua.efunnel funnel, ua.ecampaign campaign_path, ua.ecampaign_id campaign_id, ua.emedia media_buyer, ua.ecountry country, ua.ecard card_type,
+    s.issuer_key issuer_key, s.issuer_name issuer_name, s.issuer_group issuer_group,
+    s.issuer_country issuer_country, s.card_network card_network, s.payment_method payment_method,
+    s.card_type_tx card_type_tx,
     multiIf(is_success=1 AND lt='upsell','upsell', is_success=1 AND lt='trial','trial_or_entry',
       is_success=1 AND ${LIFE}, ${stageFrom("lvl")}, is_success=1,'unknown',
       seq_before>=1, ${stageFrom("(seq_before+1)")}, entry_before>=1,'first_subscription','trial_or_entry') stage,
@@ -171,9 +182,18 @@ staged AS (
 
 // The fixed projection materialized into the per-request Memory table — every
 // column any aggregation needs, so no query has to re-run the classifier.
+// APPEND ONLY, never reorder: materializeStaged does a positional
+// CREATE TABLE ... AS SELECT over this exact list.
+//
+// The issuer/network/method columns are PER-TRANSACTION (from allrows, not
+// uattr): a user can pay with several cards, and a user-level argMin would
+// credit a successful card with the declines of the card it replaced.
+// card_type_tx is the per-transaction twin of the user-attributed card_type,
+// for Banks-tab cross-tabs only.
 const STAGED_COLUMNS =
   "uid, is_success, is_failed, rn, event_day_tx, event_day_cohort, ttype, decline_key, " +
-  "funnel, campaign_path, campaign_id, media_buyer, country, card_type, stage, sub_level";
+  "funnel, campaign_path, campaign_id, media_buyer, country, card_type, stage, sub_level, " +
+  "issuer_key, issuer_name, issuer_group, issuer_country, card_network, payment_method, card_type_tx";
 
 // Date-basis picks which materialized day column the filters/day-series read.
 function dayCol(filters: PaymentAnalyticsFilters): string {
@@ -226,7 +246,8 @@ async function sweepStaleTables(client: ClickHouseClientLike): Promise<void> {
 const EMPTY_FILTERS: PaymentAnalyticsFilters = {
   date_basis: "transaction", date_from: null, date_to: null,
   funnel: [], campaign_path: [], campaign_id: [], media_buyer: [], country: [], card_type: [],
-  stage: [], decline_reason: [], transaction_type: [], outcome: "all",
+  stage: [], decline_reason: [], transaction_type: [],
+  issuer: [], issuer_group: [], card_network: [], payment_method: [], issuer_country: [], outcome: "all",
 };
 
 function attemptWhere(filters: PaymentAnalyticsFilters, params: Record<string, unknown>): string {
@@ -238,6 +259,9 @@ function attemptWhere(filters: PaymentAnalyticsFilters, params: Record<string, u
   add("funnel", filters.funnel, "fn"); add("campaign_path", filters.campaign_path, "cp"); add("campaign_id", filters.campaign_id, "ci");
   add("media_buyer", filters.media_buyer, "mb"); add("country", filters.country, "co"); add("card_type", filters.card_type, "ct");
   add("stage", filters.stage, "st"); add("ttype", filters.transaction_type, "tt");
+  add("issuer_key", filters.issuer, "ik"); add("issuer_group", filters.issuer_group, "ig");
+  add("card_network", filters.card_network, "cn"); add("payment_method", filters.payment_method, "pm");
+  add("issuer_country", filters.issuer_country, "ic");
   if (filters.decline_reason.length) c.push(inClause("decline_key", filters.decline_reason, "dr", params));
   if (filters.outcome === "success") c.push(`is_success = 1`);
   if (filters.outcome === "failed") c.push(`is_failed = 1`);
@@ -460,4 +484,14 @@ export async function runPaymentAnalytics(input: { authUserId: string; clickhous
   }
 }
 
-export { groupBy as _groupBy, ungrouped as _ungrouped, toMetrics as _toMetrics };
+export {
+  groupBy as _groupBy, ungrouped as _ungrouped, toMetrics as _toMetrics,
+  // Shared scratch-table machinery for bankAnalytics.ts. The table name MUST
+  // come from stagedTableName(): sweepStaleTables only reaches names matching
+  // /^pp_staged_[0-9a-f]{32}$/, so any other prefix would orphan tables forever.
+  stagedTableName as _stagedTableName, materializeStaged as _materializeStaged,
+  dropStagedTable as _dropStagedTable, sweepStaleTables as _sweepStaleTables,
+  attemptWhere as _attemptWhere, dayCol as _dayCol, inClause as _inClause,
+  attachTopDecline as _attachTopDecline, json as _json,
+  METRIC_COLS as _METRIC_COLS, EMPTY_FILTERS as _EMPTY_FILTERS,
+};

@@ -9,6 +9,7 @@
 import { createClickHouseClient } from "../_shared/clickhouse/client.ts";
 import { jsonResponse, methodNotAllowed, optionsResponse, parseJsonBody, requireSupabaseUser } from "../_shared/clickhouse/http.ts";
 import { PaymentAnalyticsRequestError, runPaymentAnalytics } from "../_shared/clickhouse/paymentAnalytics.ts";
+import { runBankAnalytics, runBankDetail } from "../_shared/clickhouse/bankAnalytics.ts";
 import type { PaymentAnalyticsRequest } from "../_shared/clickhouse/paymentAnalytics.ts";
 
 // Generous timeout: the bundle fans out ~20 classifier aggregations; cold-start
@@ -39,7 +40,18 @@ Deno.serve(async (req: Request) => {
   let client: ReturnType<typeof createClickHouseClient> | null = null;
   try {
     client = createClickHouseClient();
-    const result = await withTimeout(runPaymentAnalytics({ authUserId: auth.id, clickhouse: client, request }), QUERY_TIMEOUT_MS);
+    const common = { authUserId: auth.id, clickhouse: client };
+    const action = String((request as { action?: unknown }).action ?? "");
+    // Banks actions branch BEFORE the default: runPaymentAnalytics answers any
+    // unrecognized action with the full bundle, so a missing branch here would
+    // hand the Banks tab an analytics bundle with ok:true and no issuer rows.
+    if (action === "banks") {
+      return jsonResponse(await withTimeout(runBankAnalytics({ ...common, request }), QUERY_TIMEOUT_MS));
+    }
+    if (action === "bank_detail") {
+      return jsonResponse(await withTimeout(runBankDetail({ ...common, request }), QUERY_TIMEOUT_MS));
+    }
+    const result = await withTimeout(runPaymentAnalytics({ ...common, request }), QUERY_TIMEOUT_MS);
     return jsonResponse(result);
   } catch (error) {
     const status = error instanceof PaymentAnalyticsRequestError ? 400 : 502;
