@@ -42,7 +42,7 @@ import {
 } from "@/services/bankAnalyticsDataSource";
 import { issuerGroupLabel, issuerLabel } from "@/services/cardIssuer";
 import { cardNetworkLabel, paymentMethodLabel } from "@/services/cardNetwork";
-import { DECLINE_REASON_LABELS } from "@/services/paymentPassAnalytics";
+import { DECLINE_REASON_LABELS, PAYMENT_STAGE_LABELS, STAGE_BREAKDOWN_ORDER } from "@/services/paymentPassAnalytics";
 
 const PAGE_SIZE = 25;
 const MIN_VOLUME_OPTIONS = [0, 30, 100, 300, 1000] as const;
@@ -60,6 +60,7 @@ const DEFAULT_UI_STATE = {
   cardNetwork: [] as string[],
   paymentMethod: [] as string[],
   issuerCountry: [] as string[],
+  stage: [] as string[],
   groupSubBrands: false,
   minVolume: 100 as (typeof MIN_VOLUME_OPTIONS)[number],
   sortKey: "attempts" as SortKey,
@@ -227,7 +228,8 @@ export function BankAnalytics() {
     cardNetwork: uiState.cardNetwork,
     paymentMethod: uiState.paymentMethod,
     issuerCountry: uiState.issuerCountry,
-  }), [uiState.dateBasis, uiState.dateFrom, uiState.dateTo, uiState.funnel, uiState.issuer, uiState.issuerGroup, uiState.cardNetwork, uiState.paymentMethod, uiState.issuerCountry]);
+    stage: uiState.stage,
+  }), [uiState.dateBasis, uiState.dateFrom, uiState.dateTo, uiState.funnel, uiState.issuer, uiState.issuerGroup, uiState.cardNetwork, uiState.paymentMethod, uiState.issuerCountry, uiState.stage]);
 
   const { bundle, error, isFetching, isInitialLoading } = useBankAnalyticsBundle({
     query, userScopeHash, warehouseVersion,
@@ -410,6 +412,10 @@ export function BankAnalytics() {
             values={uiState.issuerCountry}
             options={filterOptions.issuer_country.map((v) => ({ value: v, label: v }))}
             onChange={(v) => { update({ issuerCountry: v }); setPage(1); }} />
+          <MultiSelect label="Стадия подписки" placeholder="Все стадии"
+            values={uiState.stage}
+            options={STAGE_BREAKDOWN_ORDER.map((v) => ({ value: v, label: PAYMENT_STAGE_LABELS[v] }))}
+            onChange={(v) => { update({ stage: v }); setPage(1); }} />
           <div className="space-y-1">
             <Label className="text-xs text-muted-foreground">Мин. попыток</Label>
             <Select value={String(uiState.minVolume)} onValueChange={(v) => { update({ minVolume: Number(v) as typeof uiState.minVolume }); setPage(1); }}>

@@ -74,6 +74,7 @@ describe("cache keys", () => {
       { issuer: ["sutton_bank"] }, { issuerGroup: ["bancolombia"] },
       { cardNetwork: ["visa"] }, { paymentMethod: ["apple_pay"] },
       { issuerCountry: ["US"] }, { funnel: ["soulmate"] },
+      { stage: ["first_subscription"] },
       { dateFrom: "2026-07-01" }, { outcome: "failed" as const },
     ]) {
       const key = bankAnalyticsBundleKey({ ...parts, request: { ...EMPTY_BANK_QUERY, ...patch } });
@@ -105,7 +106,7 @@ describe("buildBankAnalyticsRequest", () => {
     const req = buildBankAnalyticsRequest({
       ...EMPTY_BANK_QUERY,
       issuer: ["sutton_bank"], cardNetwork: ["visa"], paymentMethod: ["apple_pay"],
-      issuerCountry: ["US"], issuerGroup: ["bancolombia"],
+      issuerCountry: ["US"], issuerGroup: ["bancolombia"], stage: ["trial_or_entry", "renewal_2"],
     });
     expect(req.action).toBe("banks");
     const filters = req.filters as Record<string, unknown>;
@@ -114,5 +115,8 @@ describe("buildBankAnalyticsRequest", () => {
     expect(filters.payment_method).toEqual(["apple_pay"]);
     expect(filters.issuer_country).toEqual(["US"]);
     expect(filters.issuer_group).toEqual(["bancolombia"]);
+    // The stage filter rides the same contract field Payment Pass uses, so the
+    // server's attemptWhere applies it with no server change at all.
+    expect(filters.stage).toEqual(["trial_or_entry", "renewal_2"]);
   });
 });
