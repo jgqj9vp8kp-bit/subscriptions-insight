@@ -2,6 +2,18 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
+import {
+  capsuledTrafficMetric,
+  enumerateDays,
+  MAX_DAILY_SPLIT_DAYS,
+  pathMappingStats,
+  resolveCampaignPaths,
+  supersededPeriodRowIds,
+  type CampaignPathEvidenceRow,
+} from "../_shared/clickhouse/capsuledTraffic.ts";
+import { loadActiveCampaignAliasMap } from "../_shared/clickhouse/fbCampaignResolution.ts";
+import { CONFIRMED_FB_CAMPAIGN_ALIASES } from "../_shared/clickhouse/fbSourceClassification.ts";
+
 const LEVELS = new Set(["account", "campaign", "adset", "ad", "day"]);
 const DEFAULT_TIMEOUT_MS = 30000;
 const MAX_ATTEMPTS = 3;
@@ -296,30 +308,23 @@ function importKey(row: NormalizedRow): string {
   return [row.level, row.campaign_id ?? "missing", row.date_from, row.date_to].join("__");
 }
 
-function toTrafficMetric(row: NormalizedRow): Record<string, unknown> {
-  return {
-    date: row.date_from,
-    campaign_path: row.campaign_name || row.campaign_id || "capsuled",
-    campaign_id: row.campaign_id,
-    campaign_name: row.campaign_name,
-    ad_account_id: row.ad_account_id,
-    ad_account_name: row.ad_account_name,
-    trial_count: row.fb_purchases,
-    cac: row.fb_purchases ? row.spend / row.fb_purchases : 0,
-    spend: row.spend,
-    fb_purchases: row.fb_purchases,
-    cpp: row.cpp,
-    impressions: row.impressions,
-    clicks: row.clicks,
-    cpc: row.cpc ?? 0,
-    cpm: row.cpm ?? 0,
-    ctr: row.ctr ?? 0,
-    outbound_clicks: row.outbound_clicks,
-    outbound_ctr: row.outbound_ctr,
-    currency: row.currency,
-    last_import_at: row.last_import_at,
-    source: "facebook",
-  };
+/** campaign_id -> funnel path, from trial-transaction evidence (RPC) plus the
+ * Layer A alias map. Any failure degrades to an empty map: the snapshot still
+ * builds with the historical name fallback instead of blocking the sync. */
+async function loadCampaignPathMap(
+  client: ReturnType<typeof createClient>,
+  userId: string,
+): Promise<{ pathByCampaign: Map<string, string>; error: string | null }> {
+  try {
+    const [{ data: evidence, error: evidenceError }, aliases] = await Promise.all([
+      client.rpc("capsuled_campaign_path_evidence", { p_auth_user_id: userId }),
+      loadActiveCampaignAliasMap(client, userId).catch(() => ({ ...CONFIRMED_FB_CAMPAIGN_ALIASES })),
+    ]);
+    if (evidenceError) throw new Error(evidenceError.message);
+    return { pathByCampaign: resolveCampaignPaths((evidence ?? []) as CampaignPathEvidenceRow[], aliases), error: null };
+  } catch (error) {
+    return { pathByCampaign: new Map(), error: error instanceof Error ? error.message : "Campaign path evidence failed." };
+  }
 }
 
 Deno.serve(async (req: Request) => {
@@ -348,9 +353,46 @@ Deno.serve(async (req: Request) => {
   let syncId: string | null = null;
 
   try {
-    const { payload, responseText } = await fetchCapsuled(params, failedRequests);
+    // Campaign-level multi-day windows are fetched DAY BY DAY: the API returns
+    // one aggregated row per campaign for the whole window, which would date a
+    // week of spend on its first day (see capsuledTraffic.ts).
+    const splitDays = params.level === "campaign" && params.dateFrom !== params.dateTo
+      ? enumerateDays(params.dateFrom, params.dateTo)
+      : [];
+    if (splitDays.length > MAX_DAILY_SPLIT_DAYS) {
+      return jsonResponse(
+        { error: `Campaign-level sync fetches per-day rows; the window is limited to ${MAX_DAILY_SPLIT_DAYS} days. Split the range into smaller windows.` },
+        400,
+      );
+    }
+
     const importedAt = new Date().toISOString();
-    const rows = aggregateRows(normalizeRows(payload, params, importedAt));
+    const failedDays: string[] = [];
+    let rows: NormalizedRow[];
+    let responseText: string;
+    let rawPayload: unknown;
+    if (splitDays.length) {
+      const collected: NormalizedRow[] = [];
+      for (const day of splitDays) {
+        const dayParams: RequestParams = { dateFrom: day, dateTo: day, level: params.level, force: params.force };
+        try {
+          const { payload } = await fetchCapsuled(dayParams, failedRequests);
+          collected.push(...normalizeRows(payload, dayParams, importedAt));
+        } catch (error) {
+          failedDays.push(day);
+          failedRequests.push(`Day ${day}: ${error instanceof Error ? error.message : String(error)}`);
+          if (error instanceof CapsuledApiError) throw error; // auth/format errors will not heal on the next day
+        }
+      }
+      rows = aggregateRows(collected);
+      rawPayload = { mode: "daily", days: splitDays.length, failed_days: failedDays, rows: rows.length };
+      responseText = JSON.stringify(rawPayload);
+    } else {
+      const single = await fetchCapsuled(params, failedRequests);
+      rows = aggregateRows(normalizeRows(single.payload, params, importedAt));
+      rawPayload = single.payload;
+      responseText = single.responseText;
+    }
     const durationMs = Date.now() - startedAt;
     const facebookStatsDate = rows.map((row) => row.date_to).sort().at(-1) ?? params.dateTo;
 
@@ -362,7 +404,7 @@ Deno.serve(async (req: Request) => {
         date_to: params.dateTo,
         level: params.level,
         status: failedRequests.length ? "partial" : "success",
-        raw_payload: payload,
+        raw_payload: rawPayload,
         rows_imported: rows.length,
         api_freshness: facebookStatsDate,
         facebook_stats_date: facebookStatsDate,
@@ -390,14 +432,60 @@ Deno.serve(async (req: Request) => {
       if (upsertError) throw upsertError;
     }
 
-    const { data: allStats } = await client
-      .from("capsuled_facebook_stats")
-      .select("date_from,date_to,level,campaign_id,campaign_name,ad_account_id,ad_account_name,spend,fb_purchases,cpp,impressions,clicks,ctr,cpc,cpm,outbound_clicks,outbound_ctr,currency,last_import_at,raw_payload")
-      .eq("user_id", userId)
-      .eq("level", "campaign")
-      .order("last_import_at", { ascending: false })
-      .limit(50000);
-    const trafficMetrics = ((allStats ?? []) as NormalizedRow[]).map(toTrafficMetric);
+    // A fully successful daily window supersedes the multi-day period rows it
+    // covers: keeping both would double-count the same spend (daily rows plus
+    // the window aggregate). Any failed day keeps the period rows in place so
+    // no spend disappears. PostgREST cannot compare two columns, so candidate
+    // rows are picked in JS and deleted by id.
+    if (splitDays.length && !failedDays.length) {
+      const { data: windowRows, error: windowError } = await client
+        .from("capsuled_facebook_stats")
+        .select("id,date_from,date_to")
+        .eq("user_id", userId)
+        .eq("level", "campaign")
+        .gte("date_from", params.dateFrom)
+        .lte("date_to", params.dateTo);
+      if (!windowError) {
+        const staleIds = supersededPeriodRowIds(
+          (windowRows ?? []) as Array<{ id: string; date_from: string; date_to: string }>,
+          params.dateFrom,
+          params.dateTo,
+        );
+        for (let i = 0; i < staleIds.length; i += 200) {
+          const { error: deleteError } = await client
+            .from("capsuled_facebook_stats")
+            .delete()
+            .eq("user_id", userId)
+            .in("id", staleIds.slice(i, i + 200));
+          if (deleteError) {
+            failedRequests.push(`Superseded-row cleanup failed: ${deleteError.message}`);
+            break;
+          }
+        }
+      }
+    }
+
+    // PostgREST caps a single response at 1000 rows regardless of .limit();
+    // with daily-split rows the campaign table is well past that, so the
+    // snapshot source must be read in pages or it silently truncates.
+    const statsRows: NormalizedRow[] = [];
+    const SNAPSHOT_PAGE = 1000;
+    for (let offset = 0; offset < 50000; offset += SNAPSHOT_PAGE) {
+      const { data: page, error: pageError } = await client
+        .from("capsuled_facebook_stats")
+        .select("date_from,date_to,level,campaign_id,campaign_name,ad_account_id,ad_account_name,spend,fb_purchases,cpp,impressions,clicks,ctr,cpc,cpm,outbound_clicks,outbound_ctr,currency,last_import_at,raw_payload")
+        .eq("user_id", userId)
+        .eq("level", "campaign")
+        .order("date_from", { ascending: false })
+        .order("import_key", { ascending: true })
+        .range(offset, offset + SNAPSHOT_PAGE - 1);
+      if (pageError) throw pageError;
+      const rowsPage = (page ?? []) as NormalizedRow[];
+      statsRows.push(...rowsPage);
+      if (rowsPage.length < SNAPSHOT_PAGE) break;
+    }
+    const { pathByCampaign, error: pathMapError } = await loadCampaignPathMap(client, userId);
+    const trafficMetrics = statsRows.map((row) => capsuledTrafficMetric(row, pathByCampaign));
     await client.from("data_snapshots").upsert(
       {
         user_id: userId,
@@ -410,6 +498,7 @@ Deno.serve(async (req: Request) => {
           latest_sync_id: syncId,
           saved_at: new Date().toISOString(),
           date_range: { from: params.dateFrom, to: params.dateTo },
+          path_mapping: { ...pathMappingStats(statsRows, pathByCampaign), ...(pathMapError ? { error: pathMapError } : {}) },
         },
       },
       { onConflict: "user_id,dataset_type" },
