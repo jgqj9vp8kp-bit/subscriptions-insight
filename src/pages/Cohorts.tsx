@@ -89,6 +89,7 @@ import {
   type CohortsUiSettingsPayload,
 } from "@/services/cohortsUiSettings";
 import {
+  cohortDisplayName,
   nextCohortSortState,
   sortCohortRows,
   type CohortSortDirection,
@@ -4164,7 +4165,7 @@ export default function CohortsPage() {
                             aria-expanded={expanded}
                           >
                             {expanded ? <ChevronDown className="h-3.5 w-3.5 shrink-0" /> : <ChevronRight className="h-3.5 w-3.5 shrink-0" />}
-                            <span className="truncate">{c.cohort_id}</span>
+                            <span className="truncate" title={c.cohort_id}>{cohortDisplayName(c)}</span>
                           </button>
                         </div>
                       </TableCell>

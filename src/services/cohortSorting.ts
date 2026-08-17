@@ -34,6 +34,16 @@ export function defaultSortDirectionForColumn(columnId: string): CohortSortDirec
   return getCohortSortKind(columnId) === "text" ? "asc" : "desc";
 }
 
+/** Visible cohort label: campaign path + date, WITHOUT the funnel prefix that
+ * cohort_id carries. cohort_id stays the identity everywhere (keys, expansion,
+ * snapshots) — this is display + sort only, so the table orders by exactly
+ * what the user reads. */
+export function cohortDisplayName(cohort: Pick<CohortRow, "campaign_path" | "cohort_date">): string {
+  const path = String(cohort.campaign_path ?? "").trim() || "unknown";
+  const date = normalizeCohortDateKey(cohort.cohort_date) || String(cohort.cohort_date ?? "").trim();
+  return `${path}_${date}`;
+}
+
 export function nextCohortSortState(current: CohortSortState, columnId: string): CohortSortState {
   if (current.sortColumn !== columnId) {
     return { sortColumn: columnId, sortDirection: defaultSortDirectionForColumn(columnId) };
@@ -54,7 +64,7 @@ export function getCohortSortValue(
 
   switch (columnId) {
     case "__cohort__":
-      return cohort.cohort_id;
+      return cohortDisplayName(cohort);
     case "cohort_date": {
       const normalized = normalizeCohortDateKey(cohort.cohort_date);
       const timestamp = normalized ? Date.parse(`${normalized}T00:00:00.000Z`) : NaN;

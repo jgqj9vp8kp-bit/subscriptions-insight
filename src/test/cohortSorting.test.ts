@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  cohortDisplayName,
   compareCohortSortValues,
   getCohortSortValue,
   nextCohortSortState,
@@ -72,6 +73,33 @@ function cohort(overrides: Partial<CohortRow>): CohortRow {
     ...overrides,
   };
 }
+
+describe("cohortDisplayName", () => {
+  it("shows path + date without the funnel prefix that cohort_id carries", () => {
+    const row = cohort({
+      cohort_id: "unknown_palm-reading-web_2026-08-08",
+      funnel: "unknown",
+      campaign_path: "palm-reading-web",
+      cohort_date: "2026-08-08",
+    });
+    expect(cohortDisplayName(row)).toBe("palm-reading-web_2026-08-08");
+  });
+
+  it("normalizes non-ISO dates and falls back to 'unknown' for an empty path", () => {
+    expect(cohortDisplayName(cohort({ campaign_path: "  ", cohort_date: "2026-04-30T23:30:00Z" }))).toBe(
+      "unknown_2026-04-30",
+    );
+  });
+
+  it("drives the Cohort column sort, so ordering matches the visible label", () => {
+    const row = cohort({
+      cohort_id: "soulmate_soulmate-sketch-web-en_2026-08-13",
+      campaign_path: "soulmate-sketch-web-en",
+      cohort_date: "2026-08-13",
+    });
+    expect(getCohortSortValue(row, "__cohort__")).toBe(cohortDisplayName(row));
+  });
+});
 
 describe("cohort sorting", () => {
   it("sorts numeric columns by raw numeric value", () => {
