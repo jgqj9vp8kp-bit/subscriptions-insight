@@ -20,6 +20,7 @@
 // This module is pure: the SQL string and the row mapper. The Edge Function owns
 // the client and the paging loop.
 import type { ClickHouseClientLike } from "./types.ts";
+import { FACT_FACEBOOK_STATS_TABLE } from "./schema.ts";
 
 export const EXPORT_TRANSACTIONS_PAGE_SIZE = 20000;
 
@@ -40,6 +41,7 @@ export interface ExportSourceTxn {
   funnel: string;
   campaign_path: string;
   campaign_id: string;
+  country: string;
   utm_source: string | null;
   classification_reason: string;
   billing_reason?: string;
@@ -73,6 +75,7 @@ export const EXPORT_TRANSACTIONS_SELECT = `
   funnel,
   campaign_path,
   campaign_id,
+  country_code,
   utm_source,
   classification_reason,
   billing_reason,
@@ -135,6 +138,9 @@ export function mapExportSourceRow(row: Record<string, unknown>): ExportSourceTx
     funnel: str(row.funnel) || "unknown",
     campaign_path: str(row.campaign_path) || "unknown",
     campaign_id: str(row.campaign_id),
+    // Ingestion already uppercases (normalizeCountryCode), but the geo export's
+    // partition invariant hangs on this value, so it is enforced again here.
+    country: str(row.country_code).toUpperCase(),
     utm_source: str(row.utm_source) || null,
     classification_reason: str(row.classification_reason),
     billing_reason: str(row.billing_reason) || undefined,
@@ -169,4 +175,30 @@ export async function loadExportTransactions(
     if (rows.length < pageSize) return out;
     offset += pageSize;
   }
+}
+
+/** campaign_id → Meta campaign name, latest known spelling. Feeds the geo-daily
+ * export's campaign_name; a campaign the FB warehouse has never seen simply has
+ * no name (null in the row) — the id is the join key, the name is cosmetics. */
+export async function loadCampaignNames(
+  clickhouse: ClickHouseClientLike,
+  authUserId: string,
+): Promise<Map<string, string>> {
+  const result = await clickhouse.query({
+    query: `SELECT campaign_id, argMax(campaign_name, stat_date) AS campaign_name
+      FROM ${FACT_FACEBOOK_STATS_TABLE}
+      WHERE auth_user_id = {auth_user_id:String} AND campaign_id != '' AND campaign_name != ''
+      GROUP BY campaign_id
+      FORMAT JSONEachRow`,
+    query_params: { auth_user_id: authUserId },
+    format: "JSONEachRow",
+  });
+  const rows = (await result.json()) as Array<{ campaign_id?: unknown; campaign_name?: unknown }>;
+  const out = new Map<string, string>();
+  for (const row of rows) {
+    const id = str(row.campaign_id);
+    const name = str(row.campaign_name);
+    if (id && name) out.set(id, name);
+  }
+  return out;
 }

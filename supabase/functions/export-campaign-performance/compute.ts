@@ -15,6 +15,7 @@ export interface ComputeTxn extends ClassifiableTxn {
   refund_amount_usd?: number;
   net_amount_usd?: number;
   utm_source?: string | null;
+  country?: string;
   metadata?: Record<string, unknown> | null;
   raw?: Record<string, unknown> | null;
   source?: string | null;
@@ -241,43 +242,17 @@ export function buildCampaignPerformanceRows(input: {
   const params = input.params ?? {};
   const from = dateKey(params.date_from);
   const to = dateKey(params.date_to);
-  const pathFilter = normalizePath(params.campaign_path);
-  const buyerFilter = normalize(params.media_buyer);
-  const campaignIdFilter = normalize(params.campaign_id);
   const traffic = input.traffic ?? [];
 
-  // 1. Authoritative classification over each user's full warehouse history.
-  const classified = classifyWarehouseTransactions(input.txs);
-
-  // 2. Group transactions by user.
-  const byUser = new Map<string, ComputeTxn[]>();
-  for (const tx of classified) {
-    const key = userKey(tx);
-    byUser.set(key, [...(byUser.get(key) ?? []), tx]);
-  }
-
-  // 3. Attribute each user to their first successful trial and apply request filters.
+  // Classification, per-user grouping, trial anchoring and request filters all
+  // live in attributeUsers — SHARED with the geo-daily builder, so the two can
+  // never disagree about which users a campaign+day owns (the geo partition
+  // invariant depends on exactly that).
   const grouped = new Map<string, Entry[]>();
-  byUser.forEach((list, userId) => {
-    const trial = [...list]
-      .filter((tx) => tx.status === "success" && tx.transaction_type === "trial")
-      .sort((a, b) => a.event_time.localeCompare(b.event_time))[0];
-    if (!trial) return;
-    const trialDate = dateKey(trial.event_time);
-    if (!trialDate) return;
-    if (from && trialDate < from) return;
-    if (to && trialDate > to) return;
-
-    const campaignId = campaignIdFor(trial);
-    if (campaignIdFilter && campaignId !== campaignIdFilter) return;
-    const campaignPath = trial.campaign_path || "unknown";
-    if (pathFilter && normalizePath(campaignPath) !== pathFilter) return;
-    if (buyerFilter && mediaBuyerForUser(list) !== buyerFilter) return;
-
-    const funnel = trial.funnel || "unknown";
-    const key = [campaignId, campaignPath, funnel].join("||");
-    grouped.set(key, [...(grouped.get(key) ?? []), { userId, txs: list, campaignId, campaignPath, funnel }]);
-  });
+  for (const user of attributeUsers(input.txs, params)) {
+    const key = [user.campaignId, user.campaignPath, user.funnel].join("||");
+    grouped.set(key, [...(grouped.get(key) ?? []), user]);
+  }
 
   // 4. Map each campaign_path to the campaign_ids using it (for spend-attribution exclusivity).
   const campaignIdsByPath = new Map<string, Set<string>>();
@@ -329,4 +304,190 @@ export function buildCampaignPerformanceRows(input: {
   });
 
   return rows.sort((a, b) => b.trial_users - a.trial_users || a.campaign_id.localeCompare(b.campaign_id));
+}
+
+// ---------------------------------------------------------------------------
+// Geo-daily breakdown (?breakdown=country)
+// ---------------------------------------------------------------------------
+//
+// One row per (campaign, trial day, country). The consuming platform's sync
+// walks day by day and joins against Meta's alpha-2 geo breakdown, so:
+//   - date_from === date_to === the user's trial day (never a period aggregate);
+//   - country is ISO 3166-1 alpha-2, uppercase; anything else becomes the
+//     explicit "ZZ" bucket — never dropped and never dissolved into real
+//     countries, so the consumer can decide what to do with it;
+//   - THE invariant: summing these rows over countries for one campaign+day
+//     reproduces the legacy row's totals for that campaign+day exactly. Both
+//     builders share attributeUsers(), so they cannot drift apart.
+//
+// CRs are deliberately absent: the consumer computes them itself (its matured-
+// cohort estimator) and would recompute anything we sent.
+
+/** ISO 3166-1 alpha-2 user-assigned code for "geo unknown". The consumer's
+ * normalizer treats "unknown"/"-"/"" as no-geo and DROPS the row; ZZ survives
+ * as an explicit bucket. */
+export const GEO_UNKNOWN_COUNTRY = "ZZ";
+
+export interface CampaignGeoDailyRow {
+  campaign_id: string;
+  campaign_name: string | null;
+  campaign_path: string;
+  funnel: string;
+  media_buyer: string;
+  utm_source: string | null;
+  date_from: string;
+  date_to: string;
+  country: string;
+  trial_users: number;
+  first_sub_users: number;
+  upsell_users: number;
+  refund_users: number;
+  failed_payment_users: number;
+}
+
+interface AttributedUser {
+  userId: string;
+  txs: ComputeTxn[];
+  trial: ComputeTxn;
+  trialDate: string;
+  campaignId: string;
+  campaignPath: string;
+  funnel: string;
+}
+
+/**
+ * The shared attribution pipeline: classify over full history, group by user,
+ * anchor each user to their first successful trial, apply the request filters.
+ * Extracted so the legacy campaign rows and the geo-daily rows draw from ONE
+ * user set — the partition invariant is by construction, not by coincidence.
+ */
+function attributeUsers(txs: ComputeTxn[], params: ComputeParams): AttributedUser[] {
+  const from = dateKey(params.date_from);
+  const to = dateKey(params.date_to);
+  const pathFilter = normalizePath(params.campaign_path);
+  const buyerFilter = normalize(params.media_buyer);
+  const campaignIdFilter = normalize(params.campaign_id);
+
+  const classified = classifyWarehouseTransactions(txs);
+  const byUser = new Map<string, ComputeTxn[]>();
+  for (const tx of classified) {
+    const key = userKey(tx);
+    byUser.set(key, [...(byUser.get(key) ?? []), tx]);
+  }
+
+  const out: AttributedUser[] = [];
+  byUser.forEach((list, userId) => {
+    const trial = [...list]
+      .filter((tx) => tx.status === "success" && tx.transaction_type === "trial")
+      .sort((a, b) => a.event_time.localeCompare(b.event_time))[0];
+    if (!trial) return;
+    const trialDate = dateKey(trial.event_time);
+    if (!trialDate) return;
+    if (from && trialDate < from) return;
+    if (to && trialDate > to) return;
+
+    const campaignId = campaignIdFor(trial);
+    if (campaignIdFilter && campaignId !== campaignIdFilter) return;
+    const campaignPath = trial.campaign_path || "unknown";
+    if (pathFilter && normalizePath(campaignPath) !== pathFilter) return;
+    if (buyerFilter && mediaBuyerForUser(list) !== buyerFilter) return;
+
+    out.push({ userId, txs: list, trial, trialDate, campaignId, campaignPath, funnel: trial.funnel || "unknown" });
+  });
+  return out;
+}
+
+/**
+ * The country a user's counters land in. Exactly one bucket per user — that is
+ * what makes the geo rows a partition of the campaign+day totals.
+ *
+ * The trial transaction anchors everything else in this API (campaign, path,
+ * funnel, date), so its country wins; a trial without one falls back to the
+ * user's first successful transaction that has one, then any transaction.
+ * Anything that is not clean alpha-2 lands in the explicit ZZ bucket.
+ */
+export function geoCountryForUser(user: { trial: ComputeTxn; txs: ComputeTxn[] }): string {
+  const clean = (value: unknown): string | null => {
+    const code = normalize(value).toUpperCase();
+    return /^[A-Z]{2}$/.test(code) ? code : null;
+  };
+  const fromTrial = clean(user.trial.country);
+  if (fromTrial) return fromTrial;
+  const sorted = [...user.txs].sort((a, b) => a.event_time.localeCompare(b.event_time));
+  const firstSuccessful = sorted.find((tx) => tx.status === "success" && clean(tx.country));
+  if (firstSuccessful) return clean(firstSuccessful.country) as string;
+  const firstAny = sorted.find((tx) => clean(tx.country));
+  return firstAny ? (clean(firstAny.country) as string) : GEO_UNKNOWN_COUNTRY;
+}
+
+/** Deterministic most-common value: max users, ties alphabetically. */
+function modeOf(values: string[]): string {
+  const counts = new Map<string, number>();
+  for (const value of values) counts.set(value, (counts.get(value) ?? 0) + 1);
+  let best = "";
+  let bestCount = -1;
+  for (const [value, count] of counts) {
+    if (count > bestCount || (count === bestCount && value < best)) { best = value; bestCount = count; }
+  }
+  return best;
+}
+
+export function buildCampaignGeoDailyRows(input: {
+  txs: ComputeTxn[];
+  params?: ComputeParams;
+  /** campaign_id -> Meta campaign name, when the FB warehouse knows it. */
+  campaignNames?: Map<string, string>;
+}): CampaignGeoDailyRow[] {
+  const users = attributeUsers(input.txs, input.params ?? {});
+  const names = input.campaignNames ?? new Map<string, string>();
+
+  const grouped = new Map<string, AttributedUser[]>();
+  for (const user of users) {
+    const country = geoCountryForUser(user);
+    const key = [user.campaignId, user.campaignPath, user.funnel, user.trialDate, country].join("||");
+    grouped.set(key, [...(grouped.get(key) ?? []), user]);
+  }
+
+  const rows = Array.from(grouped.entries()).map(([key, members]) => {
+    const first = members[0];
+    const country = key.split("||")[4];
+    const allTxs = members.flatMap((member) => member.txs);
+    const successUsers = (type: string) => new Set(
+      allTxs.filter((tx) => tx.status === "success" && tx.transaction_type === type).map(userKey),
+    ).size;
+    const refundUsers = new Set(
+      allTxs.filter((tx) => tx.is_refunded || tx.transaction_type === "refund" || (tx.refund_amount_usd ?? 0) > 0).map(userKey),
+    ).size;
+    const failedPaymentUsers = new Set(
+      allTxs.filter((tx) => tx.status === "failed" || tx.transaction_type === "failed_payment").map(userKey),
+    ).size;
+
+    return {
+      // Always a string: the consumer rejects numeric Meta IDs outright because
+      // 17-digit IDs lose precision as JSON numbers.
+      campaign_id: first.campaignId,
+      campaign_name: names.get(first.campaignId) ?? null,
+      campaign_path: first.campaignPath,
+      funnel: first.funnel,
+      // Buyer/utm are user-level values; within one campaign they are constant
+      // in practice, so the deterministic mode is exact there and stable
+      // everywhere else.
+      media_buyer: modeOf(members.map((member) => mediaBuyerForUser(member.txs))),
+      utm_source: modeOf(members.map((member) => utmSourceFor(member.trial) ?? "")) || null,
+      date_from: first.trialDate,
+      date_to: first.trialDate,
+      country,
+      trial_users: members.length,
+      first_sub_users: successUsers("first_subscription"),
+      upsell_users: successUsers("upsell"),
+      refund_users: refundUsers,
+      failed_payment_users: failedPaymentUsers,
+    } satisfies CampaignGeoDailyRow;
+  });
+
+  return rows.sort((a, b) =>
+    a.date_from.localeCompare(b.date_from) ||
+    b.trial_users - a.trial_users ||
+    a.campaign_id.localeCompare(b.campaign_id) ||
+    a.country.localeCompare(b.country));
 }

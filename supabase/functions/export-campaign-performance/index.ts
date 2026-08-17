@@ -1,9 +1,9 @@
 /* global Deno */
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { buildCampaignPerformanceRows, summarizeBatchLoad, type ComputeTxn } from "./compute.ts";
+import { buildCampaignGeoDailyRows, buildCampaignPerformanceRows, summarizeBatchLoad, type ComputeTxn } from "./compute.ts";
 import { createClickHouseClient } from "../_shared/clickhouse/client.ts";
-import { loadExportTransactions } from "../_shared/clickhouse/exportCampaignSource.ts";
+import { loadCampaignNames, loadExportTransactions } from "../_shared/clickhouse/exportCampaignSource.ts";
 
 type ApiKeyRecord = {
   id: string;
@@ -119,17 +119,24 @@ Deno.serve(async (req: Request) => {
     // existed (API_EXPORT.md documents them as nullable). The response shape is
     // unchanged so existing consumers keep parsing successfully.
     const traffic: [] = [];
-    const rows = buildCampaignPerformanceRows({
-      txs,
-      traffic,
-      params: {
-        date_from: params.get("date_from"),
-        date_to: params.get("date_to"),
-        campaign_path: params.get("campaign_path"),
-        media_buyer: params.get("media_buyer"),
-        campaign_id: params.get("campaign_id"),
-      },
-    });
+    const computeParams = {
+      date_from: params.get("date_from"),
+      date_to: params.get("date_to"),
+      campaign_path: params.get("campaign_path"),
+      media_buyer: params.get("media_buyer"),
+      campaign_id: params.get("campaign_id"),
+    };
+    // ?breakdown=country (alias: geo) switches the row shape to the daily
+    // campaign×country partition; without it the legacy contract is untouched.
+    const breakdown = normalize(params.get("breakdown")).toLowerCase();
+    const geoMode = breakdown === "country" || breakdown === "geo";
+    const rows = geoMode
+      ? buildCampaignGeoDailyRows({
+        txs,
+        params: computeParams,
+        campaignNames: await loadCampaignNames(clickhouse, key.user_id).catch(() => new Map<string, string>()),
+      })
+      : buildCampaignPerformanceRows({ txs, traffic, params: computeParams });
     const batchLoad = summarizeBatchLoad(txs, latestBatchId);
     await client.from("api_export_logs").insert({ ...logBase, status_code: 200, rows_returned: rows.length });
     return jsonResponse({
@@ -138,6 +145,7 @@ Deno.serve(async (req: Request) => {
         date_from: dateKey(params.get("date_from")),
         date_to: dateKey(params.get("date_to")),
         rows: rows.length,
+        breakdown: geoMode ? "country" : null,
         traffic_rows: traffic.length,
         transactions_loaded: batchLoad.transactions_loaded,
         import_batches_loaded: batchLoad.import_batches_loaded,
