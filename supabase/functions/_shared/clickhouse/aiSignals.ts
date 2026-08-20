@@ -498,6 +498,51 @@ function benchmarkVerdict(params: {
   return above === higherIsBetter ? "good" : "bad";
 }
 
+// ---- Pass-rate verdict ------------------------------------------------------
+//
+// A fixed floor alone is useless when the whole account sits below it (live
+// account pass rate ≈ 40% vs the 45% floor): every row would scream
+// "payment issue" and the column would carry no information. "Bad" therefore
+// requires BOTH the absolute floor breach AND Wilson-95 separation BELOW the
+// pooled account norm — a path must be a payment anomaly, not merely share the
+// account's baseline weakness.
+
+function pooledPassRate(passRates: AiEngineInput["passRates"]): number | null {
+  if (!passRates) return null;
+  let successful = 0;
+  let attempts = 0;
+  for (const slice of Object.values(passRates.byKey)) {
+    successful += slice.successful;
+    attempts += slice.attempts;
+  }
+  return attempts > 0 ? successful / attempts : null;
+}
+
+function passRateEvidence(
+  slice: AiPassRateSlice,
+  globalPassRate: number | null,
+  thresholds: AiThresholds,
+  evidencePath: string,
+): AiEvidence {
+  const pct = slice.pass_rate * 100;
+  let verdict: AiMetricVerdict = "neutral";
+  if (slice.attempts < MIN_PASS_RATE_ATTEMPTS) {
+    verdict = "inconclusive";
+  } else if (pct >= thresholds.passRateTarget) {
+    verdict = "good";
+  } else if (pct < thresholds.passRateFloor) {
+    const interval = wilsonInterval95(slice.successful, slice.attempts);
+    verdict = globalPassRate === null || interval.high < globalPassRate ? "bad" : "neutral";
+  }
+  const benchmark = globalPassRate !== null
+    ? { value: round2(globalPassRate * 100), rendered: renderPercent(globalPassRate * 100), source: "global_peers" as const, peers: null }
+    : thresholdBenchmark(thresholds.passRateTarget, "percent");
+  return evidence({
+    metric: "pass_rate", label: "Payment pass", value: pct, unit: "percent",
+    benchmark, verdict, sampleSize: slice.attempts, evidencePath,
+  });
+}
+
 // ---- Payback (observed grid, v1 — no extrapolation) -------------------------
 
 export interface PaybackReading {
@@ -777,6 +822,7 @@ function analyzeCohortRow(
   pools: CohortPools,
   trends: Map<string, PathTrend>,
   passRates: AiEngineInput["passRates"],
+  globalPassRate: number | null,
   trialDurationFor: (path: string) => number | null,
   thresholds: AiThresholds,
   asOfDate: string,
@@ -867,15 +913,7 @@ function analyzeCohortRow(
     passRate = passRates.byKey[key] ?? null;
     if (passRate) {
       notes.push({ code: "path_level_pass_rate", detail: "Payment pass rate is funnel-path level (per-cohort pass rate is not tracked)." });
-      evidences.set("pass_rate", evidence({
-        metric: "pass_rate", label: "Payment pass", value: passRate.pass_rate * 100, unit: "percent",
-        benchmark: thresholdBenchmark(thresholds.passRateTarget, "percent"),
-        verdict: passRate.attempts >= MIN_PASS_RATE_ATTEMPTS
-          ? (passRate.pass_rate * 100 < thresholds.passRateFloor ? "bad" : passRate.pass_rate * 100 >= thresholds.passRateTarget ? "good" : "neutral")
-          : "inconclusive",
-        sampleSize: passRate.attempts,
-        evidencePath: `path[${row.campaign_path}].pass_rate`,
-      }));
+      evidences.set("pass_rate", passRateEvidence(passRate, globalPassRate, thresholds, `path[${row.campaign_path}].pass_rate`));
     }
   }
 
@@ -977,6 +1015,7 @@ function analyzeCampaignRow(
   row: FbAnalyticsRow,
   pools: CampaignPools,
   passRates: AiEngineInput["passRates"],
+  globalPassRate: number | null,
   thresholds: AiThresholds,
 ): RowAnalysis {
   const scope: AiScope = { kind: "campaign", campaignId: row.campaign_id, campaignName: row.campaign_name };
@@ -1058,15 +1097,7 @@ function analyzeCampaignRow(
   if (passRates?.level === "campaign_id") {
     passRate = passRates.byKey[row.campaign_id] ?? null;
     if (passRate) {
-      evidences.set("pass_rate", evidence({
-        metric: "pass_rate", label: "Payment pass", value: passRate.pass_rate * 100, unit: "percent",
-        benchmark: thresholdBenchmark(thresholds.passRateTarget, "percent"),
-        verdict: passRate.attempts >= MIN_PASS_RATE_ATTEMPTS
-          ? (passRate.pass_rate * 100 < thresholds.passRateFloor ? "bad" : passRate.pass_rate * 100 >= thresholds.passRateTarget ? "good" : "neutral")
-          : "inconclusive",
-        sampleSize: passRate.attempts,
-        evidencePath: `campaign[${row.campaign_id}].pass_rate`,
-      }));
+      evidences.set("pass_rate", passRateEvidence(passRate, globalPassRate, thresholds, `campaign[${row.campaign_id}].pass_rate`));
     }
   }
 
@@ -1095,8 +1126,6 @@ function analyzeCampaignRow(
 // ---- The ladder -------------------------------------------------------------
 
 function runLadder(a: RowAnalysis, thresholds: AiThresholds): LadderVerdict {
-  const passPct = a.passRate ? a.passRate.pass_rate * 100 : null;
-  const passAttempts = a.passRate?.attempts ?? 0;
   const refundBreachRate = a.surface === "cohort" ? a.refundAmountRate : a.refundUserRate;
   const qualityOk = (a.surface === "cohort"
     ? (a.refundAmountRate === null || a.refundAmountRate <= thresholds.refundRateCeiling)
@@ -1111,8 +1140,9 @@ function runLadder(a: RowAnalysis, thresholds: AiThresholds): LadderVerdict {
   if (economicsAllowed && refundBreachRate !== null && refundBreachRate > thresholds.refundRateCeiling * 2) {
     return { action: "STOP", budgetDeltaPct: null, ruleId: "refund_breach_stop", primaryDomain: "refund", monitorAfter: ["refund_rate"], severity: ACTION_SEVERITY.STOP };
   }
-  // 3. payment_investigate
-  if (passPct !== null && passAttempts >= MIN_PASS_RATE_ATTEMPTS && passPct < thresholds.passRateFloor) {
+  // 3. payment_investigate — evidence verdict is already floor-AND-below-account
+  // (a fixed floor alone would flag every row when the whole account is weak).
+  if (a.evidences.get("pass_rate")?.verdict === "bad") {
     const monitor = ["pass_rate", "first_sub_pass_rate"];
     if (a.mainDeclineReason) monitor.push("main_decline_reason");
     return { action: "INVESTIGATE", budgetDeltaPct: null, ruleId: "payment_investigate", primaryDomain: "payment", monitorAfter: monitor, severity: ACTION_SEVERITY.INVESTIGATE };
@@ -1459,13 +1489,14 @@ export function computeAiSignals(input: AiEngineInput): AiEngineOutput {
     totalRows = rows.length;
     const pools = buildCohortPools(rows, asOfDate, trialDurationFor);
     const trends = buildPathTrends(rows, asOfDate, trialDurationFor, thresholds);
+    const globalPassRate = pooledPassRate(input.passRates ?? null);
     pathCount = trends.size;
     for (const trend of trends.values()) {
       if (trend.known) trendKnownPaths += 1;
       signals.push(...trend.signals);
     }
     for (const row of rows) {
-      const analysis = analyzeCohortRow(row, pools, trends, input.passRates ?? null, trialDurationFor, thresholds, asOfDate);
+      const analysis = analyzeCohortRow(row, pools, trends, input.passRates ?? null, globalPassRate, trialDurationFor, thresholds, asOfDate);
       analyses.set(scopeKey(analysis.scope), analysis);
       if (analysis.spendInfo.usable) {
         spendUsableRows += 1;
@@ -1479,8 +1510,9 @@ export function computeAiSignals(input: AiEngineInput): AiEngineOutput {
     const rows = [...(input.campaignRows ?? [])].sort((a, b) => a.campaign_id.localeCompare(b.campaign_id));
     totalRows = rows.length;
     const pools = buildCampaignPools(rows);
+    const globalPassRate = pooledPassRate(input.passRates ?? null);
     for (const row of rows) {
-      const analysis = analyzeCampaignRow(row, pools, input.passRates ?? null, thresholds);
+      const analysis = analyzeCampaignRow(row, pools, input.passRates ?? null, globalPassRate, thresholds);
       analyses.set(scopeKey(analysis.scope), analysis);
       if (analysis.spendInfo.usable) {
         spendUsableRows += 1;

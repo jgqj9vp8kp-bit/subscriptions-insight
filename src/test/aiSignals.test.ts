@@ -139,12 +139,19 @@ describe("cohort ladder golden cases", () => {
     expect(rec.contradictions.map((c) => c.flag)).toContain("cheap_but_weak");
   });
 
-  it("payment_investigate beats CPA/conversion rungs", () => {
+  it("payment_investigate beats CPA/conversion rungs when the path is a payment anomaly", () => {
+    // The bad path is Wilson-separated BELOW the pooled account norm (~54%):
+    // a floor breach alone must not fire when the whole account is weak.
     const passRates: Record<string, AiPassRateSlice> = {
       "soulmate-sketch-web-en": {
         attempts: 500, successful: 205, pass_rate: 0.41, pass_rate_ex_if: 0.47,
         first_sub_attempts: 200, first_sub_pass_rate: 0.4,
         renewal_attempts: 100, renewal_pass_rate: 0.45,
+      },
+      "healthy-path": {
+        attempts: 1000, successful: 600, pass_rate: 0.6, pass_rate_ex_if: 0.65,
+        first_sub_attempts: 400, first_sub_pass_rate: 0.6,
+        renewal_attempts: 200, renewal_pass_rate: 0.62,
       },
     };
     const bad = cohort({ cohort_date: "2026-07-01", first_subscription_users: 15, fb_spend: 4000 }); // CPA $40 over ceiling too
@@ -155,6 +162,27 @@ describe("cohort ladder golden cases", () => {
     expect(rec.primaryDomain).toBe("payment");
     expect(out.signals.some((s) => s.code === "PAYMENT_PASS_BAD")).toBe(true);
     expect(rec.dataNotes.some((n) => n.code === "path_level_pass_rate")).toBe(true);
+  });
+
+  it("account-wide weak pass rate does NOT flag every path as a payment issue", () => {
+    // Both paths sit near the pooled norm (~41%): floor is breached everywhere,
+    // but nothing is an anomaly — the ladder must fall through to economics.
+    const passRates: Record<string, AiPassRateSlice> = {
+      "soulmate-sketch-web-en": {
+        attempts: 500, successful: 205, pass_rate: 0.41, pass_rate_ex_if: 0.47,
+        first_sub_attempts: 200, first_sub_pass_rate: 0.4,
+        renewal_attempts: 100, renewal_pass_rate: 0.45,
+      },
+      "other-path": {
+        attempts: 800, successful: 330, pass_rate: 0.4125, pass_rate_ex_if: 0.46,
+        first_sub_attempts: 300, first_sub_pass_rate: 0.41,
+        renewal_attempts: 150, renewal_pass_rate: 0.43,
+      },
+    };
+    const out = run([cohort({ cohort_date: "2026-07-01" }), ...peers(5)], { passRates: { level: "campaign_path", byKey: passRates } });
+    const rec = recommendationFor(out, "2026-07-01");
+    expect(rec.action).not.toBe("INVESTIGATE");
+    expect(out.signals.some((s) => s.code === "PAYMENT_PASS_BAD")).toBe(false);
   });
 
   it("immature cohort: no Trial→Paid judgement, no payback penalty", () => {

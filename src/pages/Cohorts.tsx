@@ -1,6 +1,10 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDown, ArrowUp, ArrowUpDown, ChevronDown, ChevronRight, GripVertical, Check, Loader2, Plus, Trash2 } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
+import { AiActionChip } from "@/components/ai/AiActionChip";
+import { AiAnalysisPanel } from "@/components/ai/AiAnalysisPanel";
+import { AiOpportunities } from "@/components/ai/AiOpportunities";
+import { aiCohortKey, useAiCohortSignals } from "@/hooks/useAiCohortSignals";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -175,6 +179,10 @@ const COLUMN_ORDER_BEFORE_RENEWALS = [
   // FB Analytics user-cost metrics: selected-period Campaign CPP is assigned by
   // campaign_id; Spend / matched FB Purchases / CPP lead the row.
   ...FB_COHORT_DEFAULT_COLUMNS,
+  // Deterministic AI recommendation (aiSignals engine) — sits right after the
+  // economics inputs it reads. Registered here so the cohortsUiSettings
+  // sanitizers whitelist it (saved views would silently drop an unknown id).
+  "ai_action",
   "trial_users",
   "support_users",
   "support_rate",
@@ -279,6 +287,7 @@ const STATIC_COLUMN_LABELS: Record<string, string> = {
   cohort_date: "Cohort date",
   campaign_path: "Campaign path",
   funnel: "Funnel",
+  ai_action: "AI",
   trial_users: "Trial",
   support_users: "Support Users",
   support_rate: "Support Rate",
@@ -372,6 +381,7 @@ const COLUMN_MIN_WIDTHS: Record<string, number> = {
   cohort_date: 120,
   campaign_path: 160,
   funnel: 110,
+  ai_action: 140,
   trial_users: 76,
   support_users: 110,
   support_rate: 110,
@@ -476,7 +486,7 @@ const COLUMN_MIN_WIDTHS: Record<string, number> = {
 function buildDefaultColumnWidths(defaultColumnOrder: readonly string[]): Record<string, number> {
   const out: Record<string, number> = { [COHORT_FIRST_COL_KEY]: 150 };
   for (const id of defaultColumnOrder) {
-    const isText = id === "cohort_date" || id === "campaign_path" || id === "funnel";
+    const isText = id === "cohort_date" || id === "campaign_path" || id === "funnel" || id === "ai_action";
     const minWidth = COLUMN_MIN_WIDTHS[id] ?? 90;
     out[id] = isText ? Math.max(130, minWidth) : Math.max(MIN_COLUMN_WIDTH, Math.min(100, minWidth));
   }
@@ -508,8 +518,9 @@ function persistColumnWidths(widths: Record<string, number>) {
   }
 }
 
-const TEXT_COLUMNS = new Set<CohortColumnId>(["cohort_date", "campaign_path", "funnel", "currency_mix"]);
+const TEXT_COLUMNS = new Set<CohortColumnId>(["cohort_date", "campaign_path", "funnel", "currency_mix", "ai_action"]);
 const SECTION_DIVIDER_COLUMNS = new Set<CohortColumnId>([
+  "ai_action",
   "trial_users",
   "trial_to_upsell_cr",
   "renewal_2_users",
@@ -532,6 +543,8 @@ function formatRowsCount(value: number | null | undefined): string {
 // Header tooltips for the monetization columns (native title attribute, same
 // mechanism the traffic columns already use).
 const COLUMN_HELP: Partial<Record<CohortColumnId, string>> = {
+  ai_action:
+    "Deterministic recommendation from the AI signal engine: CPA, Trial → Paid, payment pass, refunds, retention and observed payback vs funnel benchmarks. Click a chip for the full explanation.",
   active_users: "Unique cohort users with at least one currently active and renewing subscription.",
   active_subscriptions: "Unique subscriptions with period_ends_at in the future and renews=true.",
   gross_revenue: USD_CONVERTED_NOTE,
@@ -1118,6 +1131,9 @@ export default function CohortsPage() {
   // just drops the highlight/tag affordances.
   const [activeFunnelPaths, setActiveFunnelPaths] = useState<Set<string>>(new Set());
   const [funnelTagsByPath, setFunnelTagsByPath] = useState<Map<string, string[]>>(new Map());
+  // Trial durations gate the AI engine's Trial → Paid maturity judgement; the
+  // same listFunnels call feeds them so the AI layer adds no extra request.
+  const [trialDurationsByPath, setTrialDurationsByPath] = useState<Record<string, number | null>>({});
   useEffect(() => {
     let cancelled = false;
     listFunnels()
@@ -1125,8 +1141,13 @@ export default function CohortsPage() {
         if (cancelled) return;
         setActiveFunnelPaths(new Set(rows.filter((row) => row.is_active).map((row) => row.funnel_path)));
         const byPath = new Map<string, string[]>();
-        for (const row of rows) byPath.set(row.funnel_path, row.tags.map((tag) => tag.name));
+        const durations: Record<string, number | null> = {};
+        for (const row of rows) {
+          byPath.set(row.funnel_path, row.tags.map((tag) => tag.name));
+          durations[row.funnel_path] = typeof row.trial_duration_days === "number" ? row.trial_duration_days : null;
+        }
         setFunnelTagsByPath(byPath);
+        setTrialDurationsByPath(durations);
       })
       .catch(() => {
         /* highlight/tags are best-effort; registry is optional to the report */
@@ -2080,8 +2101,51 @@ export default function CohortsPage() {
     }
   }, [clickHouseDriving, effectiveFilteredCohorts, expandedCohortIdList, planDetails, planDetailsRequest]);
 
+  // AI signal engine over the filtered rows (benchmarks pool from the same
+  // set the table shows). Pass rates arrive in the background and refine the
+  // chips; nothing here blocks the table.
+  const aiSignals = useAiCohortSignals({
+    rows: effectiveFilteredCohorts,
+    enabled: clickHouseDriving && effectiveFilteredCohorts.length > 0,
+    dateFrom: cohortDateFrom || null,
+    dateTo: cohortDateTo || null,
+    trialDurationDaysByPath: trialDurationsByPath,
+    userScopeHash,
+    warehouseVersion,
+  });
+  // AI analysis expansion is per-session UI state (deliberately not persisted:
+  // recommendations move with the data, a stale open panel would mislead).
+  const [aiExpandedIds, setAiExpandedIds] = useState<ReadonlySet<string>>(new Set());
+  const toggleAiExpanded = useCallback((cohortId: string) => {
+    setAiExpandedIds((current) => {
+      const next = new Set(current);
+      if (next.has(cohortId)) next.delete(cohortId);
+      else next.add(cohortId);
+      return next;
+    });
+  }, []);
+  const aiRecForCohort = useCallback(
+    (c: CohortRow) => aiSignals.byCohort.get(aiCohortKey(c)) ?? null,
+    [aiSignals.byCohort],
+  );
+
   const cohorts = useMemo(
     () => {
+      // The AI column sorts by decision rank (Scale first … Collect data last)
+      // via the page-level lookup — getCohortSortValue stays AI-agnostic.
+      if (sortColumn === "ai_action" && sortDirection) {
+        const rank = (c: CohortRow): number => {
+          const rec = aiSignals.byCohort.get(aiCohortKey(c));
+          if (!rec) return -1;
+          const order: Record<string, number> = { SCALE: 6, INVESTIGATE: 5, REDUCE: 4, STOP: 3, WATCH: 2, HOLD: 1, NOT_ENOUGH_DATA: 0 };
+          return order[rec.action] * 100 + (rec.budgetDeltaPct ?? 0);
+        };
+        const direction = sortDirection === "asc" ? 1 : -1;
+        return [...effectiveFilteredCohorts]
+          .map((cohort, index) => ({ cohort, index }))
+          .sort((a, b) => (rank(a.cohort) - rank(b.cohort)) * direction || a.index - b.index)
+          .map(({ cohort }) => cohort);
+      }
       if (sortColumn && sortDirection) {
         return sortCohortRows(
           effectiveFilteredCohorts,
@@ -2099,7 +2163,7 @@ export default function CohortsPage() {
         return b.cohort_date.localeCompare(a.cohort_date);
       });
     },
-    [effectiveFilteredCohorts, sortColumn, sortDirection, trafficByKey]
+    [effectiveFilteredCohorts, sortColumn, sortDirection, trafficByKey, aiSignals.byCohort]
   );
   const hasUsers = useMemo(() => new Set(txs.map((t) => t.user_id)).size > 0, [txs]);
 
@@ -2107,7 +2171,9 @@ export default function CohortsPage() {
   // sort/filters) to CSV or XLSX. Values resolve through the same field/traffic
   // resolver as sorting, so exports include every FB column automatically.
   const exportCohortsTable = async (format: "csv" | "xlsx") => {
-    const exportColumns = columnOrder.filter((id) => columnVisibility[id] !== false);
+    // ai_action is an interactive affordance (chip + expandable explanation);
+    // a bare action word in a CSV would detach the claim from its evidence.
+    const exportColumns = columnOrder.filter((id) => columnVisibility[id] !== false && id !== "ai_action");
     const table = buildCohortsExportTable({
       cohorts,
       columnOrder: exportColumns,
@@ -2610,6 +2676,16 @@ export default function CohortsPage() {
         return <TableCell key={id} className={className}>{c.campaign_path}</TableCell>;
       case "funnel":
         return <TableCell key={id} className={`${className} capitalize`}>{c.funnel.replace("_", " ")}</TableCell>;
+      case "ai_action": {
+        const rec = aiRecForCohort(c);
+        return (
+          <TableCell key={id} className={className}>
+            {rec
+              ? <AiActionChip rec={rec} expanded={aiExpandedIds.has(c.cohort_id)} onClick={() => toggleAiExpanded(c.cohort_id)} />
+              : dash}
+          </TableCell>
+        );
+      }
       case "trial_users":
         return <TableCell key={id} className={className}>{c.trial_users}</TableCell>;
       case "support_users":
@@ -2797,6 +2873,7 @@ export default function CohortsPage() {
       case "cohort_date":
       case "campaign_path":
       case "funnel":
+      case "ai_action":
         return <TableCell key={id} className={className}>{dash}</TableCell>;
       case "trial_users":
         return <TableCell key={id} className={className}>{plan.trial_users}</TableCell>;
@@ -2951,6 +3028,18 @@ export default function CohortsPage() {
     // campaign feeding several funnels on one day would double-count.
     const fbT = clickHouseDriving ? chResult?.fbTotals : undefined;
     switch (id) {
+      case "ai_action": {
+        // Totals cell = the decision mix of the visible rows.
+        const counts = new Map<string, number>();
+        for (const c of cohorts) {
+          const rec = aiRecForCohort(c);
+          if (!rec) continue;
+          const label = rec.action === "SCALE" ? "scale" : rec.action === "REDUCE" || rec.action === "STOP" ? "reduce" : rec.action === "INVESTIGATE" ? "invest." : null;
+          if (label) counts.set(label, (counts.get(label) ?? 0) + 1);
+        }
+        const summary = [...counts.entries()].map(([label, n]) => `${n} ${label}`).join(" · ");
+        return <TableCell key={id} className={`${className} text-xs text-muted-foreground`}>{summary || dash}</TableCell>;
+      }
       case "fb_spend":
         return <TableCell key={id} className={className}>{fbT ? formatFbUsd(fbT.fb_spend) : dash}</TableCell>;
       case "fb_purchases":
@@ -4107,6 +4196,25 @@ export default function CohortsPage() {
         )}
         </div>
         )}
+        {clickHouseDriving && aiSignals.output && (
+          <AiOpportunities
+            opportunities={aiSignals.output.opportunities}
+            loading={aiSignals.paymentLoading}
+            openLabel="View cohort"
+            onOpen={(opp) => {
+              if (opp.recommendation.scope.kind !== "cohort") return;
+              const scope = opp.recommendation.scope;
+              const row = cohorts.find(
+                (c) => c.cohort_date === scope.cohortDate && c.funnel === scope.funnel && c.campaign_path === scope.campaignPath,
+              );
+              if (!row) return;
+              setAiExpandedIds((current) => new Set(current).add(row.cohort_id));
+              window.setTimeout(() => {
+                document.querySelector(`[data-cohort-id="${CSS.escape(row.cohort_id)}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" });
+              }, 50);
+            }}
+          />
+        )}
         <div className="rounded-lg border border-border [&>div]:max-h-[calc(100vh-220px)] [&>div]:overflow-auto [&>div]:rounded-lg [&>div]:scroll-smooth">
           <Table
             className="border-separate border-spacing-0 w-auto"
@@ -4152,6 +4260,7 @@ export default function CohortsPage() {
                   <Fragment key={c.cohort_id}>
                     <TableRow
                       key={c.cohort_id}
+                      data-cohort-id={c.cohort_id}
                       className="even:bg-muted/20 hover:bg-muted/40 [&>td.sticky]:even:bg-[hsl(var(--card))] [&>td.sticky]:hover:bg-[hsl(var(--muted))]"
                     >
                       <TableCell
@@ -4218,6 +4327,24 @@ export default function CohortsPage() {
                         </TableCell>
                       </TableRow>
                     )}
+                    {aiExpandedIds.has(c.cohort_id) && (() => {
+                      const rec = aiRecForCohort(c);
+                      return rec ? (
+                        <TableRow
+                          key={`${c.cohort_id}-ai`}
+                          className="bg-muted/10 hover:bg-muted/10"
+                        >
+                          {/* One cell across the whole row; the inner wrapper is pinned
+                              so the analysis reads without horizontal scrolling even
+                              though the table itself is ~3000px wide. */}
+                          <TableCell colSpan={visibleColumnOrder.length + 1} className="py-2 px-3">
+                            <div className="sticky left-3 w-[min(56rem,calc(100vw-360px))]">
+                              <AiAnalysisPanel rec={rec} />
+                            </div>
+                          </TableCell>
+                        </TableRow>
+                      ) : null;
+                    })()}
                   </Fragment>
                 );
               })}
