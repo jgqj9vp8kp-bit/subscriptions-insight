@@ -1,0 +1,349 @@
+// Golden decisions of the AI signal engine. Each case pins the ladder outcome
+// end-to-end: action, ruleId, contradictions, data notes and the null
+// discipline (spend=null is "unknown", never 0).
+import { describe, expect, it } from "vitest";
+import {
+  AI_DEFAULT_THRESHOLDS,
+  aiActionLabel,
+  computeAiSignals,
+  observedPayback,
+  wilsonInterval95,
+  type AiCohortRowInput,
+  type AiEngineInput,
+  type AiPassRateSlice,
+} from "@/services/aiSignals";
+import type { FbAnalyticsRow } from "@/services/fbAnalytics";
+
+const AS_OF = "2026-08-20";
+
+function cohort(over: Partial<AiCohortRowInput>): AiCohortRowInput {
+  return {
+    cohort_date: "2026-07-01",
+    funnel: "soulmate",
+    campaign_path: "soulmate-sketch-web-en",
+    trial_users: 100,
+    first_subscription_users: 45,
+    renewal_2_users: 30,
+    refund_users: 2,
+    amount_refunded: 40,
+    gross_revenue: 2000,
+    upsell_revenue: 600,
+    revenue_d0: 700,
+    revenue_d7: 1000,
+    revenue_d14: 1300,
+    revenue_d30: 1700,
+    revenue_d60: 2000,
+    ltv_1m_per_user: 17,
+    fb_spend: 1500,
+    fb_match_status: "matched",
+    coverage_rate: 95,
+    ...over,
+  };
+}
+
+/** N peer cohorts so path benchmarks qualify (>=4 peers, >=25 pooled trials). */
+function peers(count: number, over: Partial<AiCohortRowInput> = {}): AiCohortRowInput[] {
+  return Array.from({ length: count }, (_, i) =>
+    cohort({ cohort_date: `2026-06-${String(i + 2).padStart(2, "0")}`, ...over }),
+  );
+}
+
+function run(rows: AiCohortRowInput[], extra: Partial<AiEngineInput> = {}) {
+  return computeAiSignals({
+    surface: "cohort",
+    cohortRows: rows,
+    trialDurationDaysByPath: { "soulmate-sketch-web-en": 7 },
+    asOfDate: AS_OF,
+    ...extra,
+  });
+}
+
+function recommendationFor(output: ReturnType<typeof computeAiSignals>, cohortDate: string) {
+  const rec = output.recommendations.find(
+    (r) => r.scope.kind === "cohort" && r.scope.cohortDate === cohortDate,
+  );
+  expect(rec).toBeTruthy();
+  return rec!;
+}
+
+function campaign(over: Partial<FbAnalyticsRow>): FbAnalyticsRow {
+  return {
+    campaign_id: "120200000000000001",
+    campaign_name: "Campaign A",
+    campaign_path: "soulmate-sketch-web-en",
+    ad_account_id: null,
+    ad_account_name: null,
+    trial_users: 120,
+    upsell_users: 20,
+    upsell_1_users: 20,
+    upsell_2_users: 0,
+    upsell_3_users: 0,
+    token_buyers: 5,
+    token_revenue: 100,
+    upsell_cr: 16,
+    first_subscription_users: 55,
+    trial_to_sub_cr: 45.8,
+    renewal_2_users: 30,
+    renewal_3_users: 12,
+    active_subscriptions: 40,
+    gross_revenue: 2600,
+    net_revenue: 2400,
+    spend: 1800,
+    spend_status: "available",
+    fb_purchases: 118,
+    cpp: 15.25,
+    impressions: 100000,
+    clicks: 2800,
+    ctr: 2.8,
+    cpc: 0.64,
+    cpm: 18,
+    outbound_clicks: 2500,
+    outbound_ctr: 2.5,
+    currency: "USD",
+    cac: 15,
+    cost_per_first_sub: 32.7,
+    roas: 1.33,
+    revenue_per_trial: 20,
+    revenue_per_purchase: 22,
+    profit: 600,
+    refund_users: 3,
+    refund_rate: 2.5,
+    failed_payment_users: 10,
+    main_decline_reason: null,
+    ...over,
+  } as FbAnalyticsRow;
+}
+
+// ---- Golden ladder cases ----------------------------------------------------
+
+describe("cohort ladder golden cases", () => {
+  it("scale_strong_mature: cheap CPA + strong conversion + confirmed economics", () => {
+    // CPA 1500/100 = $15 = 0.5x ceiling; conv 45% >= 40; ltvRatio 17/15 > 1.
+    const out = run([cohort({ cohort_date: "2026-07-01" }), ...peers(5)]);
+    const rec = recommendationFor(out, "2026-07-01");
+    expect(rec.action).toBe("SCALE");
+    expect(rec.budgetDeltaPct).toBe(20);
+    expect(rec.ruleId).toBe("scale_strong");
+    expect(rec.monitorAfter).toEqual(["cpa", "pass_rate", "refund_rate"]);
+    expect(rec.confidence).toBe("high");
+    expect(aiActionLabel(rec.action, rec.budgetDeltaPct)).toBe("Scale +20%");
+  });
+
+  it("cheap_but_weak: good CPA + weak conversion contradicts — WATCH, never SCALE", () => {
+    const weak = cohort({ cohort_date: "2026-07-01", first_subscription_users: 15, ltv_1m_per_user: 6 }); // conv 15%
+    const out = run([weak, ...peers(5)]);
+    const rec = recommendationFor(out, "2026-07-01");
+    expect(rec.action).toBe("WATCH");
+    expect(rec.ruleId).toBe("cheap_but_weak");
+    expect(rec.primaryDomain).toBe("conversion");
+    expect(rec.contradictions.map((c) => c.flag)).toContain("cheap_but_weak");
+  });
+
+  it("payment_investigate beats CPA/conversion rungs", () => {
+    const passRates: Record<string, AiPassRateSlice> = {
+      "soulmate-sketch-web-en": {
+        attempts: 500, successful: 205, pass_rate: 0.41, pass_rate_ex_if: 0.47,
+        first_sub_attempts: 200, first_sub_pass_rate: 0.4,
+        renewal_attempts: 100, renewal_pass_rate: 0.45,
+      },
+    };
+    const bad = cohort({ cohort_date: "2026-07-01", first_subscription_users: 15, fb_spend: 4000 }); // CPA $40 over ceiling too
+    const out = run([bad, ...peers(5)], { passRates: { level: "campaign_path", byKey: passRates } });
+    const rec = recommendationFor(out, "2026-07-01");
+    expect(rec.action).toBe("INVESTIGATE");
+    expect(rec.ruleId).toBe("payment_investigate");
+    expect(rec.primaryDomain).toBe("payment");
+    expect(out.signals.some((s) => s.code === "PAYMENT_PASS_BAD")).toBe(true);
+    expect(rec.dataNotes.some((n) => n.code === "path_level_pass_rate")).toBe(true);
+  });
+
+  it("immature cohort: no Trial→Paid judgement, no payback penalty", () => {
+    const young = cohort({
+      cohort_date: "2026-08-18", // 2 days old, 7d trial
+      trial_users: 40,
+      first_subscription_users: 0,
+      revenue_d7: null, revenue_d14: null, revenue_d30: null, revenue_d60: null,
+      ltv_1m_per_user: null,
+    });
+    const out = run([young, ...peers(5)]);
+    const rec = recommendationFor(out, "2026-08-18");
+    expect(rec.dataNotes.some((n) => n.code === "immature_cohort")).toBe(true);
+    const codes = out.signals.filter((s) => s.scope.kind === "cohort" && s.scope.cohortDate === "2026-08-18").map((s) => s.code);
+    expect(codes).not.toContain("TRIAL_TO_PAID_BAD");
+    expect(codes).not.toContain("PAYBACK_NOT_REACHED");
+  });
+
+  it("spend=null is unknown, not zero: economics absent, action capped", () => {
+    const noSpend = cohort({ cohort_date: "2026-07-01", fb_spend: null, fb_match_status: "no_fb_campaign" });
+    const out = run([noSpend, ...peers(5)]);
+    const rec = recommendationFor(out, "2026-07-01");
+    expect(["HOLD", "WATCH", "INVESTIGATE", "NOT_ENOUGH_DATA"]).toContain(rec.action);
+    expect(rec.dataNotes.some((n) => n.code === "spend_unavailable")).toBe(true);
+    const own = out.signals.filter((s) => s.scope.kind === "cohort" && s.scope.cohortDate === "2026-07-01");
+    expect(own.map((s) => s.code)).not.toContain("CPA_GOOD");
+    expect(own.map((s) => s.code)).not.toContain("CPA_BAD");
+    const cpaEvidence = rec.because.find((ev) => ev.metric === "cpa");
+    expect(cpaEvidence).toBeUndefined();
+  });
+
+  it("stop_on_refund_breach with good CPA -> contradiction attached", () => {
+    const refundy = cohort({ cohort_date: "2026-07-01", amount_refunded: 460, gross_revenue: 2000 }); // 23%
+    const out = run([refundy, ...peers(5)]);
+    const rec = recommendationFor(out, "2026-07-01");
+    expect(rec.action).toBe("STOP");
+    expect(rec.ruleId).toBe("refund_breach_stop");
+    expect(rec.primaryDomain).toBe("refund");
+    expect(rec.contradictions.map((c) => c.flag)).toContain("good_cpa_bad_downstream");
+    expect(out.signals.some((s) => s.code === "REFUND_RATE_HIGH")).toBe(true);
+  });
+
+  it("benchmark_empty: lone path still gets threshold-based verdicts", () => {
+    const lonely = cohort({ cohort_date: "2026-07-01", campaign_path: "lonely-path" });
+    const out = computeAiSignals({
+      surface: "cohort",
+      cohortRows: [lonely],
+      trialDurationDaysByPath: { "lonely-path": 7 },
+      asOfDate: AS_OF,
+    });
+    const rec = out.recommendations[0];
+    expect(rec.action).toBe("SCALE"); // thresholds alone qualify it
+    const cpaEv = rec.because.find((ev) => ev.metric === "cpa");
+    expect(cpaEv?.benchmark?.source).toBe("threshold");
+    expect(out.inputStatus.benchmark).toBe("missing");
+  });
+
+  it("not_enough_data below the verdict floor", () => {
+    const tiny = cohort({ cohort_date: "2026-07-01", trial_users: 9, first_subscription_users: 3 });
+    const out = run([tiny, ...peers(5)]);
+    const rec = recommendationFor(out, "2026-07-01");
+    expect(rec.action).toBe("NOT_ENOUGH_DATA");
+    expect(rec.ruleId).toBe("sample_gate");
+    expect(out.signals.some((s) => s.code === "LOW_SAMPLE_SIZE" && s.scope.kind === "cohort" && s.scope.cohortDate === "2026-07-01")).toBe(true);
+  });
+
+  it("trend_deteriorating_reduce: recent CPA jump turns breach into REDUCE −20", () => {
+    // 8 cohorts on one path: older 5 at CPA $20, recent 3 at CPA $39 (1.3x ceiling).
+    const rows = [
+      ...Array.from({ length: 5 }, (_, i) =>
+        cohort({ cohort_date: `2026-06-${String(i + 1).padStart(2, "0")}`, fb_spend: 2000, trial_users: 100 })),
+      ...Array.from({ length: 3 }, (_, i) =>
+        cohort({ cohort_date: `2026-07-${String(i + 1).padStart(2, "0")}`, fb_spend: 3900, trial_users: 100 })),
+    ];
+    const out = run(rows);
+    expect(out.signals.some((s) => s.code === "CPA_DETERIORATING" && s.scope.kind === "path")).toBe(true);
+    const rec = recommendationFor(out, "2026-07-03");
+    expect(rec.action).toBe("REDUCE");
+    expect(rec.budgetDeltaPct).toBe(-20);
+    expect(rec.ruleId).toBe("cpa_breach_reduce");
+  });
+});
+
+describe("campaign ladder golden cases", () => {
+  it("campaign_shared_path: spend unattributable caps the action space", () => {
+    const shared = campaign({ spend: null, spend_status: "unavailable_shared_path", cac: null, roas: null });
+    const out = computeAiSignals({ surface: "campaign", campaignRows: [shared, campaign({ campaign_id: "2" }), campaign({ campaign_id: "3" })], asOfDate: AS_OF });
+    const rec = out.recommendations.find((r) => r.scope.kind === "campaign" && r.scope.campaignId === shared.campaign_id)!;
+    expect(["HOLD", "WATCH", "INVESTIGATE", "NOT_ENOUGH_DATA"]).toContain(rec.action);
+    expect(rec.action).not.toBe("SCALE");
+    expect(rec.dataNotes.some((n) => n.code === "spend_unavailable")).toBe(true);
+    expect(out.inputStatus.trend).toBe("missing"); // campaigns have no time axis
+  });
+
+  it("good CPA + roas >= 1 -> SCALE +20 on campaigns", () => {
+    const out = computeAiSignals({ surface: "campaign", campaignRows: [campaign({})], asOfDate: AS_OF });
+    const rec = out.recommendations[0];
+    expect(rec.action).toBe("SCALE");
+    expect(rec.budgetDeltaPct).toBe(20);
+    expect(rec.dataNotes.some((n) => n.code === "not_maturity_gated")).toBe(true);
+  });
+
+  it("good CPA + weak trial_to_sub_cr -> WATCH with contradiction (brief §6)", () => {
+    const cheapWeak = campaign({ trial_to_sub_cr: 19, first_subscription_users: 23, cac: 13.2 });
+    const out = computeAiSignals({ surface: "campaign", campaignRows: [cheapWeak], asOfDate: AS_OF });
+    const rec = out.recommendations[0];
+    expect(rec.action).toBe("WATCH");
+    expect(rec.ruleId).toBe("cheap_but_weak");
+    expect(rec.contradictions.map((c) => c.flag)).toContain("cheap_but_weak");
+  });
+});
+
+// ---- Payback math -----------------------------------------------------------
+
+describe("observedPayback", () => {
+  it("interpolates between grid points and marks provenance", () => {
+    const row = cohort({ revenue_d14: 900, revenue_d30: 1700, fb_spend: 1300 });
+    const reading = observedPayback(row, 1300, AS_OF);
+    expect(reading.status).toBe("reached");
+    expect(reading.interpolated).toBe(true);
+    // 14 + (1300-900)*(30-14)/(1700-900) = 14 + 8 = 22
+    expect(reading.day).toBe(22);
+  });
+
+  it("not reached by D60 on a mature cohort is a bad signal; young cohort is silent", () => {
+    const mature = observedPayback(
+      cohort({ cohort_date: "2026-06-01", revenue_d60: 900, revenue_d30: 700, revenue_d14: 400, revenue_d7: 200, revenue_d0: 50 }),
+      2000,
+      AS_OF,
+    );
+    expect(mature.status).toBe("not_reached_mature");
+    const young = observedPayback(
+      cohort({ cohort_date: "2026-08-01", revenue_d14: 400, revenue_d7: 200, revenue_d0: 50, revenue_d30: null, revenue_d60: null }),
+      2000,
+      AS_OF,
+    );
+    expect(young.status).toBe("not_reached_yet");
+  });
+
+  it("no spend -> unavailable, never a division", () => {
+    expect(observedPayback(cohort({}), null, AS_OF).status).toBe("unavailable");
+  });
+});
+
+describe("wilsonInterval95", () => {
+  it("matches the bankAnalytics twin on a reference value", () => {
+    const { low, high } = wilsonInterval95(10, 40);
+    expect(low).toBeCloseTo(0.1419, 3);
+    expect(high).toBeCloseTo(0.4023, 3);
+  });
+});
+
+// ---- Invariants -------------------------------------------------------------
+
+describe("engine invariants", () => {
+  const fixture = [cohort({ cohort_date: "2026-07-01" }), ...peers(6), cohort({ cohort_date: "2026-07-05", trial_users: 10 })];
+
+  it("deterministic: same input -> deep-equal output", () => {
+    expect(run([...fixture])).toEqual(run([...fixture]));
+  });
+
+  it("row order does not change decisions", () => {
+    const shuffled = [...fixture].reverse();
+    expect(run(shuffled)).toEqual(run([...fixture]));
+  });
+
+  it("exactly one recommendation per scope; no NaN/Infinity anywhere", () => {
+    const out = run([...fixture]);
+    const keys = out.recommendations.map((r) => JSON.stringify(r.scope));
+    expect(new Set(keys).size).toBe(keys.length);
+    expect(out.recommendations).toHaveLength(fixture.length);
+    const flat = JSON.stringify(out);
+    expect(flat).not.toContain("NaN");
+    expect(flat).not.toContain("Infinity");
+  });
+
+  it("null values render as dash, never as zero", () => {
+    const out = run([cohort({ fb_spend: null, fb_match_status: "no_fb_campaign" }), ...peers(5)]);
+    for (const rec of out.recommendations) {
+      for (const ev of rec.because) {
+        if (ev.value === null) expect(ev.valueRendered).toBe("—");
+      }
+    }
+  });
+
+  it("context pack lines carry rendered numbers of their evidence", () => {
+    const out = run([...fixture]);
+    for (const item of out.contextPack.items) {
+      expect(item.evidenceLines.every((line) => line.includes("—") || /\d/.test(line))).toBe(true);
+    }
+  });
+});
