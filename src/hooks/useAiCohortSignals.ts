@@ -1,18 +1,50 @@
-// AI-signals glue for the Cohorts page: the deterministic engine runs over the
-// rows the page ALREADY shows. Two auxiliary inputs load in the background and
+// AI-signals glue for the analytics pages: the deterministic engine runs over
+// the rows each page ALREADY shows. Auxiliary inputs load in the background and
 // never block the chips:
-//  - funnel passports (trial_duration_days) gate Trial→Paid maturity;
-//  - one payment-analytics bundle grouped by campaign_path supplies pass rates
-//    (path level — per-cohort pass rate is not tracked; the engine labels it).
+//  - funnel passports (trial_duration_days) gate Trial→Paid maturity (Cohorts);
+//  - one payment-analytics bundle (grouped by campaign_path on Cohorts,
+//    campaign_id on FB Analytics) supplies pass rates.
 // Until they arrive the engine simply reports those input families as missing.
 import { useMemo } from "react";
 import { computeAiSignals, type AiEngineOutput, type AiPassRateSlice, type AiRecommendation } from "@/services/aiSignals";
 import { usePaymentAnalyticsBundle } from "@/hooks/usePaymentAnalyticsCache";
 import type { PaymentAnalyticsQuery } from "@/services/paymentAnalyticsDataSource";
+import type { SegmentRow } from "@/services/paymentPassAnalytics";
+import type { FbAnalyticsRow } from "@/services/fbAnalytics";
 import type { CohortRow } from "@/services/types";
 
 export function aiCohortKey(row: Pick<CohortRow, "cohort_date" | "funnel" | "campaign_path">): string {
   return `${row.cohort_date}|${row.funnel}|${row.campaign_path}`;
+}
+
+function passSlicesByKey(segmentRows: readonly SegmentRow[] | undefined): Record<string, AiPassRateSlice> | null {
+  if (!segmentRows?.length) return null;
+  const byKey: Record<string, AiPassRateSlice> = {};
+  for (const row of segmentRows) {
+    byKey[row.key] = {
+      attempts: row.attempts,
+      successful: row.successful,
+      pass_rate: row.pass_rate,
+      pass_rate_ex_if: row.pass_rate_ex_if,
+      first_sub_attempts: row.first_sub_attempts,
+      first_sub_pass_rate: row.first_sub_pass_rate,
+      renewal_attempts: row.renewal_attempts,
+      renewal_pass_rate: row.renewal_pass_rate,
+    };
+  }
+  return byKey;
+}
+
+function basePaymentQuery(dateFrom: string | null, dateTo: string | null, groupBy: "campaign_path" | "campaign_id"): PaymentAnalyticsQuery {
+  return {
+    dateBasis: "cohort",
+    dateFrom: dateFrom || null,
+    dateTo: dateTo || null,
+    funnel: "all", campaignPath: "all", campaignId: "all", mediaBuyer: "all",
+    country: "all", cardType: "all", stage: "all", declineReason: "all",
+    transactionType: "all", outcome: "all",
+    groupBy, firstTxDimension: "funnel", renewalDimension: "funnel",
+  };
 }
 
 export interface UseAiCohortSignalsResult {
@@ -35,15 +67,7 @@ export function useAiCohortSignals(params: {
   const { rows, enabled, dateFrom, dateTo, trialDurationDaysByPath, userScopeHash, warehouseVersion } = params;
 
   const paymentQuery = useMemo<PaymentAnalyticsQuery>(
-    () => ({
-      dateBasis: "cohort",
-      dateFrom: dateFrom || null,
-      dateTo: dateTo || null,
-      funnel: "all", campaignPath: "all", campaignId: "all", mediaBuyer: "all",
-      country: "all", cardType: "all", stage: "all", declineReason: "all",
-      transactionType: "all", outcome: "all",
-      groupBy: "campaign_path", firstTxDimension: "funnel", renewalDimension: "funnel",
-    }),
+    () => basePaymentQuery(dateFrom, dateTo, "campaign_path"),
     [dateFrom, dateTo],
   );
 
@@ -55,22 +79,8 @@ export function useAiCohortSignals(params: {
   });
 
   const passRates = useMemo(() => {
-    const segmentRows = payment.chBundle?.segmentRows;
-    if (!segmentRows?.length) return null;
-    const byKey: Record<string, AiPassRateSlice> = {};
-    for (const row of segmentRows) {
-      byKey[row.key] = {
-        attempts: row.attempts,
-        successful: row.successful,
-        pass_rate: row.pass_rate,
-        pass_rate_ex_if: row.pass_rate_ex_if,
-        first_sub_attempts: row.first_sub_attempts,
-        first_sub_pass_rate: row.first_sub_pass_rate,
-        renewal_attempts: row.renewal_attempts,
-        renewal_pass_rate: row.renewal_pass_rate,
-      };
-    }
-    return { level: "campaign_path" as const, byKey };
+    const byKey = passSlicesByKey(payment.chBundle?.segmentRows);
+    return byKey ? { level: "campaign_path" as const, byKey } : null;
   }, [payment.chBundle]);
 
   // Stable per render-day: the engine is pure and must not observe a ticking clock.
@@ -97,4 +107,61 @@ export function useAiCohortSignals(params: {
   }, [output]);
 
   return { output, byCohort, paymentLoading: payment.isInitialLoading };
+}
+
+export interface UseAiCampaignSignalsResult {
+  output: AiEngineOutput | null;
+  byCampaign: ReadonlyMap<string, AiRecommendation>;
+  paymentLoading: boolean;
+}
+
+/** FB Analytics twin: campaign surface, pass rates grouped by campaign_id. */
+export function useAiCampaignSignals(params: {
+  rows: readonly FbAnalyticsRow[];
+  enabled: boolean;
+  dateFrom: string | null;
+  dateTo: string | null;
+  userScopeHash: string;
+  warehouseVersion: string;
+}): UseAiCampaignSignalsResult {
+  const { rows, enabled, dateFrom, dateTo, userScopeHash, warehouseVersion } = params;
+
+  const paymentQuery = useMemo<PaymentAnalyticsQuery>(
+    () => basePaymentQuery(dateFrom, dateTo, "campaign_id"),
+    [dateFrom, dateTo],
+  );
+
+  const payment = usePaymentAnalyticsBundle({
+    query: paymentQuery,
+    userScopeHash,
+    warehouseVersion,
+    enabled: enabled && rows.length > 0,
+  });
+
+  const passRates = useMemo(() => {
+    const byKey = passSlicesByKey(payment.chBundle?.segmentRows);
+    return byKey ? { level: "campaign_id" as const, byKey } : null;
+  }, [payment.chBundle]);
+
+  const asOfDate = useMemo(() => new Date().toISOString().slice(0, 10), []);
+
+  const output = useMemo(() => {
+    if (!enabled || rows.length === 0) return null;
+    return computeAiSignals({
+      surface: "campaign",
+      campaignRows: rows,
+      passRates,
+      asOfDate,
+    });
+  }, [enabled, rows, passRates, asOfDate]);
+
+  const byCampaign = useMemo(() => {
+    const map = new Map<string, AiRecommendation>();
+    for (const rec of output?.recommendations ?? []) {
+      if (rec.scope.kind === "campaign") map.set(rec.scope.campaignId, rec);
+    }
+    return map;
+  }, [output]);
+
+  return { output, byCampaign, paymentLoading: payment.isInitialLoading };
 }

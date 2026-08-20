@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   AlertTriangle,
   ArrowDown,
@@ -19,6 +19,13 @@ import {
 } from "lucide-react";
 import { Bar, BarChart, CartesianGrid, XAxis, YAxis } from "recharts";
 import { AppLayout } from "@/components/AppLayout";
+import { AiActionChip } from "@/components/ai/AiActionChip";
+import { AiAnalysisPanel } from "@/components/ai/AiAnalysisPanel";
+import { AiOpportunities } from "@/components/ai/AiOpportunities";
+import { useAiCampaignSignals } from "@/hooks/useAiCohortSignals";
+import { useAuth } from "@/hooks/useAuth";
+import { hashUserScope } from "@/services/analyticsCache";
+import { useWarehouseVersion } from "@/hooks/useAnalyticsCache";
 import { KpiCard } from "@/components/KpiCard";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -779,6 +786,24 @@ export default function FBAnalyticsPage() {
   }, [result.summary, enrichedTxs, subscriptions, appliedFbFilters]);
 
   const rows = useMemo(() => sortRows(result.rows, uiState.sortKey, uiState.sortDir), [result.rows, uiState.sortKey, uiState.sortDir]);
+
+  // AI action layer: deterministic engine over the campaign rows already
+  // computed above; pass rates by campaign_id arrive in the background.
+  const { user } = useAuth();
+  const aiUserScopeHash = useMemo(() => hashUserScope(user?.id), [user?.id]);
+  const { version: aiWarehouseVersion } = useWarehouseVersion(true);
+  const aiCampaigns = useAiCampaignSignals({
+    rows: result.rows,
+    enabled: result.rows.length > 0,
+    dateFrom: uiState.cohortDateFrom || null,
+    dateTo: uiState.cohortDateTo || null,
+    userScopeHash: aiUserScopeHash,
+    warehouseVersion: aiWarehouseVersion,
+  });
+  // Single-open diagnosis (Banks accordion pattern): a campaign diagnosis is a
+  // comparison against its peers, two open at once just fights for attention.
+  const [aiExpandedCampaignId, setAiExpandedCampaignId] = useState<string | null>(null);
+
   const topTrials = useMemo(() => rows.slice(0, 10).map((row) => ({ ...row, label: shortCampaignLabel(row) })), [rows]);
   const topRevenue = useMemo(
     () => [...rows].sort((a, b) => b.net_revenue - a.net_revenue).slice(0, 10).map((row) => ({ ...row, label: shortCampaignLabel(row) })),
@@ -1258,6 +1283,21 @@ export default function FBAnalyticsPage() {
           </Card>
         </div>
 
+        {aiCampaigns.output && (
+          <AiOpportunities
+            opportunities={aiCampaigns.output.opportunities}
+            loading={aiCampaigns.paymentLoading}
+            openLabel="View campaign"
+            onOpen={(opp) => {
+              if (opp.recommendation.scope.kind !== "campaign") return;
+              const campaignId = opp.recommendation.scope.campaignId;
+              setAiExpandedCampaignId(campaignId);
+              window.setTimeout(() => {
+                document.querySelector(`[data-campaign-id="${CSS.escape(campaignId)}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" });
+              }, 50);
+            }}
+          />
+        )}
         <Card className="shadow-card">
           <div className="flex items-center justify-between gap-3 border-b border-border p-4">
             <SectionHeader
@@ -1282,7 +1322,25 @@ export default function FBAnalyticsPage() {
             <Table>
               <TableHeader>
                 <TableRow>
-                  {columns.map((column) => (
+                  {columns.slice(0, 2).map((column) => (
+                    <TableHead key={column.key} className={cn("whitespace-nowrap", column.align === "right" && "text-right")}>
+                      <button
+                        type="button"
+                        className={cn("inline-flex items-center gap-1 hover:text-foreground", column.align === "right" && "justify-end")}
+                        onClick={() => toggleSort(column.key)}
+                      >
+                        {column.label}
+                        {sortIcon(uiState.sortKey === column.key, uiState.sortDir)}
+                      </button>
+                    </TableHead>
+                  ))}
+                  <TableHead
+                    className="whitespace-nowrap"
+                    title="Deterministic recommendation: acquisition + payments + downstream monetization vs campaign peers. Click a chip for the diagnosis."
+                  >
+                    AI Action
+                  </TableHead>
+                  {columns.slice(2).map((column) => (
                     <TableHead key={column.key} className={cn("whitespace-nowrap", column.align === "right" && "text-right")}>
                       <button
                         type="button"
@@ -1298,29 +1356,57 @@ export default function FBAnalyticsPage() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {rows.length ? rows.map((row) => (
-                  <TableRow key={row.campaign_id}>
-                    {columns.map((column) => (
-                      <TableCell
-                        key={column.key}
-                        className={cn(
-                          "whitespace-nowrap text-sm",
-                          column.align === "right" && "text-right tabular-nums",
-                          column.key === "campaign_id" && "font-medium",
-                          column.key === "campaign_name" && "max-w-[260px] truncate text-muted-foreground",
-                        )}
-                        title={column.key === "campaign_id" || column.key === "campaign_name" ? campaignDisplayName(row) : undefined}
-                      >
-                        {column.render(row)}
-                      </TableCell>
-                    ))}
-                    <TableCell className="whitespace-nowrap text-sm capitalize text-muted-foreground">
-                      {declineLabel(row.main_decline_reason)}
+                {rows.length ? rows.map((row) => {
+                  const aiRec = aiCampaigns.byCampaign.get(row.campaign_id) ?? null;
+                  const aiExpanded = aiExpandedCampaignId === row.campaign_id;
+                  const cell = (column: (typeof columns)[number]) => (
+                    <TableCell
+                      key={column.key}
+                      className={cn(
+                        "whitespace-nowrap text-sm",
+                        column.align === "right" && "text-right tabular-nums",
+                        column.key === "campaign_id" && "font-medium",
+                        column.key === "campaign_name" && "max-w-[260px] truncate text-muted-foreground",
+                      )}
+                      title={column.key === "campaign_id" || column.key === "campaign_name" ? campaignDisplayName(row) : undefined}
+                    >
+                      {column.render(row)}
                     </TableCell>
-                  </TableRow>
-                )) : (
+                  );
+                  return (
+                    <Fragment key={row.campaign_id}>
+                      <TableRow data-campaign-id={row.campaign_id}>
+                        {columns.slice(0, 2).map(cell)}
+                        <TableCell className="whitespace-nowrap">
+                          {aiRec ? (
+                            <AiActionChip
+                              rec={aiRec}
+                              expanded={aiExpanded}
+                              onClick={() => setAiExpandedCampaignId(aiExpanded ? null : row.campaign_id)}
+                            />
+                          ) : (
+                            <span className="text-muted-foreground/40">—</span>
+                          )}
+                        </TableCell>
+                        {columns.slice(2).map(cell)}
+                        <TableCell className="whitespace-nowrap text-sm capitalize text-muted-foreground">
+                          {declineLabel(row.main_decline_reason)}
+                        </TableCell>
+                      </TableRow>
+                      {aiExpanded && aiRec && (
+                        <TableRow className="bg-muted/10 hover:bg-muted/10">
+                          <TableCell colSpan={columns.length + 2} className="px-4 py-2">
+                            <div className="sticky left-4 w-[min(56rem,calc(100vw-360px))]">
+                              <AiAnalysisPanel rec={aiRec} />
+                            </div>
+                          </TableCell>
+                        </TableRow>
+                      )}
+                    </Fragment>
+                  );
+                }) : (
                   <TableRow>
-                    <TableCell colSpan={columns.length + 1} className="h-40 text-center text-sm text-muted-foreground">
+                    <TableCell colSpan={columns.length + 2} className="h-40 text-center text-sm text-muted-foreground">
                       No Campaign IDs for current filters
                     </TableCell>
                   </TableRow>

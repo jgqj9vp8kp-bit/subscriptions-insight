@@ -1152,6 +1152,13 @@ function runLadder(a: RowAnalysis, thresholds: AiThresholds): LadderVerdict {
       a.cpa > thresholds.cpaCeiling * 1.5 && a.conv < thresholds.trialToSubTarget * 0.6) {
     return { action: "STOP", budgetDeltaPct: null, ruleId: "cpa_and_conv_breach", primaryDomain: "traffic", monitorAfter: ["cpa", "trial_to_paid"], severity: ACTION_SEVERITY.STOP };
   }
+  // 5a. expensive_but_converting (campaign surface): campaigns have no trend
+  // axis, so rung 5's "trend unknown" clause would swallow every converting
+  // campaign; positive net economics (roas >= 1) earns a HOLD instead.
+  if (economicsAllowed && a.surface === "campaign" && a.cpa !== null && a.cpa > thresholds.cpaCeiling &&
+      a.conv !== null && a.conv >= thresholds.trialToSubTarget && a.roas !== null && a.roas >= 1) {
+    return { action: "HOLD", budgetDeltaPct: null, ruleId: "expensive_but_converting", primaryDomain: "traffic", monitorAfter: ["cpa", "roas"], severity: ACTION_SEVERITY.HOLD };
+  }
   // 5. cpa_breach_reduce
   if (economicsAllowed && a.cpa !== null && a.cpa > thresholds.cpaCeiling && a.trendCpaDeteriorating !== false) {
     return { action: "REDUCE", budgetDeltaPct: reduceStep(a.cpa, thresholds.cpaCeiling), ruleId: "cpa_breach_reduce", primaryDomain: "traffic", monitorAfter: ["cpa", "trial_to_paid"], severity: ACTION_SEVERITY.REDUCE };

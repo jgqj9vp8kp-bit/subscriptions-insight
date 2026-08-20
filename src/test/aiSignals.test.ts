@@ -285,6 +285,17 @@ describe("campaign ladder golden cases", () => {
     expect(rec.dataNotes.some((n) => n.code === "not_maturity_gated")).toBe(true);
   });
 
+  it("over-ceiling CPA with strong conversion and roas >= 1 holds instead of reducing", () => {
+    const expensive = campaign({ cac: 38, trial_to_sub_cr: 68, roas: 1.1 });
+    const out = computeAiSignals({ surface: "campaign", campaignRows: [expensive], asOfDate: AS_OF });
+    expect(out.recommendations[0].action).toBe("HOLD");
+    expect(out.recommendations[0].ruleId).toBe("expensive_but_converting");
+    // Negative unit economics keeps the REDUCE path.
+    const losing = campaign({ cac: 38, trial_to_sub_cr: 68, roas: 0.5 });
+    const out2 = computeAiSignals({ surface: "campaign", campaignRows: [losing], asOfDate: AS_OF });
+    expect(out2.recommendations[0].action).toBe("REDUCE");
+  });
+
   it("good CPA + weak trial_to_sub_cr -> WATCH with contradiction (brief §6)", () => {
     const cheapWeak = campaign({ trial_to_sub_cr: 19, first_subscription_users: 23, cac: 13.2 });
     const out = computeAiSignals({ surface: "campaign", campaignRows: [cheapWeak], asOfDate: AS_OF });
