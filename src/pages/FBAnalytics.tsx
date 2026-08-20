@@ -23,6 +23,7 @@ import { AiActionChip } from "@/components/ai/AiActionChip";
 import { AiAnalysisPanel } from "@/components/ai/AiAnalysisPanel";
 import { AiOpportunities } from "@/components/ai/AiOpportunities";
 import { useAiCampaignSignals } from "@/hooks/useAiCohortSignals";
+import { useAiAssistantStore } from "@/store/aiAssistantStore";
 import { useAuth } from "@/hooks/useAuth";
 import { hashUserScope } from "@/services/analyticsCache";
 import { useWarehouseVersion } from "@/hooks/useAnalyticsCache";
@@ -803,6 +804,15 @@ export default function FBAnalyticsPage() {
   // Single-open diagnosis (Banks accordion pattern): a campaign diagnosis is a
   // comparison against its peers, two open at once just fights for attention.
   const [aiExpandedCampaignId, setAiExpandedCampaignId] = useState<string | null>(null);
+  useEffect(() => {
+    if (!aiCampaigns.output) return;
+    useAiAssistantStore.getState().publishContext({
+      surface: "campaign",
+      label: `FB Analytics · ${result.rows.length} campaigns`,
+      contextPack: aiCampaigns.output.contextPack,
+    });
+  }, [aiCampaigns.output, result.rows.length]);
+  useEffect(() => () => useAiAssistantStore.getState().publishContext(null), []);
 
   const topTrials = useMemo(() => rows.slice(0, 10).map((row) => ({ ...row, label: shortCampaignLabel(row) })), [rows]);
   const topRevenue = useMemo(

@@ -5,6 +5,7 @@ import { AiActionChip } from "@/components/ai/AiActionChip";
 import { AiAnalysisPanel } from "@/components/ai/AiAnalysisPanel";
 import { AiOpportunities } from "@/components/ai/AiOpportunities";
 import { aiCohortKey, useAiCohortSignals } from "@/hooks/useAiCohortSignals";
+import { useAiAssistantStore } from "@/store/aiAssistantStore";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -2113,6 +2114,18 @@ export default function CohortsPage() {
     userScopeHash,
     warehouseVersion,
   });
+  // Publish the deterministic context to the global assistant; cleared on
+  // unmount so another page's context never leaks into questions asked here.
+  useEffect(() => {
+    if (!aiSignals.output) return;
+    const range = cohortDateFrom || cohortDateTo ? ` · ${cohortDateFrom || "…"} — ${cohortDateTo || "…"}` : "";
+    useAiAssistantStore.getState().publishContext({
+      surface: "cohort",
+      label: `Cohorts · ${effectiveFilteredCohorts.length} cohorts${range}`,
+      contextPack: aiSignals.output.contextPack,
+    });
+  }, [aiSignals.output, effectiveFilteredCohorts.length, cohortDateFrom, cohortDateTo]);
+  useEffect(() => () => useAiAssistantStore.getState().publishContext(null), []);
   // AI analysis expansion is per-session UI state (deliberately not persisted:
   // recommendations move with the data, a stale open panel would mislead).
   const [aiExpandedIds, setAiExpandedIds] = useState<ReadonlySet<string>>(new Set());

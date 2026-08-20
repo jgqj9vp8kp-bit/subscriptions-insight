@@ -378,7 +378,7 @@ function scopeKey(scope: AiScope): string {
   return `campaign|${scope.campaignId}`;
 }
 
-function scopeLabel(scope: AiScope): string {
+export function aiScopeLabel(scope: AiScope): string {
   if (scope.kind === "cohort") return `${scope.campaignPath} · ${scope.cohortDate}`;
   if (scope.kind === "path") return scope.campaignPath;
   return scope.campaignName ? `${scope.campaignName} (${scope.campaignId})` : scope.campaignId;
@@ -1453,7 +1453,7 @@ function buildContextPack(
   asOfDate: string,
 ): AiContextPack {
   const items = recommendations.map((rec) => ({
-    scopeLabel: scopeLabel(rec.scope),
+    scopeLabel: aiScopeLabel(rec.scope),
     action: aiActionLabel(rec.action, rec.budgetDeltaPct),
     claim: rec.claim,
     evidenceLines: rec.because.map((ev) => {

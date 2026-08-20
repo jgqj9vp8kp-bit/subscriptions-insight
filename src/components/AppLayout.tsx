@@ -1,10 +1,12 @@
 import { ReactNode, useEffect, useState } from "react";
 import { useLocation } from "react-router-dom";
-import { LogOut, TriangleAlert } from "lucide-react";
+import { LogOut, Sparkles, TriangleAlert } from "lucide-react";
 import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import { AppSidebar } from "@/components/AppSidebar";
+import { AiAssistantDrawer } from "@/components/ai/AiAssistantDrawer";
 import { Button } from "@/components/ui/button";
 import { useAuth } from "@/hooks/useAuth";
+import { useAiAssistantStore } from "@/store/aiAssistantStore";
 import { useDataStore } from "@/store/dataStore";
 import { shouldShowSampleDataBanner } from "@/services/transactionAutoLoadPolicy";
 
@@ -55,6 +57,16 @@ export function AppLayout({ title, description, actions, children }: AppLayoutPr
             </div>
             <div className="flex items-center gap-2">
               {actions}
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => useAiAssistantStore.getState().setOpen(true)}
+                title="AI Assistant: ask about the analytics on this page"
+              >
+                <Sparkles className="h-4 w-4 text-primary" />
+                <span className="hidden sm:inline">AI</span>
+              </Button>
               {user?.email && (
                 <div className="hidden max-w-[240px] truncate text-xs text-muted-foreground md:block">
                   {user.email}
@@ -85,6 +97,7 @@ export function AppLayout({ title, description, actions, children }: AppLayoutPr
             {children}
           </main>
         </div>
+        <AiAssistantDrawer />
       </div>
     </SidebarProvider>
   );

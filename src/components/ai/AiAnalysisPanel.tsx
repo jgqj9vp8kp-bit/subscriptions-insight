@@ -1,10 +1,12 @@
 // Expanded AI analysis for one cohort/campaign row. Mirrors BankDetailPanel's
 // skeleton: a dense metric grid, everything deterministic and instant — the
 // numbers ARE the explanation, no model call involved.
-import { AlertTriangle } from "lucide-react";
+import { AlertTriangle, Sparkles } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { AiActionChip } from "@/components/ai/AiActionChip";
-import type { AiEvidence, AiMetricVerdict, AiRecommendation } from "@/services/aiSignals";
+import { AiFeedback } from "@/components/ai/AiFeedback";
+import { aiActionLabel, aiScopeLabel, type AiEvidence, type AiMetricVerdict, type AiRecommendation } from "@/services/aiSignals";
+import { useAiAssistantStore } from "@/store/aiAssistantStore";
 
 const VERDICT_STYLE: Record<AiMetricVerdict, string> = {
   good: "text-success border-success/40",
@@ -60,6 +62,27 @@ function EvidenceRow({ ev }: { ev: AiEvidence }) {
         </span>
       </span>
     </div>
+  );
+}
+
+/** "Ask AI" opens the assistant with the page's published context and a
+ * pre-filled question about this row — follow-ups can then compare to peers. */
+function AskAiButton({ rec }: { rec: AiRecommendation }) {
+  const context = useAiAssistantStore((state) => state.context);
+  if (!context) return null;
+  return (
+    <button
+      type="button"
+      className="inline-flex items-center gap-1 text-xs font-medium text-primary hover:underline"
+      onClick={() =>
+        useAiAssistantStore.getState().openWith({
+          ...context,
+          seedQuestion: `Why do you recommend "${aiActionLabel(rec.action, rec.budgetDeltaPct)}" for ${aiScopeLabel(rec.scope)}?`,
+        })
+      }
+    >
+      <Sparkles className="h-3 w-3" /> Ask AI about this
+    </button>
   );
 }
 
@@ -125,7 +148,15 @@ export function AiAnalysisPanel({ rec, footer }: { rec: AiRecommendation; footer
         )}
       </div>
 
-      {footer}
+      <div className="flex items-center gap-4">
+        <AskAiButton rec={rec} />
+        <AiFeedback
+          subjectKind="recommendation"
+          subjectId={`${rec.surface}:${aiScopeLabel(rec.scope)}:${rec.ruleId}`}
+          payload={{ action: rec.action, budgetDeltaPct: rec.budgetDeltaPct, ruleId: rec.ruleId, confidence: rec.confidence }}
+        />
+        {footer}
+      </div>
     </div>
   );
 }
