@@ -8,6 +8,7 @@
 // can exercise it without an API key or a network call.
 import Anthropic from "https://esm.sh/@anthropic-ai/sdk@0.115.0";
 import type { ModelCaller, ModelCallRequest, ModelCallResult } from "./clickhouse/supportClassifier.ts";
+import { stripUnsupportedSchemaKeywords } from "./clickhouse/structuredOutputSchema.ts";
 
 export function anthropicApiKey(): string | null {
   const key = Deno.env.get("ANTHROPIC_API_KEY")?.trim();
@@ -32,7 +33,10 @@ export function createAnthropicModelCaller(apiKey: string, model: string): Model
       system: request.system,
       output_config: {
         effort: "low",
-        format: { type: "json_schema", schema: request.schema },
+        // The structured-outputs API rejects size/range keywords (maxItems,
+        // maxLength, ...) with a 400; builders keep them as documentation and
+        // this boundary strips them, mirroring the official SDK helpers.
+        format: { type: "json_schema", schema: stripUnsupportedSchemaKeywords(request.schema) },
       },
       messages: [{ role: "user", content: request.user }],
     });
