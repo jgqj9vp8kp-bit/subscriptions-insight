@@ -9,6 +9,8 @@ import {
   funnelTrafficForGroup,
 } from "@/services/cohortReporting";
 import { buildFunnelViewRows, isFunnelViewRow, FUNNEL_ROW_ID_PREFIX } from "@/services/funnelView";
+import { buildCohortsExportTable } from "@/services/cohortsExport";
+import { sortCohortRows } from "@/services/cohortSorting";
 import type { TrafficMetric } from "@/services/trafficImport";
 
 let seq = 0;
@@ -337,6 +339,40 @@ describe("identity and display", () => {
     expect(row.cohort_date).toBe("2026-08-02"); // youngest — conservative maturity
     expect(row.funnel_values).toEqual(["past_life", "soulmate"]);
     expect(row.funnel).toBe("unknown"); // mixed funnels never invent a single value
+  });
+
+  it("exports one row per funnel with a leading 'Funnel' identity column", () => {
+    const { rows, trafficByKey } = fixture();
+    const funnelRows = buildFunnelViewRows({
+      cohorts: rows,
+      trafficByKey,
+      displayNameByPath: new Map([["path-a", "Soulmate Sketch"]]),
+    });
+    const table = buildCohortsExportTable({
+      cohorts: funnelRows,
+      columnOrder: ["trial_users", "gross_revenue", "traffic_spend"],
+      columnLabel: (id) => id,
+      trafficForCohort: (row) => (isFunnelViewRow(row) ? row.funnel_traffic : null),
+      leadingColumn: { header: "Funnel", value: (row) => (isFunnelViewRow(row) ? row.funnel_display_name : row.campaign_path) },
+    });
+    expect(table.headers).toEqual(["Funnel", "trial_users", "gross_revenue", "traffic_spend"]);
+    expect(table.rows).toHaveLength(2);
+    const pathARow = table.rows.find((r) => r[0] === "Soulmate Sketch")!;
+    expect(pathARow[1]).toBe(150);
+    expect(pathARow[3]).toBe(420); // deduped traffic spend rides the export too
+  });
+
+  it("sorts pseudo-rows through the standard sorter, including the traffic resolver", () => {
+    const { rows, trafficByKey } = fixture();
+    const funnelRows = buildFunnelViewRows({ cohorts: rows, trafficByKey });
+    const byPathAsc = sortCohortRows(funnelRows, { sortColumn: "campaign_path", sortDirection: "asc" });
+    expect(byPathAsc.map((r) => r.campaign_path)).toEqual(["path-a", "path-b"]);
+    const bySpendDesc = sortCohortRows(
+      funnelRows,
+      { sortColumn: "traffic_spend", sortDirection: "desc" },
+      (row) => (isFunnelViewRow(row) ? row.funnel_traffic : null),
+    );
+    expect(bySpendDesc[0].campaign_path).toBe("path-a"); // 420 > 210
   });
 
   it("is deterministic and stable under input row order", () => {

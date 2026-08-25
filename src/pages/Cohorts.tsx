@@ -8,6 +8,7 @@ import { aiCohortKey, useAiCohortSignals } from "@/hooks/useAiCohortSignals";
 import { useAiAssistantStore } from "@/store/aiAssistantStore";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -177,10 +178,17 @@ const DEFAULT_COHORTS_UI_STATE = {
   selectedMediaBuyers: [] as Array<MediaBuyer | string>,
   cohortDateFrom: "",
   cohortDateTo: "",
+  // Dead field kept for persisted-state compatibility; nothing reads it.
   dateSort: "desc" as "desc" | "asc",
   sortColumn: null as string | null,
   sortDirection: null as CohortSortDirection | null,
   expandedCohortIds: [] as string[],
+  // Two views of ONE dataset: "cohorts" = one row per cohort date,
+  // "funnels" = one row per campaign_path over the selected period. Old
+  // persisted payloads lack the key and fall back to "cohorts" at every
+  // merge point (usePersistedPageState, applyCohortsUiSettings, cloud spread).
+  // Note: "Reset filters" removes the whole key, returning to "cohorts" too.
+  viewMode: "cohorts" as "cohorts" | "funnels",
 };
 
 const COLUMN_ORDER_BEFORE_RENEWALS = [
@@ -690,6 +698,13 @@ const TRAFFIC_DERIVED_COLUMN_PREFIXES = ["traffic_", "roas_", "profit"] as const
 
 // Traffic joining/aggregation helpers now come from the shared cohortReporting
 // module (they were byte-identical page-local copies before the Funnels view).
+
+// Columns with no meaning at funnel grain (computed filter — column state,
+// saved views and sanitizers stay mode-agnostic): cohort_date spans a range,
+// ai_action is a cohort-grain engine, currency_mix / fx_missing_amount are
+// deliberately non-aggregatable.
+const FUNNELS_INAPPLICABLE_COLUMNS = new Set<string>(["cohort_date", "ai_action", "currency_mix", "fx_missing_amount"]);
+
 function isTrafficDerivedColumn(id: string): boolean {
   return id === "trial_cost" || TRAFFIC_DERIVED_COLUMN_PREFIXES.some((prefix) => id.startsWith(prefix));
 }
@@ -1069,6 +1084,8 @@ export default function CohortsPage() {
   // Trial durations gate the AI engine's Trial → Paid maturity judgement; the
   // same listFunnels call feeds them so the AI layer adds no extra request.
   const [trialDurationsByPath, setTrialDurationsByPath] = useState<Record<string, number | null>>({});
+  // Human-readable names for the Funnels view's first column; same fetch.
+  const [funnelDisplayNameByPath, setFunnelDisplayNameByPath] = useState<Map<string, string>>(new Map());
   useEffect(() => {
     let cancelled = false;
     listFunnels()
@@ -1077,12 +1094,15 @@ export default function CohortsPage() {
         setActiveFunnelPaths(new Set(rows.filter((row) => row.is_active).map((row) => row.funnel_path)));
         const byPath = new Map<string, string[]>();
         const durations: Record<string, number | null> = {};
+        const displayNames = new Map<string, string>();
         for (const row of rows) {
           byPath.set(row.funnel_path, row.tags.map((tag) => tag.name));
           durations[row.funnel_path] = typeof row.trial_duration_days === "number" ? row.trial_duration_days : null;
+          if (row.display_name) displayNames.set(row.funnel_path, row.display_name);
         }
         setFunnelTagsByPath(byPath);
         setTrialDurationsByPath(durations);
+        setFunnelDisplayNameByPath(displayNames);
       })
       .catch(() => {
         /* highlight/tags are best-effort; registry is optional to the report */
@@ -1109,7 +1129,9 @@ export default function CohortsPage() {
     sortColumn,
     sortDirection,
     expandedCohortIds: expandedCohortIdList,
+    viewMode,
   } = uiState;
+  const isFunnelsView = viewMode === "funnels";
   // Traffic-source and refund filters were removed from the Cohorts UI; the
   // report is always unfiltered on these two dimensions. Kept as `"all"`
   // constants (typed as string to avoid literal-narrowing in the comparisons
@@ -2080,8 +2102,37 @@ export default function CohortsPage() {
     [aiSignals.byCohort],
   );
 
+  // Funnels view: one pseudo-row per campaign_path, each a projection of the
+  // SAME totals engine over that path's already-filtered cohort rows.
+  const funnelRows = useMemo(
+    () =>
+      isFunnelsView
+        ? buildFunnelViewRows({
+            cohorts: effectiveFilteredCohorts,
+            trafficByKey,
+            displayNameByPath: funnelDisplayNameByPath,
+          })
+        : [],
+    [isFunnelsView, effectiveFilteredCohorts, trafficByKey, funnelDisplayNameByPath],
+  );
+  // Traffic resolver seam: funnel rows carry their own (date,path)-deduped
+  // join; cohort rows keep the per-row lookup.
+  const trafficForRow = useCallback(
+    (c: CohortRow): CohortTraffic | null => (isFunnelViewRow(c) ? c.funnel_traffic : trafficForCohort(c, trafficByKey)),
+    [trafficByKey],
+  );
+
   const cohorts = useMemo(
     () => {
+      if (isFunnelsView) {
+        if (sortColumn && sortDirection) {
+          // The sticky first column sorts funnels by their identity (path).
+          const mapped = sortColumn === COHORT_FIRST_COL_KEY ? "campaign_path" : sortColumn;
+          return sortCohortRows(funnelRows, { sortColumn: mapped, sortDirection }, trafficForRow);
+        }
+        // Default: biggest funnels first (builder pre-sorts by trials desc).
+        return funnelRows;
+      }
       // The AI column sorts by decision rank (Scale first … Collect data last)
       // via the page-level lookup — getCohortSortValue stays AI-agnostic.
       if (sortColumn === "ai_action" && sortDirection) {
@@ -2114,7 +2165,7 @@ export default function CohortsPage() {
         return b.cohort_date.localeCompare(a.cohort_date);
       });
     },
-    [effectiveFilteredCohorts, sortColumn, sortDirection, trafficByKey, aiSignals.byCohort]
+    [effectiveFilteredCohorts, sortColumn, sortDirection, trafficByKey, aiSignals.byCohort, isFunnelsView, funnelRows, trafficForRow]
   );
   const hasUsers = useMemo(() => new Set(txs.map((t) => t.user_id)).size > 0, [txs]);
 
@@ -2124,20 +2175,30 @@ export default function CohortsPage() {
   const exportCohortsTable = async (format: "csv" | "xlsx") => {
     // ai_action is an interactive affordance (chip + expandable explanation);
     // a bare action word in a CSV would detach the claim from its evidence.
-    const exportColumns = columnOrder.filter((id) => columnVisibility[id] !== false && id !== "ai_action");
+    const exportColumns = columnOrder.filter(
+      (id) =>
+        columnVisibility[id] !== false &&
+        id !== "ai_action" &&
+        !(isFunnelsView && FUNNELS_INAPPLICABLE_COLUMNS.has(id)),
+    );
     const table = buildCohortsExportTable({
       cohorts,
       columnOrder: exportColumns,
       columnLabel,
-      trafficForCohort: (cohort) => trafficForCohort(cohort, trafficByKey),
+      trafficForCohort: trafficForRow,
+      // Funnels mode: one row per funnel, identified by its display name.
+      leadingColumn: isFunnelsView
+        ? { header: "Funnel", value: (row) => (isFunnelViewRow(row) ? row.funnel_display_name : row.campaign_path) }
+        : undefined,
     });
     const stamp = new Date().toISOString().slice(0, 10);
+    const baseName = isFunnelsView ? "funnels" : "cohorts";
     if (format === "csv") {
       const blob = new Blob(["\uFEFF", cohortsTableToCsv(table)], { type: "text/csv;charset=utf-8" });
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
-      link.download = `cohorts-${stamp}.csv`;
+      link.download = `${baseName}-${stamp}.csv`;
       link.click();
       URL.revokeObjectURL(url);
       return;
@@ -2145,8 +2206,8 @@ export default function CohortsPage() {
     const XLSX = await import("xlsx");
     const sheet = XLSX.utils.aoa_to_sheet([table.headers, ...table.rows]);
     const book = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(book, sheet, "Cohorts");
-    XLSX.writeFile(book, `cohorts-${stamp}.xlsx`);
+    XLSX.utils.book_append_sheet(book, sheet, isFunnelsView ? "Funnels" : "Cohorts");
+    XLSX.writeFile(book, `${baseName}-${stamp}.xlsx`);
   };
   useEffect(() => {
     if (firstRowsRef.current || cohorts.length === 0) return;
@@ -2298,8 +2359,11 @@ export default function CohortsPage() {
   };
 
   const visibleColumnOrder = useMemo(
-    () => columnOrder.filter((id) => columnVisibility[id] !== false),
-    [columnOrder, columnVisibility],
+    () =>
+      columnOrder.filter(
+        (id) => columnVisibility[id] !== false && !(isFunnelsView && FUNNELS_INAPPLICABLE_COLUMNS.has(id)),
+      ),
+    [columnOrder, columnVisibility, isFunnelsView],
   );
   // table-layout:fixed needs an explicit total width — with table-layout:auto (the
   // default), the browser ignores a column's requested width whenever it's narrower
@@ -2327,10 +2391,16 @@ export default function CohortsPage() {
   // here, the Funnels-view rows (buildFunnelViewRows) and the weekly report.
   // Traffic is deduplicated per (date, path) inside it, so a campaign path
   // feeding two funnels on one day counts that day's spend once.
-  const totals = useMemo(() => computeCohortReportTotals(cohorts, trafficByKey), [cohorts, trafficByKey]);
+  // ALWAYS computed over the underlying cohort rows (not the display rows):
+  // funnel pseudo-rows carry a synthetic cohort_date, and identical inputs are
+  // what make the Total provably equal across both view modes.
+  const totals = useMemo(
+    () => computeCohortReportTotals(effectiveFilteredCohorts, trafficByKey),
+    [effectiveFilteredCohorts, trafficByKey],
+  );
   const aggregatedTokenPacks = useMemo<TokenPackRow[]>(
-    () => aggregateTokenPackBreakdowns(cohorts.map((c) => c.token_pack_breakdown ?? [])),
-    [cohorts],
+    () => aggregateTokenPackBreakdowns(effectiveFilteredCohorts.map((c) => c.token_pack_breakdown ?? [])),
+    [effectiveFilteredCohorts],
   );
 
   const headerClassFor = (id: CohortColumnId) =>
@@ -2515,7 +2585,11 @@ export default function CohortsPage() {
 
   const renderCohortCell = (id: CohortColumnId, c: CohortRow) => {
     const className = cellClassFor(id);
-    const traffic = trafficForCohort(c, trafficByKey);
+    const traffic = trafficForRow(c);
+    // Profit/ROAS mix revenue with spend, so a funnel row only shows them when
+    // every underlying cohort day joined traffic — the Total row's exact gate.
+    // A plain cohort row is a single day: resolved traffic IS complete.
+    const trafficComplete = isFunnelViewRow(c) ? c.funnel_has_complete_traffic : true;
     const renewalUsers = renewalUsersForColumn(c, id);
     if (renewalUsers != null) return <TableCell key={id} className={className}>{renewalUsers}</TableCell>;
     switch (id) {
@@ -2524,7 +2598,15 @@ export default function CohortsPage() {
       case "campaign_path":
         return <TableCell key={id} className={className}>{c.campaign_path}</TableCell>;
       case "funnel":
-        return <TableCell key={id} className={`${className} capitalize`}>{c.funnel.replace("_", " ")}</TableCell>;
+        // A funnel-grain row can span several `funnel` values; show them all
+        // instead of the synthetic "unknown" the union collapses to.
+        return (
+          <TableCell key={id} className={`${className} capitalize`}>
+            {isFunnelViewRow(c) && c.funnel_values.length > 1
+              ? c.funnel_values.map((value) => value.replace("_", " ")).join(", ")
+              : c.funnel.replace("_", " ")}
+          </TableCell>
+        );
       case "ai_action": {
         const rec = aiRecForCohort(c);
         return (
@@ -2685,13 +2767,13 @@ export default function CohortsPage() {
         return <TableCell key={id} className={className} title={trafficCellTitle}>{trialCost != null ? formatCurrency(trialCost) : dash}</TableCell>;
       }
       case "profit":
-        return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic ? formatCurrency(c.net_revenue - traffic.spend) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic && trafficComplete ? formatCurrency(c.net_revenue - traffic.spend) : dash}</TableCell>;
       case "profit_d7":
-        return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic ? formatCurrency(c.revenue_d7 - traffic.spend) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic && trafficComplete ? formatCurrency(c.revenue_d7 - traffic.spend) : dash}</TableCell>;
       case "profit_1m":
-        return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic ? formatCurrency(c.revenue_d30 - traffic.spend) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic && trafficComplete ? formatCurrency(c.revenue_d30 - traffic.spend) : dash}</TableCell>;
       case "profit_2m":
-        return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic ? formatCurrency(c.revenue_d60 - traffic.spend) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic && trafficComplete ? formatCurrency(c.revenue_d60 - traffic.spend) : dash}</TableCell>;
       case "traffic_cac":
         return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic ? formatCurrency(traffic.cac) : dash}</TableCell>;
       case "traffic_trial_count":
@@ -2705,11 +2787,11 @@ export default function CohortsPage() {
       case "traffic_ctr":
         return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic?.ctr != null ? formatPct(traffic.ctr) : dash}</TableCell>;
       case "roas_d7":
-        return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic?.spend ? formatRoas(c.revenue_d7 / traffic.spend) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic?.spend && trafficComplete ? formatRoas(c.revenue_d7 / traffic.spend) : dash}</TableCell>;
       case "roas_1m":
-        return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic?.spend ? formatRoas(c.revenue_d30 / traffic.spend) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic?.spend && trafficComplete ? formatRoas(c.revenue_d30 / traffic.spend) : dash}</TableCell>;
       case "roas_2m":
-        return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic?.spend ? formatRoas(c.revenue_d60 / traffic.spend) : dash}</TableCell>;
+        return <TableCell key={id} className={className} title={trafficCellTitle}>{traffic?.spend && trafficComplete ? formatRoas(c.revenue_d60 / traffic.spend) : dash}</TableCell>;
     }
   };
 
@@ -3084,8 +3166,19 @@ export default function CohortsPage() {
   };
 
   return (
-    <AppLayout title="Cohorts" description="Grouped by trial date">
+    <AppLayout
+      title="Cohorts"
+      description={isFunnelsView ? "Grouped by campaign path over the selected period" : "Grouped by trial date"}
+    >
       <Card className="rounded-lg border bg-card text-card-foreground shadow-sm p-4 shadow-card py-[20px]">
+        {/* Two views of ONE dataset: same filters, same rows, same totals
+            engine — only the row grain changes (Users-page Tabs pattern). */}
+        <Tabs value={viewMode} onValueChange={(value) => setUiState((current) => ({ ...current, viewMode: value as "cohorts" | "funnels" }))}>
+          <TabsList className="mb-3">
+            <TabsTrigger value="cohorts">Cohorts</TabsTrigger>
+            <TabsTrigger value="funnels">Funnels</TabsTrigger>
+          </TabsList>
+        </Tabs>
         <div className="mb-3 flex flex-wrap items-center gap-2 pb-3 border-b border-border">
           {isRecomputing && (
             <span className="order-last ml-auto flex items-center gap-1 text-xs text-primary">
@@ -4053,14 +4146,17 @@ export default function CohortsPage() {
             onOpen={(opp) => {
               if (opp.recommendation.scope.kind !== "cohort") return;
               const scope = opp.recommendation.scope;
-              const row = cohorts.find(
+              // Search the underlying cohort rows: in Funnels mode the display
+              // rows are path-grain pseudo-rows, so switch back first.
+              const row = effectiveFilteredCohorts.find(
                 (c) => c.cohort_date === scope.cohortDate && c.funnel === scope.funnel && c.campaign_path === scope.campaignPath,
               );
               if (!row) return;
+              if (isFunnelsView) setUiState((current) => ({ ...current, viewMode: "cohorts" }));
               setAiExpandedIds((current) => new Set(current).add(row.cohort_id));
               window.setTimeout(() => {
                 document.querySelector(`[data-cohort-id="${CSS.escape(row.cohort_id)}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" });
-              }, 50);
+              }, isFunnelsView ? 150 : 50);
             }}
           />
         )}
@@ -4079,9 +4175,9 @@ export default function CohortsPage() {
                     type="button"
                     onClick={() => onSortColumn(COHORT_FIRST_COL_KEY)}
                     className="inline-flex max-w-full items-center gap-1 hover:text-foreground"
-                    aria-label="Sort by Cohort"
+                    aria-label={isFunnelsView ? "Sort by Funnel" : "Sort by Cohort"}
                   >
-                    <span className="line-clamp-2 min-w-0 whitespace-normal break-words leading-tight">Cohort</span>
+                    <span className="line-clamp-2 min-w-0 whitespace-normal break-words leading-tight">{isFunnelsView ? "Funnel" : "Cohort"}</span>
                     <span className="shrink-0">{sortIcon(COHORT_FIRST_COL_KEY)}</span>
                   </button>
                   <div
@@ -4123,7 +4219,16 @@ export default function CohortsPage() {
                             aria-expanded={expanded}
                           >
                             {expanded ? <ChevronDown className="h-3.5 w-3.5 shrink-0" /> : <ChevronRight className="h-3.5 w-3.5 shrink-0" />}
-                            <span className="truncate" title={c.cohort_id}>{cohortDisplayName(c)}</span>
+                            {isFunnelViewRow(c) ? (
+                              <span
+                                className="truncate"
+                                title={`${c.campaign_path} · ${c.funnel_cohort_count} cohorts · ${c.funnel_date_min}${c.funnel_date_max !== c.funnel_date_min ? `–${c.funnel_date_max}` : ""}`}
+                              >
+                                {c.funnel_display_name}
+                              </span>
+                            ) : (
+                              <span className="truncate" title={c.cohort_id}>{cohortDisplayName(c)}</span>
+                            )}
                           </button>
                         </div>
                       </TableCell>
@@ -4176,7 +4281,7 @@ export default function CohortsPage() {
                         </TableCell>
                       </TableRow>
                     )}
-                    {aiExpandedIds.has(c.cohort_id) && (() => {
+                    {!isFunnelsView && aiExpandedIds.has(c.cohort_id) && (() => {
                       const rec = aiRecForCohort(c);
                       return rec ? (
                         <TableRow

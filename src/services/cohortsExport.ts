@@ -17,17 +17,24 @@ export function buildCohortsExportTable(input: {
   columnOrder: string[];
   columnLabel: (id: string) => string;
   trafficForCohort?: (cohort: CohortRow) => CohortSortTraffic;
+  /** Extra identity column prepended to every row (the Funnels view exports
+   * "Funnel" with the registry display name; the Cohorts view passes none). */
+  leadingColumn?: { header: string; value: (cohort: CohortRow) => string | number };
 }): CohortsExportTable {
   const traffic = input.trafficForCohort ?? (() => null);
-  const headers = input.columnOrder.map((id) => input.columnLabel(id));
-  const rows = input.cohorts.map((cohort) =>
-    input.columnOrder.map((id) => {
+  const headers = [
+    ...(input.leadingColumn ? [input.leadingColumn.header] : []),
+    ...input.columnOrder.map((id) => input.columnLabel(id)),
+  ];
+  const rows = input.cohorts.map((cohort) => [
+    ...(input.leadingColumn ? [input.leadingColumn.value(cohort)] : []),
+    ...input.columnOrder.map((id): string | number => {
       if (id === "cohort_date") return cohort.cohort_date;
       const value = getCohortSortValue(cohort, id, traffic(cohort));
       if (value == null) return "";
       return value;
     }),
-  );
+  ]);
   return { headers, rows };
 }
 
