@@ -294,6 +294,22 @@ export async function loadCohortDetailsFromClickHouse(
   return response;
 }
 
+/** Funnel-grain details: every cohort of one campaign_path within the
+ * request's date window — feeds the Funnels view's expanded row with the same
+ * plan/currency/token breakdowns a single cohort gets. */
+export async function loadFunnelDetailsFromClickHouse(
+  campaignPath: string,
+  request: Omit<CohortRequest, "action" | "cohort_key" | "funnel_key"> = {},
+): Promise<CohortDetailsResponse> {
+  const response = await runClickHouseCohortDetails({
+    ...request,
+    action: "details",
+    funnel_key: { campaign_path: campaignPath },
+  });
+  if (!response.ok) throw new Error(response.error || "ClickHouse funnel details request failed.");
+  return response;
+}
+
 // ---- Expanded-row price-plan breakdown ------------------------------------
 // Each details plan row embeds a full CohortAggregateRow computed over ONLY
 // that plan's users, so it goes through the SAME mapAggregateToCohortRow as the

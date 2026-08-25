@@ -42,7 +42,7 @@ import {
   subscriptionSyncCompletenessWarning,
 } from "@/services/funnelfoxSubscriptionsSync";
 import type { CardType, CohortRow, MediaBuyer, PlanBreakdownRow } from "@/services/types";
-import { cohortsDataSourceMode, loadCohortDetailsFromClickHouse, mapDetailsPlanBreakdown } from "@/services/cohortsDataSource";
+import { cohortsDataSourceMode, loadCohortDetailsFromClickHouse, loadFunnelDetailsFromClickHouse, mapDetailsPlanBreakdown } from "@/services/cohortsDataSource";
 import { isClickHouseCircuitOpen } from "@/services/clickhouse";
 import { deriveCohortSnapshotHealth, ensureCohortSnapshotRebuild } from "@/services/cohortSnapshotHealth";
 import {
@@ -2013,7 +2013,35 @@ export default function CohortsPage() {
   // are never fetched. Cache lives per cohort_id and is dropped whenever the
   // ClickHouse result changes (new filters or a background refresh), because
   // the details request embeds the same member filters as the list.
-  type PlanDetailsEntry = { status: "loading" | "ready" | "error"; rows: PlanBreakdownRow[]; error?: string };
+  // Funnels view: one pseudo-row per campaign_path, each a projection of the
+  // SAME totals engine over that path's already-filtered cohort rows.
+  const funnelRows = useMemo(
+    () =>
+      isFunnelsView
+        ? buildFunnelViewRows({
+            cohorts: effectiveFilteredCohorts,
+            trafficByKey,
+            displayNameByPath: funnelDisplayNameByPath,
+          })
+        : [],
+    [isFunnelsView, effectiveFilteredCohorts, trafficByKey, funnelDisplayNameByPath],
+  );
+  // Traffic resolver seam: funnel rows carry their own (date,path)-deduped
+  // join; cohort rows keep the per-row lookup.
+  const trafficForRow = useCallback(
+    (c: CohortRow): CohortTraffic | null => (isFunnelViewRow(c) ? c.funnel_traffic : trafficForCohort(c, trafficByKey)),
+    [trafficByKey],
+  );
+
+  type PlanDetailsEntry = {
+    status: "loading" | "ready" | "error";
+    rows: PlanBreakdownRow[];
+    error?: string;
+    /** Funnel-grain details only: breakdowns the pseudo-row cannot carry
+     * itself (per-cohort rows get these on the list row already). */
+    tokenPacks?: TokenPackRow[];
+    currencies?: CohortRow["currency_breakdown"];
+  };
   const [planDetails, setPlanDetails] = useState<ReadonlyMap<string, PlanDetailsEntry>>(new Map());
   const planDetailsGenRef = useRef(0);
   useEffect(() => {
@@ -2035,20 +2063,39 @@ export default function CohortsPage() {
     if (!clickHouseDriving) return;
     for (const cohortId of expandedCohortIdList) {
       if (planDetails.has(cohortId)) continue;
-      const cohort = effectiveFilteredCohorts.find((row) => row.cohort_id === cohortId);
-      if (!cohort || cohort.plan_breakdown.length > 0) continue;
+      // A "funnelpath:" id is a Funnels-view pseudo-row: fetch funnel-grain
+      // details (all cohorts of the path within the window) instead.
+      const funnelRow = isFunnelsView ? funnelRows.find((row) => row.cohort_id === cohortId) : undefined;
+      const cohort = funnelRow ? undefined : effectiveFilteredCohorts.find((row) => row.cohort_id === cohortId);
+      if (!funnelRow && (!cohort || cohort.plan_breakdown.length > 0)) continue;
       const generation = planDetailsGenRef.current;
       setPlanDetails((current) => new Map(current).set(cohortId, { status: "loading", rows: [] }));
-      void loadCohortDetailsFromClickHouse(
-        { cohort_date: cohort.cohort_date, funnel: cohort.funnel, campaign_path: cohort.campaign_path },
-        planDetailsRequest,
-      )
+      const load = funnelRow
+        ? loadFunnelDetailsFromClickHouse(funnelRow.campaign_path, planDetailsRequest)
+        : loadCohortDetailsFromClickHouse(
+            { cohort_date: cohort!.cohort_date, funnel: cohort!.funnel, campaign_path: cohort!.campaign_path },
+            planDetailsRequest,
+          );
+      void load
         .then((details) => {
           if (planDetailsGenRef.current !== generation) return;
           setPlanDetails((current) => new Map(current).set(cohortId, {
             status: "ready",
             rows: mapDetailsPlanBreakdown(details),
             error: details.error,
+            ...(funnelRow
+              ? {
+                  tokenPacks: details.token_pack_breakdown ?? [],
+                  // The details contract carries no avg trial price (that is a
+                  // mean of trial PRICES, which only the legacy engine tracks);
+                  // the panel renders "—" for null.
+                  currencies: (details.currency_breakdown ?? []).map((row) => ({
+                    ...row,
+                    avg_trial_price_original: null,
+                    avg_trial_price_usd: null,
+                  })),
+                }
+              : {}),
           }));
         })
         .catch((error) => {
@@ -2060,7 +2107,7 @@ export default function CohortsPage() {
           }));
         });
     }
-  }, [clickHouseDriving, effectiveFilteredCohorts, expandedCohortIdList, planDetails, planDetailsRequest]);
+  }, [clickHouseDriving, effectiveFilteredCohorts, expandedCohortIdList, planDetails, planDetailsRequest, isFunnelsView, funnelRows]);
 
   // AI signal engine over the filtered rows (benchmarks pool from the same
   // set the table shows). Pass rates arrive in the background and refine the
@@ -2100,26 +2147,6 @@ export default function CohortsPage() {
   const aiRecForCohort = useCallback(
     (c: CohortRow) => aiSignals.byCohort.get(aiCohortKey(c)) ?? null,
     [aiSignals.byCohort],
-  );
-
-  // Funnels view: one pseudo-row per campaign_path, each a projection of the
-  // SAME totals engine over that path's already-filtered cohort rows.
-  const funnelRows = useMemo(
-    () =>
-      isFunnelsView
-        ? buildFunnelViewRows({
-            cohorts: effectiveFilteredCohorts,
-            trafficByKey,
-            displayNameByPath: funnelDisplayNameByPath,
-          })
-        : [],
-    [isFunnelsView, effectiveFilteredCohorts, trafficByKey, funnelDisplayNameByPath],
-  );
-  // Traffic resolver seam: funnel rows carry their own (date,path)-deduped
-  // join; cohort rows keep the per-row lookup.
-  const trafficForRow = useCallback(
-    (c: CohortRow): CohortTraffic | null => (isFunnelViewRow(c) ? c.funnel_traffic : trafficForCohort(c, trafficByKey)),
-    [trafficByKey],
   );
 
   const cohorts = useMemo(
@@ -2954,9 +2981,11 @@ export default function CohortsPage() {
     if (renewalLevel != null) {
       return <TableCell key={id} className={className}>{totals.renewalTotalsByLevel[renewalLevel] ?? 0}</TableCell>;
     }
-    // FB totals come from the SERVER bundle: sums over deduplicated
-    // (campaign_id, date) pairs of the visible rows — never row-sum here, or a
-    // campaign feeding several funnels on one day would double-count.
+    // FB totals come from the SERVER bundle. Under the per-user allocation
+    // model each authoritative user belongs to exactly one cohort row, so
+    // Σ(non-null row fb_spend) equals the bundle — the bundle is kept as the
+    // source of truth (it also carries fields rows cannot, e.g. fb_purchases
+    // semantics and currency collapse), not because row sums double-count.
     const fbT = clickHouseDriving ? chResult?.fbTotals : undefined;
     switch (id) {
       case "ai_action": {
@@ -4277,7 +4306,14 @@ export default function CohortsPage() {
                           Monetization
                         </TableCell>
                         <TableCell colSpan={visibleColumnOrder.length} className="py-2 px-3">
-                          <CohortMonetizationDetails cohort={c} nowMs={nowMs} />
+                          <CohortMonetizationDetails
+                            cohort={
+                              isFunnelViewRow(c) && planEntry?.status === "ready"
+                                ? { ...c, token_pack_breakdown: planEntry.tokenPacks ?? [], currency_breakdown: planEntry.currencies ?? [] }
+                                : c
+                            }
+                            nowMs={nowMs}
+                          />
                         </TableCell>
                       </TableRow>
                     )}

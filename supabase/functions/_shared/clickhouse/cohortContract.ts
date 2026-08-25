@@ -78,6 +78,10 @@ export interface CohortRequest {
   now?: string;
   /** For action=details: the exact cohort to expand. */
   cohort_key?: { cohort_date: string; funnel: string; campaign_path: string };
+  /** For action=details at FUNNEL grain: every cohort of one campaign_path
+   * within date_from/date_to (the Funnels view's expanded row). Mutually
+   * exclusive with cohort_key; cohort_key wins when both are present. */
+  funnel_key?: { campaign_path: string };
   /** Authenticated, server-flagged runtime allocation diagnostics controls. */
   fb_allocation_diagnostics?: import("./fbAllocationDiagnostics.ts").FbAllocationDiagnosticsRequest | null;
 }

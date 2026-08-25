@@ -103,6 +103,43 @@ describe("plan query shape", () => {
     }
   });
 
+  it("funnel_key scopes to the whole path with the date window and funnel filter applied explicitly", async () => {
+    // The list applies date range / funnel as cohort-level POST-filters
+    // (HAVING); details has no HAVING, so the funnel scope must carry them in
+    // WHERE or the breakdown would not reconcile with the funnel row.
+    const { client, queries } = fakeClickHouse([]);
+    const response = await runCohortDetails({
+      authUserId: "user-1",
+      clickhouse: client,
+      request: {
+        action: "details",
+        funnel_key: { campaign_path: "soulmate-sketch" },
+        date_from: "2026-07-01",
+        date_to: "2026-07-31",
+        filters: { funnel: ["soulmate"] },
+      } as never,
+    });
+    const planQuery = queries.find((q) => q.query.includes("plankey"));
+    expect(planQuery!.query).toContain("c_camp = {fk_camp:String}");
+    expect(planQuery!.query).toContain("c_date >= {fk_from:String}");
+    expect(planQuery!.query).toContain("c_date <= {fk_to:String}");
+    expect(planQuery!.query).toContain("c_funnel IN ({p_fk_f_0:String})");
+    expect(planQuery!.params).toMatchObject({
+      fk_camp: "soulmate-sketch",
+      fk_from: "2026-07-01",
+      fk_to: "2026-07-31",
+      p_fk_f_0: "soulmate",
+    });
+    expect(response.cohort_key.campaign_path).toBe("soulmate-sketch");
+  });
+
+  it("rejects a details request with neither cohort_key nor funnel_key", async () => {
+    const { client } = fakeClickHouse([]);
+    await expect(
+      runCohortDetails({ authUserId: "user-1", clickhouse: client, request: { action: "details" } as never }),
+    ).rejects.toThrow(/cohort_key .* or funnel_key/);
+  });
+
   it("keeps auth scoping by bound parameter in the plan query", async () => {
     const { planQuery } = await runDetails([]);
     expect(planQuery!.query).toContain("a.auth_user_id = {auth_user_id:String}");

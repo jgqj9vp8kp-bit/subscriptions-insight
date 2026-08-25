@@ -117,6 +117,7 @@ export interface NormalizedCohortRequest {
   maxRenewalDepth: number;
   now: number;
   cohortKey: { cohort_date: string; funnel: string; campaign_path: string } | null;
+  funnelKey: { campaign_path: string } | null;
 }
 
 export function normalizeCohortRequest(req: CohortRequest): NormalizedCohortRequest {
@@ -128,6 +129,8 @@ export function normalizeCohortRequest(req: CohortRequest): NormalizedCohortRequ
         campaign_path: s(req.cohort_key.campaign_path),
       }
     : null;
+  const funnelKeyPath = s(req.funnel_key?.campaign_path);
+  const funnelKey = funnelKeyPath ? { campaign_path: funnelKeyPath } : null;
   const depth = Number(req.max_renewal_depth);
   const nowMs = req.now ? Date.parse(s(req.now)) : Date.now();
   return {
@@ -151,6 +154,7 @@ export function normalizeCohortRequest(req: CohortRequest): NormalizedCohortRequ
     maxRenewalDepth: Number.isFinite(depth) ? Math.max(2, Math.min(12, Math.floor(depth))) : DEFAULT_MAX_RENEWAL_DEPTH,
     now: Number.isFinite(nowMs) ? nowMs : Date.now(),
     cohortKey,
+    funnelKey,
   };
 }
 
@@ -964,6 +968,33 @@ function cohortKeyWhere(key: { cohort_date: string; funnel: string; campaign_pat
   return `c_date = {ck_date:String} AND c_funnel = {ck_funnel:String} AND c_camp = {ck_camp:String}`;
 }
 
+// Scope `fin` to a whole campaign_path over the request window (the Funnels
+// view's expanded row). Unlike cohortKeyWhere, the date range and the funnel
+// filter must be applied here explicitly: on the list path they are
+// cohort-level post-filters (HAVING), which details has no equivalent of —
+// without them the breakdown would not reconcile with the funnel row.
+// refund_status is NOT reproduced (it is a per-cohort-group HAVING; the UI
+// hardcodes "all" since the filter's removal).
+function funnelKeyWhere(
+  key: { campaign_path: string },
+  nreq: NormalizedCohortRequest,
+  params: Record<string, unknown>,
+): string {
+  params.fk_camp = key.campaign_path;
+  const conds = [`c_camp = {fk_camp:String}`];
+  if (nreq.dateFrom) {
+    params.fk_from = nreq.dateFrom;
+    conds.push(`c_date >= {fk_from:String}`);
+  }
+  if (nreq.dateTo) {
+    params.fk_to = nreq.dateTo;
+    conds.push(`c_date <= {fk_to:String}`);
+  }
+  const funnelIn = inClause("c_funnel", nreq.filters.funnel, "fk_f", params);
+  if (funnelIn) conds.push(funnelIn);
+  return conds.join(" AND ");
+}
+
 export async function runCohortDetails(input: {
   authUserId: string;
   clickhouse: ClickHouseClientLike;
@@ -972,7 +1003,12 @@ export async function runCohortDetails(input: {
   const started = Date.now();
   const nreq = normalizeCohortRequest(input.request);
   const key = nreq.cohortKey;
-  if (!key || !key.cohort_date) throw new CohortRequestError("action=details requires cohort_key {cohort_date, funnel, campaign_path}.");
+  const funnelKey = key ? null : nreq.funnelKey;
+  if ((!key || !key.cohort_date) && !funnelKey) {
+    throw new CohortRequestError(
+      "action=details requires cohort_key {cohort_date, funnel, campaign_path} or funnel_key {campaign_path}.",
+    );
+  }
 
   // Details read finx (fin + email-matched token rows) so the expanded row's
   // token packs / currency mix / net_revenue_1m agree with the list row. The
@@ -986,11 +1022,12 @@ export async function runCohortDetails(input: {
     .catch(() => "unavailable" as const);
   const base = (extra: string, params: Record<string, unknown>) => {
     const memberConds = memberFilterConds(nreq.filters, params);
+    const scopeWhere = key ? cohortKeyWhere(key, params) : funnelKeyWhere(funnelKey!, nreq, params);
     return `WITH
 ${supportEmailsCTE(supportStatus)},
 ${classifierSQL(`a.auth_user_id = {auth_user_id:String}`, "")}
 , ${emailTokenSQL(memberFilterWhere(nreq.filters, params))}
-, scoped AS (SELECT * FROM finx WHERE ${cohortKeyWhere(key, params)}${memberConds.length ? ` AND ${memberConds.join(" AND ")}` : ""})
+, scoped AS (SELECT * FROM finx WHERE ${scopeWhere}${memberConds.length ? ` AND ${memberConds.join(" AND ")}` : ""})
 ${extra}
 FORMAT JSONEachRow`;
   };
@@ -998,6 +1035,7 @@ FORMAT JSONEachRow`;
   const p1: Record<string, unknown> = { auth_user_id: input.authUserId };
   const summarySql = base(`SELECT
     uniqExact(uid) trial_users,
+    max(c_date) max_cohort_date,
     sumIf(nn, is_success = 1 AND d <= 30) net_revenue_1m,
     uniqExactIf(uid, slot = 1) u1u, uniqExactIf(uid, slot = 2) u2u, uniqExactIf(uid, slot = 3) u3u, uniqExactIf(uid, slot >= 4) uxu,
     sumIf(g, slot = 1) u1r, sumIf(g, slot = 2) u2r, sumIf(g, slot = 3) u3r, sumIf(g, slot >= 4) uxr
@@ -1066,15 +1104,19 @@ FORMAT JSONEachRow`;
   const sumRow = ((sumRes as Array<Record<string, unknown>>)[0]) ?? {};
   const trialUsers = n(sumRow.trial_users);
   const net1m = round2(n(sumRow.net_revenue_1m));
-  const ageDays = Math.floor((nreq.now - Date.parse(`${key.cohort_date}T00:00:00.000Z`)) / 86400000);
+  // Funnel scope: maturity anchored to the YOUNGEST cohort in scope — the 1M
+  // window is complete only when even the newest cohort has 30 days of data.
+  const anchorDate = key?.cohort_date || s(sumRow.max_cohort_date) || nreq.dateTo || "";
+  const ageDays = Math.floor((nreq.now - Date.parse(`${anchorDate}T00:00:00.000Z`)) / 86400000);
   const tokenGross = (tokRes as Array<Record<string, unknown>>).reduce((a, r) => a + n(r.gross_revenue), 0);
+  const responseKey = key ?? { cohort_date: anchorDate, funnel: "", campaign_path: funnelKey!.campaign_path };
 
   return {
     ok: true,
     source: "clickhouse",
     generated_at: new Date().toISOString(),
     query_duration_ms: Date.now() - started,
-    cohort_key: key,
+    cohort_key: responseKey,
     // Each plan row reuses toAggregateRow — the exact mapper the list rows go
     // through — so a plan's gross/net/renewal/CR semantics can never drift from
     // the parent cohort's.
@@ -1083,9 +1125,9 @@ FORMAT JSONEachRow`;
       plan_name: s(r.plan_name) || "Unknown",
       ...toAggregateRow({
         ...r,
-        cohort_date: key.cohort_date,
-        funnel: key.funnel,
-        campaign_path: key.campaign_path,
+        cohort_date: responseKey.cohort_date,
+        funnel: responseKey.funnel,
+        campaign_path: responseKey.campaign_path,
       } as unknown as RawCohortRow),
     })),
     currency_breakdown: (curRes as Array<Record<string, unknown>>).map((r) => ({

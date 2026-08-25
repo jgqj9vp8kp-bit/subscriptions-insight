@@ -58,6 +58,40 @@
 - IndexedDB is the fast local cache, while Supabase `data_snapshots` is the cross-device source of truth for imported Palmer data, FunnelFox subscription snapshots, Facebook traffic data, and forecasting default settings.
 - localStorage is only for small UI state such as filters, column settings, selected views, and forecast assumptions.
 
+## Cohorts: Funnels view (2026-08)
+
+The Cohorts page has two view modes (persisted `viewMode`, default `cohorts`):
+one row per cohort date, or one row per `campaign_path` over the selected
+period ("Funnels"). Both are projections of the SAME dataset and totals
+engine — `computeCohortReportTotals` (shared, also feeds fbAnalyticsSummary)
+builds the Total row, each funnel pseudo-row (`src/services/funnelView.ts`,
+synthetic `funnelpath:` ids) and the weekly report rollup. Invariant, pinned
+by `src/test/funnelViewRollup.test.ts`: Funnels TOTAL == Cohorts TOTAL, and a
+single selected path's funnel row equals the Cohorts Total for that path.
+
+Aggregation rules (proven by the totals engine): trial-anchored counts are
+additive (a user belongs to exactly one cohort row); only active users /
+active subscriptions need id-array unions (the email-keyed FunnelFox overlay
+can duplicate across rows); every ratio recomputes from summed
+numerator/denominator — never averaged. Traffic joins by (date, path) and is
+deduplicated per key (`funnelTrafficForGroup`) in BOTH the Total row and
+funnel rows: a campaign path feeding two funnels on one day counts that day's
+spend once (the pre-2026-08 Total double-counted this case). FB fields sum
+exactly (per-user allocation partitions across rows); business ratios
+re-derive via `deriveFbBusinessMetrics` on the aggregated inputs.
+
+Funnel-grain details: `action: "details"` with `funnel_key: {campaign_path}`
+scopes to every cohort of one path within `date_from/date_to` — the date
+window and funnel filter are applied in WHERE explicitly because on the list
+path they are cohort-level HAVING post-filters that details has no
+equivalent of. `refund_status` is not reproduced there (the UI hardcodes
+"all"). Columns with no funnel-grain meaning (`cohort_date`, `ai_action`,
+`currency_mix`, `fx_missing_amount`) are filtered from the visible order per
+mode; column state, saved views and sanitizers stay mode-agnostic.
+
+Known dead field: `dateSort` in `ui_state_cohorts` (kept for persisted-state
+compatibility; nothing reads it).
+
 ## Supabase Dataset Snapshots
 
 The migration `supabase/migrations/202605090001_create_data_snapshots.sql` creates `public.data_snapshots`.
