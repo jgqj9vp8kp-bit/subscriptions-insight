@@ -257,6 +257,10 @@ export interface CohortRow extends CohortMonetizationFields, CohortFbFields {
   funnel: Funnel;
   campaign_path: string;
   trial_users: number;
+  /** Present at runtime on both engines (contract CohortAggregateRow carries
+   * them); previously read untyped by the Cohorts totals row. */
+  support_users?: number;
+  support_rate?: number;
   active_users: number;
   active_rate: number;
   active_subscriptions: number;

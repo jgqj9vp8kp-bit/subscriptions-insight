@@ -40,7 +40,6 @@ import {
   getFunnelFoxSubscriptionsSyncState,
   subscriptionSyncCompletenessWarning,
 } from "@/services/funnelfoxSubscriptionsSync";
-import { normalizeCampaignPath, type TrafficMetric } from "@/services/trafficImport";
 import type { CardType, CohortRow, MediaBuyer, PlanBreakdownRow } from "@/services/types";
 import { cohortsDataSourceMode, loadCohortDetailsFromClickHouse, mapDetailsPlanBreakdown } from "@/services/cohortsDataSource";
 import { isClickHouseCircuitOpen } from "@/services/clickhouse";
@@ -99,7 +98,18 @@ import {
   sortCohortRows,
   type CohortSortDirection,
 } from "@/services/cohortSorting";
-import { renewalUsersForColumn, renewalUsersForLevel, trialCostForCohort, trialCostFromSpend } from "@/services/cohortReporting";
+import {
+  aggregateTrafficMetrics,
+  computeCohortReportTotals,
+  renewalUsersForColumn,
+  renewalUsersForLevel,
+  trafficForCohort,
+  trialCostForCohort,
+  trialCostFromSpend,
+  type CohortTraffic,
+  type TrafficAggregate,
+} from "@/services/cohortReporting";
+import { buildFunnelViewRows, isFunnelViewRow, type FunnelViewRow } from "@/services/funnelView";
 import {
   MAX_RENEWAL_COLUMNS_CHANGED_EVENT,
   loadMaxRenewalColumns,
@@ -671,20 +681,6 @@ interface SavedView {
   builtin?: boolean;
 }
 
-type TrafficAggregate = TrafficMetric & {
-  row_count: number;
-};
-
-type CohortTraffic = {
-  spend: number;
-  cac: number;
-  trial_count: number;
-  clicks: number;
-  cpc: number;
-  cpm: number | null;
-  ctr: number | null;
-};
-
 const TRAFFIC_GEO_NOTE = "Traffic spend is not GEO-split";
 const TRAFFIC_CARD_TYPE_NOTE = "Traffic spend is not split by card type.";
 const TRAFFIC_PLATFORM_NOTE = "Traffic spend is not split by platform.";
@@ -692,70 +688,8 @@ const TRAFFIC_CAMPAIGN_ID_NOTE = "Traffic spend is cohort-level and is not split
 const TRAFFIC_MEDIA_BUYER_NOTE = "Spend is not split by Media Buyer";
 const TRAFFIC_DERIVED_COLUMN_PREFIXES = ["traffic_", "roas_", "profit"] as const;
 
-function normalizeCohortDate(date: string): string {
-  const trimmed = String(date ?? "").trim();
-  const isoMatch = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})/);
-  if (isoMatch) return `${isoMatch[1]}-${isoMatch[2]}-${isoMatch[3]}`;
-  const parsed = new Date(trimmed);
-  if (Number.isNaN(parsed.getTime())) return trimmed;
-  const yyyy = parsed.getFullYear();
-  const mm = String(parsed.getMonth() + 1).padStart(2, "0");
-  const dd = String(parsed.getDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
-}
-
-function normalizeCohortCampaignPath(campaignPath: string): string {
-  return String(campaignPath ?? "")
-    .trim()
-    .replace(/^["']+|["']+$/g, "")
-    .trim()
-    .replace(/^\/+/, "")
-    .toLowerCase();
-}
-
-function trafficKey(date: string, campaignPath: string): string {
-  return `${normalizeCohortDate(date)}__${normalizeCampaignPath(campaignPath)}`;
-}
-
-function cohortTrafficKey(row: CohortRow): string {
-  return `${normalizeCohortDate(row.cohort_date)}__${normalizeCohortCampaignPath(row.campaign_path)}`;
-}
-
-function aggregateTrafficMetrics(rows: TrafficMetric[]): Map<string, TrafficAggregate> {
-  const map = new Map<string, TrafficAggregate>();
-  for (const row of rows) {
-    const key = trafficKey(row.date, row.campaign_path);
-    const current = map.get(key);
-    if (!current) {
-      map.set(key, { ...row, row_count: 1 });
-      continue;
-    }
-    current.trial_count += row.trial_count;
-    current.spend += row.spend;
-    current.clicks += row.clicks;
-    current.cac = current.trial_count ? current.spend / current.trial_count : 0;
-    current.cpc = current.clicks ? current.spend / current.clicks : 0;
-    current.cpm = 0;
-    current.ctr = 0;
-    current.row_count += 1;
-  }
-  return map;
-}
-
-function trafficForCohort(row: CohortRow, trafficByKey: Map<string, TrafficAggregate>): CohortTraffic | null {
-  const traffic = trafficByKey.get(cohortTrafficKey(row));
-  if (!traffic) return null;
-  return {
-    spend: traffic.spend,
-    cac: traffic.trial_count ? traffic.spend / traffic.trial_count : traffic.cac,
-    trial_count: traffic.trial_count,
-    clicks: traffic.clicks,
-    cpc: traffic.clicks ? traffic.spend / traffic.clicks : traffic.cpc,
-    cpm: traffic.row_count === 1 ? traffic.cpm : null,
-    ctr: traffic.row_count === 1 ? traffic.ctr : null,
-  };
-}
-
+// Traffic joining/aggregation helpers now come from the shared cohortReporting
+// module (they were byte-identical page-local copies before the Funnels view).
 function isTrafficDerivedColumn(id: string): boolean {
   return id === "trial_cost" || TRAFFIC_DERIVED_COLUMN_PREFIXES.some((prefix) => id.startsWith(prefix));
 }
@@ -1586,7 +1520,11 @@ export default function CohortsPage() {
     setColumnWidths((current) =>
       sanitizeColumnWidths(current, defaultColumnWidths, [COHORT_FIRST_COL_KEY, ...defaultColumnOrder]),
     );
-    if (sortColumn && !defaultColumnOrder.includes(sortColumn)) {
+    // "__cohort__" is the sticky first column: a valid sort key (see
+    // validSortColumnIds) that never appears in defaultColumnOrder — without
+    // this carve-out, clicking its header set the sort and this effect
+    // immediately cleared it.
+    if (sortColumn && sortColumn !== COHORT_FIRST_COL_KEY && !defaultColumnOrder.includes(sortColumn)) {
       markCohortsUiSettingsUpdated();
       setUiState((current) => ({ ...current, sortColumn: null, sortDirection: null }));
     }
@@ -2385,113 +2323,11 @@ export default function CohortsPage() {
   const maxUpsell2CR = Math.max(0, ...cohorts.map((c) => c.upsell_2_cr ?? 0));
   const maxUpsell3CR = Math.max(0, ...cohorts.map((c) => c.upsell_3_cr ?? 0));
   const maxTokenBuyerCR = Math.max(0, ...cohorts.map((c) => c.token_buyer_cr ?? 0));
-  const totals = useMemo(() => {
-    const sum = (pick: (c: (typeof cohorts)[number]) => number) =>
-      cohorts.reduce((total, cohort) => total + pick(cohort), 0);
-    const totalTrialUsers = sum((c) => c.trial_users);
-    const totalSupportUsers = sum((c) => c.support_users ?? 0);
-    const totalUpsellUsers = sum((c) => c.upsell_users);
-    const totalFirstSubscriptionUsers = sum((c) => c.first_subscription_users);
-    const renewalTotalsByLevel = Object.fromEntries(
-      renewalColumnIds(maxRenewalColumns).map((id) => {
-        const level = renewalLevelFromColumnId(id) ?? 0;
-        return [level, sum((c) => renewalUsersForLevel(c, level))];
-      }),
-    );
-    const totalRenewal2Users = renewalTotalsByLevel[2] ?? 0;
-    const totalRenewal3Users = renewalTotalsByLevel[3] ?? 0;
-    const totalRenewal4Users = renewalTotalsByLevel[4] ?? 0;
-    const totalRenewal5Users = renewalTotalsByLevel[5] ?? 0;
-    const totalRenewal6Users = renewalTotalsByLevel[6] ?? 0;
-    const totalRenewalUsers = sum((c) => c.renewal_users);
-    const totalRefundUsers = new Set(cohorts.flatMap((c) => c.refunded_user_ids)).size;
-    const totalActiveUsers = new Set(cohorts.flatMap((c) => c.active_user_ids)).size;
-    // Dedup by active subscription_id across visible cohorts (not user ids).
-    const totalActiveSubscriptions = new Set(cohorts.flatMap((c) => c.active_subscription_ids ?? [])).size;
-    const totalCancelledUsers = new Set(cohorts.flatMap((c) => c.cancelled_user_ids)).size;
-    const totalUserCancelledUsers = new Set(cohorts.flatMap((c) => c.user_cancelled_user_ids)).size;
-    const totalAutoCancelledUsers = new Set(cohorts.flatMap((c) => c.auto_cancelled_user_ids)).size;
-    const totalCancelledActiveUsers = new Set(cohorts.flatMap((c) => c.cancelled_active_user_ids)).size;
-    const amountRefunded = sum((c) => c.amount_refunded);
-    const grossRevenue = sum((c) => c.gross_revenue);
-    const netRevenue = sum((c) => c.net_revenue);
-    const trafficRows = cohorts.map((c) => trafficForCohort(c, trafficByKey)).filter(Boolean) as CohortTraffic[];
-    const hasTrafficSpend = trafficRows.length > 0;
-    const hasCompleteTrafficSpend = cohorts.length > 0 && trafficRows.length === cohorts.length;
-    const totalTrafficSpend = trafficRows.reduce((total, traffic) => total + traffic.spend, 0);
-    const totalTrafficTrials = trafficRows.reduce((total, traffic) => total + traffic.trial_count, 0);
-    const totalTrafficClicks = trafficRows.reduce((total, traffic) => total + traffic.clicks, 0);
-    const totalRevenueD7 = sum((c) => c.revenue_d7);
-    const totalRevenueD30 = sum((c) => c.revenue_d30);
-    const totalRevenueD60 = sum((c) => c.revenue_d60);
-    return {
-      totalTrialUsers,
-      totalSupportUsers,
-      totalSupportRate: totalTrialUsers ? (totalSupportUsers / totalTrialUsers) * 100 : 0,
-      totalUpsellUsers,
-      totalFirstSubscriptionUsers,
-      totalRenewal2Users,
-      totalRenewal3Users,
-      totalRenewal4Users,
-      totalRenewal5Users,
-      totalRenewal6Users,
-      renewalTotalsByLevel,
-      totalRenewalUsers,
-      totalRefundUsers,
-      totalActiveUsers,
-      totalActiveSubscriptions,
-      totalCancelledUsers,
-      totalUserCancelledUsers,
-      totalAutoCancelledUsers,
-      totalCancelledActiveUsers,
-      totalActiveRate: totalTrialUsers ? (totalActiveUsers / totalTrialUsers) * 100 : 0,
-      totalActiveSubscriptionsRate: totalTrialUsers ? (totalActiveSubscriptions / totalTrialUsers) * 100 : 0,
-      totalCancellationRate: totalTrialUsers ? (totalCancelledUsers / totalTrialUsers) * 100 : 0,
-      totalUserCancelRate: totalTrialUsers ? (totalUserCancelledUsers / totalTrialUsers) * 100 : 0,
-      totalAutoCancelRate: totalTrialUsers ? (totalAutoCancelledUsers / totalTrialUsers) * 100 : 0,
-      trialRevenue: sum((c) => c.trial_revenue),
-      upsellRevenue: sum((c) => c.upsell_revenue),
-      firstSubscriptionRevenue: sum((c) => c.first_subscription_revenue),
-      renewalRevenue: sum((c) => c.renewal_revenue),
-      amountRefunded,
-      refundRate: totalTrialUsers ? (totalRefundUsers / totalTrialUsers) * 100 : 0,
-      grossRevenue,
-      netRevenue,
-      revenueD0: sum((c) => c.revenue_d0),
-      revenueD7: totalRevenueD7,
-      revenueD30: totalRevenueD30,
-      revenueD60: totalRevenueD60,
-      // Weighted realized 1M LTV, NOT the average of per-cohort ltv_1m_per_user.
-      ltv1mPerUser: totalTrialUsers ? totalRevenueD30 / totalTrialUsers : 0,
-      trafficSpend: totalTrafficSpend,
-      hasTrafficSpend,
-      hasCompleteTrafficSpend,
-      trialCost: trialCostFromSpend(hasTrafficSpend ? totalTrafficSpend : null, totalTrialUsers),
-      profit: netRevenue - totalTrafficSpend,
-      profitD7: totalRevenueD7 - totalTrafficSpend,
-      profit1m: totalRevenueD30 - totalTrafficSpend,
-      profit2m: totalRevenueD60 - totalTrafficSpend,
-      trafficTrials: totalTrafficTrials,
-      trafficClicks: totalTrafficClicks,
-      trafficCac: totalTrafficTrials ? totalTrafficSpend / totalTrafficTrials : 0,
-      trafficCpc: totalTrafficClicks ? totalTrafficSpend / totalTrafficClicks : 0,
-      roasD7: totalTrafficSpend ? totalRevenueD7 / totalTrafficSpend : 0,
-      roas1m: totalTrafficSpend ? totalRevenueD30 / totalTrafficSpend : 0,
-      roas2m: totalTrafficSpend ? totalRevenueD60 / totalTrafficSpend : 0,
-      trialToUpsellCr: totalTrialUsers ? (totalUpsellUsers / totalTrialUsers) * 100 : 0,
-      trialToFirstSubscriptionCr: totalTrialUsers ? (totalFirstSubscriptionUsers / totalTrialUsers) * 100 : 0,
-      firstSubscriptionToRenewal2Cr: totalFirstSubscriptionUsers ? (totalRenewal2Users / totalFirstSubscriptionUsers) * 100 : 0,
-      renewal2ToRenewal3Cr: totalRenewal2Users ? (totalRenewal3Users / totalRenewal2Users) * 100 : 0,
-      // Renewal N → N+1 total CRs recomputed from summed level totals; null when
-      // the denominator level is empty so the row renders "—", never NaN.
-      renewal3ToRenewal4Cr: totalRenewal3Users ? (totalRenewal4Users / totalRenewal3Users) * 100 : null,
-      renewal4ToRenewal5Cr: totalRenewal4Users ? (totalRenewal5Users / totalRenewal4Users) * 100 : null,
-      renewal5ToRenewal6Cr: totalRenewal5Users ? (totalRenewal6Users / totalRenewal5Users) * 100 : null,
-      // Monetization total CRs are recomputed from summed totals, not averaged.
-      monetization: computeCohortMonetizationTotals(cohorts, totalTrialUsers),
-      fxMissingTransactions: sum((c) => c.fx_missing_transactions ?? 0),
-    };
-  }, [cohorts, trafficByKey, maxRenewalColumns]);
+  // The single metric-definition path: the same engine builds the Total row
+  // here, the Funnels-view rows (buildFunnelViewRows) and the weekly report.
+  // Traffic is deduplicated per (date, path) inside it, so a campaign path
+  // feeding two funnels on one day counts that day's spend once.
+  const totals = useMemo(() => computeCohortReportTotals(cohorts, trafficByKey), [cohorts, trafficByKey]);
   const aggregatedTokenPacks = useMemo<TokenPackRow[]>(
     () => aggregateTokenPackBreakdowns(cohorts.map((c) => c.token_pack_breakdown ?? [])),
     [cohorts],
