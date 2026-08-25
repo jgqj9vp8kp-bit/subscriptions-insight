@@ -407,6 +407,7 @@ GROUP BY c_date, c_funnel, c_camp`;
  * plus the support_emails CTE in scope. */
 export const AGGREGATE_MEASURES = `uniqExact(uid) trial_users,
   sum(if(is_success = 1, g, 0)) gross_raw, sum(rr) refund_raw,
+  uniqExactIf(uid, rr > 0) refund_users,
   sum(if(is_success = 1 AND d = 0, nn, 0)) d0_raw, sum(if(is_success = 1 AND d <= 7, nn, 0)) d7_raw,
   sum(if(is_success = 1 AND d <= 14, nn, 0)) d14_raw, sum(if(is_success = 1 AND d <= 30, nn, 0)) d30_raw,
   sum(if(is_success = 1 AND d <= 60, nn, 0)) d60_raw,

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  AGGREGATE_MEASURES,
   CohortRequestError,
   normalizeAction,
   normalizeCohortRequest,
@@ -171,6 +172,14 @@ function rawAgg(over: Record<string, unknown> = {}): Record<string, unknown> {
 }
 
 describe("clickhouse-cohorts aggregate mapping + totals", () => {
+  it("produces refund_users in SQL — the legacy rule (any post-anchor refund amount)", () => {
+    // Regression: toAggregateRow always read refund_users, but the measure was
+    // missing from AGGREGATE_MEASURES, so refund_users/refund_rate were
+    // structurally ZERO on both ClickHouse paths (only amount_refunded was
+    // real). The rule mirrors the legacy engine: userRefundAmount > 0.
+    expect(AGGREGATE_MEASURES).toContain("uniqExactIf(uid, rr > 0) refund_users");
+  });
+
   it("rounds money half-up and computes addon = u1+u2+u3+token_net", () => {
     const row = toAggregateRow(rawAgg() as never);
     expect(row.gross_revenue).toBe(1000.01); // 1000.005 -> half-up
