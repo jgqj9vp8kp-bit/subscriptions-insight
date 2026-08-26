@@ -54,11 +54,16 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
   });
 }
 
-async function logRun(supabase: SupabaseLikeClient, row: Record<string, unknown>): Promise<void> {
+/** Returns the run row's id so the client can key feedback to this exact
+ * answer; null when logging fails (logging never breaks the response). */
+async function logRun(supabase: SupabaseLikeClient, row: Record<string, unknown>): Promise<string | null> {
   try {
-    await supabase.from("ai_assistant_runs").insert(row);
+    const builder = supabase.from("ai_assistant_runs").insert?.(row);
+    if (!builder) return null;
+    const result = builder.select ? await builder.select("id").single() : await builder;
+    return ((result.data ?? null) as { id?: string } | null)?.id ?? null;
   } catch (_error) {
-    // Intentionally swallowed; the response already carries the outcome.
+    return null;
   }
 }
 
@@ -125,7 +130,7 @@ Deno.serve(async (req: Request) => {
     const validation = validateAssistantAnswer(result.payload as AssistantAnswer, input);
     const durationMs = Date.now() - startedAt;
 
-    await logRun(supabase, {
+    const runId = await logRun(supabase, {
       ...baseRow,
       input_tokens: result.input_tokens,
       output_tokens: result.output_tokens,
@@ -141,13 +146,14 @@ Deno.serve(async (req: Request) => {
       ok: validation.ok,
       promptVersion: ASSISTANT_PROMPT_VERSION,
       model,
+      runId,
       answer: validation.accepted,
       validation: { ok: validation.ok, violations: validation.violations },
       usage: { inputTokens: result.input_tokens, outputTokens: result.output_tokens, durationMs },
     }, 200);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Assistant call failed.";
-    await logRun(supabase, {
+    const runId = await logRun(supabase, {
       ...baseRow,
       duration_ms: Date.now() - startedAt,
       status: "error",
@@ -163,6 +169,6 @@ Deno.serve(async (req: Request) => {
         error: "The Anthropic API balance is empty — top it up to enable assistant answers. All deterministic AI features keep working.",
       }, 200);
     }
-    return jsonResponse({ ok: false, error: message }, 200);
+    return jsonResponse({ ok: false, runId, error: message }, 200);
   }
 });

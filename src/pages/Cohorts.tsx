@@ -5,6 +5,7 @@ import { AiActionChip } from "@/components/ai/AiActionChip";
 import { AiAnalysisPanel } from "@/components/ai/AiAnalysisPanel";
 import { AiOpportunities } from "@/components/ai/AiOpportunities";
 import { aiCohortKey, useAiCohortSignals } from "@/hooks/useAiCohortSignals";
+import { stableJson } from "@/services/aiRecommendationLog";
 import { useAiAssistantStore } from "@/store/aiAssistantStore";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -2112,6 +2113,23 @@ export default function CohortsPage() {
   // AI signal engine over the filtered rows (benchmarks pool from the same
   // set the table shows). Pass rates arrive in the background and refine the
   // chips; nothing here blocks the table.
+  // Applied-filter identity for the recommendation history writer — the
+  // APPLIED (debounced) values, i.e. what effectiveFilteredCohorts actually
+  // reflects. viewMode is deliberately excluded: Cohorts and Funnels views
+  // share one engine run.
+  const aiContextKey = useMemo(
+    () => stableJson({
+      funnels: [...selectedFunnels].sort(),
+      paths: [...selectedCampaignPaths].sort(),
+      currency: currencyFilter,
+      campaignIds: [...appliedSelectedCampaignIds].sort(),
+      countries: [...appliedSelectedCountries].sort(),
+      cardTypes: [...appliedSelectedCardTypes].sort(),
+      platforms: [...appliedSelectedPlatforms].sort(),
+      mediaBuyers: [...appliedSelectedMediaBuyers].sort(),
+    }),
+    [selectedFunnels, selectedCampaignPaths, currencyFilter, appliedSelectedCampaignIds, appliedSelectedCountries, appliedSelectedCardTypes, appliedSelectedPlatforms, appliedSelectedMediaBuyers],
+  );
   const aiSignals = useAiCohortSignals({
     rows: effectiveFilteredCohorts,
     enabled: clickHouseDriving && effectiveFilteredCohorts.length > 0,
@@ -2120,6 +2138,7 @@ export default function CohortsPage() {
     trialDurationDaysByPath: trialDurationsByPath,
     userScopeHash,
     warehouseVersion,
+    contextKey: aiContextKey,
   });
   // Publish the deterministic context to the global assistant; cleared on
   // unmount so another page's context never leaks into questions asked here.

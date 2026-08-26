@@ -10,7 +10,7 @@ import { MAX_CONTEXT_ITEMS, type AssistantAnswer, type AssistantInput, type Assi
 export const AI_ANALYTICS_FUNCTION = "ai-analytics";
 
 export type AssistantOutcome =
-  | { kind: "ok" | "partial"; answer: AssistantAnswer; violations: AssistantViolation[]; model: string; usage: { inputTokens: number; outputTokens: number; durationMs: number } }
+  | { kind: "ok" | "partial"; answer: AssistantAnswer; violations: AssistantViolation[]; model: string; runId: string | null; usage: { inputTokens: number; outputTokens: number; durationMs: number } }
   | { kind: "unavailable"; reason: string }
   | { kind: "error"; message: string };
 
@@ -19,6 +19,7 @@ interface AssistantResponseBody {
   unavailable?: boolean;
   error?: string;
   model?: string;
+  runId?: string | null;
   answer?: AssistantAnswer;
   validation?: { ok: boolean; violations: AssistantViolation[] };
   usage?: { inputTokens: number; outputTokens: number; durationMs: number };
@@ -57,6 +58,7 @@ export async function askAssistant(input: AssistantInput): Promise<AssistantOutc
     answer: body.answer,
     violations: body.validation?.violations ?? [],
     model: body.model ?? "",
+    runId: body.runId ?? null,
     usage: body.usage ?? { inputTokens: 0, outputTokens: 0, durationMs: 0 },
   };
 }

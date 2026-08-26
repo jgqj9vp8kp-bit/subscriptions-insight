@@ -54,7 +54,7 @@ export const WAREHOUSE_ANALYTICS_INVALIDATED_EVENT = "warehouse-analytics-invali
 // warehouse version, so a transaction-sync invalidation is just a cheap refetch.
 export const WAREHOUSE_DEPENDENT_ROOTS: readonly string[] = ["cohorts", "users", "payment-analytics", "support", "fb-analytics"];
 
-function fnv(input: string): string {
+export function fnv(input: string): string {
   let h = 0x811c9dc5;
   for (let i = 0; i < input.length; i += 1) {
     h ^= input.charCodeAt(i);

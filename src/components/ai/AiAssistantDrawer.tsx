@@ -182,7 +182,7 @@ export function AiAssistantDrawer() {
                   )}
                   <AiFeedback
                     subjectKind="assistant_answer"
-                    subjectId={exchange.question.slice(0, 120)}
+                    subjectId={exchange.outcome.runId ?? exchange.question.slice(0, 120)}
                     payload={{ model: exchange.outcome.model, surface: context?.surface ?? "global" }}
                   />
                 </div>

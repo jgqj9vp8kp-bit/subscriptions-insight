@@ -24,6 +24,7 @@ import { AiAnalysisPanel } from "@/components/ai/AiAnalysisPanel";
 import { AiOpportunities } from "@/components/ai/AiOpportunities";
 import { useAiCampaignSignals } from "@/hooks/useAiCohortSignals";
 import { buildCampaignDailySeries } from "@/services/aiCampaignSeries";
+import { stableJson } from "@/services/aiRecommendationLog";
 import { useAiAssistantStore } from "@/store/aiAssistantStore";
 import { useAuth } from "@/hooks/useAuth";
 import { hashUserScope } from "@/services/analyticsCache";
@@ -803,6 +804,22 @@ export default function FBAnalyticsPage() {
     }),
     [capsuledRows, appliedFbFilters.cohortDateFrom, appliedFbFilters.cohortDateTo],
   );
+  // Applied-filter identity for the recommendation history writer (dates ride
+  // separately in the hash; sorts/search UI state are part of the filters here
+  // because they change which rows the engine sees — searches filter rows).
+  const aiContextKey = useMemo(
+    () => stableJson({
+      campaignPath: appliedFbFilters.campaignPathFilter,
+      funnel: appliedFbFilters.funnelFilter,
+      mediaBuyer: appliedFbFilters.mediaBuyerFilter,
+      adAccount: appliedFbFilters.adAccountFilter,
+      countries: [...appliedFbFilters.selectedCountries].sort(),
+      cardTypes: [...appliedFbFilters.selectedCardTypes].sort(),
+      campaignIdSearch: appliedFbFilters.campaignIdSearch,
+      campaignNameSearch: appliedFbFilters.campaignNameSearch,
+    }),
+    [appliedFbFilters],
+  );
   const aiCampaigns = useAiCampaignSignals({
     rows: result.rows,
     enabled: result.rows.length > 0,
@@ -811,6 +828,7 @@ export default function FBAnalyticsPage() {
     dailySeries: aiDailySeries,
     userScopeHash: aiUserScopeHash,
     warehouseVersion: aiWarehouseVersion,
+    contextKey: aiContextKey,
   });
   // Single-open diagnosis (Banks accordion pattern): a campaign diagnosis is a
   // comparison against its peers, two open at once just fights for attention.

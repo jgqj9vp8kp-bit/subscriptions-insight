@@ -5,9 +5,10 @@
 //  - one payment-analytics bundle (grouped by campaign_path on Cohorts,
 //    campaign_id on FB Analytics) supplies pass rates.
 // Until they arrive the engine simply reports those input families as missing.
-import { useMemo } from "react";
+import { useEffect, useMemo } from "react";
 import { computeAiSignals, type AiEngineOutput, type AiPassRateSlice, type AiRecommendation } from "@/services/aiSignals";
 import type { AiCampaignDailyPoint } from "@/services/aiCampaignSeries";
+import { computeAiContextHash, maybeWriteAiRecommendations } from "@/services/aiRecommendationLog";
 import { usePaymentAnalyticsBundle } from "@/hooks/usePaymentAnalyticsCache";
 import type { PaymentAnalyticsQuery } from "@/services/paymentAnalyticsDataSource";
 import type { SegmentRow } from "@/services/paymentPassAnalytics";
@@ -48,6 +49,34 @@ function basePaymentQuery(dateFrom: string | null, dateTo: string | null, groupB
   };
 }
 
+/** Append-only history writer, shared by both surface hooks. Fires only after
+ * the pass-rate input settles (else every page load would snapshot twice: once
+ * without pass rates, once with) and debounces 2s so filter churn coalesces.
+ * Content dedup lives in maybeWriteAiRecommendations; this is best-effort and
+ * never surfaces to the page. */
+function useAiSnapshotWriter(params: {
+  output: AiEngineOutput | null;
+  surface: "cohort" | "campaign";
+  contextKey: string | undefined;
+  dateFrom: string | null;
+  dateTo: string | null;
+  warehouseVersion: string;
+  settled: boolean;
+}): void {
+  const { output, surface, contextKey, dateFrom, dateTo, warehouseVersion, settled } = params;
+  const contextHash = useMemo(
+    () => (contextKey === undefined ? null : computeAiContextHash({ surface, dateFrom, dateTo, contextKey })),
+    [surface, contextKey, dateFrom, dateTo],
+  );
+  useEffect(() => {
+    if (!output || !contextHash || !settled) return;
+    const timer = setTimeout(() => {
+      void maybeWriteAiRecommendations({ contextHash, warehouseVersion: warehouseVersion || null, output });
+    }, 2000);
+    return () => clearTimeout(timer);
+  }, [output, contextHash, settled, warehouseVersion]);
+}
+
 export interface UseAiCohortSignalsResult {
   output: AiEngineOutput | null;
   byCohort: ReadonlyMap<string, AiRecommendation>;
@@ -66,8 +95,11 @@ export function useAiCohortSignals(params: {
   trialDurationDaysByPath: Readonly<Record<string, number | null>>;
   userScopeHash: string;
   warehouseVersion: string;
+  /** Stable serialization of the page's applied filters (presentation state
+   * excluded). When present, engine output is snapshotted to history. */
+  contextKey?: string;
 }): UseAiCohortSignalsResult {
-  const { rows, enabled, dateFrom, dateTo, trialDurationDaysByPath, userScopeHash, warehouseVersion } = params;
+  const { rows, enabled, dateFrom, dateTo, trialDurationDaysByPath, userScopeHash, warehouseVersion, contextKey } = params;
 
   const paymentQuery = useMemo<PaymentAnalyticsQuery>(
     () => basePaymentQuery(dateFrom, dateTo, "campaign_path"),
@@ -117,6 +149,11 @@ export function useAiCohortSignals(params: {
     return map;
   }, [output]);
 
+  useAiSnapshotWriter({
+    output, surface: "cohort", contextKey, dateFrom, dateTo, warehouseVersion,
+    settled: !payment.isInitialLoading,
+  });
+
   return { output, byCohort, byPath, paymentLoading: payment.isInitialLoading };
 }
 
@@ -136,8 +173,10 @@ export function useAiCampaignSignals(params: {
   dailySeries?: Readonly<Record<string, readonly AiCampaignDailyPoint[]>>;
   userScopeHash: string;
   warehouseVersion: string;
+  /** Stable serialization of the page's applied filters — see the cohort twin. */
+  contextKey?: string;
 }): UseAiCampaignSignalsResult {
-  const { rows, enabled, dateFrom, dateTo, dailySeries, userScopeHash, warehouseVersion } = params;
+  const { rows, enabled, dateFrom, dateTo, dailySeries, userScopeHash, warehouseVersion, contextKey } = params;
 
   const paymentQuery = useMemo<PaymentAnalyticsQuery>(
     () => basePaymentQuery(dateFrom, dateTo, "campaign_id"),
@@ -176,6 +215,11 @@ export function useAiCampaignSignals(params: {
     }
     return map;
   }, [output]);
+
+  useAiSnapshotWriter({
+    output, surface: "campaign", contextKey, dateFrom, dateTo, warehouseVersion,
+    settled: !payment.isInitialLoading,
+  });
 
   return { output, byCampaign, paymentLoading: payment.isInitialLoading };
 }

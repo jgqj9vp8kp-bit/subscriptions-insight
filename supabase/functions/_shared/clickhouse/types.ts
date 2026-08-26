@@ -30,6 +30,13 @@ export interface SupabaseQueryResult<T = unknown> {
   error?: { message: string } | null;
 }
 
+/** Awaiting the builder inserts without reading back; `.select("id").single()`
+ * reads the generated id (ai-analytics run ids). Optional so fakes returning a
+ * bare promise stay valid. */
+export interface SupabaseInsertBuilder extends PromiseLike<SupabaseQueryResult> {
+  select?(columns?: string): { single(): Promise<SupabaseQueryResult> };
+}
+
 export interface SupabaseQueryBuilder extends PromiseLike<SupabaseQueryResult> {
   select(columns?: string, options?: Record<string, unknown>): SupabaseQueryBuilder;
   eq(column: string, value: unknown): SupabaseQueryBuilder;
@@ -44,7 +51,7 @@ export interface SupabaseQueryBuilder extends PromiseLike<SupabaseQueryResult> {
   maybeSingle(): Promise<SupabaseQueryResult>;
   upsert(values: unknown, options?: Record<string, unknown>): Promise<SupabaseQueryResult>;
   /** Append-only history writes (Facebook Warehouse V2 Phase 1). Optional: fakes without them stay valid — the history layer is fail-safe. */
-  insert?(values: unknown, options?: Record<string, unknown>): PromiseLike<SupabaseQueryResult>;
+  insert?(values: unknown, options?: Record<string, unknown>): SupabaseInsertBuilder;
   update?(values: unknown): SupabaseQueryBuilder;
   /** Support classification job: "not yet on the current version" scans and
    * resetting job state. Optional so existing test fakes stay valid. */

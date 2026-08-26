@@ -5,7 +5,7 @@ import { AlertTriangle, Sparkles } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { AiActionChip } from "@/components/ai/AiActionChip";
 import { AiFeedback } from "@/components/ai/AiFeedback";
-import { aiActionLabel, aiScopeLabel, type AiEvidence, type AiMetricVerdict, type AiRecommendation } from "@/services/aiSignals";
+import { aiActionLabel, aiScopeKey, aiScopeLabel, type AiEvidence, type AiMetricVerdict, type AiRecommendation } from "@/services/aiSignals";
 import { useAiAssistantStore } from "@/store/aiAssistantStore";
 
 const VERDICT_STYLE: Record<AiMetricVerdict, string> = {
@@ -152,8 +152,8 @@ export function AiAnalysisPanel({ rec, footer }: { rec: AiRecommendation; footer
         <AskAiButton rec={rec} />
         <AiFeedback
           subjectKind="recommendation"
-          subjectId={`${rec.surface}:${aiScopeLabel(rec.scope)}:${rec.ruleId}`}
-          payload={{ action: rec.action, budgetDeltaPct: rec.budgetDeltaPct, ruleId: rec.ruleId, confidence: rec.confidence }}
+          subjectId={`${rec.surface}:${aiScopeKey(rec.scope)}:${rec.ruleId}`}
+          payload={{ action: rec.action, budgetDeltaPct: rec.budgetDeltaPct, ruleId: rec.ruleId, confidence: rec.confidence, claim: rec.claim, scopeLabel: aiScopeLabel(rec.scope) }}
         />
         {footer}
       </div>

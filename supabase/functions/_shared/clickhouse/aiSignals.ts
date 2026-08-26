@@ -396,7 +396,9 @@ function cohortAgeDays(cohortDate: string, asOfDate: string): number {
   return Math.max(0, Math.floor((to - from) / 86_400_000));
 }
 
-function scopeKey(scope: AiScope): string {
+/** Stable scope identity — display-name independent. Feedback subject ids and
+ * opportunity ids are built from it, so its format is a persisted contract. */
+export function aiScopeKey(scope: AiScope): string {
   if (scope.kind === "cohort") return `cohort|${scope.cohortDate}|${scope.funnel}|${scope.campaignPath}`;
   if (scope.kind === "path") return `path|${scope.campaignPath}`;
   return `campaign|${scope.campaignId}`;
@@ -1884,7 +1886,7 @@ function buildOpportunities(
   const scored = recommendations
     .filter((rec) => rec.action !== "HOLD")
     .map((rec) => {
-      const a = analyses.get(scopeKey(rec.scope));
+      const a = analyses.get(aiScopeKey(rec.scope));
       const spend = a?.spendInfo.spend ?? null;
       const budgetShare = totalSpend > 0 && spend !== null ? Math.min(1, spend / totalSpend) : 0.25;
       const severity = ACTION_SEVERITY[rec.action];
@@ -1899,7 +1901,7 @@ function buildOpportunities(
       const maturityFactor = !a ? 0.6 : a.surface === "campaign" ? 0.8 : a.conv !== null ? 1 : 0.6;
       const spendFactor = a?.spendInfo.usable ? a.spendInfo.factor : 0.7;
       return {
-        id: `${rec.surface}:${scopeKey(rec.scope)}:${rec.ruleId}`,
+        id: `${rec.surface}:${aiScopeKey(rec.scope)}:${rec.ruleId}`,
         recommendation: rec,
         budgetShare: round2(budgetShare),
         score: round2(base * maturityFactor * spendFactor),
@@ -1974,8 +1976,8 @@ export function computeAiSignals(input: AiEngineInput): AiEngineOutput {
 
   if (input.surface === "cohort") {
     const rows = [...(input.cohortRows ?? [])].sort((a, b) =>
-      scopeKey({ kind: "cohort", cohortDate: a.cohort_date, funnel: a.funnel, campaignPath: a.campaign_path })
-        .localeCompare(scopeKey({ kind: "cohort", cohortDate: b.cohort_date, funnel: b.funnel, campaignPath: b.campaign_path })),
+      aiScopeKey({ kind: "cohort", cohortDate: a.cohort_date, funnel: a.funnel, campaignPath: a.campaign_path })
+        .localeCompare(aiScopeKey({ kind: "cohort", cohortDate: b.cohort_date, funnel: b.funnel, campaignPath: b.campaign_path })),
     );
     totalRows = rows.length;
     const pools = buildCohortPools(rows, asOfDate, trialDurationFor);
@@ -1988,7 +1990,7 @@ export function computeAiSignals(input: AiEngineInput): AiEngineOutput {
     }
     for (const row of rows) {
       const analysis = analyzeCohortRow(row, pools, trends, input.passRates ?? null, globalPassRate, trialDurationFor, thresholds, asOfDate);
-      analyses.set(scopeKey(analysis.scope), analysis);
+      analyses.set(aiScopeKey(analysis.scope), analysis);
       if (analysis.spendInfo.usable) {
         spendUsableRows += 1;
         derivedTotalSpend += analysis.spendInfo.spend as number;
@@ -2018,7 +2020,7 @@ export function computeAiSignals(input: AiEngineInput): AiEngineOutput {
         thresholds,
         asOfDate,
       });
-      analyses.set(scopeKey(analysis.scope), analysis);
+      analyses.set(aiScopeKey(analysis.scope), analysis);
       const confidence = analysisConfidence(analysis, thresholds);
       signals.push(...signalsForAnalysis(analysis, thresholds, confidence));
       recommendations.push(buildRecommendation(analysis, thresholds));
@@ -2030,7 +2032,7 @@ export function computeAiSignals(input: AiEngineInput): AiEngineOutput {
     const globalPassRate = pooledPassRate(input.passRates ?? null);
     for (const row of rows) {
       const analysis = analyzeCampaignRow(row, pools, input.campaignDailySeries, input.passRates ?? null, globalPassRate, thresholds);
-      analyses.set(scopeKey(analysis.scope), analysis);
+      analyses.set(aiScopeKey(analysis.scope), analysis);
       if (analysis.spendInfo.usable) {
         spendUsableRows += 1;
         derivedTotalSpend += analysis.spendInfo.spend as number;
