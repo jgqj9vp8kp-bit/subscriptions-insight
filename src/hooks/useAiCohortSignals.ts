@@ -7,6 +7,7 @@
 // Until they arrive the engine simply reports those input families as missing.
 import { useMemo } from "react";
 import { computeAiSignals, type AiEngineOutput, type AiPassRateSlice, type AiRecommendation } from "@/services/aiSignals";
+import type { AiCampaignDailyPoint } from "@/services/aiCampaignSeries";
 import { usePaymentAnalyticsBundle } from "@/hooks/usePaymentAnalyticsCache";
 import type { PaymentAnalyticsQuery } from "@/services/paymentAnalyticsDataSource";
 import type { SegmentRow } from "@/services/paymentPassAnalytics";
@@ -131,10 +132,12 @@ export function useAiCampaignSignals(params: {
   enabled: boolean;
   dateFrom: string | null;
   dateTo: string | null;
+  /** Daily spend/purchases per campaign_id (aiCampaignSeries) — the trend axis. */
+  dailySeries?: Readonly<Record<string, readonly AiCampaignDailyPoint[]>>;
   userScopeHash: string;
   warehouseVersion: string;
 }): UseAiCampaignSignalsResult {
-  const { rows, enabled, dateFrom, dateTo, userScopeHash, warehouseVersion } = params;
+  const { rows, enabled, dateFrom, dateTo, dailySeries, userScopeHash, warehouseVersion } = params;
 
   const paymentQuery = useMemo<PaymentAnalyticsQuery>(
     () => basePaymentQuery(dateFrom, dateTo, "campaign_id"),
@@ -160,10 +163,11 @@ export function useAiCampaignSignals(params: {
     return computeAiSignals({
       surface: "campaign",
       campaignRows: rows,
+      campaignDailySeries: dailySeries,
       passRates,
       asOfDate,
     });
-  }, [enabled, rows, passRates, asOfDate]);
+  }, [enabled, rows, dailySeries, passRates, asOfDate]);
 
   const byCampaign = useMemo(() => {
     const map = new Map<string, AiRecommendation>();

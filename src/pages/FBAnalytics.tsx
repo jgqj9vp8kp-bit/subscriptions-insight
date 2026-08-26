@@ -23,6 +23,7 @@ import { AiActionChip } from "@/components/ai/AiActionChip";
 import { AiAnalysisPanel } from "@/components/ai/AiAnalysisPanel";
 import { AiOpportunities } from "@/components/ai/AiOpportunities";
 import { useAiCampaignSignals } from "@/hooks/useAiCohortSignals";
+import { buildCampaignDailySeries } from "@/services/aiCampaignSeries";
 import { useAiAssistantStore } from "@/store/aiAssistantStore";
 import { useAuth } from "@/hooks/useAuth";
 import { hashUserScope } from "@/services/analyticsCache";
@@ -793,11 +794,21 @@ export default function FBAnalyticsPage() {
   const { user } = useAuth();
   const aiUserScopeHash = useMemo(() => hashUserScope(user?.id), [user?.id]);
   const { version: aiWarehouseVersion } = useWarehouseVersion(true);
+  // Daily spend/purchases per campaign from the Capsuled rows already in
+  // state — the AI engine's trend axis (direction-only CPA_fb).
+  const aiDailySeries = useMemo(
+    () => buildCampaignDailySeries(capsuledRows, {
+      dateFrom: appliedFbFilters.cohortDateFrom || null,
+      dateTo: appliedFbFilters.cohortDateTo || null,
+    }),
+    [capsuledRows, appliedFbFilters.cohortDateFrom, appliedFbFilters.cohortDateTo],
+  );
   const aiCampaigns = useAiCampaignSignals({
     rows: result.rows,
     enabled: result.rows.length > 0,
     dateFrom: uiState.cohortDateFrom || null,
     dateTo: uiState.cohortDateTo || null,
+    dailySeries: aiDailySeries,
     userScopeHash: aiUserScopeHash,
     warehouseVersion: aiWarehouseVersion,
   });

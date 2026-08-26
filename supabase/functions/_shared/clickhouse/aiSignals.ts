@@ -48,6 +48,7 @@ import {
 import { round2 } from "./financialPrimitives.ts";
 import type { FbAnalyticsRow } from "./fbAnalyticsCompute.ts";
 import type { FbMatchStatus } from "./fbCohortStats.ts";
+import type { AiCampaignDailyPoint } from "./aiCampaignSeries.ts";
 
 export const AI_SIGNALS_ENGINE_VERSION = "ai-signals-v2";
 
@@ -71,6 +72,9 @@ export interface AiThresholds extends ReportThresholds {
    * of Wilson separation for rates) so chips do not flap. */
   benchmarkRel: number;
   upsellRevenuePerTrialTarget: number;
+  /** Min pooled FB purchases per 7d window for a campaign CPA_fb trend —
+   * minTrialsForSignificance (50) would starve a week-sized window. */
+  minFbPurchasesForTrend: number;
 }
 
 export const AI_DEFAULT_THRESHOLDS: AiThresholds = {
@@ -85,6 +89,7 @@ export const AI_DEFAULT_THRESHOLDS: AiThresholds = {
   scaleStrongHeadroom: 0.8,
   benchmarkRel: 0.15,
   upsellRevenuePerTrialTarget: 5,
+  minFbPurchasesForTrend: 20,
 };
 
 /** Minimum peer rows for a pooled benchmark to qualify. */
@@ -284,6 +289,9 @@ export interface AiEngineInput {
   surface: AiSurface;
   cohortRows?: readonly AiCohortRowInput[];
   campaignRows?: readonly FbAnalyticsRow[];
+  /** Daily spend/purchases per campaign_id (aiCampaignSeries) — gives the
+   * campaign surface its trend axis; direction-only CPA_fb, never a level. */
+  campaignDailySeries?: Readonly<Record<string, readonly AiCampaignDailyPoint[]>>;
   passRates?: {
     level: "funnel" | "campaign_path" | "campaign_id";
     byKey: Readonly<Record<string, AiPassRateSlice>>;
@@ -1359,9 +1367,75 @@ function buildCampaignPools(rows: readonly FbAnalyticsRow[]): CampaignPools {
   return pools;
 }
 
+interface CampaignTrendReading {
+  known: boolean;
+  deteriorating: boolean | null;
+  evidence: AiEvidence | null;
+  signalCode: AiSignalCode | null;
+  /** Pooled purchases of the thinner window — the trend's sample size. */
+  sample: number;
+}
+
+/** 7d-vs-previous-7d pooled CPA_fb trend, anchored to the SERIES max date
+ * (coverage depends on manual syncs; anchoring to "today" would empty the
+ * recent window whenever the sync lags). Direction only: CPA_fb is
+ * spend / FB purchases and is never compared against cpaCeiling. */
+function campaignCpaTrend(
+  series: readonly AiCampaignDailyPoint[] | undefined,
+  campaignId: string,
+  thresholds: AiThresholds,
+): CampaignTrendReading {
+  const none: CampaignTrendReading = { known: false, deteriorating: null, evidence: null, signalCode: null, sample: 0 };
+  if (!series?.length) return none;
+  const maxDate = series[series.length - 1].date;
+  const maxMs = Date.parse(`${maxDate}T00:00:00Z`);
+  if (!Number.isFinite(maxMs)) return none;
+  const dayOffset = (date: string) => Math.round((maxMs - Date.parse(`${date}T00:00:00Z`)) / 86_400_000);
+  const recent = series.filter((p) => dayOffset(p.date) >= 0 && dayOffset(p.date) < 7);
+  const previous = series.filter((p) => dayOffset(p.date) >= 7 && dayOffset(p.date) < 14);
+  const window = (points: AiCampaignDailyPoint[]) => ({
+    spendDays: points.filter((p) => p.spend > 0).length,
+    spend: points.reduce((sum, p) => sum + p.spend, 0),
+    purchases: points.reduce((sum, p) => sum + p.purchases, 0),
+  });
+  const r = window(recent);
+  const p = window(previous);
+  // >=4 active days and >0 purchases per side; zero-purchase windows are
+  // "unknown", never an infinite CPA.
+  if (r.spendDays < 4 || p.spendDays < 4 || r.purchases <= 0 || p.purchases <= 0) return none;
+  const recentCpa = round2(r.spend / r.purchases);
+  const previousCpa = round2(p.spend / p.purchases);
+  const sample = Math.min(r.purchases, p.purchases);
+  const delta = computeDelta(recentCpa, previousCpa, "money", {
+    polarity: "lower_better",
+    sampleSize: sample,
+    minSample: thresholds.minFbPurchasesForTrend,
+    minRelative: thresholds.minRelativeMove,
+  });
+  if (!delta || !delta.significant || delta.better === null) {
+    // The axis exists and both windows qualify — the trend is KNOWN, just flat.
+    return { known: true, deteriorating: null, evidence: null, signalCode: null, sample };
+  }
+  return {
+    known: true,
+    deteriorating: !delta.better,
+    signalCode: delta.better ? "CPA_IMPROVING" : "CPA_DETERIORATING",
+    sample,
+    evidence: evidence({
+      metric: "cpa_trend", label: "CPA trend (FB, 7d vs prev 7d)", value: recentCpa, unit: "money",
+      benchmark: { value: previousCpa, rendered: renderMoney(previousCpa), source: "trend_previous", peers: null },
+      delta: { absolute: delta.absolute, relative: delta.percent, rendered: delta.percentRendered, direction: delta.direction },
+      verdict: delta.better ? "good" : "bad",
+      sampleSize: sample,
+      evidencePath: `campaign[${campaignId}].cpa_fb_trend`,
+    }),
+  };
+}
+
 function analyzeCampaignRow(
   row: FbAnalyticsRow,
   pools: CampaignPools,
+  dailySeries: AiEngineInput["campaignDailySeries"],
   passRates: AiEngineInput["passRates"],
   globalPassRate: number | null,
   thresholds: AiThresholds,
@@ -1372,7 +1446,12 @@ function analyzeCampaignRow(
   const spendInfo = campaignSpendInfo(row);
   const trials = row.trial_users;
 
-  notes.push({ code: "no_time_axis", detail: "Campaign metrics aggregate the whole selected window; trends need day-level history." });
+  const trend = campaignCpaTrend(dailySeries?.[row.campaign_id], row.campaign_id, thresholds);
+  if (trend.known) {
+    if (trend.evidence) evidences.set("cpa_trend", trend.evidence);
+  } else {
+    notes.push({ code: "no_time_axis", detail: "No usable daily series for this campaign (needs two 7-day windows with spend and purchases); trend unknown." });
+  }
 
   if (!spendInfo.usable) {
     notes.push({
@@ -1483,7 +1562,7 @@ function analyzeCampaignRow(
     upsellPerTrial: null, roas, mainDeclineReason: row.main_decline_reason ? String(row.main_decline_reason) : null,
     ageDays: null,
     dataNotes: notes, evidences,
-    trendCpaDeteriorating: null, trendKnown: false,
+    trendCpaDeteriorating: trend.deteriorating, trendKnown: trend.known,
     confidenceExtraFactor: 1,
   };
 }
@@ -1517,11 +1596,14 @@ function runLadder(a: RowAnalysis, thresholds: AiThresholds): LadderVerdict {
       a.cpa > thresholds.cpaCeiling * 1.5 && a.conv < thresholds.trialToSubTarget * 0.6) {
     return { action: "STOP", budgetDeltaPct: null, ruleId: "cpa_and_conv_breach", primaryDomain: "traffic", monitorAfter: ["cpa", "trial_to_paid"], severity: ACTION_SEVERITY.STOP };
   }
-  // 5a. expensive_but_converting (campaign surface): campaigns have no trend
-  // axis, so rung 5's "trend unknown" clause would swallow every converting
-  // campaign; positive net economics (roas >= 1) earns a HOLD instead.
+  // 5a. expensive_but_converting (campaign surface): with no usable trend
+  // axis, rung 5's "trend unknown" clause would swallow every converting
+  // campaign; positive net economics (roas >= 1) earns a HOLD instead. A
+  // KNOWN deteriorating CPA_fb trend disqualifies the excuse and falls
+  // through to rung 5 REDUCE.
   if (economicsAllowed && a.surface === "campaign" && a.cpa !== null && a.cpa > thresholds.cpaCeiling &&
-      a.conv !== null && a.conv >= thresholds.trialToSubTarget && a.roas !== null && a.roas >= 1) {
+      a.conv !== null && a.conv >= thresholds.trialToSubTarget && a.roas !== null && a.roas >= 1 &&
+      a.trendCpaDeteriorating !== true) {
     return { action: "HOLD", budgetDeltaPct: null, ruleId: "expensive_but_converting", primaryDomain: "traffic", monitorAfter: ["cpa", "roas"], severity: ACTION_SEVERITY.HOLD };
   }
   // 5. cpa_breach_reduce
@@ -1596,6 +1678,14 @@ function signalsForAnalysis(a: RowAnalysis, thresholds: AiThresholds, confidence
   const cpaEv = a.evidences.get("cpa");
   if (cpaEv?.verdict === "good") push("CPA_GOOD", "cpa", "good", "low", "cpa", `CPA ${cpaEv.valueRendered} vs ${cpaEv.benchmark?.rendered ?? DASH}.`);
   if (cpaEv?.verdict === "bad") push("CPA_BAD", "cpa", "bad", "medium", "cpa", `CPA ${cpaEv.valueRendered} vs ${cpaEv.benchmark?.rendered ?? DASH}.`);
+
+  // Campaign CPA_fb trend (path trends are emitted by buildPathTrends at path
+  // scope — re-emitting here would duplicate them).
+  const trendEv = a.evidences.get("cpa_trend");
+  if (a.surface === "campaign" && trendEv) {
+    if (trendEv.verdict === "good") push("CPA_IMPROVING", "cpa", "good", "low", "cpa_trend", `CPA (FB) improving: ${trendEv.valueRendered} last 7d vs ${trendEv.benchmark?.rendered ?? DASH} before (${trendEv.delta?.rendered ?? DASH}).`, ["trend_7v7_fb_purchases"]);
+    if (trendEv.verdict === "bad") push("CPA_DETERIORATING", "cpa", "bad", "medium", "cpa_trend", `CPA (FB) deteriorating: ${trendEv.valueRendered} last 7d vs ${trendEv.benchmark?.rendered ?? DASH} before (${trendEv.delta?.rendered ?? DASH}).`, ["trend_7v7_fb_purchases"]);
+  }
 
   const convEv = a.evidences.get("trial_to_paid");
   if (convEv?.verdict === "good") push("TRIAL_TO_PAID_GOOD", "conversion", "good", "low", "trial_to_paid", `Trial → Paid ${convEv.valueRendered} vs ${convEv.benchmark?.rendered ?? DASH}.`);
@@ -1930,12 +2020,14 @@ export function computeAiSignals(input: AiEngineInput): AiEngineOutput {
     const pools = buildCampaignPools(rows);
     const globalPassRate = pooledPassRate(input.passRates ?? null);
     for (const row of rows) {
-      const analysis = analyzeCampaignRow(row, pools, input.passRates ?? null, globalPassRate, thresholds);
+      const analysis = analyzeCampaignRow(row, pools, input.campaignDailySeries, input.passRates ?? null, globalPassRate, thresholds);
       analyses.set(scopeKey(analysis.scope), analysis);
       if (analysis.spendInfo.usable) {
         spendUsableRows += 1;
         derivedTotalSpend += analysis.spendInfo.spend as number;
       }
+      if (analysis.trendKnown) trendKnownPaths += 1;
+      pathCount += 1;
       const confidence = analysisConfidence(analysis, thresholds);
       signals.push(...signalsForAnalysis(analysis, thresholds, confidence));
       recommendations.push(buildRecommendation(analysis, thresholds));
@@ -1949,9 +2041,9 @@ export function computeAiSignals(input: AiEngineInput): AiEngineOutput {
       ? "partial"
       : (input.trialDurationDaysByPath && Object.keys(input.trialDurationDaysByPath).length ? "ok" : "missing"),
     benchmark: totalRows >= MIN_BENCHMARK_PEERS + 1 ? "ok" : totalRows > 1 ? "partial" : "missing",
-    trend: input.surface === "campaign"
-      ? "missing"
-      : trendKnownPaths === 0 ? "missing" : trendKnownPaths < pathCount ? "partial" : "ok",
+    // Both surfaces now have a trend axis: paths from cohort series, campaigns
+    // from the daily CPA_fb series (when supplied and thick enough).
+    trend: trendKnownPaths === 0 ? "missing" : trendKnownPaths < pathCount ? "partial" : "ok",
   };
 
   const totalSpend = typeof input.totalSpend === "number" && input.totalSpend > 0 ? input.totalSpend : derivedTotalSpend;

@@ -390,6 +390,69 @@ describe("campaign ladder golden cases", () => {
   });
 });
 
+// ---- Campaign CPA_fb trends (wave-2 P3) -------------------------------------
+
+/** 14 daily points; the last 7 use recentCpa, the previous 7 prevCpa. */
+function dailySeries(campaignId: string, prevCpa: number, recentCpa: number, purchasesPerDay = 10) {
+  const points = Array.from({ length: 14 }, (_, i) => {
+    const day = String(i + 1).padStart(2, "0");
+    const cpa = i < 7 ? prevCpa : recentCpa;
+    return { date: `2026-08-${day}`, spend: cpa * purchasesPerDay, purchases: purchasesPerDay };
+  });
+  return { [campaignId]: points };
+}
+
+describe("campaign CPA_fb trend", () => {
+  const ID = "120200000000000001";
+
+  it("a known deteriorating trend disqualifies the 5a excuse -> REDUCE despite roas >= 1", () => {
+    const expensive = campaign({ cac: 38, trial_to_sub_cr: 68, roas: 1.1 });
+    const out = computeAiSignals({
+      surface: "campaign", campaignRows: [expensive],
+      campaignDailySeries: dailySeries(ID, 20, 34), // +70% CPA_fb
+      asOfDate: AS_OF,
+    });
+    const rec = out.recommendations[0];
+    expect(rec.action).toBe("REDUCE");
+    expect(rec.ruleId).toBe("cpa_breach_reduce");
+    expect(rec.because.some((ev) => ev.metric === "cpa_trend")).toBe(true);
+    expect(out.inputStatus.trend).toBe("ok");
+    expect(out.signals.some((s) => s.code === "CPA_DETERIORATING" && s.scope.kind === "campaign")).toBe(true);
+  });
+
+  it("an improving trend keeps the 5a HOLD and emits CPA_IMPROVING", () => {
+    const expensive = campaign({ cac: 38, trial_to_sub_cr: 68, roas: 1.1 });
+    const out = computeAiSignals({
+      surface: "campaign", campaignRows: [expensive],
+      campaignDailySeries: dailySeries(ID, 34, 20),
+      asOfDate: AS_OF,
+    });
+    expect(out.recommendations[0].action).toBe("HOLD");
+    expect(out.recommendations[0].ruleId).toBe("expensive_but_converting");
+    expect(out.signals.some((s) => s.code === "CPA_IMPROVING")).toBe(true);
+  });
+
+  it("thin or zero-purchase windows stay unknown — 5a keeps its excuse, no infinities", () => {
+    const expensive = campaign({ cac: 38, trial_to_sub_cr: 68, roas: 1.1 });
+    const thin = { [ID]: [
+      { date: "2026-08-12", spend: 100, purchases: 5 },
+      { date: "2026-08-13", spend: 100, purchases: 5 },
+      { date: "2026-08-14", spend: 100, purchases: 5 },
+    ] };
+    const out = computeAiSignals({ surface: "campaign", campaignRows: [expensive], campaignDailySeries: thin, asOfDate: AS_OF });
+    expect(out.recommendations[0].action).toBe("HOLD");
+    expect(out.recommendations[0].dataNotes.some((n) => n.code === "no_time_axis")).toBe(true);
+    expect(out.inputStatus.trend).toBe("missing");
+
+    const zeroPurchases = { [ID]: Array.from({ length: 14 }, (_, i) => ({
+      date: `2026-08-${String(i + 1).padStart(2, "0")}`, spend: 100, purchases: 0,
+    })) };
+    const out2 = computeAiSignals({ surface: "campaign", campaignRows: [expensive], campaignDailySeries: zeroPurchases, asOfDate: AS_OF });
+    expect(JSON.stringify(out2)).not.toContain("Infinity");
+    expect(out2.inputStatus.trend).toBe("missing");
+  });
+});
+
 // ---- Payback math -----------------------------------------------------------
 
 describe("observedPayback", () => {
