@@ -85,12 +85,74 @@ scopes to every cohort of one path within `date_from/date_to` — the date
 window and funnel filter are applied in WHERE explicitly because on the list
 path they are cohort-level HAVING post-filters that details has no
 equivalent of. `refund_status` is not reproduced there (the UI hardcodes
-"all"). Columns with no funnel-grain meaning (`cohort_date`, `ai_action`,
-`currency_mix`, `fx_missing_amount`) are filtered from the visible order per
-mode; column state, saved views and sanitizers stay mode-agnostic.
+"all"). Columns with no funnel-grain meaning (`cohort_date`, `currency_mix`,
+`fx_missing_amount`) are filtered from the visible order per mode (`ai_action`
+works in both modes since path-grain recommendations); column state, saved
+views and sanitizers stay mode-agnostic.
 
 Known dead field: `dateSort` in `ui_state_cohorts` (kept for persisted-state
 compatibility; nothing reads it).
+
+## AI Analytics layer (2026-08)
+
+The layer is deterministic-first: a pure rules engine
+(`_shared/clickhouse/aiSignals.ts`, `ai-signals-v2`) computes every
+recommendation in the browser over the rows the page already shows; the model
+(assistant) only selects/phrases over that output and can never widen it.
+
+**Engine.** One strict-precedence ladder (sample gate → refund/payment stops →
+CPA breaches → scale rungs → hold) runs per row on two surfaces: `cohort`
+(Cohorts page rows) and `campaign` (FB Analytics). Benchmarks are pooled
+leave-one-out (Σnum/Σden across peers, never averaged ratios); rates get
+Wilson-95 anti-flap ("bad" = floor breach AND Wilson-below-account-norm);
+confidence is a product of sample/maturity/spend/benchmark factors bucketed
+high/medium/low. Effective thresholds ride on `AiEngineOutput.thresholds`.
+
+**Grains.** On the cohort surface the SAME engine run also emits one
+recommendation per `campaign_path` (`scope.kind === "path"`,
+`analyzePathGroup` over pooled rows) — pseudo-rows are never fed to the
+engine (their synthetic cohort_date would break maturity/payback/trends).
+Path policies: conversion from the mature-row subset only, refunds
+amount-based (cohort-surface convention; campaign surface is user-based —
+same ruleId, documented asymmetry), payback from the age≥60 pooled grid,
+peers = other paths. Path recommendations do not enter derivedTotalSpend;
+Opportunities cap path-family entries at 1 per path (others 3).
+
+**Campaign trends.** `aiCampaignSeries.ts` builds daily per-campaign series
+from Capsuled daily-split rows already in FB Analytics state. The trend basis
+CPA_fb = spend / FB purchases is DIRECTION-ONLY: it is never compared to
+`cpaCeiling` (the ladder's CPA is spend / authoritative trials). Windows are
+7d-vs-prev-7d anchored to the series max date (syncs are manual), each needs
+≥4 active days and >0 purchases. A known deteriorating trend disqualifies
+rung 5a's "no trend axis" fallback.
+
+**Assistant** (`aiAssistant.ts` + `ai-analytics` edge fn, `ai-assistant-v2`).
+Stateless multi-turn: the drawer re-sends the last 3 accepted exchanges;
+prior questions travel inside the `#####` fence (untrusted), prior answers
+are plain-quoted with `#` neutralized. Every number the model emits must
+already exist in the context pack, the question, or a prior exchange —
+violating fragments are rejected one by one (the rest of the answer
+survives). Number rendering must stay round-trippable: `extractNumbers` sees
+"12 106,00" as [12, 106] on BOTH sides of the gate, so do not change the
+space-thousands format. The Cohorts page publishes the grain the table
+shows (path items in Funnels mode); the client slices packs to 120 items.
+
+**Storage & keys.** `ai_assistant_runs` (audit, one row per call; the edge
+returns `runId`), `ai_recommendations` (append-only snapshots with a
+mutation-guard trigger), `ai_feedback`. Feedback subject ids:
+recommendations use `surface:aiScopeKey(scope):ruleId` (byte-for-byte the
+AiOpportunity id; aiScopeKey is display-name independent — a campaign rename
+must not fork history), assistant answers use the run uuid.
+`aiRecommendationLog.ts` writes snapshots per (surface, `context_hash` =
+`c_` + fnv of surface+dates+applied-filter contextKey; warehouseVersion is a
+column, not part of the hash). Dedup canonicalizes JSON (Postgres jsonb does
+not preserve key order) and compares the last 3 rows, not 1 — a cold load
+emits settling steps (maturity missing → full) that a last-row compare would
+re-insert forever; writes are serialized per tab because two debounce timers
+can race read-then-insert (observed live) and the append-only guard makes a
+raced duplicate permanent. Path recommendations persist under
+surface='cohort' (the table CHECK knows only cohort/campaign; the grain
+lives in scope.kind inside the jsonb).
 
 ## Supabase Dataset Snapshots
 
