@@ -50,6 +50,8 @@ function basePaymentQuery(dateFrom: string | null, dateTo: string | null, groupB
 export interface UseAiCohortSignalsResult {
   output: AiEngineOutput | null;
   byCohort: ReadonlyMap<string, AiRecommendation>;
+  /** Path-grain recommendations (the Funnels view's rows), keyed by campaign_path. */
+  byPath: ReadonlyMap<string, AiRecommendation>;
   /** True while the pass-rate bundle is still on its way (chips already work). */
   paymentLoading: boolean;
 }
@@ -106,7 +108,15 @@ export function useAiCohortSignals(params: {
     return map;
   }, [output]);
 
-  return { output, byCohort, paymentLoading: payment.isInitialLoading };
+  const byPath = useMemo(() => {
+    const map = new Map<string, AiRecommendation>();
+    for (const rec of output?.recommendations ?? []) {
+      if (rec.scope.kind === "path") map.set(rec.scope.campaignPath, rec);
+    }
+    return map;
+  }, [output]);
+
+  return { output, byCohort, byPath, paymentLoading: payment.isInitialLoading };
 }
 
 export interface UseAiCampaignSignalsResult {

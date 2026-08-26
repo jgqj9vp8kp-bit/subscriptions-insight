@@ -110,7 +110,7 @@ import {
   type CohortTraffic,
   type TrafficAggregate,
 } from "@/services/cohortReporting";
-import { buildFunnelViewRows, isFunnelViewRow, type FunnelViewRow } from "@/services/funnelView";
+import { buildFunnelViewRows, FUNNEL_ROW_ID_PREFIX, isFunnelViewRow, type FunnelViewRow } from "@/services/funnelView";
 import {
   MAX_RENEWAL_COLUMNS_CHANGED_EVENT,
   loadMaxRenewalColumns,
@@ -701,9 +701,9 @@ const TRAFFIC_DERIVED_COLUMN_PREFIXES = ["traffic_", "roas_", "profit"] as const
 
 // Columns with no meaning at funnel grain (computed filter — column state,
 // saved views and sanitizers stay mode-agnostic): cohort_date spans a range,
-// ai_action is a cohort-grain engine, currency_mix / fx_missing_amount are
-// deliberately non-aggregatable.
-const FUNNELS_INAPPLICABLE_COLUMNS = new Set<string>(["cohort_date", "ai_action", "currency_mix", "fx_missing_amount"]);
+// currency_mix / fx_missing_amount are deliberately non-aggregatable.
+// ai_action works in both modes since engine v2 (path-grain recommendations).
+const FUNNELS_INAPPLICABLE_COLUMNS = new Set<string>(["cohort_date", "currency_mix", "fx_missing_amount"]);
 
 function isTrafficDerivedColumn(id: string): boolean {
   return id === "trial_cost" || TRAFFIC_DERIVED_COLUMN_PREFIXES.some((prefix) => id.startsWith(prefix));
@@ -2144,14 +2144,38 @@ export default function CohortsPage() {
       return next;
     });
   }, []);
+  // Mode-aware resolver: funnel pseudo-rows read the PATH-grain recommendation
+  // (engine v2), cohort rows the per-cohort one.
   const aiRecForCohort = useCallback(
-    (c: CohortRow) => aiSignals.byCohort.get(aiCohortKey(c)) ?? null,
-    [aiSignals.byCohort],
+    (c: CohortRow) =>
+      isFunnelViewRow(c)
+        ? aiSignals.byPath.get(c.campaign_path) ?? null
+        : aiSignals.byCohort.get(aiCohortKey(c)) ?? null,
+    [aiSignals.byCohort, aiSignals.byPath],
+  );
+  // The AI column sorts by decision rank (Scale first … Collect data last)
+  // via the page-level lookup — getCohortSortValue stays AI-agnostic.
+  const aiRank = useCallback(
+    (c: CohortRow): number => {
+      const rec = aiRecForCohort(c);
+      if (!rec) return -1;
+      const order: Record<string, number> = { SCALE: 6, INVESTIGATE: 5, REDUCE: 4, STOP: 3, WATCH: 2, HOLD: 1, NOT_ENOUGH_DATA: 0 };
+      return order[rec.action] * 100 + (rec.budgetDeltaPct ?? 0);
+    },
+    [aiRecForCohort],
   );
 
   const cohorts = useMemo(
     () => {
+      const sortByAiRank = (rows: readonly CohortRow[], direction: 1 | -1) =>
+        [...rows]
+          .map((cohort, index) => ({ cohort, index }))
+          .sort((a, b) => (aiRank(a.cohort) - aiRank(b.cohort)) * direction || a.index - b.index)
+          .map(({ cohort }) => cohort);
       if (isFunnelsView) {
+        if (sortColumn === "ai_action" && sortDirection) {
+          return sortByAiRank(funnelRows, sortDirection === "asc" ? 1 : -1);
+        }
         if (sortColumn && sortDirection) {
           // The sticky first column sorts funnels by their identity (path).
           const mapped = sortColumn === COHORT_FIRST_COL_KEY ? "campaign_path" : sortColumn;
@@ -2160,20 +2184,8 @@ export default function CohortsPage() {
         // Default: biggest funnels first (builder pre-sorts by trials desc).
         return funnelRows;
       }
-      // The AI column sorts by decision rank (Scale first … Collect data last)
-      // via the page-level lookup — getCohortSortValue stays AI-agnostic.
       if (sortColumn === "ai_action" && sortDirection) {
-        const rank = (c: CohortRow): number => {
-          const rec = aiSignals.byCohort.get(aiCohortKey(c));
-          if (!rec) return -1;
-          const order: Record<string, number> = { SCALE: 6, INVESTIGATE: 5, REDUCE: 4, STOP: 3, WATCH: 2, HOLD: 1, NOT_ENOUGH_DATA: 0 };
-          return order[rec.action] * 100 + (rec.budgetDeltaPct ?? 0);
-        };
-        const direction = sortDirection === "asc" ? 1 : -1;
-        return [...effectiveFilteredCohorts]
-          .map((cohort, index) => ({ cohort, index }))
-          .sort((a, b) => (rank(a.cohort) - rank(b.cohort)) * direction || a.index - b.index)
-          .map(({ cohort }) => cohort);
+        return sortByAiRank(effectiveFilteredCohorts, sortDirection === "asc" ? 1 : -1);
       }
       if (sortColumn && sortDirection) {
         return sortCohortRows(
@@ -2192,7 +2204,7 @@ export default function CohortsPage() {
         return b.cohort_date.localeCompare(a.cohort_date);
       });
     },
-    [effectiveFilteredCohorts, sortColumn, sortDirection, trafficByKey, aiSignals.byCohort, isFunnelsView, funnelRows, trafficForRow]
+    [effectiveFilteredCohorts, sortColumn, sortDirection, trafficByKey, aiRank, isFunnelsView, funnelRows, trafficForRow]
   );
   const hasUsers = useMemo(() => new Set(txs.map((t) => t.user_id)).size > 0, [txs]);
 
@@ -4173,8 +4185,20 @@ export default function CohortsPage() {
             loading={aiSignals.paymentLoading}
             openLabel="View cohort"
             onOpen={(opp) => {
-              if (opp.recommendation.scope.kind !== "cohort") return;
               const scope = opp.recommendation.scope;
+              // A PATH opportunity opens in the Funnels view (its native
+              // grain); a cohort one opens in the Cohorts view. Either way the
+              // AI panel expands under the target row after the mode settles.
+              if (scope.kind === "path") {
+                const pseudoId = `${FUNNEL_ROW_ID_PREFIX}${scope.campaignPath}`;
+                if (!isFunnelsView) setUiState((current) => ({ ...current, viewMode: "funnels" }));
+                setAiExpandedIds((current) => new Set(current).add(pseudoId));
+                window.setTimeout(() => {
+                  document.querySelector(`[data-cohort-id="${CSS.escape(pseudoId)}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" });
+                }, isFunnelsView ? 50 : 150);
+                return;
+              }
+              if (scope.kind !== "cohort") return;
               // Search the underlying cohort rows: in Funnels mode the display
               // rows are path-grain pseudo-rows, so switch back first.
               const row = effectiveFilteredCohorts.find(
@@ -4317,7 +4341,7 @@ export default function CohortsPage() {
                         </TableCell>
                       </TableRow>
                     )}
-                    {!isFunnelsView && aiExpandedIds.has(c.cohort_id) && (() => {
+                    {aiExpandedIds.has(c.cohort_id) && (() => {
                       const rec = aiRecForCohort(c);
                       return rec ? (
                         <TableRow
