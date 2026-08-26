@@ -272,9 +272,14 @@ export interface AiCohortRowInput {
 
 export interface AiContextPackItem {
   scopeLabel: string;
+  scopeKind: AiScope["kind"];
   action: string;
+  confidence: AiConfidence;
   claim: string;
   evidenceLines: string[];
+  contradictionLines: string[];
+  /** Joined monitorAfter metric keys; empty string when none. */
+  monitorLine: string;
   dataNotes: string[];
 }
 
@@ -1929,12 +1934,16 @@ function buildContextPack(
 ): AiContextPack {
   const items = recommendations.map((rec) => ({
     scopeLabel: aiScopeLabel(rec.scope),
+    scopeKind: rec.scope.kind,
     action: aiActionLabel(rec.action, rec.budgetDeltaPct),
+    confidence: rec.confidence,
     claim: rec.claim,
     evidenceLines: rec.because.map((ev) => {
       const bench = ev.benchmark ? ` (benchmark ${ev.benchmark.rendered}${ev.benchmark.peers ? `, ${ev.benchmark.peers} peers` : ""})` : "";
       return `${ev.label}: ${ev.valueRendered}${bench} — ${ev.verdict}`;
     }),
+    contradictionLines: rec.contradictions.map((contradiction) => contradiction.claim),
+    monitorLine: rec.monitorAfter.join(", "),
     dataNotes: rec.dataNotes.map((note) => note.detail),
   }));
   const inputStatusLines = (Object.entries(inputStatus) as Array<[AiInputFamily, string]>)

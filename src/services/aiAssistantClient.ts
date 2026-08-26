@@ -5,7 +5,7 @@
 // (deploy/transport failure — loud UI). The deterministic AI layer never
 // touches this path; only free-form questions do.
 import { supabase } from "@/services/supabaseClient";
-import type { AssistantAnswer, AssistantInput, AssistantViolation } from "@/services/aiAssistant";
+import { MAX_CONTEXT_ITEMS, type AssistantAnswer, type AssistantInput, type AssistantViolation } from "@/services/aiAssistant";
 
 export const AI_ANALYTICS_FUNCTION = "ai-analytics";
 
@@ -30,8 +30,15 @@ export async function askAssistant(input: AssistantInput): Promise<AssistantOutc
   const token = sessionData.session?.access_token;
   if (!token) return { kind: "unavailable", reason: "Sign in to use the assistant." };
 
+  // The prompt builder slices anyway; slicing here too keeps huge packs
+  // (500+ cohort rows) off the wire entirely.
+  const payload: AssistantInput =
+    input.contextPack.items.length > MAX_CONTEXT_ITEMS
+      ? { ...input, contextPack: { ...input.contextPack, items: input.contextPack.items.slice(0, MAX_CONTEXT_ITEMS) } }
+      : input;
+
   const { data, error } = await supabase.functions.invoke(AI_ANALYTICS_FUNCTION, {
-    body: { action: "assistant_answer", input },
+    body: { action: "assistant_answer", input: payload },
     headers: { Authorization: `Bearer ${token}` },
   });
 

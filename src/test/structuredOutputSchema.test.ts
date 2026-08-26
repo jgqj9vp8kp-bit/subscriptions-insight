@@ -88,7 +88,7 @@ describe("production schemas pass the boundary sanitizer", () => {
         engineVersion: "ai-signals-v1",
         asOfDate: "2026-08-24",
         items: [
-          { scopeLabel: "Campaign A", action: "SCALE +20%", claim: "CPA $14.20", evidenceLines: ["CPA $14.20"], dataNotes: [] },
+          { scopeLabel: "Campaign A", scopeKind: "campaign", action: "SCALE +20%", confidence: "high", claim: "CPA $14.20", evidenceLines: ["CPA $14.20"], contradictionLines: [], monitorLine: "", dataNotes: [] },
         ],
         inputStatusLines: [],
       },

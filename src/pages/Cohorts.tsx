@@ -2123,15 +2123,23 @@ export default function CohortsPage() {
   });
   // Publish the deterministic context to the global assistant; cleared on
   // unmount so another page's context never leaks into questions asked here.
+  // Mode-aware: the assistant sees the grain the table shows — path items in
+  // Funnels view, cohort items otherwise (one engine run carries both).
   useEffect(() => {
     if (!aiSignals.output) return;
     const range = cohortDateFrom || cohortDateTo ? ` · ${cohortDateFrom || "…"} — ${cohortDateTo || "…"}` : "";
+    const pack = aiSignals.output.contextPack;
+    const items = pack.items.filter((item) =>
+      isFunnelsView ? item.scopeKind === "path" : item.scopeKind !== "path",
+    );
     useAiAssistantStore.getState().publishContext({
       surface: "cohort",
-      label: `Cohorts · ${effectiveFilteredCohorts.length} cohorts${range}`,
-      contextPack: aiSignals.output.contextPack,
+      label: isFunnelsView
+        ? `Cohorts · Funnels view · ${items.length} paths${range}`
+        : `Cohorts · ${effectiveFilteredCohorts.length} cohorts${range}`,
+      contextPack: { ...pack, items },
     });
-  }, [aiSignals.output, effectiveFilteredCohorts.length, cohortDateFrom, cohortDateTo]);
+  }, [aiSignals.output, effectiveFilteredCohorts.length, cohortDateFrom, cohortDateTo, isFunnelsView]);
   useEffect(() => () => useAiAssistantStore.getState().publishContext(null), []);
   // AI analysis expansion is per-session UI state (deliberately not persisted:
   // recommendations move with the data, a stale open panel would mislead).

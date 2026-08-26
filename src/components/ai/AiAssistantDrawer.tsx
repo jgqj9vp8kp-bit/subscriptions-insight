@@ -14,6 +14,11 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { askAssistant, type AssistantOutcome } from "@/services/aiAssistantClient";
+import {
+  MAX_PRIOR_ANSWER_CHARS,
+  MAX_PRIOR_EXCHANGES,
+  type AssistantPriorExchange,
+} from "@/services/aiAssistant";
 import { useAiAssistantStore } from "@/store/aiAssistantStore";
 import { cn } from "@/lib/utils";
 
@@ -27,6 +32,30 @@ const SUGGESTED_QUESTIONS = [
 interface Exchange {
   question: string;
   outcome: AssistantOutcome | null; // null while in flight
+}
+
+/** Flatten an accepted answer into the compact prior-turn form the prompt
+ * replays (multi-turn is stateless: the drawer re-sends recent exchanges). */
+function summarizeAnswer(outcome: AssistantOutcome): string {
+  if (outcome.kind !== "ok" && outcome.kind !== "partial") return "";
+  const parts: string[] = [];
+  if (outcome.answer.conclusion) parts.push(outcome.answer.conclusion);
+  for (const section of outcome.answer.sections) {
+    for (const item of section.items) {
+      parts.push(item.scopeLabel ? `${item.scopeLabel}: ${item.text}` : item.text);
+    }
+  }
+  return parts.join(" · ").slice(0, MAX_PRIOR_ANSWER_CHARS);
+}
+
+function collectPriorExchanges(exchanges: Exchange[]): AssistantPriorExchange[] {
+  const prior: AssistantPriorExchange[] = [];
+  for (const exchange of exchanges) {
+    if (exchange.outcome?.kind !== "ok" && exchange.outcome?.kind !== "partial") continue;
+    const answerSummary = summarizeAnswer(exchange.outcome);
+    if (answerSummary) prior.push({ question: exchange.question, answerSummary });
+  }
+  return prior.slice(-MAX_PRIOR_EXCHANGES);
 }
 
 export function AiAssistantDrawer() {
@@ -49,12 +78,14 @@ export function AiAssistantDrawer() {
     if (!trimmed || busy || !context) return;
     setQuestion("");
     setBusy(true);
+    const priorExchanges = collectPriorExchanges(exchanges);
     setExchanges((current) => [...current, { question: trimmed, outcome: null }]);
     const outcome = await askAssistant({
       question: trimmed,
       surface: context.surface,
       contextLabel: context.label,
       contextPack: context.contextPack,
+      priorExchanges,
     });
     setExchanges((current) =>
       current.map((exchange, index) =>
@@ -96,28 +127,6 @@ export function AiAssistantDrawer() {
         </SheetHeader>
 
         <div ref={scrollRef} className="flex-1 space-y-4 overflow-y-auto px-4 py-3">
-          {exchanges.length === 0 && (
-            <div className="space-y-2">
-              <div className="text-xs font-medium text-muted-foreground">Suggested questions</div>
-              <div className="flex flex-wrap gap-1.5">
-                {SUGGESTED_QUESTIONS.map((suggested) => (
-                  <button
-                    key={suggested}
-                    type="button"
-                    disabled={!context || busy}
-                    onClick={() => void ask(suggested)}
-                    className={cn(
-                      "rounded-md border border-border bg-muted/20 px-2 py-1 text-xs hover:bg-muted/50",
-                      (!context || busy) && "cursor-not-allowed opacity-50",
-                    )}
-                  >
-                    {suggested}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-
           {exchanges.map((exchange, index) => (
             <div key={index} className="space-y-2">
               <div className="rounded-md bg-primary/10 px-2.5 py-1.5 text-xs font-medium text-foreground">
@@ -180,6 +189,30 @@ export function AiAssistantDrawer() {
               )}
             </div>
           ))}
+
+          {!busy && (
+            <div className="space-y-2">
+              {exchanges.length === 0 && (
+                <div className="text-xs font-medium text-muted-foreground">Suggested questions</div>
+              )}
+              <div className="flex flex-wrap gap-1.5">
+                {SUGGESTED_QUESTIONS.map((suggested) => (
+                  <button
+                    key={suggested}
+                    type="button"
+                    disabled={!context}
+                    onClick={() => void ask(suggested)}
+                    className={cn(
+                      "rounded-md border border-border bg-muted/20 px-2 py-1 text-xs hover:bg-muted/50",
+                      !context && "cursor-not-allowed opacity-50",
+                    )}
+                  >
+                    {suggested}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
 
         <form
