@@ -114,6 +114,90 @@ function campaign(over: Partial<FbAnalyticsRow>): FbAnalyticsRow {
   } as FbAnalyticsRow;
 }
 
+// ---- Path-grain golden cases (v2) -------------------------------------------
+
+function pathRecFor(output: ReturnType<typeof computeAiSignals>, path: string) {
+  const rec = output.recommendations.find((r) => r.scope.kind === "path" && r.scope.campaignPath === path);
+  expect(rec).toBeTruthy();
+  return rec!;
+}
+
+describe("path-grain recommendations", () => {
+  it("emits one path recommendation per campaign_path, pooled from the rows", () => {
+    const out = run([cohort({ cohort_date: "2026-07-01" }), ...peers(5)]);
+    const rec = pathRecFor(out, "soulmate-sketch-web-en");
+    expect(rec.surface).toBe("cohort");
+    // 6 mature rows x 100 trials, pooled CPA 1500x6/600 = $15 → scale_strong.
+    expect(rec.action).toBe("SCALE");
+    expect(rec.ruleId).toBe("scale_strong");
+    const cpaEv = rec.because.find((ev) => ev.metric === "cpa")!;
+    expect(cpaEv.value).toBe(15);
+  });
+
+  it("judges Trial → Paid on the mature subset with a partial_maturity note", () => {
+    // One IMMATURE cohort (trial window 7d, cohort 2 days old) with terrible
+    // conversion must not drag the path verdict.
+    const young = cohort({ cohort_date: "2026-08-19", first_subscription_users: 0, revenue_d30: 0, revenue_d60: 0 });
+    const out = run([young, ...peers(5)]);
+    const rec = pathRecFor(out, "soulmate-sketch-web-en");
+    const convEv = rec.because.find((ev) => ev.metric === "trial_to_paid")!;
+    // Mature subset: 5 peers x 45/100 = 45%, the young row excluded.
+    expect(convEv.value).toBe(45);
+    expect(rec.dataNotes.some((n) => n.code === "partial_maturity")).toBe(true);
+  });
+
+  it("benchmarks a path against the OTHER paths", () => {
+    const pathA = [cohort({}), ...peers(5)];
+    const mkPath = (path: string, cpaSpend: number) =>
+      peers(5, { campaign_path: path, fb_spend: cpaSpend }).map((row, i) =>
+        ({ ...row, cohort_date: `2026-05-${String(i + 2).padStart(2, "0")}` }));
+    const out = run(
+      [...pathA, ...mkPath("path-b", 2500), ...mkPath("path-c", 2600), ...mkPath("path-d", 2700), ...mkPath("path-e", 2800)],
+      { trialDurationDaysByPath: { "soulmate-sketch-web-en": 7, "path-b": 7, "path-c": 7, "path-d": 7, "path-e": 7 } },
+    );
+    const rec = pathRecFor(out, "soulmate-sketch-web-en");
+    const cpaEv = rec.because.find((ev) => ev.metric === "cpa")!;
+    expect(cpaEv.benchmark?.source).toBe("global_peers");
+    expect(cpaEv.benchmark?.peers).toBe(4); // 5 paths − this one
+    expect(cpaEv.verdict).toBe("good"); // $15 vs ~$26 peers
+  });
+
+  it("a real deteriorating path trend keeps REDUCE; an improving one rescues to HOLD", () => {
+    // 6 mature cohorts, CPA over ceiling; oldest 3 cheap → recent 3 expensive =
+    // deteriorating → REDUCE. Reversed order → improving → rung 6 HOLD.
+    const mk = (dates: string[], spends: number[]) =>
+      dates.map((date, i) => cohort({ cohort_date: date, fb_spend: spends[i], ltv_1m_per_user: 40 }));
+    const dates = ["2026-06-01", "2026-06-02", "2026-06-03", "2026-06-04", "2026-06-05", "2026-06-06"];
+    const deteriorating = run(mk(dates, [3200, 3200, 3200, 4700, 4700, 4700]));
+    const recBad = pathRecFor(deteriorating, "soulmate-sketch-web-en");
+    expect(recBad.action).toBe("REDUCE");
+    expect(recBad.because.some((ev) => ev.metric === "cpa_trend")).toBe(true);
+
+    const improving = run(mk(dates, [4700, 4700, 4700, 3200, 3200, 3200]));
+    const recGood = pathRecFor(improving, "soulmate-sketch-web-en");
+    expect(recGood.action).toBe("HOLD");
+    expect(recGood.ruleId).toBe("expensive_but_converting");
+  });
+
+  it("caps path opportunities at one per path, alongside cohort opportunities", () => {
+    const out = run([cohort({ fb_spend: 4700 }), ...peers(5, { fb_spend: 4700 })]); // REDUCE everywhere
+    const pathOpps = out.opportunities.filter((o) => o.recommendation.scope.kind === "path");
+    expect(pathOpps.length).toBe(1);
+    const cohortOpps = out.opportunities.filter((o) => o.recommendation.scope.kind === "cohort");
+    expect(cohortOpps.length).toBeLessThanOrEqual(3);
+  });
+
+  it("pathless refund definition is amount-based and can STOP the path", () => {
+    const refundy = peers(5, { amount_refunded: 500 }); // 25% of gross each
+    const out = run(refundy);
+    const rec = pathRecFor(out, "soulmate-sketch-web-en");
+    expect(rec.action).toBe("STOP");
+    expect(rec.ruleId).toBe("refund_breach_stop");
+    const refundEv = rec.because.find((ev) => ev.metric === "refund_rate")!;
+    expect(refundEv.label).toBe("Refund rate ($)");
+  });
+});
+
 // ---- Golden ladder cases ----------------------------------------------------
 
 describe("cohort ladder golden cases", () => {
@@ -364,7 +448,10 @@ describe("engine invariants", () => {
     const out = run([...fixture]);
     const keys = out.recommendations.map((r) => JSON.stringify(r.scope));
     expect(new Set(keys).size).toBe(keys.length);
-    expect(out.recommendations).toHaveLength(fixture.length);
+    // v2: one recommendation per cohort row PLUS one per campaign_path.
+    const pathCount = new Set(fixture.map((row) => row.campaign_path)).size;
+    expect(out.recommendations).toHaveLength(fixture.length + pathCount);
+    expect(out.recommendations.filter((r) => r.scope.kind === "path")).toHaveLength(pathCount);
     const flat = JSON.stringify(out);
     expect(flat).not.toContain("NaN");
     expect(flat).not.toContain("Infinity");
