@@ -156,6 +156,20 @@ describe("ClickHouse cohort membership materialization", () => {
     expect(params.p_mmb_0).toBe("Ivan");
   });
 
+  it("binds campaign_path_exclude as a parameterized NOT IN on the member scope", () => {
+    const params: Record<string, unknown> = {};
+    const where = activeCohortMemberWhere(
+      { ...(request.filters as CohortFilters), campaign_path_exclude: ["soulmate-sketch-es"] },
+      params,
+    );
+    expect(where).toContain("fc.campaign_path NOT IN ({p_mcpx_0:String})");
+    expect(where).not.toContain("soulmate-sketch-es");
+    expect(params.p_mcpx_0).toBe("soulmate-sketch-es");
+    // Absent (old clients) or empty -> no clause.
+    const cleanParams: Record<string, unknown> = {};
+    expect(activeCohortMemberWhere(request.filters as CohortFilters, cleanParams)).not.toContain("NOT IN");
+  });
+
   // Intentional contract update (UTM filter): every cohort dimension still
   // comes from fact_user_cohorts, but the Media Buyer dropdown's UTM entries
   // need the authoritative first-trial utm_source, which only exists in

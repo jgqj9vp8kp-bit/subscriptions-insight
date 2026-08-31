@@ -140,6 +140,7 @@ export function normalizeCohortRequest(req: CohortRequest): NormalizedCohortRequ
     filters: {
       funnel: stringArray(f.funnel, "funnel"),
       campaign_path: stringArray(f.campaign_path, "campaign_path"),
+      campaign_path_exclude: stringArray(f.campaign_path_exclude, "campaign_path_exclude"),
       campaign_id: stringArray(f.campaign_id, "campaign_id"),
       traffic_source: stringArray(f.traffic_source, "traffic_source"),
       price_plan: stringArray(f.price_plan, "price_plan"),
@@ -170,6 +171,16 @@ function inClause(column: string, values: string[], prefix: string, params: Reco
     return `{${key}:String}`;
   });
   return `${column} IN (${ph.join(", ")})`;
+}
+
+function notInClause(column: string, values: string[], prefix: string, params: Record<string, unknown>): string {
+  if (!values.length) return "";
+  const ph = values.map((v, i) => {
+    const key = `p_${prefix}_${i}`;
+    params[key] = v;
+    return `{${key}:String}`;
+  });
+  return `${column} NOT IN (${ph.join(", ")})`;
 }
 
 // Which filters this Edge Function reproduced for the current request.
@@ -492,6 +503,8 @@ function cohortPostFilter(nreq: NormalizedCohortRequest, params: Record<string, 
   if (fn) conds.push(fn);
   const cp = inClause("campaign_path", nreq.filters.campaign_path, "cp", params);
   if (cp) conds.push(cp);
+  const cpx = notInClause("campaign_path", nreq.filters.campaign_path_exclude ?? [], "cpx", params);
+  if (cpx) conds.push(cpx);
   if (nreq.filters.refund_status === "has") conds.push(`refund_raw > 0`);
   if (nreq.filters.refund_status === "none") conds.push(`refund_raw = 0`);
   return conds.length ? `HAVING ${conds.join(" AND ")}` : "";

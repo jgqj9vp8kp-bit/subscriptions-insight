@@ -39,6 +39,11 @@ export interface CohortFiltersApplied {
 export interface CohortFilters {
   funnel: string[];
   campaign_path: string[];
+  /** Funnels switched OFF by the user (Cohorts page exclusion switch). Applied
+   * as NOT IN wherever campaign_path IN applies — the row list AND the FB
+   * spend/allocation scope — so BOTH spend models recompute without the
+   * excluded paths. Optional for old clients; normalize fills []. */
+  campaign_path_exclude?: string[];
   campaign_id: string[];
   traffic_source: string[];
   price_plan: string[];

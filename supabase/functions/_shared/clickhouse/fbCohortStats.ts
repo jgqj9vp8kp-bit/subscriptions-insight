@@ -440,6 +440,16 @@ function inClause(column: string, values: string[], prefix: string, params: Reco
   return ` AND ${column} IN (${placeholders.join(", ")})`;
 }
 
+function notInClause(column: string, values: string[], prefix: string, params: Record<string, unknown>): string {
+  if (!values.length) return "";
+  const placeholders = values.map((value, index) => {
+    const key = `p_fbu_${prefix}_${index}`;
+    params[key] = value;
+    return `{${key}:String}`;
+  });
+  return ` AND ${column} NOT IN (${placeholders.join(", ")})`;
+}
+
 function clickHouseHexString(value: string): string {
   const bytes = new TextEncoder().encode(value);
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -477,6 +487,7 @@ function authoritativeScopeWhere(input: {
   if (input.dateTo) { const key = `${prefix}_date_to`; params[key] = input.dateTo; where += ` AND toString(cohort_date) <= {${key}:String}`; }
   where += inClause("funnel", filters.funnel, `${prefix}_fn`, params);
   where += inClause("campaign_path", filters.campaign_path, `${prefix}_cp`, params);
+  where += notInClause("campaign_path", filters.campaign_path_exclude ?? [], `${prefix}_cpx`, params);
   if (filters.campaign_id.length) {
     where += ` AND ${authoritativeCampaignExpr()} IN ${clickHouseBodyStringSet(filters.campaign_id)}`;
   }
@@ -517,6 +528,7 @@ export function fbAuthoritativeUsersSql(input: {
   if (input.dateTo) { params.fbu_date_to = input.dateTo; where += ` AND toString(cohort_date) <= {fbu_date_to:String}`; }
   where += inClause("funnel", filters.funnel, "fn", params);
   where += inClause("campaign_path", filters.campaign_path, "cp", params);
+  where += notInClause("campaign_path", filters.campaign_path_exclude ?? [], "cpx", params);
   if (filters.campaign_id.length) {
     where += ` AND ${authoritativeCampaignExpr()} IN ${clickHouseBodyStringSet(filters.campaign_id)}`;
   }

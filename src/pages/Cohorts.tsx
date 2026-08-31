@@ -1591,6 +1591,12 @@ export default function CohortsPage() {
       filters: {
         funnel: selectedFunnels,
         campaign_path: selectedCampaignPaths,
+        // Switched-off funnels recompute SERVER-side too: the fb_totals bundle
+        // (full-funnel Spend (FB)/CPP (FB)/FB Purchases) is not derivable from
+        // rows, so the exclusion must reach its allocation scope. The client
+        // post-filter on effectiveFilteredCohorts still gives the instant
+        // response while this refetch is in flight.
+        campaign_path_exclude: excludedCampaignPaths,
         campaign_id: appliedSelectedCampaignIds ?? [],
         traffic_source: appliedTrafficSourceFilter && appliedTrafficSourceFilter !== "all" ? [appliedTrafficSourceFilter] : [],
         price_plan: [],
@@ -1617,7 +1623,7 @@ export default function CohortsPage() {
         },
       },
     }),
-    [cohortDateFrom, cohortDateTo, selectedFunnels, selectedCampaignPaths, appliedSelectedCampaignIds, appliedTrafficSourceFilter, effectiveSelectedMediaBuyers, appliedSelectedCountries, effectiveSelectedCardTypes, effectiveSelectedPlatforms, selectedCurrencies, refundFilter, maxRenewalColumns, fbAllocationDiagnosticsUi],
+    [cohortDateFrom, cohortDateTo, selectedFunnels, selectedCampaignPaths, excludedCampaignPaths, appliedSelectedCampaignIds, appliedTrafficSourceFilter, effectiveSelectedMediaBuyers, appliedSelectedCountries, effectiveSelectedCardTypes, effectiveSelectedPlatforms, selectedCurrencies, refundFilter, maxRenewalColumns, fbAllocationDiagnosticsUi],
   );
   const {
     chResult,

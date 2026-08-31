@@ -136,6 +136,21 @@ describe("clickhouse-cohorts SQL safety and scoping", () => {
     expect(sql).toContain("refund_raw > 0");
   });
 
+  // The funnel exclusion switch: excluded paths are a parameterized NOT IN in
+  // the same HAVING wrapper the include-filter uses, so the row list and every
+  // total derived from it drop the switched-off funnels server-side.
+  it("emits campaign_path_exclude as a parameterized NOT IN post-filter", () => {
+    const nreq = normalizeCohortRequest({ filters: { campaign_path_exclude: ["soulmate-sketch-es", "tt-test"] } });
+    const params: Record<string, unknown> = { auth_user_id: "u" };
+    const sql = buildListQuery(nreq, params);
+    expect(sql).toContain("campaign_path NOT IN ({p_cpx_0:String}, {p_cpx_1:String})");
+    expect(params.p_cpx_0).toBe("soulmate-sketch-es");
+    expect(params.p_cpx_1).toBe("tt-test");
+    // No exclusions -> no clause at all (the classifier's own NOT INs remain).
+    const clean = buildListQuery(normalizeCohortRequest({}), { auth_user_id: "u" });
+    expect(clean).not.toContain("campaign_path NOT IN");
+  });
+
   it("adds Support metrics with a deduped email semi-join, not a many-to-many join", () => {
     const nreq = normalizeCohortRequest({});
     const sql = buildListQuery(nreq, { auth_user_id: "u" });

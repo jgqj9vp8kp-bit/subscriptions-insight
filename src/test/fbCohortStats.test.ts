@@ -55,6 +55,21 @@ describe("FB Cohorts user-first smoke contract", () => {
     const sql = fbAuthoritativeUsersSql({ filters: NO_FILTERS, dateFrom: null, dateTo: null, params: {} });
     expect(sql).toContain("trial_timestamp_utc");
     expect(sql).not.toContain("fact_facebook_stats");
+    expect(sql).not.toContain("NOT IN");
+  });
+
+  // The funnel exclusion switch reaches the FB allocation scope: excluded
+  // paths drop out of the authoritative-user stage, so fb_totals (full-funnel
+  // Spend (FB) / CPP (FB) / FB Purchases) recompute without them.
+  it("excludes switched-off campaign paths from the authoritative user scope", () => {
+    const params: Record<string, unknown> = {};
+    const sql = fbAuthoritativeUsersSql({
+      filters: { ...NO_FILTERS, campaign_path_exclude: ["soulmate-sketch-es"] },
+      dateFrom: null, dateTo: null, params,
+    });
+    expect(sql).toContain("campaign_path NOT IN ({p_fbu_cpx_0:String})");
+    expect(sql).not.toContain("soulmate-sketch-es");
+    expect(params.p_fbu_cpx_0).toBe("soulmate-sketch-es");
   });
 
   it("builds Campaign Metrics at selected-period Campaign grain", () => {

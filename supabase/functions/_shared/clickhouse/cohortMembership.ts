@@ -557,8 +557,13 @@ export function activeCohortMemberWhere(filters: CohortFilters, params: Record<s
     params[key] = value;
     return `{${key}:String}`;
   });
+  const addNotIn = (column: string, values: string[], prefix: string) => {
+    if (!values.length) return;
+    clauses.push(`${column} NOT IN (${bindList(values, prefix).join(", ")})`);
+  };
   addIn("fc.funnel", filters.funnel, "mfn");
   addIn("fc.campaign_path", filters.campaign_path, "mcp");
+  addNotIn("fc.campaign_path", filters.campaign_path_exclude ?? [], "mcpx");
   addIn("fc.campaign_id", filters.campaign_id, "mcid");
   addIn("fc.traffic_source", filters.traffic_source, "mtsrc");
   // Media Buyer dropdown: buyer names filter fc.media_buyer exactly as before;

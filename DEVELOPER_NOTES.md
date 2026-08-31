@@ -93,15 +93,22 @@ views and sanitizers stay mode-agnostic.
 Known dead field: `dateSort` in `ui_state_cohorts` (kept for persisted-state
 compatibility; nothing reads it).
 
-Funnel exclusion switch: `excludedCampaignPaths` in `ui_state_cohorts` drops
-those paths' rows at the single ClickHouse/legacy merge point
-(`effectiveFilteredCohorts`), so every downstream derive — funnel
-pseudo-rows, Total, AI signals (and the AI history contextKey), exports,
-assistant context — follows from one client-side filter; the server contract
-is untouched. It is a hygiene switch, not a view filter: it deliberately
-survives "Reset filters" (the "Excluded" popover has its own "Include all"),
-and stale excluded paths are never pruned against the options list — a path
-with no current data must stay re-includable.
+Funnel exclusion switch: `excludedCampaignPaths` in `ui_state_cohorts` works
+at TWO levels. Client-side, the paths' rows are dropped at the single
+ClickHouse/legacy merge point (`effectiveFilteredCohorts`) — instant, and it
+carries every row-derived stat (funnel pseudo-rows, Total, AI signals + the
+AI history contextKey, exports, assistant context). Server-side, the same
+list travels as `filters.campaign_path_exclude` (NOT IN wherever
+campaign_path IN applies: the list HAVING, the materialized member scope,
+and BOTH fbCohortStats scopes) because `fb_totals` — full-funnel Spend (FB)
+/ CPP (FB) / FB Purchases — is a server bundle not derivable from rows.
+Gotcha caught live: the client cache-key normalizer
+(`cohortsCache.normalizeCohortRequest`) must also carry the field, or the
+query key never changes and the refetch silently doesn't happen. Filter
+OPTION lists deliberately ignore the exclusion, and stale excluded paths
+are never pruned against them — a path with no current data must stay
+re-includable. It is a hygiene switch, not a view filter: it survives
+"Reset filters" (the "Excluded" popover has its own "Include all").
 
 ## AI Analytics layer (2026-08)
 

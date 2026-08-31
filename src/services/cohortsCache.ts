@@ -28,6 +28,7 @@ export interface NormalizedCohortRequest {
   sort: { field: string; direction: string } | null;
   funnel: string[];
   campaign_path: string[];
+  campaign_path_exclude: string[];
   campaign_id: string[];
   traffic_source: string[];
   price_plan: string[];
@@ -54,6 +55,7 @@ export function normalizeCohortRequest(req: CohortRequest, opts: { includeSort?:
     sort: opts.includeSort && sort ? { field: sort.field, direction: sort.direction } : null,
     funnel: sortUniq(f.funnel),
     campaign_path: sortUniq(f.campaign_path),
+    campaign_path_exclude: sortUniq(f.campaign_path_exclude),
     campaign_id: sortUniq(f.campaign_id),
     traffic_source: sortUniq(f.traffic_source),
     price_plan: sortUniq(f.price_plan),
