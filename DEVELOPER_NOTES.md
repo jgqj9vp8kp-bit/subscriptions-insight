@@ -93,6 +93,16 @@ views and sanitizers stay mode-agnostic.
 Known dead field: `dateSort` in `ui_state_cohorts` (kept for persisted-state
 compatibility; nothing reads it).
 
+Funnel exclusion switch: `excludedCampaignPaths` in `ui_state_cohorts` drops
+those paths' rows at the single ClickHouse/legacy merge point
+(`effectiveFilteredCohorts`), so every downstream derive — funnel
+pseudo-rows, Total, AI signals (and the AI history contextKey), exports,
+assistant context — follows from one client-side filter; the server contract
+is untouched. It is a hygiene switch, not a view filter: it deliberately
+survives "Reset filters" (the "Excluded" popover has its own "Include all"),
+and stale excluded paths are never pruned against the options list — a path
+with no current data must stay re-includable.
+
 ## AI Analytics layer (2026-08)
 
 The layer is deterministic-first: a pure rules engine

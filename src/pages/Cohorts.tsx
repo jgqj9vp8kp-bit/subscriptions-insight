@@ -1,5 +1,5 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowDown, ArrowUp, ArrowUpDown, ChevronDown, ChevronRight, GripVertical, Check, Loader2, Plus, Trash2 } from "lucide-react";
+import { ArrowDown, ArrowUp, ArrowUpDown, ChevronDown, ChevronRight, EyeOff, GripVertical, Check, Loader2, Plus, Trash2 } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { AiActionChip } from "@/components/ai/AiActionChip";
 import { AiAnalysisPanel } from "@/components/ai/AiAnalysisPanel";
@@ -167,6 +167,10 @@ const DEFAULT_COHORTS_UI_STATE = {
   // shape as selectedCampaignIds / campaignIdFilter below).
   selectedFunnels: [] as string[],
   selectedCampaignPaths: [] as string[],
+  // Funnels switched OFF: their campaign_paths are removed from every number
+  // on this page (rows, Total, AI, exports) in BOTH view modes. A hygiene
+  // switch, not a view filter — it survives "Reset filters" deliberately.
+  excludedCampaignPaths: [] as string[],
   funnelFilter: "all",
   campaignPathFilter: "all",
   currencyFilter: "all",
@@ -1116,6 +1120,7 @@ export default function CohortsPage() {
   const {
     selectedFunnels: rawSelectedFunnels,
     selectedCampaignPaths: rawSelectedCampaignPaths,
+    excludedCampaignPaths: rawExcludedCampaignPaths,
     funnelFilter: legacyFunnelFilter,
     campaignPathFilter: legacyCampaignPathFilter,
     currencyFilter,
@@ -1169,6 +1174,14 @@ export default function CohortsPage() {
         : [],
     [rawSelectedMediaBuyers],
   );
+  const excludedCampaignPaths = useMemo(
+    () =>
+      Array.isArray(rawExcludedCampaignPaths)
+        ? Array.from(new Set(rawExcludedCampaignPaths.map((value) => String(value ?? "").trim()).filter(Boolean))).sort()
+        : [],
+    [rawExcludedCampaignPaths],
+  );
+  const excludedPathSet = useMemo(() => new Set(excludedCampaignPaths), [excludedCampaignPaths]);
   // Multi-select selections, merged with the legacy single-select key so a
   // persisted "funnelFilter: soulmate" keeps working after the upgrade.
   const mergeLegacySelection = (raw: unknown, legacy: unknown): string[] => {
@@ -1248,7 +1261,15 @@ export default function CohortsPage() {
   };
   const resetCohortFilters = () => {
     markCohortsUiSettingsUpdated();
+    // Excluded funnels survive a filter reset on purpose: the switch exists to
+    // keep test funnels out of the stats, and "Reset filters" silently
+    // re-admitting them would defeat it. The "Excluded" popover has its own
+    // explicit "Include all". (Both updates batch into one render.)
+    const keptExclusions = excludedCampaignPaths;
     resetUiState();
+    if (keptExclusions.length) {
+      setUiState((current) => ({ ...current, excludedCampaignPaths: keptExclusions }));
+    }
   };
   const [columnsPopoverOpen, setColumnsPopoverOpen] = useState(false);
   const [viewsPopoverOpen, setViewsPopoverOpen] = useState(false);
@@ -1820,10 +1841,15 @@ export default function CohortsPage() {
 
   // ClickHouse drives the table when it is the active engine and no fallback is
   // needed (see clickHouseDriving); otherwise the legacy filtered cohorts are used.
-  const effectiveFilteredCohorts = useMemo(
-    () => (clickHouseDriving && chResult ? chResult.cohorts : filteredCohorts),
-    [clickHouseDriving, chResult, filteredCohorts],
-  );
+  // Excluded funnels are dropped HERE, at the single merge point of both
+  // engines: every downstream derive (funnel pseudo-rows, Total, AI signals,
+  // exports, assistant context) reads this memo, so one filter covers them all
+  // — and the server contract stays untouched.
+  const effectiveFilteredCohorts = useMemo(() => {
+    const rows = clickHouseDriving && chResult ? chResult.cohorts : filteredCohorts;
+    if (excludedPathSet.size === 0) return rows;
+    return rows.filter((row) => !excludedPathSet.has(row.campaign_path));
+  }, [clickHouseDriving, chResult, filteredCohorts, excludedPathSet]);
 
   const cohortRowFilters = useMemo(
     () => ({
@@ -2121,6 +2147,7 @@ export default function CohortsPage() {
     () => stableJson({
       funnels: [...selectedFunnels].sort(),
       paths: [...selectedCampaignPaths].sort(),
+      excluded: excludedCampaignPaths,
       currency: currencyFilter,
       campaignIds: [...appliedSelectedCampaignIds].sort(),
       countries: [...appliedSelectedCountries].sort(),
@@ -2128,7 +2155,7 @@ export default function CohortsPage() {
       platforms: [...appliedSelectedPlatforms].sort(),
       mediaBuyers: [...appliedSelectedMediaBuyers].sort(),
     }),
-    [selectedFunnels, selectedCampaignPaths, currencyFilter, appliedSelectedCampaignIds, appliedSelectedCountries, appliedSelectedCardTypes, appliedSelectedPlatforms, appliedSelectedMediaBuyers],
+    [selectedFunnels, selectedCampaignPaths, excludedCampaignPaths, currencyFilter, appliedSelectedCampaignIds, appliedSelectedCountries, appliedSelectedCardTypes, appliedSelectedPlatforms, appliedSelectedMediaBuyers],
   );
   const aiSignals = useAiCohortSignals({
     rows: effectiveFilteredCohorts,
@@ -2544,6 +2571,14 @@ export default function CohortsPage() {
     updateUiState({ selectedCampaignPaths: next, campaignPathFilter: "all" });
   };
   const clearCampaignPaths = () => updateUiState({ selectedCampaignPaths: [], campaignPathFilter: "all" });
+  // The funnel on/off switch (see excludedCampaignPaths on the default state).
+  const toggleExcludedPath = (path: string) => {
+    const next = excludedPathSet.has(path)
+      ? excludedCampaignPaths.filter((value) => value !== path)
+      : [...excludedCampaignPaths, path].sort();
+    updateUiState({ excludedCampaignPaths: next });
+  };
+  const includeAllExcludedPaths = () => updateUiState({ excludedCampaignPaths: [] });
   const campaignPathSummary = selectedCampaignPaths.length === 0
     ? "All campaign paths"
     : selectedCampaignPaths.length === 1
@@ -3605,6 +3640,55 @@ export default function CohortsPage() {
             />
           </div>
           <div className="ml-auto flex items-center gap-2">
+            <Popover>
+              <PopoverTrigger asChild>
+                <Button
+                  type="button"
+                  variant={excludedCampaignPaths.length ? "outline" : "ghost"}
+                  size="sm"
+                  className={`h-9 gap-1.5 ${excludedCampaignPaths.length ? "border-warning/60 text-warning hover:text-warning" : "text-muted-foreground"}`}
+                  title="Funnels switched off — removed from every number on this page"
+                >
+                  <EyeOff className="h-3.5 w-3.5" />
+                  Excluded{excludedCampaignPaths.length ? ` ${excludedCampaignPaths.length}` : ""}
+                </Button>
+              </PopoverTrigger>
+              <PopoverContent align="end" className="w-96 p-0">
+                <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
+                  <div>
+                    <div className="text-xs font-medium text-muted-foreground">Excluded funnels</div>
+                    <div className="text-xs text-muted-foreground">Removed from rows, Total, AI and exports · kept across "Reset filters"</div>
+                  </div>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 text-xs"
+                    onClick={includeAllExcludedPaths}
+                    disabled={!excludedCampaignPaths.length}
+                  >
+                    Include all
+                  </Button>
+                </div>
+                <div className="max-h-72 overflow-auto py-1">
+                  {excludedCampaignPaths.length === 0 && (
+                    <div className="px-3 py-3 text-sm text-muted-foreground">
+                      Nothing excluded. Use the <EyeOff className="inline h-3.5 w-3.5 align-[-2px]" /> button on a table row to switch a funnel off.
+                    </div>
+                  )}
+                  {excludedCampaignPaths.map((path) => (
+                    <label
+                      key={path}
+                      className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted/50"
+                      title={path}
+                    >
+                      <Checkbox checked onCheckedChange={() => toggleExcludedPath(path)} />
+                      <span className="truncate">{funnelDisplayNameByPath.get(path) ?? path}</span>
+                    </label>
+                  ))}
+                </div>
+              </PopoverContent>
+            </Popover>
             <Button type="button" variant="ghost" size="sm" className="h-9" onClick={resetCohortFilters}>
               Reset filters
             </Button>
@@ -4286,7 +4370,7 @@ export default function CohortsPage() {
                     <TableRow
                       key={c.cohort_id}
                       data-cohort-id={c.cohort_id}
-                      className="even:bg-muted/20 hover:bg-muted/40 [&>td.sticky]:even:bg-[hsl(var(--card))] [&>td.sticky]:hover:bg-[hsl(var(--muted))]"
+                      className="group/row even:bg-muted/20 hover:bg-muted/40 [&>td.sticky]:even:bg-[hsl(var(--card))] [&>td.sticky]:hover:bg-[hsl(var(--muted))]"
                     >
                       <TableCell
                         className={`${CELL_BASE} sticky left-0 bg-card z-10 font-medium text-sm whitespace-nowrap shadow-[1px_0_0_0_hsl(var(--border))]`}
@@ -4309,6 +4393,14 @@ export default function CohortsPage() {
                             ) : (
                               <span className="truncate" title={c.cohort_id}>{cohortDisplayName(c)}</span>
                             )}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => toggleExcludedPath(c.campaign_path)}
+                            title={`Switch off ${c.campaign_path} — exclude this funnel from all statistics on this page`}
+                            className="ml-auto shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-warning focus-visible:opacity-100 group-hover/row:opacity-100"
+                          >
+                            <EyeOff className="h-3.5 w-3.5" />
                           </button>
                         </div>
                       </TableCell>
