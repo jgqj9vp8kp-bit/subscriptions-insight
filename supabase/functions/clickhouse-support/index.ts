@@ -16,6 +16,7 @@ import {
   runSupportOptions,
   runSupportStatus,
   runSupportSync,
+  runSupportUnansweredContacts,
   SupportRequestError,
 } from "../_shared/clickhouse/support.ts";
 import type { SupportRequest } from "../_shared/clickhouse/supportContract.ts";
@@ -63,6 +64,7 @@ Deno.serve(async (req: Request) => {
     // fallthrough, so a missing branch here would answer an analytics bundle —
     // ok: true and no rows — and the export would quietly write an empty file.
     if (action === "export") return jsonResponse(await withTimeout(runSupportExport({ ...common, request }), QUERY_TIMEOUT_MS));
+    if (action === "unanswered_contacts") return jsonResponse(await withTimeout(runSupportUnansweredContacts({ ...common, request }), QUERY_TIMEOUT_MS));
     return jsonResponse(await withTimeout(runSupportBundle({ ...common, supabase: auth.supabase, request }), QUERY_TIMEOUT_MS));
   } catch (error) {
     const status = error instanceof SupportRequestError ? 400 : 502;

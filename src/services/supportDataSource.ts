@@ -9,6 +9,7 @@ import {
   type SupportOptionsResponse,
   type SupportRequest,
   type SupportSyncResult,
+  type SupportUnansweredContactsResponse,
 } from "../../supabase/functions/_shared/clickhouse/supportContract";
 
 export interface SupportQuery {
@@ -81,6 +82,21 @@ export async function loadSupportExportPage(query: SupportQuery, page: number): 
     pagination: { page, page_size: request.pagination?.page_size ?? 200 },
   });
   if (!response.ok) throw new Error(response.error || "ClickHouse support export failed.");
+  return response;
+}
+
+/** The unhandled-people list: unique addresses with answerable requests and
+ * ZERO outgoing mail, under the same filters the screen shows. The action
+ * discriminator check matters: the edge router falls through to `bundle`, and
+ * a missing branch would otherwise turn the file into an empty header row. */
+export async function loadUnansweredContacts(query: SupportQuery): Promise<SupportUnansweredContactsResponse> {
+  const response = await runClickHouseSupport<SupportUnansweredContactsResponse>(
+    buildSupportRequest(query, "unanswered_contacts"),
+  );
+  if (!response.ok) throw new Error(response.error || "ClickHouse unanswered-contacts export failed.");
+  if (response.action !== "unanswered_contacts") {
+    throw new Error("Support edge function does not support unanswered_contacts yet — deploy clickhouse-support.");
+  }
   return response;
 }
 

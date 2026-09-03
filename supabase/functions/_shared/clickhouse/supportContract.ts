@@ -2,7 +2,7 @@
 // The browser receives aggregate bundles, paged request rows, and one opened
 // detail only. Filtering/search/sorting/pagination happen in ClickHouse.
 
-export type SupportAction = "bundle" | "list" | "details" | "options" | "sync" | "status" | "export";
+export type SupportAction = "bundle" | "list" | "details" | "options" | "sync" | "status" | "export" | "unanswered_contacts";
 export type SupportSortDirection = "asc" | "desc";
 export type SupportTriState = "all" | "yes" | "no";
 export const EMPTY_CAMPAIGN_PATH = "—";
@@ -285,6 +285,37 @@ export interface SupportExportResponse {
   error?: string;
 }
 
+/** One unhandled person: a unique customer address with at least one
+ * answerable request under the current filter and ZERO outgoing mail. */
+export interface SupportUnansweredContactRow {
+  email: string;
+  sender_name: string | null;
+  /** All their messages under the filter (spam/auto included for context). */
+  messages: number;
+  first_received_at: string | null;
+  last_received_at: string | null;
+  last_subject: string | null;
+  /** Effective category of their latest message. */
+  last_category: string;
+  high_priority: number;
+}
+
+export interface SupportUnansweredContactsResponse {
+  ok: boolean;
+  source: "clickhouse";
+  /** Discriminator: the edge router falls through to `bundle`, so the client
+   * must verify it got THIS action back (export-route precedent). */
+  action: "unanswered_contacts";
+  generated_at: string;
+  query_duration_ms: number;
+  rows: SupportUnansweredContactRow[];
+  total_contacts: number;
+  /** Unanswered answerable contacts with NO email address (name-only
+   * spreadsheet imports) — real people, but not exportable as addresses. */
+  contacts_without_email: number;
+  error?: string;
+}
+
 export interface SupportOptionsResponse {
   ok: boolean;
   source: "clickhouse";
@@ -294,4 +325,4 @@ export interface SupportOptionsResponse {
   error?: string;
 }
 
-export type SupportResponse = SupportAnalyticsBundle | SupportListResponse | SupportDetailsResponse | SupportOptionsResponse | SupportSyncResult | SupportExportResponse;
+export type SupportResponse = SupportAnalyticsBundle | SupportListResponse | SupportDetailsResponse | SupportOptionsResponse | SupportSyncResult | SupportExportResponse | SupportUnansweredContactsResponse;

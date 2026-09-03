@@ -78,14 +78,18 @@ import {
   loadSupportDetails,
   loadSupportExportPage,
   loadSupportSyncStatus,
+  loadUnansweredContacts,
   syncSupportToClickHouse,
   type SupportQuery,
 } from "@/services/supportDataSource";
 import {
   buildSupportExportTable,
+  buildUnansweredContactsTable,
   collectSupportExportRows,
   downloadSupportCsv,
   downloadSupportXlsx,
+  downloadUnansweredContactsCsv,
+  downloadUnansweredContactsXlsx,
   MAX_EXPORT_ROWS,
   type SupportExportMeta,
 } from "@/services/supportExport";
@@ -437,6 +441,39 @@ export default function SupportPage() {
       });
     } finally {
       setExportState({ busy: null, loaded: 0, total: 0 });
+    }
+  }
+
+  // The unhandled-people file: unique addresses with zero outgoing mail, under
+  // the same filters the screen shows (contact grain, one server call).
+  const [unansweredBusy, setUnansweredBusy] = useState(false);
+  async function onExportUnanswered(format: "csv" | "xlsx") {
+    setUnansweredBusy(true);
+    try {
+      const response = await loadUnansweredContacts(supportQuery);
+      const table = buildUnansweredContactsTable(response.rows);
+      const meta = {
+        generatedAt: response.generated_at,
+        totalContacts: response.total_contacts,
+        contactsWithoutEmail: response.contacts_without_email,
+        filterSummary: describeSupportFilters(filters).join("; ") || "без фильтров",
+      };
+      if (format === "csv") downloadUnansweredContactsCsv(table, meta);
+      else await downloadUnansweredContactsXlsx(table, meta);
+      toast({
+        title: `Контактов без ответа: ${response.total_contacts}`,
+        description: response.contacts_without_email
+          ? `Ещё ${response.contacts_without_email} без e-mail (только имя) — в файл не вошли.`
+          : "Каждая строка — уникальный адрес, на который мы не отправили ни одного письма.",
+      });
+    } catch (error) {
+      toast({
+        title: "Выгрузка контактов не удалась",
+        description: error instanceof Error ? error.message : "Неизвестная ошибка",
+        variant: "destructive",
+      });
+    } finally {
+      setUnansweredBusy(false);
     }
   }
 
@@ -1492,6 +1529,12 @@ export default function SupportPage() {
                 title="Тот же набор писем в CSV (RFC 4180, разделитель — запятая).">
                 {exportState.busy === "csv" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
                 CSV
+              </Button>
+              <Button type="button" variant="outline" size="sm"
+                onClick={() => void onExportUnanswered("xlsx")} disabled={unansweredBusy}
+                title="Уникальные адреса, на которые мы не отправили ни одного письма (спам и автоуведомления не считаются). Учитывает текущие фильтры.">
+                {unansweredBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+                E-mail без ответа
               </Button>
               <Button type="button" variant="outline" size="sm" onClick={() => setPage((value) => Math.max(1, value - 1))} disabled={page <= 1}>Previous</Button>
               <Button type="button" variant="outline" size="sm" onClick={() => setPage((value) => Math.min(totalPages, value + 1))} disabled={page >= totalPages}>Next</Button>

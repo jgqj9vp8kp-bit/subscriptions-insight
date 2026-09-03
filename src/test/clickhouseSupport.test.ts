@@ -13,6 +13,7 @@ import {
   runSupportExport,
   runSupportList,
   runSupportOptions,
+  runSupportUnansweredContacts,
   supportAttributionStatus,
   SupportRequestError,
   SUPPORT_FACT_COLUMNS,
@@ -71,6 +72,46 @@ describe("clickhouse-support architecture", () => {
     expect(SUPPORT_FACT_COLUMNS).toContain("answered_at");
     expect(SUPPORT_FACT_COLUMNS).toContain("answer_source");
     expect(SUPPORT_FACT_COLUMNS).toContain("reply_count");
+  });
+
+  it("lists unanswered contacts at the ADDRESS grain with the shared filter scope", async () => {
+    const queries: Array<{ sql: string; params: Record<string, unknown> }> = [];
+    const clickhouse: ClickHouseClientLike = {
+      command: async () => undefined,
+      insert: async () => undefined,
+      query: async ({ query, query_params }) => {
+        queries.push({ sql: query, params: query_params ?? {} });
+        return {
+          json: async () => query.includes("GROUP BY normalized_email")
+            ? [{ email: "jane@example.com", sender_name: "Jane", messages: 3, first_received_at: "2026-08-01T10:00:00.000Z", last_received_at: "2026-08-20T10:00:00.000Z", last_subject: "Still waiting", last_category: "Refund", high_priority: 1 }]
+            : [{ contacts: 2 }],
+        };
+      },
+    };
+    const response = await runSupportUnansweredContacts({
+      authUserId: "owner-1",
+      clickhouse,
+      request: { action: "unanswered_contacts", date_from: "2026-08-01", filters: { category: ["Refund"] } },
+    });
+    const contactsSql = queries[0]?.sql ?? "";
+    // One row per unique address; the verdict spans EVERY message of the
+    // address (a person answered in another thread never appears here); the
+    // person must have at least one answerable (non spam/auto) request.
+    expect(contactsSql).toContain("GROUP BY normalized_email");
+    expect(contactsSql).toContain("countIf(answer_source != '') = 0");
+    expect(contactsSql).toContain("countIf(category NOT IN ('Spam/unrelated', 'Automated notification')) > 0");
+    expect(contactsSql).toContain("normalized_email != ''");
+    // The page's filters travel through the shared whereClause.
+    expect(contactsSql).toContain("request_date >= toDate({date_from:String})");
+    expect(queries[0]?.params).toMatchObject({ auth_user_id: "owner-1", category_0: "Refund" });
+    expect(response.action).toBe("unanswered_contacts");
+    expect(response.rows).toEqual([{
+      email: "jane@example.com", sender_name: "Jane", messages: 3,
+      first_received_at: "2026-08-01T10:00:00.000Z", last_received_at: "2026-08-20T10:00:00.000Z",
+      last_subject: "Still waiting", last_category: "Refund", high_priority: 1,
+    }]);
+    expect(response.total_contacts).toBe(1);
+    expect(response.contacts_without_email).toBe(2);
   });
 
   it("filters answered/unanswered on answer_source, not answered_at", async () => {

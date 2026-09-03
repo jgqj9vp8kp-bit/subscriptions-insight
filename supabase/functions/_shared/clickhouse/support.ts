@@ -20,6 +20,8 @@ import {
   type SupportRequestRow,
   type SupportSyncResult,
   type SupportTriState,
+  type SupportUnansweredContactRow,
+  type SupportUnansweredContactsResponse,
 } from "./supportContract.ts";
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -55,7 +57,7 @@ const SUPPORT_SELECT = [
   "answered_at,answer_source,reply_count",
 ].join(",");
 
-type SupportAction = "bundle" | "list" | "details" | "options" | "sync" | "status" | "export";
+type SupportAction = "bundle" | "list" | "details" | "options" | "sync" | "status" | "export" | "unanswered_contacts";
 type SortDirection = "asc" | "desc";
 
 type NormalizedRequest = {
@@ -245,6 +247,7 @@ function normalizeAction(action: unknown): SupportAction {
     case "sync":
     case "status":
     case "export":
+    case "unanswered_contacts":
     case "bundle": return action;
     case undefined:
     case null: return "bundle";
@@ -581,6 +584,74 @@ export async function runSupportExport(input: { authUserId: string; clickhouse: 
     page_size: pageSize,
     has_more: page * pageSize < total,
     rows: rows.map((raw) => ({ ...row(raw), message_body: s(raw.message_body) || null })),
+  };
+}
+
+/**
+ * The unhandled-people list: one row per unique customer address that has at
+ * least one answerable request under the current filter and ZERO outgoing mail
+ * from us. Shares whereClause with list/export so the file matches the screen.
+ * Contact grain, so the verdict is per ADDRESS: countIf(answer_source != '')
+ * = 0 across every message of the address — a person answered in another
+ * thread never shows up here. Name-only rows (no email) cannot be exported as
+ * addresses; they are counted separately so nobody mistakes the file for the
+ * full unanswered population.
+ */
+export async function runSupportUnansweredContacts(input: { authUserId: string; clickhouse: ClickHouseClientLike; request: SupportRequest }): Promise<SupportUnansweredContactsResponse> {
+  const started = Date.now();
+  const req = normalizeSupportRequest({ ...input.request, action: "unanswered_contacts" });
+  const params: Record<string, unknown> = {};
+  const where = whereClause(input.authUserId, req, params);
+  const unansweredAnswerable = `countIf(answer_source != '') = 0 AND countIf(category NOT IN (${ANSWER_EXEMPT_SQL})) > 0`;
+  const rows = await jsonRows<Record<string, unknown>>(
+    input.clickhouse,
+    `SELECT
+       normalized_email AS email,
+       argMax(sender, received_at) AS sender_name,
+       count() AS messages,
+       formatDateTime(min(received_at), '%Y-%m-%dT%H:%i:%S.000Z') AS first_received_at,
+       formatDateTime(max(received_at), '%Y-%m-%dT%H:%i:%S.000Z') AS last_received_at,
+       argMax(subject, received_at) AS last_subject,
+       argMax(category, received_at) AS last_category,
+       countIf(urgency = 'high') AS high_priority
+     FROM ${FACT_SUPPORT_REQUESTS_TABLE} FINAL
+     WHERE ${where} AND normalized_email != ''
+     GROUP BY normalized_email
+     HAVING ${unansweredAnswerable}
+     ORDER BY max(received_at) DESC
+     LIMIT 10000`,
+    params,
+  );
+  const [nameOnly] = await jsonRows<{ contacts?: number | string }>(
+    input.clickhouse,
+    `SELECT count() AS contacts FROM (
+       SELECT sender
+       FROM ${FACT_SUPPORT_REQUESTS_TABLE} FINAL
+       WHERE ${where} AND normalized_email = '' AND sender != ''
+       GROUP BY sender
+       HAVING ${unansweredAnswerable}
+     )`,
+    params,
+  );
+  const mapped: SupportUnansweredContactRow[] = rows.map((r) => ({
+    email: s(r.email),
+    sender_name: s(r.sender_name) || null,
+    messages: n(r.messages),
+    first_received_at: s(r.first_received_at) || null,
+    last_received_at: s(r.last_received_at) || null,
+    last_subject: s(r.last_subject) || null,
+    last_category: s(r.last_category),
+    high_priority: n(r.high_priority),
+  }));
+  return {
+    ok: true,
+    source: "clickhouse",
+    action: "unanswered_contacts",
+    generated_at: new Date().toISOString(),
+    query_duration_ms: Date.now() - started,
+    rows: mapped,
+    total_contacts: mapped.length,
+    contacts_without_email: n(nameOnly?.contacts),
   };
 }
 
