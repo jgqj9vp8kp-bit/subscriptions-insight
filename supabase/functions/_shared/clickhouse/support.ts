@@ -663,9 +663,9 @@ export async function runSupportBundle(input: { authUserId: string; supabase: Su
         countIf(category = 'Payment issue') payment_issues,
         countIf(urgency = 'high') high,
         countIf(payment_related = 1) payment_related,
-        countIf(answer_source != '') answered,
-        countIf(category NOT IN (${ANSWER_EXEMPT_SQL})) answerable,
-        countIf(answer_source != '' AND category NOT IN (${ANSWER_EXEMPT_SQL})) answered_answerable,
+        uniqExactIf(if(normalized_email != '', normalized_email, sender), answer_source != '') answered_contacts,
+        uniqExactIf(if(normalized_email != '', normalized_email, sender), category NOT IN (${ANSWER_EXEMPT_SQL})) answerable_contacts,
+        uniqExactIf(if(normalized_email != '', normalized_email, sender), answer_source != '' AND category NOT IN (${ANSWER_EXEMPT_SQL})) answered_answerable_contacts,
         quantileExactIf(0.5)(dateDiff('minute', received_at, answered_at), answered_at IS NOT NULL) median_response_minutes,
         uniqExact(request_date) active_days,
         countIf(funnel != '' AND funnel != '${UNKNOWN_FUNNEL}') requests_with_funnel,
@@ -758,9 +758,10 @@ export async function runSupportBundle(input: { authUserId: string; supabase: Su
 
   const summary = summaryRows[0] ?? {};
   const total = n(summary.total);
-  const answered = n(summary.answered);
-  const answerable = n(summary.answerable);
-  const answeredAnswerable = n(summary.answered_answerable);
+  // Contact grain: the unit of "answered" is a unique address, not a message.
+  const answeredContacts = n(summary.answered_contacts);
+  const answerableContacts = n(summary.answerable_contacts);
+  const answeredAnswerableContacts = n(summary.answered_answerable_contacts);
   const medianResponseRaw = summary.median_response_minutes;
   const medianResponseMinutes = medianResponseRaw == null || !Number.isFinite(Number(medianResponseRaw))
     ? null
@@ -855,10 +856,10 @@ export async function runSupportBundle(input: { authUserId: string; supabase: Su
         cancellationPct: pct(cancellation, total),
         refundPct: pct(refund, total),
         paymentRelatedPct: pct(paymentRelated, total),
-        answeredRequests: answered,
-        unansweredRequests: total - answered,
-        answerablePool: answerable,
-        answerRatePct: pct(answeredAnswerable, answerable),
+        answeredContacts,
+        unansweredContacts: Math.max(0, answerableContacts - answeredAnswerableContacts),
+        answerableContacts,
+        answerRatePct: pct(answeredAnswerableContacts, answerableContacts),
         medianFirstResponseMinutes: medianResponseMinutes,
       },
       byDay,
@@ -883,7 +884,7 @@ export async function runSupportBundle(input: { authUserId: string; supabase: Su
       },
       insights: [
         topCategory ? `Most common reason: ${topCategory.category} (${topCategory.requests} requests).` : "No support requests in the selected range.",
-        `Answer rate: ${pct(answeredAnswerable, answerable)}% (${answeredAnswerable} of ${answerable} answerable requests).`,
+        `Answer rate: ${pct(answeredAnswerableContacts, answerableContacts)}% (${answeredAnswerableContacts} of ${answerableContacts} answerable contacts).`,
         `Cancellation share: ${pct(cancellation, total)}%.`,
         `Refund share: ${pct(refund, total)}%.`,
         `Unexpected-charge share: ${pct(unauthorized, total)}%.`,

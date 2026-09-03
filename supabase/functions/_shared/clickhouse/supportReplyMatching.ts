@@ -1,11 +1,15 @@
 // Answered/unanswered support analytics: the reply matcher.
 //
-// Decides, for every INBOX support request, whether WE answered it, from three
-// independent signals in strength order:
+// The unit of "answered" is the ADDRESS, not the message: a support
+// conversation is a person, and a person counts as answered once ANY mail left
+// our mailbox for their address. Per-message verdicts still carry the richest
+// available evidence, in strength order:
 //   'thread'         a Sent reply whose In-Reply-To/References thread contains
 //                    the request (exact, carries the reply timestamp);
-//   'recipient'      a Sent mail to the same customer after the request
-//                    (heuristic, carries a timestamp);
+//   'recipient'      a Sent mail to the customer's address at/after the
+//                    request (address-level, carries the first-response time);
+//   'contact'        we have written to this address, but only BEFORE this
+//                    message (address-level, no meaningful response time);
 //   'imap_flag'      the INBOX message carries \Answered (exact fact, no time —
 //                    flags are frozen at sync time and refreshed periodically);
 //   'customer_reply' the customer replied to OUR message whose Sent copy is
@@ -18,15 +22,12 @@
 
 import type { SupabaseLikeClient } from "./types.ts";
 
-export const ANSWER_SOURCES = ["thread", "recipient", "imap_flag", "customer_reply"] as const;
+export const ANSWER_SOURCES = ["thread", "recipient", "contact", "imap_flag", "customer_reply"] as const;
 export type AnswerSource = (typeof ANSWER_SOURCES)[number];
 
 /** Replies may be timestamped slightly before the request they answer (server
  * clock differences between Date headers). */
 export const MATCH_CLOCK_SKEW_MS = 5 * 60_000;
-/** A Sent mail to the customer this long after the request no longer counts as
- * its answer (tier 'recipient' only — threads have no window). */
-export const RECIPIENT_MATCH_WINDOW_MS = 14 * 86_400_000;
 
 export interface MatchableRequest {
   id: string;
@@ -141,10 +142,9 @@ function outcomeDiffers(request: MatchableRequest, outcome: MatchOutcome): boole
 export function matchReplies(
   requests: readonly MatchableRequest[],
   replies: readonly MatchableReply[],
-  options: { clockSkewMs?: number; recipientWindowMs?: number } = {},
+  options: { clockSkewMs?: number } = {},
 ): MatchOutcome[] {
   const skew = options.clockSkewMs ?? MATCH_CLOCK_SKEW_MS;
-  const window = options.recipientWindowMs ?? RECIPIENT_MATCH_WINDOW_MS;
 
   // Dedupe replies by normalized message id (UIDVALIDITY re-imports store the
   // same message twice under different uids) — keep the earliest sent copy.
@@ -221,12 +221,14 @@ export function matchReplies(
     if (outcomeDiffers(request, outcome)) outcomes.push(outcome);
   }
 
-  // Tier 'recipient': a Sent mail to the same customer, after the request,
-  // inside the window. One reply closes EVERY earlier open request of that
-  // customer — answering a person answers their pending emails.
-  const recipientReplies = uniqueReplies.filter((reply) => !threadConsumedReplyIds.has(reply.id) && ts(reply.sent_at) !== null);
+  // Tiers 'recipient' / 'contact': the address is the unit. ANY Sent mail to
+  // the customer's address answers their requests — a reply at/after the
+  // request keeps the first-response time ('recipient'); when everything we
+  // sent predates this particular message, the person is still answered but
+  // without a meaningful time ('contact'). Thread-consumed replies are NOT
+  // excluded: they went to the address too.
   const repliesByRecipient = new Map<string, MatchableReply[]>();
-  for (const reply of recipientReplies) {
+  for (const reply of uniqueReplies) {
     for (const email of reply.to_emails) {
       const key = email.trim().toLowerCase();
       if (!key) continue;
@@ -239,23 +241,37 @@ export function matchReplies(
   for (const request of unansweredAfterThread) {
     const email = (request.normalized_email ?? "").trim().toLowerCase();
     const receivedAt = ts(request.received_at);
-    const candidates = email && receivedAt !== null
-      ? (repliesByRecipient.get(email) ?? []).filter((reply) => {
-          const sentAt = ts(reply.sent_at)!;
-          return sentAt >= receivedAt - skew && sentAt - receivedAt <= window;
-        })
-      : [];
+    const candidates = email ? repliesByRecipient.get(email) ?? [] : [];
     if (!candidates.length) {
       stillOpen.push(request);
       continue;
     }
-    candidates.sort((a, b) => (ts(a.sent_at) ?? 0) - (ts(b.sent_at) ?? 0));
-    const earliest = candidates[0];
+    const timed = receivedAt !== null
+      ? candidates.filter((reply) => {
+          const sentAt = ts(reply.sent_at);
+          return sentAt !== null && sentAt >= receivedAt - skew;
+        })
+      : [];
+    if (timed.length) {
+      timed.sort((a, b) => (ts(a.sent_at) ?? 0) - (ts(b.sent_at) ?? 0));
+      const earliest = timed[0];
+      const outcome: MatchOutcome = {
+        request_id: request.id,
+        answered_at: new Date(ts(earliest.sent_at)!).toISOString(),
+        answer_source: "recipient",
+        answered_reply_id: earliest.id,
+        reply_count: timed.length,
+      };
+      if (outcomeDiffers(request, outcome)) outcomes.push(outcome);
+      continue;
+    }
+    const sorted = [...candidates].sort((a, b) => (ts(a.sent_at) ?? 0) - (ts(b.sent_at) ?? 0));
+    const latest = sorted[sorted.length - 1];
     const outcome: MatchOutcome = {
       request_id: request.id,
-      answered_at: new Date(ts(earliest.sent_at)!).toISOString(),
-      answer_source: "recipient",
-      answered_reply_id: earliest.id,
+      answered_at: null,
+      answer_source: "contact",
+      answered_reply_id: latest.id,
       reply_count: candidates.length,
     };
     if (outcomeDiffers(request, outcome)) outcomes.push(outcome);

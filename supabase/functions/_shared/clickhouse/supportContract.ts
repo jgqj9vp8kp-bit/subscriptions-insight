@@ -58,12 +58,16 @@ export interface SupportKpis {
   cancellationPct: number;
   refundPct: number;
   paymentRelatedPct: number;
-  /** Answered = any evidence source (thread/recipient/imap_flag/customer_reply). */
-  answeredRequests: number;
-  unansweredRequests: number;
-  /** Requests expected to be answered: everything minus Spam/unrelated and
-   * Automated notification. The answer-rate denominator. */
-  answerablePool: number;
+  /** CONTACT grain — the unit of "answered" is a unique address (a person),
+   * not a message: answered = ANY mail left our mailbox for that address.
+   * Address key mirrors uniqueSenders: normalized_email, falling back to the
+   * sender name for rows without one. */
+  answeredContacts: number;
+  /** Answerable contacts with no outgoing mail to them. */
+  unansweredContacts: number;
+  /** Contacts with at least one request outside Spam/unrelated and Automated
+   * notification. The answer-rate denominator. */
+  answerableContacts: number;
   answerRatePct: number;
   /** Median of dateDiff(received_at → answered_at); only tiers with a real
    * timestamp (thread/recipient) contribute. */
@@ -114,7 +118,7 @@ export interface SupportRequestRow {
   manual_changed_at?: string | null;
   answered: boolean;
   answered_at: string | null;
-  /** '' when unanswered; else thread | recipient | imap_flag | customer_reply. */
+  /** '' when unanswered; else thread | recipient | contact | imap_flag | customer_reply. */
   answer_source: string;
   reply_count: number;
   first_response_minutes: number | null;

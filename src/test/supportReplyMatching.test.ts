@@ -128,19 +128,28 @@ describe("tier recipient", () => {
     ]);
   });
 
-  it("respects the 14-day window", () => {
+  it("has no time window: a late reply to the address still answers, with its time", () => {
     const outcomes = matchReplies(
       [request()],
       [reply({ in_reply_to: null, references: [], sent_at: "2026-09-20T10:00:00.000Z" })],
     );
-    expect(outcomes.find((o) => o.answer_source === "recipient")).toBeUndefined();
+    expect(outcomes[0]).toMatchObject({ answer_source: "recipient", answered_at: "2026-09-20T10:00:00.000Z" });
   });
 
-  it("does not reuse a reply already consumed by a thread match", () => {
+  it("a reply threaded to one message also answers the person's other messages", () => {
     const threaded = request({ id: "r1", message_id: "<a@c>", normalized_email: "client@example.com" });
-    const stranger = request({ id: "r2", message_id: "<z@c>", normalized_email: "client@example.com", received_at: "2026-09-01T09:00:00.000Z" });
-    const outcomes = matchReplies([threaded, stranger], [reply({ in_reply_to: "a@c", references: ["a@c"] })]);
-    expect(outcomes.find((o) => o.request_id === "r2")).toBeUndefined();
+    const other = request({ id: "r2", message_id: "<z@c>", normalized_email: "client@example.com", received_at: "2026-09-01T09:00:00.000Z" });
+    const outcomes = matchReplies([threaded, other], [reply({ in_reply_to: "a@c", references: ["a@c"] })]);
+    expect(outcomes.find((o) => o.request_id === "r1")?.answer_source).toBe("thread");
+    expect(outcomes.find((o) => o.request_id === "r2")?.answer_source).toBe("recipient");
+  });
+
+  it("mail sent only BEFORE the request still marks the contact answered, without a time", () => {
+    const outcomes = matchReplies(
+      [request({ received_at: "2026-09-10T10:00:00.000Z" })],
+      [reply({ in_reply_to: null, references: [], sent_at: "2026-09-01T12:00:00.000Z" })],
+    );
+    expect(outcomes[0]).toMatchObject({ answer_source: "contact", answered_at: null, reply_count: 1 });
   });
 });
 

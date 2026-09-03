@@ -313,14 +313,19 @@ Security warning: never put `Fox-Secret`, `FUNNELFOX_SECRET`, or the raw FunnelF
 
 ## Support answered/unanswered analytics (2026-09)
 
-Which emails WE replied to, from three independent signals ranked by strength
-(`answer_source`): `thread` (a Sent-folder reply whose In-Reply-To/References
-thread contains the request — exact, has a timestamp), `recipient` (Sent mail
-to the same customer after the request, ≤14 days), `imap_flag` (the INBOX
-message carries \Answered — exact fact, no time), `customer_reply` (the
-customer answered OUR mail whose Sent copy is gone). Answer rate =
-answered-among-answerable / answerable, where answerable excludes
-`Spam/unrelated` and `Automated notification`.
+THE UNIT IS THE ADDRESS, not the message: a contact counts as answered once
+ANY mail left our mailbox for their address. Per-message verdicts still carry
+the richest evidence (`answer_source`): `thread` (a Sent-folder reply whose
+In-Reply-To/References thread contains the request — exact, has a timestamp),
+`recipient` (Sent mail to the customer's address at/after the request — no
+time window), `contact` (we wrote to this address only BEFORE this message —
+answered, no time), `imap_flag` (\Answered on the INBOX copy), and
+`customer_reply` (the customer answered OUR mail whose Sent copy is gone).
+KPIs count unique addresses (`answeredContacts`/`unansweredContacts`,
+address key = normalized_email falling back to sender); answer rate =
+answered-answerable contacts / answerable contacts, where answerable means
+the contact has at least one request outside `Spam/unrelated` and
+`Automated notification`.
 
 Pipeline: `sync-support-mail` gained Sent-folder ingestion (headers only into
 `public.support_replies` via `BODY.PEEK[HEADER]`, own sync-state row — the

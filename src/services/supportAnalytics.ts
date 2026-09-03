@@ -167,7 +167,7 @@ export interface SupportRequestSummaryRow {
   manual_changed_at: string | null;
   answered: boolean;
   answered_at: string | null;
-  /** '' when unanswered; else thread | recipient | imap_flag | customer_reply. */
+  /** '' when unanswered; else thread | recipient | contact | imap_flag | customer_reply. */
   answer_source: string;
   reply_count: number;
   first_response_minutes: number | null;

@@ -97,6 +97,7 @@ const CATEGORY_COLORS = ["#2563eb", "#dc2626", "#f59e0b", "#059669", "#7c3aed", 
 const ANSWER_SOURCE_LABELS: Record<string, string> = {
   thread: "reply in thread",
   recipient: "mail to customer",
+  contact: "we've written to this address earlier",
   imap_flag: "IMAP \\Answered flag",
   customer_reply: "customer replied to our answer",
 };
@@ -119,9 +120,9 @@ const EMPTY_DASHBOARD = {
     cancellationPct: 0,
     refundPct: 0,
     paymentRelatedPct: 0,
-    answeredRequests: 0,
-    unansweredRequests: 0,
-    answerablePool: 0,
+    answeredContacts: 0,
+    unansweredContacts: 0,
+    answerableContacts: 0,
     answerRatePct: 0,
     medianFirstResponseMinutes: null as number | null,
   },
@@ -1053,11 +1054,11 @@ export default function SupportPage() {
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
           <StatCard label="Total Requests" value={dashboard.kpis.totalRequests} caption={`${dashboard.kpis.requestsPerDay} / day`} />
           <StatCard
-            label="Answered"
-            value={dashboard.kpis.answeredRequests}
-            caption={`${formatPct(dashboard.kpis.answerRatePct)} of ${dashboard.kpis.answerablePool} answerable`}
+            label="Contacts Answered"
+            value={dashboard.kpis.answeredContacts}
+            caption={`${formatPct(dashboard.kpis.answerRatePct)} of ${dashboard.kpis.answerableContacts} answerable contacts`}
           />
-          <StatCard label="Unanswered" value={dashboard.kpis.unansweredRequests} />
+          <StatCard label="Contacts Unanswered" value={dashboard.kpis.unansweredContacts} caption="unique addresses, not messages" />
           <StatCard
             label="Median Response"
             value={formatResponseMinutes(dashboard.kpis.medianFirstResponseMinutes)}
