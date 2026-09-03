@@ -120,6 +120,7 @@ export interface SupportAnalyticsFilters {
   paymentRelated?: boolean | "all";
   deliveryRelated?: boolean | "all";
   manualStatus?: "all" | "manual" | "automatic";
+  answered?: "all" | "answered" | "unanswered";
   search?: string;
   importBatchId?: string;
   funnel?: string[];
@@ -164,6 +165,12 @@ export interface SupportRequestSummaryRow {
   manual_subcategory: string | null;
   manual_urgency: SupportUrgency | null;
   manual_changed_at: string | null;
+  answered: boolean;
+  answered_at: string | null;
+  /** '' when unanswered; else thread | recipient | imap_flag | customer_reply. */
+  answer_source: string;
+  reply_count: number;
+  first_response_minutes: number | null;
   imported_at: string;
 }
 
@@ -826,6 +833,9 @@ const SUMMARY_SELECT = [
   "manual_subcategory",
   "manual_urgency",
   "manual_changed_at",
+  "answered_at",
+  "answer_source",
+  "reply_count",
   "imported_at",
 ].join(",");
 
@@ -909,7 +919,7 @@ export async function listSupportRequestPage(params: {
     .order(sortBy, { ascending: sortDir === "asc", nullsFirst: false })
     .range(from, to);
   if (error) throw new Error(`Could not load support requests: ${error.message}`);
-  return { rows: (data ?? []) as SupportRequestSummaryRow[], count: count ?? 0, page, pageSize };
+  return { rows: (data ?? []) as unknown as SupportRequestSummaryRow[], count: count ?? 0, page, pageSize };
 }
 
 export async function getSupportRequestDetails(id: string): Promise<SupportRequestDetailRow> {
@@ -920,7 +930,35 @@ export async function getSupportRequestDetails(id: string): Promise<SupportReque
     .eq("id", id)
     .single();
   if (error) throw new Error(`Could not load support request details: ${error.message}`);
-  return data as SupportRequestDetailRow;
+  return data as unknown as SupportRequestDetailRow;
+}
+
+export interface SupportAnsweredReply {
+  id: string;
+  subject: string | null;
+  sent_at: string | null;
+  to_email: string | null;
+  from_email: string | null;
+}
+
+/** The Sent reply that answered a request (detail dialog). Lazy Postgres read:
+ * answered_reply_id lives only in Postgres — the ClickHouse row deliberately
+ * carries just the derived verdict. */
+export async function getAnsweredReplyForRequest(requestId: string): Promise<SupportAnsweredReply | null> {
+  const client = ensureSupabase();
+  const { data: request, error: requestError } = await client
+    .from("support_requests")
+    .select("answered_reply_id")
+    .eq("id", requestId)
+    .maybeSingle();
+  if (requestError || !request?.answered_reply_id) return null;
+  const { data: reply, error: replyError } = await client
+    .from("support_replies")
+    .select("id,subject,sent_at,to_email,from_email")
+    .eq("id", request.answered_reply_id)
+    .maybeSingle();
+  if (replyError || !reply) return null;
+  return reply as SupportAnsweredReply;
 }
 
 export async function listSupportDashboardRows(filters: SupportAnalyticsFilters): Promise<SupportRequestSummaryRow[]> {
@@ -936,7 +974,7 @@ export async function listSupportDashboardRows(filters: SupportAnalyticsFilters)
     query = applySupportFilters(query, filters);
     const { data, error } = await query;
     if (error) throw new Error(`Could not load support analytics: ${error.message}`);
-    const pageRows = (data ?? []) as SupportRequestSummaryRow[];
+    const pageRows = (data ?? []) as unknown as SupportRequestSummaryRow[];
     rows.push(...pageRows);
     if (pageRows.length < pageSize) break;
   }

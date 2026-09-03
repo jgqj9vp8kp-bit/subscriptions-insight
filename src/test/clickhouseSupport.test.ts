@@ -15,6 +15,7 @@ import {
   runSupportOptions,
   supportAttributionStatus,
   SupportRequestError,
+  SUPPORT_FACT_COLUMNS,
 } from "../../supabase/functions/_shared/clickhouse/support.ts";
 import { CREATE_FACT_SUPPORT_REQUESTS_SQL, FACT_SUPPORT_REQUESTS_TABLE } from "../../supabase/functions/_shared/clickhouse/schema.ts";
 import type { ClickHouseClientLike, SupabaseLikeClient } from "../../supabase/functions/_shared/clickhouse/types.ts";
@@ -58,6 +59,45 @@ describe("clickhouse-support architecture", () => {
     expect(CREATE_FACT_SUPPORT_REQUESTS_SQL).toContain("funnel LowCardinality(String) DEFAULT 'Unknown'");
     expect(CREATE_FACT_SUPPORT_REQUESTS_SQL).toContain("attribution_status LowCardinality(String)");
     expect(CREATE_FACT_SUPPORT_REQUESTS_SQL).toContain("attribution_version String");
+  });
+
+  it("carries the answered-analytics columns through the table AND the attribution rewrite", () => {
+    // The attribution INSERT-SELECT rewrites whole rows through
+    // SUPPORT_FACT_COLUMNS: any column in the table but missing there is
+    // silently zeroed on the next attribution pass.
+    expect(CREATE_FACT_SUPPORT_REQUESTS_SQL).toContain("answered_at Nullable(DateTime64(3, 'UTC'))");
+    expect(CREATE_FACT_SUPPORT_REQUESTS_SQL).toContain("answer_source LowCardinality(String) DEFAULT ''");
+    expect(CREATE_FACT_SUPPORT_REQUESTS_SQL).toContain("reply_count UInt32 DEFAULT 0");
+    expect(SUPPORT_FACT_COLUMNS).toContain("answered_at");
+    expect(SUPPORT_FACT_COLUMNS).toContain("answer_source");
+    expect(SUPPORT_FACT_COLUMNS).toContain("reply_count");
+  });
+
+  it("filters answered/unanswered on answer_source, not answered_at", async () => {
+    // answered_at alone would miss the imap_flag/customer_reply tiers,
+    // which prove an answer but carry no timestamp.
+    const queries: Array<{ sql: string }> = [];
+    const clickhouse: ClickHouseClientLike = {
+      command: async () => undefined,
+      insert: async () => undefined,
+      query: async ({ query }) => {
+        queries.push({ sql: query });
+        return { json: async () => query.includes("SELECT count() AS count") ? [{ count: 0 }] : [] };
+      },
+    };
+    await runSupportList({
+      authUserId: "owner-1",
+      clickhouse,
+      request: { action: "list", filters: { answered: "yes" } },
+    });
+    expect(queries.at(-1)?.sql).toContain("answer_source != ''");
+    await runSupportList({
+      authUserId: "owner-1",
+      clickhouse,
+      request: { action: "list", filters: { answered: "no" } },
+    });
+    expect(queries.at(-1)?.sql).toContain("answer_source = ''");
+    expect(normalizeSupportRequest({ action: "list", filters: {} }).filters.answered).toBe("all");
   });
 
   it("builds server-side Support Edge requests from UI filters", () => {

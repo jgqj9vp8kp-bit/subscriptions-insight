@@ -20,6 +20,8 @@ export interface SupportFilters {
   payment_related: SupportTriState;
   delivery_related: SupportTriState;
   manual_status: "all" | "manual" | "automatic";
+  /** yes = any answer evidence (answer_source != ''), no = none. */
+  answered: SupportTriState;
   import_batch_id: string[];
   search: string;
 }
@@ -56,6 +58,16 @@ export interface SupportKpis {
   cancellationPct: number;
   refundPct: number;
   paymentRelatedPct: number;
+  /** Answered = any evidence source (thread/recipient/imap_flag/customer_reply). */
+  answeredRequests: number;
+  unansweredRequests: number;
+  /** Requests expected to be answered: everything minus Spam/unrelated and
+   * Automated notification. The answer-rate denominator. */
+  answerablePool: number;
+  answerRatePct: number;
+  /** Median of dateDiff(received_at → answered_at); only tiers with a real
+   * timestamp (thread/recipient) contribute. */
+  medianFirstResponseMinutes: number | null;
 }
 
 export interface SupportRequestRow {
@@ -65,7 +77,9 @@ export interface SupportRequestRow {
   sender_name: string | null;
   subject: string | null;
   received_at: string | null;
-  received_date_raw?: string | null;
+  // Always emitted by the server row mapper; required so the contract row stays
+  // assignable to the client SupportRequestSummaryRow.
+  received_date_raw: string | null;
   customer_email: string | null;
   normalized_email: string | null;
   matched_contact_name: string | null;
@@ -98,6 +112,12 @@ export interface SupportRequestRow {
   manual_subcategory: string | null;
   manual_urgency: string | null;
   manual_changed_at?: string | null;
+  answered: boolean;
+  answered_at: string | null;
+  /** '' when unanswered; else thread | recipient | imap_flag | customer_reply. */
+  answer_source: string;
+  reply_count: number;
+  first_response_minutes: number | null;
   imported_at: string;
 }
 
@@ -143,7 +163,7 @@ export interface SupportAnalyticsBundle {
   summary: {
     rows: [];
     kpis: SupportKpis;
-    byDay: Array<{ date: string; requests: number }>;
+    byDay: Array<{ date: string; requests: number; answered: number; answerable: number }>;
     categoryTrend: Array<{ date: string; category: string; requests: number }>;
     operationalTrend: Array<{ date: string; cancellation: number; refund: number; charge: number }>;
     languageDistribution: Array<{ language: string; requests: number }>;
@@ -156,6 +176,8 @@ export interface SupportAnalyticsBundle {
       uniqueSenders: number;
       matchedCustomers: number;
       highPriority: number;
+      answered: number;
+      unanswered: number;
       latestRequest: string | null;
       trendVsPrevious: number | null;
     }>;

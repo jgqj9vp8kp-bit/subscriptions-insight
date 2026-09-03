@@ -11,6 +11,7 @@ import type { Transaction } from "@/services/types";
 import {
   extractEmailLiterals,
   normalizeMessageId,
+  parseAddressList,
   parseRawEmail,
 } from "../../supabase/functions/sync-support-mail/support";
 
@@ -180,6 +181,28 @@ describe("support inbox helpers", () => {
     expect(parsed.from_email).toBe("customer@example.com");
     expect(parsed.body_text).toContain("Please refund");
     expect(JSON.stringify(parsed)).not.toContain("MAILRU_IMAP_PASSWORD");
+  });
+
+  it("collects EVERY recipient into to_emails (reply matching needs them all)", () => {
+    expect(parseAddressList('"Doe, Jane" <a@x.com>, b@y.com, Plain Name <C@Z.com>')).toEqual([
+      "a@x.com",
+      "b@y.com",
+      "c@z.com",
+    ]);
+    expect(parseAddressList(undefined)).toEqual([]);
+    const raw = [
+      "From: Support <support@azora-astro.com>",
+      "To: \"Doe, Jane\" <jane@example.com>, second@example.com",
+      "Cc: third@example.com",
+      "Message-ID: <r1@support>",
+      "Subject: Re: Refund request",
+      "Date: Fri, 02 May 2026 11:00:00 +0000",
+      "",
+      "Done.",
+    ].join("\r\n");
+    const parsed = parseRawEmail(raw, "77");
+    expect(parsed.to_email).toBe("jane@example.com");
+    expect(parsed.to_emails).toEqual(["jane@example.com", "second@example.com", "third@example.com"]);
   });
 
   it("extracts IMAP literals for message deduplication parsing", () => {

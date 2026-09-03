@@ -30,6 +30,9 @@ export type ParsedMailMessage = {
   from_name: string | null;
   reply_to_email: string | null;
   to_email: string | null;
+  /** ALL normalized recipient addresses (To + Cc). to_email keeps only the
+   * first To address — reply matching needs every recipient. */
+  to_emails: string[];
   cc_email: string | null;
   subject: string | null;
   body_text: string | null;
@@ -330,6 +333,35 @@ export function parseEmailAddress(value: string | null | undefined): { email: st
   return { email: normalizeSupportEmail(emailMatch?.[0]) || null, name: null };
 }
 
+/** Every address of a To/Cc header, normalized and deduped. Splits on commas
+ * OUTSIDE quoted display names and angle brackets ("Doe, Jane" <a@x>, b@y). */
+export function parseAddressList(value: string | null | undefined): string[] {
+  const decoded = decodeMimeWords(value) ?? "";
+  if (!decoded.trim()) return [];
+  const parts: string[] = [];
+  let current = "";
+  let inQuotes = false;
+  let inAngle = false;
+  for (const char of decoded) {
+    if (char === '"') inQuotes = !inQuotes;
+    else if (char === "<" && !inQuotes) inAngle = true;
+    else if (char === ">" && !inQuotes) inAngle = false;
+    if (char === "," && !inQuotes && !inAngle) {
+      parts.push(current);
+      current = "";
+    } else {
+      current += char;
+    }
+  }
+  parts.push(current);
+  const out = new Set<string>();
+  for (const part of parts) {
+    const email = parseEmailAddress(part).email;
+    if (email) out.add(email);
+  }
+  return [...out];
+}
+
 function splitHeaderBody(raw: string): { headerRaw: string; bodyRaw: string } {
   const normalized = raw.replace(/\r\n/g, "\n");
   const index = normalized.indexOf("\n\n");
@@ -411,6 +443,7 @@ export function parseRawEmail(raw: string, uid: string, meta: Partial<Pick<Parse
     from_name: from.name,
     reply_to_email: replyTo.email,
     to_email: to.email,
+    to_emails: [...new Set([...parseAddressList(headers.to), ...parseAddressList(headers.cc)])],
     cc_email: cc.email,
     subject: decodeMimeWords(headers.subject),
     body_text: safeText || null,

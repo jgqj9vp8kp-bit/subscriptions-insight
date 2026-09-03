@@ -40,6 +40,10 @@ const DEFAULT_SYNC_MAX_BATCHES = 10;
 const DEFAULT_SYNC_TIMEOUT_MS = 45_000;
 const SUPPORT_CLASSIFICATION_VERSION = "support_rules_v1_server";
 const UNKNOWN_FUNNEL = "Unknown";
+// Answer-rate denominator: these categories do not expect a reply, so they are
+// excluded from "answerable" (still counted, listed and filterable everywhere).
+const ANSWER_EXEMPT_CATEGORIES = ["Spam/unrelated", "Automated notification"] as const;
+const ANSWER_EXEMPT_SQL = ANSWER_EXEMPT_CATEGORIES.map((category) => `'${category}'`).join(", ");
 
 const SUPPORT_SELECT = [
   "id,auth_user_id,import_batch_id,source_row_number,sender_name,subject,message_body,received_at,received_date_raw",
@@ -48,6 +52,7 @@ const SUPPORT_SELECT = [
   "category,subcategory,secondary_categories,language,sentiment,urgency",
   "requires_refund,requires_cancellation,payment_related,delivery_related,possible_unauthorized_charge,duplicate_charge",
   "classification_source,classification_version,classification_model,classification_confidence,classification_reason",
+  "answered_at,answer_source,reply_count",
 ].join(",");
 
 type SupportAction = "bundle" | "list" | "details" | "options" | "sync" | "status" | "export";
@@ -105,6 +110,10 @@ type SupabaseSupportRow = {
   classification_model: string | null;
   classification_confidence: number | null;
   classification_reason: string | null;
+  // Reply matcher output (supportReplyMatching.ts).
+  answered_at: string | null;
+  answer_source: string | null;
+  reply_count: number | null;
 };
 
 type Classification = {
@@ -296,6 +305,7 @@ export function normalizeSupportRequest(req: SupportRequest): NormalizedRequest 
       payment_related: tri(f.payment_related),
       delivery_related: tri(f.delivery_related),
       manual_status: f.manual_status === "manual" || f.manual_status === "automatic" ? f.manual_status : "all",
+      answered: tri(f.answered),
       import_batch_id: arr(f.import_batch_id, "import_batch_id"),
       search: s(f.search).trim().slice(0, 300),
     },
@@ -363,6 +373,9 @@ function whereClause(authUserId: string, req: NormalizedRequest, params: Record<
     triClause("requires_refund", f.requires_refund),
     triClause("payment_related", f.payment_related),
     triClause("delivery_related", f.delivery_related),
+    // Answered = any evidence source; answered_at alone would miss the
+    // imap_flag/customer_reply tiers, which carry no timestamp.
+    f.answered === "yes" ? "answer_source != ''" : f.answered === "no" ? "answer_source = ''" : "",
   ].filter(Boolean).forEach((clause) => clauses.push(clause));
   if (f.manual_status === "manual") clauses.push(`manual_category != ''`);
   if (f.manual_status === "automatic") clauses.push(`manual_category = ''`);
@@ -421,6 +434,11 @@ function row(r: Record<string, unknown>): SupportRequestRow {
     manual_category: s(r.manual_category) || null,
     manual_subcategory: s(r.manual_subcategory) || null,
     manual_urgency: s(r.manual_urgency) || null,
+    answered: s(r.answer_source) !== "",
+    answered_at: s(r.answered_at) || null,
+    answer_source: s(r.answer_source),
+    reply_count: n(r.reply_count),
+    first_response_minutes: r.first_response_minutes == null ? null : n(r.first_response_minutes),
     imported_at: s(r.imported_at),
   };
 }
@@ -463,6 +481,10 @@ const ROW_SELECT = `
   nullIf(manual_category, '') AS manual_category,
   nullIf(manual_subcategory, '') AS manual_subcategory,
   nullIf(manual_urgency, '') AS manual_urgency,
+  if(answered_at IS NULL, '', formatDateTime(answered_at, '%Y-%m-%dT%H:%i:%S.000Z')) AS answered_at,
+  answer_source,
+  reply_count,
+  if(answered_at IS NULL, NULL, dateDiff('minute', received_at, answered_at)) AS first_response_minutes,
   formatDateTime(imported_at, '%Y-%m-%dT%H:%i:%S.000Z') AS imported_at
 `;
 
@@ -641,6 +663,10 @@ export async function runSupportBundle(input: { authUserId: string; supabase: Su
         countIf(category = 'Payment issue') payment_issues,
         countIf(urgency = 'high') high,
         countIf(payment_related = 1) payment_related,
+        countIf(answer_source != '') answered,
+        countIf(category NOT IN (${ANSWER_EXEMPT_SQL})) answerable,
+        countIf(answer_source != '' AND category NOT IN (${ANSWER_EXEMPT_SQL})) answered_answerable,
+        quantileExactIf(0.5)(dateDiff('minute', received_at, answered_at), answered_at IS NOT NULL) median_response_minutes,
         uniqExact(request_date) active_days,
         countIf(funnel != '' AND funnel != '${UNKNOWN_FUNNEL}') requests_with_funnel,
         countIf(funnel = '' OR funnel = '${UNKNOWN_FUNNEL}') requests_without_funnel,
@@ -650,7 +676,7 @@ export async function runSupportBundle(input: { authUserId: string; supabase: Su
         countIf(attribution_status = 'ambiguous') ambiguous,
         argMax(attribution_version, row_version) attribution_version
       ${base}`, params),
-    jsonRows<{ date: string; requests: number }>(input.clickhouse, `SELECT toString(request_date) date, count() requests ${base} GROUP BY request_date ORDER BY request_date ASC`, params),
+    jsonRows<{ date: string; requests: number; answered: number; answerable: number }>(input.clickhouse, `SELECT toString(request_date) date, count() requests, countIf(answer_source != '') answered, countIf(category NOT IN (${ANSWER_EXEMPT_SQL})) answerable ${base} GROUP BY request_date ORDER BY request_date ASC`, params),
     jsonRows<{ date: string; funnel: string; requests: number }>(input.clickhouse, `SELECT toString(request_date) date, if(funnel = '', '${UNKNOWN_FUNNEL}', funnel) funnel, count() requests ${base} GROUP BY request_date, funnel ORDER BY request_date ASC, funnel ASC`, params),
     jsonRows<{ date: string; category: string; requests: number }>(input.clickhouse, `SELECT toString(request_date) date, category, count() requests ${base} GROUP BY request_date, category ORDER BY request_date ASC, category ASC`, params),
     jsonRows<{ date: string; cancellation: number; refund: number; charge: number }>(input.clickhouse, `
@@ -667,6 +693,7 @@ export async function runSupportBundle(input: { authUserId: string; supabase: Su
         uniqExact(if(normalized_email != '', normalized_email, sender)) uniqueSenders,
         countIf(attribution_status = 'matched') matchedCustomers,
         countIf(urgency = 'high') highPriority,
+        countIf(answer_source != '') answered,
         max(received_at) latest
       ${base}
       GROUP BY category ORDER BY requests DESC, category ASC`, params),
@@ -731,6 +758,13 @@ export async function runSupportBundle(input: { authUserId: string; supabase: Su
 
   const summary = summaryRows[0] ?? {};
   const total = n(summary.total);
+  const answered = n(summary.answered);
+  const answerable = n(summary.answerable);
+  const answeredAnswerable = n(summary.answered_answerable);
+  const medianResponseRaw = summary.median_response_minutes;
+  const medianResponseMinutes = medianResponseRaw == null || !Number.isFinite(Number(medianResponseRaw))
+    ? null
+    : Math.round(Number(medianResponseRaw));
   const matched = n(summary.matched);
   const cancellation = n(summary.cancellation);
   const refund = n(summary.refund);
@@ -745,6 +779,8 @@ export async function runSupportBundle(input: { authUserId: string; supabase: Su
     uniqueSenders: n(r.uniqueSenders),
     matchedCustomers: n(r.matchedCustomers),
     highPriority: n(r.highPriority),
+    answered: n(r.answered),
+    unanswered: n(r.requests) - n(r.answered),
     latestRequest: r.latest ? `${s(r.latest).replace(" ", "T").replace(/\\.\\d+$/, "")}.000Z` : null,
     trendVsPrevious: null,
   }));
@@ -819,6 +855,11 @@ export async function runSupportBundle(input: { authUserId: string; supabase: Su
         cancellationPct: pct(cancellation, total),
         refundPct: pct(refund, total),
         paymentRelatedPct: pct(paymentRelated, total),
+        answeredRequests: answered,
+        unansweredRequests: total - answered,
+        answerablePool: answerable,
+        answerRatePct: pct(answeredAnswerable, answerable),
+        medianFirstResponseMinutes: medianResponseMinutes,
       },
       byDay,
       funnelTrend,
@@ -842,6 +883,7 @@ export async function runSupportBundle(input: { authUserId: string; supabase: Su
       },
       insights: [
         topCategory ? `Most common reason: ${topCategory.category} (${topCategory.requests} requests).` : "No support requests in the selected range.",
+        `Answer rate: ${pct(answeredAnswerable, answerable)}% (${answeredAnswerable} of ${answerable} answerable requests).`,
         `Cancellation share: ${pct(cancellation, total)}%.`,
         `Refund share: ${pct(refund, total)}%.`,
         `Unexpected-charge share: ${pct(unauthorized, total)}%.`,
@@ -1044,6 +1086,9 @@ function mapSupportRow(row: SupabaseSupportRow, syncedAt: string): Record<string
     possible_unauthorized_charge: c.possible_unauthorized_charge ? 1 : 0,
     duplicate_charge: c.duplicate_charge ? 1 : 0,
     urgent: urgency === "high" ? 1 : 0,
+    answered_at: row.answered_at ? chTime(row.answered_at) : null,
+    answer_source: row.answer_source ?? "",
+    reply_count: row.reply_count ?? 0,
     subject: row.subject ?? "",
     message_body: row.message_body ?? "",
     source_hash: row.source_hash,
@@ -1071,14 +1116,18 @@ export interface SupportAttributionBackfillResult {
   denominator_available: boolean;
 }
 
-const SUPPORT_FACT_COLUMNS = [
+// Exported for the alignment test: every column here must ALSO appear in the
+// enrichSupportAttribution INSERT-SELECT below — a column present in the table
+// but missing from that SELECT is silently zeroed on the next attribution pass.
+export const SUPPORT_FACT_COLUMNS = [
   "auth_user_id", "request_id", "import_batch_id", "source_row_number", "received_at", "request_date", "received_date_raw",
   "customer_email", "normalized_email", "matched_customer", "matched_user_id", "funnel", "campaign_path", "cohort_date",
   "attribution_status", "attribution_version", "sender", "matched_contact_name", "language", "category", "subcategory",
   "secondary_categories", "classification_source", "classification_model",
   "automatic_category", "automatic_subcategory", "manual_category", "manual_subcategory", "urgency", "automatic_urgency",
   "manual_urgency", "sentiment", "requires_refund", "requires_cancellation", "payment_related", "delivery_related",
-  "possible_unauthorized_charge", "duplicate_charge", "urgent", "subject", "message_body", "source_hash", "classification_version",
+  "possible_unauthorized_charge", "duplicate_charge", "urgent", "answered_at", "answer_source", "reply_count",
+  "subject", "message_body", "source_hash", "classification_version",
   "classification_confidence", "classification_reason", "imported_at", "source_updated_at", "clickhouse_synced_at", "row_version",
 ] as const;
 
@@ -1164,7 +1213,8 @@ export async function enrichSupportAttribution(input: {
         s.classification_source, s.classification_model, s.automatic_category, s.automatic_subcategory,
         s.manual_category, s.manual_subcategory, s.urgency, s.automatic_urgency, s.manual_urgency, s.sentiment,
         s.requires_refund, s.requires_cancellation, s.payment_related, s.delivery_related, s.possible_unauthorized_charge,
-        s.duplicate_charge, s.urgent, s.subject, s.message_body, s.source_hash, s.classification_version,
+        s.duplicate_charge, s.urgent, s.answered_at, s.answer_source, s.reply_count,
+        s.subject, s.message_body, s.source_hash, s.classification_version,
         s.classification_confidence, s.classification_reason, s.imported_at, s.source_updated_at, now64(3) clickhouse_synced_at,
         greatest(s.row_version + 1, toUInt64(toUnixTimestamp64Milli(now64(3)))) row_version
       FROM ${FACT_SUPPORT_REQUESTS_TABLE} AS s FINAL

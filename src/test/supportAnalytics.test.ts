@@ -58,6 +58,11 @@ function request(overrides: Partial<SupportRequestSummaryRow> = {}): SupportRequ
     manual_subcategory: null,
     manual_urgency: null,
     manual_changed_at: null,
+    answered: false,
+    answered_at: null,
+    answer_source: "",
+    reply_count: 0,
+    first_response_minutes: null,
     imported_at: "2026-07-13T00:00:00.000Z",
     ...overrides,
   };

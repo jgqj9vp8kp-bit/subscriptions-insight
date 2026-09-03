@@ -69,6 +69,12 @@ export interface SyncSupportMailSummary {
     password: boolean;
   };
   state?: SupportMailSyncState | null;
+  /** The Sent-folder sync state row (answered analytics backfill progress). */
+  sent_state?: SupportMailSyncState | null;
+  /** Sent-folder sync result fields (sent_* actions). */
+  replies_discovered?: number;
+  replies_imported?: number;
+  replies_remaining?: number;
   messages_discovered?: number;
   messages_processed?: number;
   messages_inserted?: number;
@@ -119,7 +125,11 @@ export type SupportMailSyncAction =
   | "continue_sync"
   | "sync_new"
   | "stop"
-  | "reset_cursor";
+  | "reset_cursor"
+  | "sent_initial_sync"
+  | "sent_continue_sync"
+  | "sent_sync_new"
+  | "rematch_replies";
 
 export interface SupportMailSyncState {
   status?: string;

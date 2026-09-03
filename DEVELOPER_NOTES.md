@@ -311,7 +311,55 @@ Duplicate subscriptions are removed before normalization using `id`, then `subsc
 
 Security warning: never put `Fox-Secret`, `FUNNELFOX_SECRET`, or the raw FunnelFox API URL in browser code. The browser must only call the server-side proxy.
 
+## Support answered/unanswered analytics (2026-09)
+
+Which emails WE replied to, from three independent signals ranked by strength
+(`answer_source`): `thread` (a Sent-folder reply whose In-Reply-To/References
+thread contains the request — exact, has a timestamp), `recipient` (Sent mail
+to the same customer after the request, ≤14 days), `imap_flag` (the INBOX
+message carries \Answered — exact fact, no time), `customer_reply` (the
+customer answered OUR mail whose Sent copy is gone). Answer rate =
+answered-among-answerable / answerable, where answerable excludes
+`Spam/unrelated` and `Automated notification`.
+
+Pipeline: `sync-support-mail` gained Sent-folder ingestion (headers only into
+`public.support_replies` via `BODY.PEEK[HEADER]`, own sync-state row — the
+`(auth_user_id, mailbox_key, folder)` key fits a second folder) and, appended
+to every `sync_new` (cron and manual), post-stages: Sent delta → INBOX flags
+refresh (one ranged `UID FETCH (UID FLAGS)` over the last 30 days; stored
+flags are frozen at first sync and systematically miss \Answered, and ONLY
+changed rows are updated — each UPDATE re-syncs the row to ClickHouse) →
+reply matching → one ClickHouse sync if anything changed. Stages are fenced
+and budgeted so they can never fail the INBOX import.
+
+Matching is the pure module `_shared/clickhouse/supportReplyMatching.ts`
+(vitest: supportReplyMatching.test.ts): thread components are connected
+components over message-id mentions (synthetic `imap:{uid}` ids excluded),
+requests store `message_id` RAW while `in_reply_to`/`references` are
+normalized — always `normalizeMessageId()` the request side, and NEVER join on
+`support_requests.normalized_message_id` (nulled on dedupe collisions).
+Verdicts land on `support_requests.answered_at/answer_source/answered_reply_id/
+reply_count` through the `support_apply_answer_matches` RPC (one call per 500
+rows); the BEFORE UPDATE trigger bumps `updated_at`, so the ClickHouse keyset
+sync republishes changed rows by itself. `thread` verdicts are terminal;
+weaker tiers are re-evaluated each pass, and the matcher emits ONLY changed
+verdicts (a no-op UPDATE storm would multiply CH row versions).
+
+ClickHouse: additive columns `answered_at/answer_source/reply_count` on
+`fact_support_requests` — they ride `SUPPORT_FACT_COLUMNS` AND the
+`enrichSupportAttribution` INSERT-SELECT (a column missing there is silently
+zeroed on the next attribution pass; guarded by clickhouseSupport.test.ts).
+`first_response_minutes` is computed at query time. The `answered` filter and
+KPIs read `answer_source != ''`, not `answered_at` (flag/customer tiers carry
+no timestamp). Rollout: the operator runs "Import Sent History" on the Support
+page until complete, then one `rematch_replies {"mode":"full"}`.
+
 ## Mail.ru Support Inbox
+
+STALE: the section below describes the original Mail.ru sync writing to
+`public.support_messages`. The live pipeline is SpaceMail IMAP →
+`public.support_requests` (see `sync-support-mail/index.ts`); the auth and
+secret-handling notes still apply.
 
 The Support page is backed by `public.support_messages` and the `sync-support-mail` Edge Function:
 

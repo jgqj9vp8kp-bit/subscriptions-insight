@@ -44,6 +44,7 @@ export function buildSupportRequest(query: SupportQuery, action: SupportRequest[
       payment_related: tri(f.paymentRelated),
       delivery_related: tri(f.deliveryRelated),
       manual_status: f.manualStatus ?? "all",
+      answered: f.answered === "answered" ? "yes" : f.answered === "unanswered" ? "no" : "all",
       import_batch_id: f.importBatchId ? [f.importBatchId] : [],
       search: f.search?.trim() ?? "",
     },

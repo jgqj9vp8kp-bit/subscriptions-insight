@@ -58,6 +58,7 @@ import {
 import {
   SUPPORT_CATEGORIES,
   SUPPORT_URGENCIES,
+  getAnsweredReplyForRequest,
   importSupportFile,
   listSupportImportBatches,
   parseSupportFile,
@@ -92,6 +93,14 @@ import {
 const PAGE_SIZE = 50;
 const CATEGORY_COLORS = ["#2563eb", "#dc2626", "#f59e0b", "#059669", "#7c3aed", "#0891b2", "#be123c", "#64748b"];
 
+/** How we know the request was answered (supportReplyMatching tiers). */
+const ANSWER_SOURCE_LABELS: Record<string, string> = {
+  thread: "reply in thread",
+  recipient: "mail to customer",
+  imap_flag: "IMAP \\Answered flag",
+  customer_reply: "customer replied to our answer",
+};
+
 const EMPTY_DASHBOARD = {
   rows: [],
   kpis: {
@@ -110,6 +119,11 @@ const EMPTY_DASHBOARD = {
     cancellationPct: 0,
     refundPct: 0,
     paymentRelatedPct: 0,
+    answeredRequests: 0,
+    unansweredRequests: 0,
+    answerablePool: 0,
+    answerRatePct: 0,
+    medianFirstResponseMinutes: null as number | null,
   },
   byDay: [],
   funnelTrend: [],
@@ -147,6 +161,7 @@ const DEFAULT_FILTERS: SupportAnalyticsFilters = {
   paymentRelated: "all",
   deliveryRelated: "all",
   manualStatus: "all",
+  answered: "all",
   search: "",
   importBatchId: "",
   funnel: [],
@@ -178,6 +193,7 @@ function describeSupportFilters(filters: SupportAnalyticsFilters): string[] {
   push("Платёж", filters.paymentRelated);
   push("Доставка", filters.deliveryRelated);
   push("Правки", filters.manualStatus);
+  push("Ответ", filters.answered);
   push("Поиск", filters.search);
   push("Батч", filters.importBatchId);
   push("Воронка", filters.funnel);
@@ -201,6 +217,14 @@ function formatDateOnly(value: string | null | undefined): string {
 
 function formatPct(value: number): string {
   return `${value.toFixed(1)}%`;
+}
+
+/** 42м / 3.5ч / 2.1д; "—" while no timed answer exists in the range. */
+function formatResponseMinutes(minutes: number | null | undefined): string {
+  if (minutes == null || !Number.isFinite(minutes)) return "—";
+  if (minutes < 60) return `${Math.round(minutes)}м`;
+  if (minutes < 48 * 60) return `${(minutes / 60).toFixed(1)}ч`;
+  return `${(minutes / (24 * 60)).toFixed(1)}д`;
 }
 
 function boolFilterValue(value: boolean | "all" | undefined): string {
@@ -416,6 +440,16 @@ export default function SupportPage() {
   }
 
   const dashboard = supportData.bundle?.summary ?? EMPTY_DASHBOARD;
+  // Rate over ANSWERABLE mail only (spam/auto excluded server-side); days with
+  // nothing answerable carry null so the line skips them instead of dropping to 0.
+  const answerRateByDay = useMemo(
+    () =>
+      dashboard.byDay.map((day) => ({
+        date: day.date,
+        rate: day.answerable > 0 ? Math.round((day.answered / day.answerable) * 1000) / 10 : null,
+      })),
+    [dashboard.byDay],
+  );
   const pageData = supportData.page;
   const batchesQuery = useQuery({
     queryKey: ["support-import-batches"],
@@ -446,6 +480,13 @@ export default function SupportPage() {
     queryKey: ["support", "details", userScopeHash, warehouseVersion, selectedId],
     queryFn: async () => (await loadSupportDetails(selectedId as string)).row,
     enabled: Boolean(selectedId) && warehouseVersionReady,
+  });
+  // The matched Sent reply (subject) — lazy, only for an answered open dialog.
+  const answeredReplyQuery = useQuery({
+    queryKey: ["support", "answered-reply", selectedId],
+    queryFn: () => getAnsweredReplyForRequest(selectedId as string),
+    enabled: Boolean(selectedId) && Boolean(detailQuery.data?.answered),
+    staleTime: 5 * 60 * 1000,
   });
 
   useEffect(() => {
@@ -714,6 +755,10 @@ export default function SupportPage() {
   const mailProgress = typeof historyTotal === "number" && historyTotal > 0
     ? `${historyImported} / ${historyTotal}`
     : `${mailCount(mailState?.messages_processed ?? mailStatus?.messages_processed ?? lastSync?.synced)} processed`;
+  // Sent-folder (answered analytics) backfill state.
+  const sentState = mailStatus?.sent_state ?? null;
+  const sentStarted = Boolean(sentState);
+  const sentHistoryComplete = Boolean(sentState?.history_completed_at);
 
   const openRequest = (request: SupportRequestSummaryRow) => {
     setManualCategory(effectiveCategory(request));
@@ -791,6 +836,22 @@ export default function SupportPage() {
                   </Button>
                 </>
               )}
+              {sentHistoryComplete ? (
+                <Button type="button" variant="outline" size="sm" onClick={() => syncMutation.mutate({ action: "sent_sync_new" })} disabled={mailActive}>
+                  Sync Sent
+                </Button>
+              ) : (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => syncMutation.mutate({ action: sentStarted ? "sent_continue_sync" : "sent_initial_sync" })}
+                  disabled={mailActive}
+                  title="Import the Sent folder history — the source of truth for answered/unanswered analytics. Resumable, 150 headers per run."
+                >
+                  {sentStarted ? "Continue Sent Import" : "Import Sent History"}
+                </Button>
+              )}
               <Button type="button" variant="outline" size="sm" onClick={() => stopMutation.mutate()} disabled={stopMutation.isPending}>
                 Stop
               </Button>
@@ -815,6 +876,16 @@ export default function SupportPage() {
             <div><span className="text-muted-foreground">Duration</span><div className="font-medium">{formatDuration(lastSync?.duration_ms)}</div></div>
             <div><span className="text-muted-foreground">Password secret</span><div className="font-medium">{mailStatus?.config?.password ? "Configured" : "Missing"}</div></div>
             <div><span className="text-muted-foreground">Last error</span><div className="font-medium truncate">{mailState?.last_error_code ?? lastSync?.error_code ?? "-"}</div></div>
+            <div>
+              <span className="text-muted-foreground">Sent history</span>
+              <div className="font-medium">
+                {sentState
+                  ? sentHistoryComplete
+                    ? `complete (${mailCount(sentState.history_imported_messages)} replies)`
+                    : `${mailCount(sentState.history_imported_messages)} / ${mailCount(sentState.history_total_messages)}`
+                  : "not imported"}
+              </div>
+            </div>
           </div>
         </Card>
 
@@ -981,6 +1052,17 @@ export default function SupportPage() {
 
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
           <StatCard label="Total Requests" value={dashboard.kpis.totalRequests} caption={`${dashboard.kpis.requestsPerDay} / day`} />
+          <StatCard
+            label="Answered"
+            value={dashboard.kpis.answeredRequests}
+            caption={`${formatPct(dashboard.kpis.answerRatePct)} of ${dashboard.kpis.answerablePool} answerable`}
+          />
+          <StatCard label="Unanswered" value={dashboard.kpis.unansweredRequests} />
+          <StatCard
+            label="Median Response"
+            value={formatResponseMinutes(dashboard.kpis.medianFirstResponseMinutes)}
+            caption="received → first reply"
+          />
           <StatCard label="Unique Senders" value={dashboard.kpis.uniqueSenders} />
           <StatCard label="Matched Customers" value={dashboard.kpis.matchedCustomers} caption={formatPct(dashboard.kpis.matchedPct)} />
           <StatCard label="Unmatched Requests" value={dashboard.kpis.unmatchedRequests} />
@@ -1090,6 +1172,17 @@ export default function SupportPage() {
               </Select>
             </div>
             <div className="space-y-1">
+              <Label>Answered</Label>
+              <Select value={filters.answered ?? "all"} onValueChange={(value) => updateFilter("answered", value as "all" | "answered" | "unanswered")}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All</SelectItem>
+                  <SelectItem value="answered">Answered</SelectItem>
+                  <SelectItem value="unanswered">Unanswered</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1">
               <Label>Search</Label>
               <Input value={filters.search ?? ""} onChange={(event) => updateFilter("search", event.target.value)} placeholder="Sender, email, subject, message" />
             </div>
@@ -1147,6 +1240,17 @@ export default function SupportPage() {
                 <YAxis allowDecimals={false} />
                 <Tooltip />
                 <Line type="monotone" dataKey="requests" stroke="#2563eb" strokeWidth={2} dot={false} />
+              </LineChart>
+            </ResponsiveContainer>
+          </ChartCard>
+          <ChartCard title="Answer Rate by Day">
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={answerRateByDay}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="date" tick={{ fontSize: 10 }} />
+                <YAxis domain={[0, 100]} tickFormatter={(value) => `${value}%`} />
+                <Tooltip formatter={(value: number) => [`${Number(value).toFixed(1)}%`, "answer rate"]} />
+                <Line type="monotone" dataKey="rate" stroke="#059669" strokeWidth={2} dot={false} connectNulls />
               </LineChart>
             </ResponsiveContainer>
           </ChartCard>
@@ -1289,6 +1393,8 @@ export default function SupportPage() {
                     <TableHead>Category</TableHead>
                     <TableHead className="text-right">Requests</TableHead>
                     <TableHead className="text-right">Share</TableHead>
+                    <TableHead className="text-right">Answered</TableHead>
+                    <TableHead className="text-right">Unanswered</TableHead>
                     <TableHead className="text-right">Unique senders</TableHead>
                     <TableHead className="text-right">Matched</TableHead>
                     <TableHead className="text-right">High</TableHead>
@@ -1302,6 +1408,8 @@ export default function SupportPage() {
                       <TableCell className="text-xs">{row.category}</TableCell>
                       <TableCell className="text-right font-mono text-xs">{row.requests}</TableCell>
                       <TableCell className="text-right text-xs">{formatPct(row.share)}</TableCell>
+                      <TableCell className="text-right font-mono text-xs">{row.answered}</TableCell>
+                      <TableCell className={`text-right font-mono text-xs ${row.unanswered > 0 ? "text-destructive" : ""}`}>{row.unanswered}</TableCell>
                       <TableCell className="text-right font-mono text-xs">{row.uniqueSenders}</TableCell>
                       <TableCell className="text-right font-mono text-xs">{row.matchedCustomers}</TableCell>
                       <TableCell className="text-right font-mono text-xs">{row.highPriority}</TableCell>
@@ -1403,6 +1511,7 @@ export default function SupportPage() {
                   <TableHead>Subcategory</TableHead>
                   <TableHead>Language</TableHead>
                   <TableHead>Priority</TableHead>
+                  <TableHead>Answered</TableHead>
                   <TableHead>Match</TableHead>
                   <TableHead>Flags</TableHead>
                 </TableRow>
@@ -1421,13 +1530,18 @@ export default function SupportPage() {
                     <TableCell className="whitespace-nowrap text-xs">{effectiveSubcategory(request)}</TableCell>
                     <TableCell className="text-xs">{request.language}</TableCell>
                     <TableCell className="text-xs">{effectiveUrgency(request)}</TableCell>
+                    <TableCell className="whitespace-nowrap text-xs" title={request.answered ? `source: ${request.answer_source}` : undefined}>
+                      {request.answered
+                        ? <span className="text-success">✓{request.first_response_minutes != null ? ` ${formatResponseMinutes(request.first_response_minutes)}` : ""}</span>
+                        : <span className="text-destructive">—</span>}
+                    </TableCell>
                     <TableCell className="text-xs">{request.attribution_status}</TableCell>
                     <TableCell className="max-w-[220px] truncate text-xs">{flagsFor(request).join(", ") || "-"}</TableCell>
                   </TableRow>
                 ))}
                 {!rows.length && (
                   <TableRow>
-                    <TableCell colSpan={13} className="h-28 text-center text-muted-foreground">
+                    <TableCell colSpan={14} className="h-28 text-center text-muted-foreground">
                       {supportData.isInitialLoading ? "Loading support requests..." : "No support requests match the current filters"}
                     </TableCell>
                   </TableRow>
@@ -1458,6 +1572,24 @@ export default function SupportPage() {
                   <div><span className="text-muted-foreground">Funnel</span><div title={[selected.campaign_path, selected.cohort_date].filter(Boolean).join(" · ") || undefined}>{selected.funnel || "Unknown"}</div></div>
                   <div><span className="text-muted-foreground">Campaign Path</span><div>{selected.campaign_path || EMPTY_CAMPAIGN_PATH}</div></div>
                   <div><span className="text-muted-foreground">Attribution status</span><div>{selected.attribution_status}</div></div>
+                  <div>
+                    <span className="text-muted-foreground">Answered</span>
+                    <div>
+                      {selected.answered ? (
+                        <>
+                          <span className="text-success">Yes</span>
+                          {selected.answered_at ? ` · ${formatDate(selected.answered_at)}` : ""}
+                          {selected.first_response_minutes != null ? ` · ${formatResponseMinutes(selected.first_response_minutes)}` : ""}
+                          <span className="ml-2 text-xs text-muted-foreground">{ANSWER_SOURCE_LABELS[selected.answer_source] ?? selected.answer_source}</span>
+                          {answeredReplyQuery.data?.subject && (
+                            <div className="text-xs text-muted-foreground">Reply: {answeredReplyQuery.data.subject}</div>
+                          )}
+                        </>
+                      ) : (
+                        <span className="text-destructive">No reply found</span>
+                      )}
+                    </div>
+                  </div>
                   <div><span className="text-muted-foreground">Automatic category</span><div>{selected.automatic_category ?? selected.category} / {selected.automatic_subcategory ?? selected.subcategory}</div></div>
                   <div>
                     <span className="text-muted-foreground">Confidence</span>

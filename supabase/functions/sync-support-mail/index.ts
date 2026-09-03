@@ -4,6 +4,8 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { createClickHouseClient } from "../_shared/clickhouse/client.ts";
 import { runSupportSync } from "../_shared/clickhouse/support.ts";
 import { classifySupportRequestServer } from "../_shared/clickhouse/support.ts";
+import { runReplyMatching } from "../_shared/clickhouse/supportReplyMatching.ts";
+import type { SupabaseLikeClient } from "../_shared/clickhouse/types.ts";
 import {
   extractEmailLiterals,
   htmlToPlainText,
@@ -36,7 +38,11 @@ type MailAction =
   | "continue_sync"
   | "sync_new"
   | "stop"
-  | "reset_cursor";
+  | "reset_cursor"
+  | "sent_initial_sync"
+  | "sent_continue_sync"
+  | "sent_sync_new"
+  | "rematch_replies";
 
 type SyncStatus =
   | "idle"
@@ -261,6 +267,49 @@ class ImapConnection {
       .filter((value) => !/spam|trash|draft|sent/i.test(value));
   }
 
+  /** The Sent mailbox: prefer the \Sent special-use attribute, fall back to a
+   * name match on the UNFILTERED list (listFolders hides Sent on purpose —
+   * request folders must never be picked from it). */
+  async findSentFolder(): Promise<string | null> {
+    const response = await this.command(`LIST "" "*"`, "IMAP_CONNECTION_FAILED");
+    const lines = response.split(/\r?\n/).filter((line) => /^\* LIST /i.test(line));
+    const nameOf = (line: string) => line.match(/\* LIST .* "([^"]+)"$/)?.[1] ?? line.match(/\* LIST .* ([^\s]+)$/)?.[1] ?? null;
+    const bySpecialUse = lines.find((line) => /\(\s*[^)]*\\Sent[^)]*\)/i.test(line));
+    if (bySpecialUse) return nameOf(bySpecialUse);
+    const byName = lines.map(nameOf).filter((value): value is string => Boolean(value)).find((value) => /sent/i.test(value));
+    return byName ?? null;
+  }
+
+  /** One UID FETCH over a range, flags only — no bodies. Used to refresh the
+   * frozen \Answered flags of already-imported INBOX mail. */
+  async fetchFlagsRange(fromUid: number, toUid: number | "*"): Promise<Map<number, string[]>> {
+    const response = await this.command(`UID FETCH ${fromUid}:${toUid} (UID FLAGS)`, "IMAP_PARSE_FAILED", 25_000);
+    const out = new Map<number, string[]>();
+    for (const line of response.split(/\r?\n/)) {
+      const uid = Number(line.match(/UID (\d+)/i)?.[1] ?? 0);
+      const flagsRaw = line.match(/FLAGS \(([^)]*)\)/i)?.[1];
+      if (!uid || flagsRaw === undefined) continue;
+      out.set(uid, flagsRaw.split(/\s+/).map((value) => value.replace(/^\\/, "")).filter(Boolean));
+    }
+    return out;
+  }
+
+  /** Headers only, regardless of size — Sent-folder ingestion never needs
+   * bodies and this keeps the retrospective backfill ~50x cheaper. */
+  async fetchHeader(uid: number): Promise<{ raw: string | null; internalDate: string | null; flags: string[]; size: number | null }> {
+    const meta = await this.command(`UID FETCH ${uid} (UID FLAGS INTERNALDATE RFC822.SIZE)`, "IMAP_PARSE_FAILED", 15_000);
+    const internal = meta.match(/INTERNALDATE "([^"]+)"/i)?.[1] ?? null;
+    const flags = (meta.match(/FLAGS \(([^)]*)\)/i)?.[1] ?? "").split(/\s+/).map((value) => value.replace(/^\\/, "")).filter(Boolean);
+    const size = Number(meta.match(/RFC822\.SIZE\s+(\d+)/i)?.[1] ?? 0);
+    const response = await this.command(`UID FETCH ${uid} (BODY.PEEK[HEADER])`, "IMAP_PARSE_FAILED", 20_000);
+    return {
+      raw: extractEmailLiterals(response)[0] ?? null,
+      internalDate: internal ? new Date(internal).toISOString() : null,
+      flags,
+      size: Number.isFinite(size) && size > 0 ? size : null,
+    };
+  }
+
   async select(folder: string): Promise<{ uidValidity: string | null; highestModseq: string | null }> {
     const response = await this.command(`SELECT ${quoteImap(folder)}`, "IMAP_FOLDER_NOT_FOUND");
     return {
@@ -394,6 +443,10 @@ function normalizeAction(value: unknown): MailAction {
     case "sync_new":
     case "stop":
     case "reset_cursor":
+    case "sent_initial_sync":
+    case "sent_continue_sync":
+    case "sent_sync_new":
+    case "rematch_replies":
       return value;
     case undefined:
     case null:
@@ -1073,9 +1126,348 @@ async function runMailSync(input: {
   }
 }
 
+// ---- Sent-folder ingestion (answered analytics) -----------------------------
+//
+// Outgoing mail is the source of truth for "we answered". Headers only, into
+// support_replies (never support_requests — replies are not requests and must
+// not enter classification or request analytics). Reuses the sync-state
+// machine: the (auth_user_id, mailbox_key, folder) unique key gives the Sent
+// folder its own state row.
+
+const SENT_BATCH_SIZE = 50;
+const SENT_MAX_BATCHES = 3;
+const SENT_MAX_MESSAGES_PER_INVOCATION = 150;
+/** How far back the INBOX \Answered flag refresh looks. Flags are frozen at
+ * first sync (within an hour of arrival — before most answers), so recent mail
+ * is re-checked; older mail keeps whatever tier the Sent history proves. */
+const FLAG_REFRESH_WINDOW_MS = 30 * 86_400_000;
+const FLAG_REFRESH_MAX_UPDATES = 500;
+/** Post-stage budget: stages are skipped once the invocation runs this long
+ * (pg_net gives the whole tick 150s; the INBOX import must never be starved). */
+const POST_STAGE_DEADLINE_MS = 90_000;
+
+async function resolveSentFolder(imap: ImapConnection): Promise<string> {
+  const override = Deno.env.get("SPACEMAIL_IMAP_SENT_FOLDER")?.trim();
+  if (override) return override;
+  const discovered = await imap.findSentFolder();
+  if (!discovered) {
+    throw new SupportMailError("SENT_FOLDER_NOT_FOUND", "Could not locate the Sent folder. Set SPACEMAIL_IMAP_SENT_FOLDER.", 404);
+  }
+  return discovered;
+}
+
+function replyRow(input: {
+  authUserId: string;
+  cfg: ReturnType<typeof configStatus>;
+  uidValidity: string;
+  message: ParsedMailMessage;
+}) {
+  const m = input.message;
+  return {
+    auth_user_id: input.authUserId,
+    mailbox_key: input.cfg.mailbox_key,
+    folder: input.cfg.folder,
+    imap_uid_validity: input.uidValidity,
+    imap_uid: Number(m.uid),
+    message_id: m.message_id,
+    normalized_message_id: m.normalized_message_id,
+    in_reply_to: m.in_reply_to,
+    references_json: m.references,
+    from_email: m.from_email,
+    to_email: m.to_email,
+    to_emails: m.to_emails,
+    cc_email: m.cc_email,
+    subject: m.subject,
+    sent_at: m.received_at || m.internal_date,
+    internal_date: m.internal_date,
+    raw_size_bytes: m.size,
+    imap_flags: m.flags,
+  };
+}
+
+async function importedReplyUidSet(input: {
+  client: SupabaseClient;
+  authUserId: string;
+  cfg: ReturnType<typeof configStatus>;
+  uidValidity: string;
+}): Promise<Set<number>> {
+  const out = new Set<number>();
+  for (let offset = 0; ; offset += 1000) {
+    const { data, error } = await input.client
+      .from("support_replies")
+      .select("imap_uid")
+      .eq("auth_user_id", input.authUserId)
+      .eq("mailbox_key", input.cfg.mailbox_key)
+      .eq("folder", input.cfg.folder)
+      .eq("imap_uid_validity", input.uidValidity)
+      .order("imap_uid", { ascending: true })
+      .range(offset, offset + 999);
+    if (error) throw new SupportMailError("SUPABASE_WRITE_FAILED", "Could not read imported reply UIDs.", 500);
+    const rows = data ?? [];
+    rows.forEach((row) => out.add(n(row.imap_uid)));
+    if (rows.length < 1000) return out;
+  }
+}
+
+async function runReplySync(input: {
+  action: Extract<MailAction, "sent_initial_sync" | "sent_continue_sync" | "sent_sync_new">;
+  authUserId: string;
+  supabase: SupabaseClient;
+}) {
+  return await withConnection(async (imap) => {
+    const sentFolder = await resolveSentFolder(imap);
+    const cfg = { ...configStatus(), folder: sentFolder };
+    const existingState = await stateFor(input.supabase, input.authUserId, cfg);
+    if (isRunning(existingState)) {
+      return { ok: false, action: input.action, folder: sentFolder, status: "already_running", error_code: "ALREADY_RUNNING", state: existingState };
+    }
+    // The hourly tick calls sent_sync_new unconditionally; before the operator
+    // finishes the Sent backfill that is a quiet no-op, not a failed state row.
+    if (input.action === "sent_sync_new" && !existingState?.history_completed_at) {
+      return { ok: false, action: input.action, folder: sentFolder, status: "history_required", error_code: "HISTORY_IMPORT_REQUIRED", state: existingState };
+    }
+
+    await upsertState(input.supabase, input.authUserId, {
+      status: "connecting",
+      sync_mode: input.action,
+      started_at: nowIso(),
+      completed_at: null,
+      last_error_code: null,
+      last_error_message_sanitized: null,
+    }, cfg);
+
+    try {
+      const selected = await imap.select(sentFolder);
+      const box = await imap.status(sentFolder);
+      const uidValidity = selected.uidValidity ?? "unknown";
+      if (existingState?.uid_validity && existingState.uid_validity !== uidValidity && input.action !== "sent_initial_sync") {
+        await upsertState(input.supabase, input.authUserId, {
+          status: "cursor_invalidated",
+          uid_validity: uidValidity,
+          last_error_code: "IMAP_UIDVALIDITY_CHANGED",
+          last_error_message_sanitized: "Sent folder UIDVALIDITY changed. Run sent_initial_sync to rediscover replies.",
+          completed_at: nowIso(),
+        }, cfg);
+        throw new SupportMailError("IMAP_UIDVALIDITY_CHANGED", "Sent folder UIDVALIDITY changed. Run sent_initial_sync.", 409);
+      }
+
+      const historyMode = input.action !== "sent_sync_new";
+      const allUids = historyMode ? await imap.searchAll(null) : [];
+      const imported = await importedReplyUidSet({ client: input.supabase, authUserId: input.authUserId, cfg, uidValidity });
+      const candidateUids = historyMode
+        ? allUids.filter((uid) => !imported.has(uid))
+        : (await imap.searchNewerThan(existingState?.last_seen_uid ?? existingState?.history_last_uid ?? null)).filter((uid) => !imported.has(uid));
+      const selectedUids = candidateUids.slice(0, SENT_MAX_MESSAGES_PER_INVOCATION);
+      const historyTotal = historyMode ? allUids.length : n(existingState?.history_total_messages);
+      const importedBefore = historyMode ? allUids.length - candidateUids.length : n(existingState?.history_imported_messages);
+
+      await upsertState(input.supabase, input.authUserId, {
+        status: selectedUids.length ? "syncing" : "completed",
+        uid_validity: uidValidity,
+        mailbox_messages: box.messages,
+        mailbox_uid_next: box.uidNext,
+        history_first_uid: historyMode ? allUids[0] ?? null : existingState?.history_first_uid ?? null,
+        history_last_uid: historyMode ? allUids.at(-1) ?? null : existingState?.history_last_uid ?? null,
+        history_total_messages: historyTotal,
+        history_imported_messages: importedBefore,
+        history_remaining_messages: Math.max(0, historyTotal - importedBefore),
+        messages_discovered: candidateUids.length,
+      }, cfg);
+
+      let inserted = 0;
+      let processed = 0;
+      let lastSeenUid = existingState?.last_seen_uid ?? null;
+      for (let batch = 0; batch < SENT_MAX_BATCHES; batch += 1) {
+        const batchUids = selectedUids.slice(batch * SENT_BATCH_SIZE, (batch + 1) * SENT_BATCH_SIZE);
+        if (!batchUids.length) break;
+        const rows: Array<Record<string, unknown>> = [];
+        for (const uid of batchUids) {
+          const fetched = await imap.fetchHeader(uid);
+          if (!fetched.raw) {
+            throw new SupportMailError("IMAP_BATCH_FETCH_FAILED", "Could not fetch a Sent message header. Cursor was not advanced.", 502);
+          }
+          const message = parseRawEmail(fetched.raw, String(uid), {
+            internal_date: fetched.internalDate,
+            size: fetched.size,
+            flags: fetched.flags,
+          });
+          rows.push(replyRow({ authUserId: input.authUserId, cfg, uidValidity, message }));
+        }
+        const { error } = await input.supabase
+          .from("support_replies")
+          .upsert(rows, { onConflict: "auth_user_id,mailbox_key,folder,imap_uid_validity,imap_uid", ignoreDuplicates: true });
+        if (error) throw new SupportMailError("SUPABASE_WRITE_FAILED", dbErrorMessage("Could not insert support replies", error), 500);
+        inserted += rows.length;
+        processed += batchUids.length;
+        lastSeenUid = batchUids.at(-1) ?? lastSeenUid;
+        await upsertState(input.supabase, input.authUserId, {
+          status: "syncing",
+          messages_processed: importedBefore + processed,
+          messages_inserted: inserted,
+          history_imported_messages: importedBefore + processed,
+          history_remaining_messages: Math.max(0, historyTotal - importedBefore - processed),
+          last_seen_uid: lastSeenUid,
+          last_imported_uid: lastSeenUid,
+        }, cfg);
+      }
+
+      const remaining = candidateUids.length - selectedUids.length + (selectedUids.length - processed);
+      const finalStatus: SyncStatus = remaining > 0 ? "partial" : "completed";
+      const historyCompletedAt = historyMode
+        ? (remaining === 0 ? existingState?.history_completed_at ?? nowIso() : null)
+        : existingState?.history_completed_at ?? null;
+      const state = await upsertState(input.supabase, input.authUserId, {
+        status: finalStatus,
+        completed_at: nowIso(),
+        last_success_at: nowIso(),
+        messages_processed: importedBefore + processed,
+        messages_inserted: inserted,
+        history_imported_messages: importedBefore + processed,
+        history_remaining_messages: Math.max(0, historyTotal - importedBefore - processed),
+        history_completed_at: historyCompletedAt,
+        last_seen_uid: lastSeenUid ?? (historyMode ? allUids.at(-1) ?? null : existingState?.last_seen_uid ?? null),
+        last_sync_imported: inserted,
+      }, cfg);
+      return {
+        ok: true,
+        action: input.action,
+        folder: sentFolder,
+        status: finalStatus,
+        replies_discovered: candidateUids.length,
+        replies_imported: inserted,
+        replies_remaining: Math.max(0, remaining),
+        history_completed_at: historyCompletedAt,
+        state,
+      };
+    } catch (error) {
+      const safe = sanitizeError(error);
+      const status: SyncStatus = safe.code === "IMAP_UIDVALIDITY_CHANGED" ? "cursor_invalidated" : "failed";
+      await upsertState(input.supabase, input.authUserId, {
+        status,
+        completed_at: nowIso(),
+        last_error_code: safe.code,
+        last_error_message_sanitized: safe.message,
+      }, cfg).catch(() => undefined);
+      throw error;
+    }
+  });
+}
+
+/** Re-reads INBOX flags of recent mail in ONE ranged UID FETCH and updates only
+ * rows whose flag set actually changed — every UPDATE bumps updated_at and
+ * re-syncs the row to ClickHouse, so the diff is load-bearing, not an
+ * optimization. */
+async function refreshInboxFlags(input: { authUserId: string; supabase: SupabaseClient }): Promise<{ checked: number; updated: number }> {
+  const cfg = configStatus();
+  const state = await stateFor(input.supabase, input.authUserId, cfg);
+  if (!state?.uid_validity) return { checked: 0, updated: 0 };
+  const sinceIso = new Date(Date.now() - FLAG_REFRESH_WINDOW_MS).toISOString();
+  const rows: Array<{ id: string; imap_uid: number; imap_flags: string[] }> = [];
+  for (let offset = 0; ; offset += 1000) {
+    const { data, error } = await input.supabase
+      .from("support_requests")
+      .select("id,imap_uid,imap_flags")
+      .eq("auth_user_id", input.authUserId)
+      .eq("source_type", "imap")
+      .eq("mailbox_key", cfg.mailbox_key)
+      .eq("imap_folder", cfg.folder)
+      .eq("imap_uid_validity", state.uid_validity)
+      .gte("received_at", sinceIso)
+      .not("imap_uid", "is", null)
+      .order("imap_uid", { ascending: true })
+      .range(offset, offset + 999);
+    if (error) throw new SupportMailError("SUPABASE_WRITE_FAILED", "Could not read INBOX flags window.", 500);
+    const page = (data ?? []) as Array<{ id: string; imap_uid: number; imap_flags: string[] }>;
+    rows.push(...page);
+    if (page.length < 1000) break;
+  }
+  if (!rows.length) return { checked: 0, updated: 0 };
+
+  const flagsByUid = await withConnection(async (imap) => {
+    const selected = await imap.select(cfg.folder);
+    // A validity change is the regular sync's problem, not the flag pass's.
+    if ((selected.uidValidity ?? "unknown") !== state.uid_validity) return null;
+    return await imap.fetchFlagsRange(Math.min(...rows.map((row) => row.imap_uid)), "*");
+  });
+  if (!flagsByUid) return { checked: 0, updated: 0 };
+
+  const flagKey = (flags: readonly string[]) => [...flags].map((flag) => flag.toLowerCase()).sort().join("");
+  const changed = rows
+    .map((row) => ({ row, next: flagsByUid.get(row.imap_uid) }))
+    .filter((entry): entry is { row: (typeof rows)[number]; next: string[] } =>
+      entry.next !== undefined && flagKey(entry.next) !== flagKey(entry.row.imap_flags ?? []));
+  let updated = 0;
+  for (const entry of changed.slice(0, FLAG_REFRESH_MAX_UPDATES)) {
+    const { error } = await input.supabase
+      .from("support_requests")
+      .update({ imap_flags: entry.next })
+      .eq("id", entry.row.id)
+      .eq("auth_user_id", input.authUserId);
+    if (error) throw new SupportMailError("SUPABASE_WRITE_FAILED", "Could not update INBOX flags.", 500);
+    updated += 1;
+  }
+  return { checked: rows.length, updated };
+}
+
+/** Stages appended to every sync_new run (cron tick and the manual button):
+ * Sent delta → flag refresh → reply matching → one ClickHouse sync if anything
+ * changed. Each stage is fenced: a Sent/flags/matching hiccup must never fail
+ * the INBOX import whose cursor has already been committed. */
+async function runPostStages(input: { authUserId: string; supabase: SupabaseClient; startedMs: number }) {
+  const stages: Record<string, unknown> = {};
+  const withinBudget = () => Date.now() - input.startedMs < POST_STAGE_DEADLINE_MS;
+  let mutated = false;
+  if (withinBudget()) {
+    try {
+      stages.sent = await runReplySync({ action: "sent_sync_new", authUserId: input.authUserId, supabase: input.supabase });
+    } catch (error) {
+      stages.sent = { ok: false, error_code: sanitizeError(error).code };
+    }
+  }
+  if (withinBudget()) {
+    try {
+      const flags = await refreshInboxFlags({ authUserId: input.authUserId, supabase: input.supabase });
+      stages.flags = flags;
+      mutated = mutated || flags.updated > 0;
+    } catch (error) {
+      stages.flags = { ok: false, error_code: sanitizeError(error).code };
+    }
+  }
+  if (withinBudget()) {
+    try {
+      const matching = await runReplyMatching({
+        supabase: input.supabase as unknown as SupabaseLikeClient,
+        authUserId: input.authUserId,
+        mode: "incremental",
+      });
+      stages.matching = matching;
+      mutated = mutated || matching.applied > 0;
+    } catch (error) {
+      stages.matching = { ok: false, error_code: sanitizeError(error).code };
+    }
+  }
+  if (mutated) {
+    try {
+      stages.clickhouse = await syncClickHouse({ authUserId: input.authUserId, supabase: input.supabase });
+    } catch (error) {
+      stages.clickhouse = { ok: false, error_code: sanitizeError(error).code };
+    }
+  }
+  return stages;
+}
+
 async function statusResponse(client: SupabaseClient, authUserId: string) {
   const cfg = configStatus();
   const state = await stateFor(client, authUserId, cfg).catch(() => null);
+  // The Sent state row (any non-INBOX folder of this mailbox) drives the
+  // backfill progress UI; folder discovery needs IMAP, so read what exists.
+  const { data: sentRows } = await client
+    .from("support_mail_sync_state")
+    .select("*")
+    .eq("auth_user_id", authUserId)
+    .eq("mailbox_key", cfg.mailbox_key)
+    .neq("folder", cfg.folder)
+    .limit(1);
   return {
     ok: true,
     action: "status",
@@ -1085,6 +1477,7 @@ async function statusResponse(client: SupabaseClient, authUserId: string) {
     connection: "unknown",
     config: cfg.configured,
     state,
+    sent_state: (sentRows ?? [])[0] ?? null,
   };
 }
 
@@ -1183,7 +1576,25 @@ Deno.serve(async (req: Request) => {
       const folders = await withConnection(async (imap) => await imap.listFolders());
       return jsonResponse({ ok: true, action, provider: PROVIDER, folders });
     }
-    return jsonResponse(await runMailSync({ action, authUserId, supabase, body }));
+    if (action === "sent_initial_sync" || action === "sent_continue_sync" || action === "sent_sync_new") {
+      return jsonResponse(await runReplySync({ action, authUserId, supabase }));
+    }
+    if (action === "rematch_replies") {
+      const mode = body.mode === "incremental" ? "incremental" as const : "full" as const;
+      const matching = await runReplyMatching({ supabase: supabase as unknown as SupabaseLikeClient, authUserId, mode });
+      const clickhouse = matching.applied > 0
+        ? await syncClickHouse({ authUserId, supabase }).catch((error) => ({ ok: false, error_code: sanitizeError(error).code }))
+        : null;
+      return jsonResponse({ ok: true, action, mode, ...matching, clickhouse });
+    }
+    const startedMs = Date.now();
+    const syncResult = await runMailSync({ action, authUserId, supabase, body });
+    // Answered-analytics stages ride every successful sync_new (cron + manual):
+    // the INBOX cursor is already committed, these only ADD data.
+    if (action === "sync_new" && (syncResult as { ok?: boolean }).ok !== false) {
+      (syncResult as Record<string, unknown>).post_stages = await runPostStages({ authUserId, supabase, startedMs });
+    }
+    return jsonResponse(syncResult);
   } catch (error) {
     const safe = sanitizeError(error);
     return jsonResponse({ ok: false, error: safe.message, error_code: safe.code }, safe.status);

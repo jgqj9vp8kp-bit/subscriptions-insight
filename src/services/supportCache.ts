@@ -19,6 +19,7 @@ export function normalizeSupportRequest(query: SupportQuery, options: { includeP
     paymentRelated: query.filters.paymentRelated ?? "all",
     deliveryRelated: query.filters.deliveryRelated ?? "all",
     manualStatus: query.filters.manualStatus ?? "all",
+    answered: query.filters.answered ?? "all",
     importBatchId: sortUniq(query.filters.importBatchId ? [query.filters.importBatchId] : []),
     search: (query.filters.search ?? "").trim(),
     sortBy: query.sortBy,

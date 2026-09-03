@@ -195,6 +195,9 @@ CREATE TABLE IF NOT EXISTS ${FACT_SUPPORT_REQUESTS_TABLE}
     possible_unauthorized_charge UInt8,
     duplicate_charge UInt8,
     urgent UInt8,
+    answered_at Nullable(DateTime64(3, 'UTC')),
+    answer_source LowCardinality(String) DEFAULT '',
+    reply_count UInt32 DEFAULT 0,
     subject String,
     message_body String,
     source_hash String,
@@ -231,6 +234,15 @@ export const ALTER_FACT_SUPPORT_REQUESTS_CLASSIFICATION_SQL = [
   `ALTER TABLE ${FACT_SUPPORT_REQUESTS_TABLE} ADD COLUMN IF NOT EXISTS secondary_categories Array(LowCardinality(String)) AFTER subcategory`,
   `ALTER TABLE ${FACT_SUPPORT_REQUESTS_TABLE} ADD COLUMN IF NOT EXISTS classification_source LowCardinality(String) DEFAULT 'rule' AFTER source_hash`,
   `ALTER TABLE ${FACT_SUPPORT_REQUESTS_TABLE} ADD COLUMN IF NOT EXISTS classification_model LowCardinality(String) AFTER classification_version`,
+];
+
+// Answered/unanswered analytics (reply matcher output). Additive; the sort key
+// stays identity-only so re-matching updates rows via row_version, never dupes.
+// first_response_minutes is deliberately NOT stored — computed at query time.
+export const ALTER_FACT_SUPPORT_REQUESTS_ANSWER_SQL = [
+  `ALTER TABLE ${FACT_SUPPORT_REQUESTS_TABLE} ADD COLUMN IF NOT EXISTS answered_at Nullable(DateTime64(3, 'UTC')) AFTER urgent`,
+  `ALTER TABLE ${FACT_SUPPORT_REQUESTS_TABLE} ADD COLUMN IF NOT EXISTS answer_source LowCardinality(String) DEFAULT '' AFTER answered_at`,
+  `ALTER TABLE ${FACT_SUPPORT_REQUESTS_TABLE} ADD COLUMN IF NOT EXISTS reply_count UInt32 DEFAULT 0 AFTER answer_source`,
 ];
 
 const REBUILD_TABLE = `${FACT_SUPPORT_REQUESTS_TABLE}_rebuild`;
@@ -349,7 +361,7 @@ export async function rebuildAnalyticsTransactionsRowVersion(client: ClickHouseC
 
 export async function ensureFactSupportRequestsSchema(client: ClickHouseClientLike): Promise<void> {
   await client.command({ query: CREATE_FACT_SUPPORT_REQUESTS_SQL });
-  for (const query of [...ALTER_FACT_SUPPORT_REQUESTS_ATTRIBUTION_SQL, ...ALTER_FACT_SUPPORT_REQUESTS_CLASSIFICATION_SQL]) {
+  for (const query of [...ALTER_FACT_SUPPORT_REQUESTS_ATTRIBUTION_SQL, ...ALTER_FACT_SUPPORT_REQUESTS_CLASSIFICATION_SQL, ...ALTER_FACT_SUPPORT_REQUESTS_ANSWER_SQL]) {
     await client.command({ query });
   }
   // Columns first: the rebuild clones the live structure, so it must run after
