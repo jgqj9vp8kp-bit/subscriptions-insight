@@ -41,7 +41,9 @@ import type { ClickHouseSummary } from "@/services/clickhouse";
 // new field, so a v13 bundle would keep serving a response that simply lacks it:
 // an empty Platform dropdown and an empty Users cohort explorer, with no refetch
 // to correct them. Discard v13 bundles so both lists populate on first load.
-export const ANALYTICS_CACHE_SCHEMA_VERSION = 14;
+// v15 (2026-09): the Dashboard Revenue Intelligence root ("revenue") joins the
+// warehouse-dependent set; older persisted caches know nothing about it.
+export const ANALYTICS_CACHE_SCHEMA_VERSION = 15;
 
 export const WAREHOUSE_VERSION_KEY = ["clickhouse", "warehouse-version"] as const;
 export const SUPPORT_WAREHOUSE_VERSION_KEY = ["clickhouse", "support-warehouse-version"] as const;
@@ -52,7 +54,7 @@ export const WAREHOUSE_ANALYTICS_INVALIDATED_EVENT = "warehouse-analytics-invali
 // the shared persistence layer. fb-analytics rides the same lifecycle (persist,
 // logout clear, external invalidation) — its own re-keying comes from the FB
 // warehouse version, so a transaction-sync invalidation is just a cheap refetch.
-export const WAREHOUSE_DEPENDENT_ROOTS: readonly string[] = ["cohorts", "users", "payment-analytics", "support", "fb-analytics"];
+export const WAREHOUSE_DEPENDENT_ROOTS: readonly string[] = ["cohorts", "users", "payment-analytics", "support", "fb-analytics", "revenue"];
 
 export function fnv(input: string): string {
   let h = 0x811c9dc5;

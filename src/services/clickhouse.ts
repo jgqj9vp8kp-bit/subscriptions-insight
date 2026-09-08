@@ -26,6 +26,7 @@ const CLICKHOUSE_BACKFILL_FUNCTION = "clickhouse-backfill";
 const CLICKHOUSE_VALIDATE_FUNCTION = "clickhouse-validate";
 const CLICKHOUSE_SUMMARY_FUNCTION = "clickhouse-summary";
 const CLICKHOUSE_COHORTS_FUNCTION = "clickhouse-cohorts";
+const CLICKHOUSE_REVENUE_FUNCTION = "clickhouse-revenue";
 const CLICKHOUSE_COHORT_MEMBERSHIP_FUNCTION = "clickhouse-cohort-membership";
 const CLICKHOUSE_USERS_FUNCTION = "clickhouse-users";
 const CLICKHOUSE_PAYMENT_ANALYTICS_FUNCTION = "clickhouse-payment-analytics";
@@ -543,6 +544,14 @@ export async function getClickHouseSummary(): Promise<ClickHouseSummary> {
 /** Drop the memoized summary so the next call refetches (post-sync refresh). */
 export function invalidateClickHouseSummaryCache(): void {
   summaryCache = null;
+}
+
+// --- Revenue Intelligence read path (clickhouse-revenue Edge Function) -----
+
+export async function runClickHouseRevenue<T extends import("../../supabase/functions/_shared/clickhouse/revenueIntelligenceContract").RevenueIntelligenceResponse>(
+  request: import("../../supabase/functions/_shared/clickhouse/revenueIntelligenceContract").RevenueIntelligenceRequest,
+): Promise<T> {
+  return clickHouseRequest<T>(CLICKHOUSE_REVENUE_FUNCTION, request as Record<string, unknown>, { breakerGated: true });
 }
 
 // --- Cohorts read path (clickhouse-cohorts Edge Function) -----------------
