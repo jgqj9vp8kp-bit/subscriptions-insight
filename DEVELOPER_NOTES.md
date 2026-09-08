@@ -373,6 +373,53 @@ KPIs read `answer_source != ''`, not `answered_at` (flag/customer tiers carry
 no timestamp). Rollout: the operator runs "Import Sent History" on the Support
 page until complete, then one `rematch_replies {"mode":"full"}`.
 
+## Dashboard Revenue Intelligence (2026-09)
+
+The calendar projection of the SAME cohort-revenue facts Cohorts reads:
+"how much did the project make on day D and which cohorts produced it".
+Contract + pure SQL/assembly in `_shared/clickhouse/revenueIntelligence*.ts`,
+edge fn `clickhouse-revenue` (actions `bundle` | `day_breakdown`), UI in
+`src/components/RevenueIntelligenceSection.tsx` (first Dashboard section).
+
+Two orthogonal axes ride every number and are NEVER merged into exclusive
+buckets: RevenueType (the Cohorts classifier's lifecycle taxonomy — the
+classifier CTEs are copied verbatim from `cohortMembership.ts` and typed over
+the user's FULL history; windowing before typing would misnumber renewal
+levels) × CohortRelation (new | existing | unattributed relative to the
+BUCKET). New/Existing is SAME-BUCKET: one daily scan carries the same-day,
+same-ISO-week (`toStartOfWeek(x, 1)` — `bucketStart()` in TS must agree) and
+same-month pairs at once, and assembly picks the pair for the requested
+grain. Summing the same-day split into weeks would be wrong and is exactly
+what invariants 14–15 in `revenueIntelligence.test.ts` guard against.
+
+Cohort identity is the ACTIVE `fact_user_cohorts` snapshot — the same
+versions Cohorts serves. No snapshot → `cohort_snapshot_not_ready` (no live
+classifier fallback). Payments whose user_id has no snapshot row flow into an
+EXPLICIT Unattributed stream (`NOT IN`), never dropped, never counted as
+existing; live coverage measured 99.94%. Refunds are RESTATED onto the
+original payment row — the warehouse has no refund date, so Net of past days
+can move after a sync while per-day Gross is stable (documented in the UI).
+
+Do not parallelize the bundle's queries: four of the six run the full
+classifier CTE chain (JOIN + window functions), and firing them concurrently
+exhausted ClickHouse into the 25s timeout. Sequential, the full-history
+bundle serves in ~800ms server-side (~1.1–1.4s wall, measured p95 over the
+whole 182-day history); `day_breakdown` ≈ 330ms. The plan's materialization
+threshold (>5M rows or p95 > 3s) is nowhere close.
+
+Filters are cohort-grain member filters — `activeCohortMemberWhere` (the
+Cohorts WHERE builder) injected into the classifier's base CTE, narrowing the
+SET OF USERS while keeping each remaining user's full history. Honesty rule:
+the Unattributed and Facebook-spend streams have no user grain, so an active
+filter EXCLUDES them (diagnostics.filters_active; the UI shows "—" with a
+banner and the CSV writes blanks) instead of silently keeping them
+project-wide, which would make profit a filtered-net-minus-full-spend lie.
+
+Client caching rides the shared analyticsCache pattern: root `"revenue"` in
+`WAREHOUSE_DEPENDENT_ROOTS`, keys carry userScopeHash + warehouseVersion +
+the normalized request (`revenueCache.ts`); adding the root required the
+`ANALYTICS_CACHE_SCHEMA_VERSION` bump to 15.
+
 ## Mail.ru Support Inbox
 
 STALE: the section below describes the original Mail.ru sync writing to

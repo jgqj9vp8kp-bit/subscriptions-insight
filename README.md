@@ -65,7 +65,7 @@ Apply migrations first, then deploy the analytics functions:
 
 ```text
 supabase db push
-supabase functions deploy clickhouse-cohorts clickhouse-facebook clickhouse-init fb-analytics-summary dashboard-summary
+supabase functions deploy clickhouse-cohorts clickhouse-facebook clickhouse-init clickhouse-revenue fb-analytics-summary dashboard-summary
 ```
 
 After deploying `clickhouse-init`, run ClickHouse Init once from the Integrations UI —
