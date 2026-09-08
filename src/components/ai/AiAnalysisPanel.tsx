@@ -1,11 +1,15 @@
 // Expanded AI analysis for one cohort/campaign row. Mirrors BankDetailPanel's
 // skeleton: a dense metric grid, everything deterministic and instant — the
-// numbers ARE the explanation, no model call involved.
-import { AlertTriangle, Sparkles } from "lucide-react";
+// numbers ARE the explanation, no model call involved. The one async extra is
+// the §18 history line (past verdicts for this scope), loaded lazily from the
+// append-only ai_recommendations snapshots when the panel opens.
+import { AlertTriangle, History, Sparkles } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
 import { cn } from "@/lib/utils";
 import { AiActionChip } from "@/components/ai/AiActionChip";
 import { AiFeedback } from "@/components/ai/AiFeedback";
-import { aiActionLabel, aiScopeKey, aiScopeLabel, type AiEvidence, type AiMetricVerdict, type AiRecommendation } from "@/services/aiSignals";
+import { loadAiActionHistory, type AiActionHistoryPoint } from "@/services/aiRecommendationLog";
+import { aiActionLabel, aiScopeKey, aiScopeLabel, type AiAction, type AiBudgetDeltaPct, type AiEvidence, type AiMetricVerdict, type AiRecommendation } from "@/services/aiSignals";
 import { useAiAssistantStore } from "@/store/aiAssistantStore";
 
 const VERDICT_STYLE: Record<AiMetricVerdict, string> = {
@@ -86,7 +90,49 @@ function AskAiButton({ rec }: { rec: AiRecommendation }) {
   );
 }
 
-export function AiAnalysisPanel({ rec, footer }: { rec: AiRecommendation; footer?: React.ReactNode }) {
+function historyDate(iso: string): string {
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? iso.slice(0, 10) : date.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+/** Brief §18: "Jul 14 Scale +10% → Jul 17 Scale +20% → Jul 21 Hold". Rendered
+ * only when the verdict actually CHANGED at least once — a flat history line
+ * under every row would be noise, not signal. */
+function HistoryLine({ points }: { points: AiActionHistoryPoint[] }) {
+  if (points.length < 2) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
+      <History className="h-3 w-3 shrink-0" />
+      {points.map((point, index) => (
+        <span key={`${point.at}-${index}`} className="inline-flex items-center gap-1.5">
+          {index > 0 && <span aria-hidden>→</span>}
+          <span>
+            {historyDate(point.at)}{" "}
+            <span className={cn("font-medium", index === points.length - 1 ? "text-foreground" : undefined)}>
+              {aiActionLabel(point.action as AiAction, point.budgetDeltaPct as AiBudgetDeltaPct | null)}
+            </span>
+          </span>
+        </span>
+      ))}
+    </div>
+  );
+}
+
+export interface AiHistoryKey {
+  surface: "cohort" | "campaign";
+  /** Filter-context identity from the signals hook; null = writer disabled. */
+  contextHash: string | null;
+}
+
+export function AiAnalysisPanel({ rec, history, footer }: { rec: AiRecommendation; history?: AiHistoryKey; footer?: React.ReactNode }) {
+  const scopeKey = aiScopeKey(rec.scope);
+  const historyQuery = useQuery({
+    queryKey: ["ai-action-history", history?.surface, history?.contextHash, scopeKey],
+    queryFn: () => loadAiActionHistory({ surface: history!.surface, contextHash: history!.contextHash!, scopeKey }),
+    enabled: Boolean(history?.contextHash),
+    staleTime: 5 * 60 * 1000,
+  });
+
   const sections = new Map<string, AiEvidence[]>();
   for (const ev of rec.because) {
     const section = SECTION_OF[ev.metric] ?? "Economics";
@@ -103,6 +149,8 @@ export function AiAnalysisPanel({ rec, footer }: { rec: AiRecommendation; footer
         <span className="text-xs text-muted-foreground">·</span>
         <span className="text-xs text-muted-foreground">{rec.claim}</span>
       </div>
+
+      {historyQuery.data && <HistoryLine points={historyQuery.data} />}
 
       {rec.contradictions.length > 0 && (
         <div className="rounded-md border border-warning/40 bg-warning/10 px-3 py-2">

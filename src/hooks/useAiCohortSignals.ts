@@ -54,20 +54,26 @@ function basePaymentQuery(dateFrom: string | null, dateTo: string | null, groupB
  * without pass rates, once with) and debounces 2s so filter churn coalesces.
  * Content dedup lives in maybeWriteAiRecommendations; this is best-effort and
  * never surfaces to the page. */
-function useAiSnapshotWriter(params: {
-  output: AiEngineOutput | null;
+function useAiContextHash(params: {
   surface: "cohort" | "campaign";
   contextKey: string | undefined;
   dateFrom: string | null;
   dateTo: string | null;
-  warehouseVersion: string;
-  settled: boolean;
-}): void {
-  const { output, surface, contextKey, dateFrom, dateTo, warehouseVersion, settled } = params;
-  const contextHash = useMemo(
+}): string | null {
+  const { surface, contextKey, dateFrom, dateTo } = params;
+  return useMemo(
     () => (contextKey === undefined ? null : computeAiContextHash({ surface, dateFrom, dateTo, contextKey })),
     [surface, contextKey, dateFrom, dateTo],
   );
+}
+
+function useAiSnapshotWriter(params: {
+  output: AiEngineOutput | null;
+  contextHash: string | null;
+  warehouseVersion: string;
+  settled: boolean;
+}): void {
+  const { output, contextHash, warehouseVersion, settled } = params;
   useEffect(() => {
     if (!output || !contextHash || !settled) return;
     const timer = setTimeout(() => {
@@ -82,6 +88,8 @@ export interface UseAiCohortSignalsResult {
   byCohort: ReadonlyMap<string, AiRecommendation>;
   /** Path-grain recommendations (the Funnels view's rows), keyed by campaign_path. */
   byPath: ReadonlyMap<string, AiRecommendation>;
+  /** Filter-context identity of this run — the recommendation-history key. */
+  contextHash: string | null;
   /** True while the pass-rate bundle is still on its way (chips already work). */
   paymentLoading: boolean;
 }
@@ -149,17 +157,17 @@ export function useAiCohortSignals(params: {
     return map;
   }, [output]);
 
-  useAiSnapshotWriter({
-    output, surface: "cohort", contextKey, dateFrom, dateTo, warehouseVersion,
-    settled: !payment.isInitialLoading,
-  });
+  const contextHash = useAiContextHash({ surface: "cohort", contextKey, dateFrom, dateTo });
+  useAiSnapshotWriter({ output, contextHash, warehouseVersion, settled: !payment.isInitialLoading });
 
-  return { output, byCohort, byPath, paymentLoading: payment.isInitialLoading };
+  return { output, byCohort, byPath, contextHash, paymentLoading: payment.isInitialLoading };
 }
 
 export interface UseAiCampaignSignalsResult {
   output: AiEngineOutput | null;
   byCampaign: ReadonlyMap<string, AiRecommendation>;
+  /** Filter-context identity of this run — the recommendation-history key. */
+  contextHash: string | null;
   paymentLoading: boolean;
 }
 
@@ -216,10 +224,8 @@ export function useAiCampaignSignals(params: {
     return map;
   }, [output]);
 
-  useAiSnapshotWriter({
-    output, surface: "campaign", contextKey, dateFrom, dateTo, warehouseVersion,
-    settled: !payment.isInitialLoading,
-  });
+  const contextHash = useAiContextHash({ surface: "campaign", contextKey, dateFrom, dateTo });
+  useAiSnapshotWriter({ output, contextHash, warehouseVersion, settled: !payment.isInitialLoading });
 
-  return { output, byCampaign, paymentLoading: payment.isInitialLoading };
+  return { output, byCampaign, contextHash, paymentLoading: payment.isInitialLoading };
 }

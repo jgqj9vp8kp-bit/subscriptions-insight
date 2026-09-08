@@ -4478,7 +4478,7 @@ export default function CohortsPage() {
                               though the table itself is ~3000px wide. */}
                           <TableCell colSpan={visibleColumnOrder.length + 1} className="py-2 px-3">
                             <div className="sticky left-3 w-[min(56rem,calc(100vw-360px))]">
-                              <AiAnalysisPanel rec={rec} />
+                              <AiAnalysisPanel rec={rec} history={{ surface: "cohort", contextHash: aiSignals.contextHash }} />
                             </div>
                           </TableCell>
                         </TableRow>

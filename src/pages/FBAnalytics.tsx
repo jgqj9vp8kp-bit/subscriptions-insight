@@ -1436,7 +1436,7 @@ export default function FBAnalyticsPage() {
                         <TableRow className="bg-muted/10 hover:bg-muted/10">
                           <TableCell colSpan={columns.length + 2} className="px-4 py-2">
                             <div className="sticky left-4 w-[min(56rem,calc(100vw-360px))]">
-                              <AiAnalysisPanel rec={aiRec} />
+                              <AiAnalysisPanel rec={aiRec} history={{ surface: "campaign", contextHash: aiCampaigns.contextHash }} />
                             </div>
                           </TableCell>
                         </TableRow>

@@ -14,7 +14,7 @@
 //    precedent — a cascading default would fight the append-only guard).
 import { supabase } from "@/services/supabaseClient";
 import { fnv } from "@/services/analyticsCache";
-import type { AiEngineOutput } from "@/services/aiSignals";
+import { aiScopeKey, type AiEngineOutput, type AiScope } from "@/services/aiSignals";
 
 /** JSON with recursively sorted object keys — stable across the Postgres jsonb
  * round-trip, which normalizes key order. */
@@ -128,6 +128,75 @@ export interface AiRecommendationSnapshot {
   opportunities: unknown[];
   inputStatus: Record<string, string>;
   createdAt: string;
+}
+
+// ---- Recommendation history (brief §18) -------------------------------------
+
+export interface AiActionHistoryPoint {
+  /** Snapshot time when this verdict FIRST appeared (consecutive identical
+   * verdicts collapse, keeping the earliest date). */
+  at: string;
+  action: string;
+  budgetDeltaPct: number | null;
+  ruleId: string;
+  confidence: string;
+}
+
+function historyScopeOf(value: unknown): AiScope | null {
+  const scope = (value as { scope?: { kind?: string } } | null)?.scope;
+  if (!scope || (scope.kind !== "cohort" && scope.kind !== "campaign" && scope.kind !== "path")) return null;
+  return scope as AiScope;
+}
+
+/** The §18 timeline for one scope: "Jul 14 Scale +10% → Jul 17 Scale +20% →
+ * Jul 21 Hold". Input snapshots may come newest-first (the reader's order);
+ * output is oldest-first CHANGES only. Snapshots where the scope is absent
+ * (filters changed what the engine saw) are skipped, not treated as verdicts. */
+export function extractAiActionHistory(
+  snapshots: ReadonlyArray<{ createdAt: string; recommendations: unknown[] }>,
+  scopeKey: string,
+  limit = 6,
+): AiActionHistoryPoint[] {
+  const ordered = [...snapshots].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  const points: AiActionHistoryPoint[] = [];
+  for (const snapshot of ordered) {
+    for (const raw of snapshot.recommendations) {
+      const scope = historyScopeOf(raw);
+      if (!scope || aiScopeKey(scope) !== scopeKey) continue;
+      const rec = raw as { action?: unknown; budgetDeltaPct?: unknown; ruleId?: unknown; confidence?: unknown };
+      const point: AiActionHistoryPoint = {
+        at: snapshot.createdAt,
+        action: String(rec.action ?? ""),
+        budgetDeltaPct: typeof rec.budgetDeltaPct === "number" ? rec.budgetDeltaPct : null,
+        ruleId: String(rec.ruleId ?? ""),
+        confidence: String(rec.confidence ?? ""),
+      };
+      const last = points[points.length - 1];
+      if (!last || last.action !== point.action || last.budgetDeltaPct !== point.budgetDeltaPct) {
+        points.push(point);
+      }
+      break;
+    }
+  }
+  return points.slice(-limit);
+}
+
+/** History of the verdict for one scope within one filter context. Reads the
+ * append-only snapshots the hooks write; contextHash scoping matters — the
+ * same funnel under different filters faces different peers and thresholds,
+ * so verdicts across contexts are not comparable. */
+export async function loadAiActionHistory(params: {
+  surface: "cohort" | "campaign";
+  contextHash: string;
+  scopeKey: string;
+  limit?: number;
+}): Promise<AiActionHistoryPoint[]> {
+  const snapshots = await listAiRecommendations({
+    surface: params.surface,
+    contextHash: params.contextHash,
+    limit: 20,
+  });
+  return extractAiActionHistory(snapshots, params.scopeKey, params.limit ?? 6);
 }
 
 export async function listAiRecommendations(params: {
