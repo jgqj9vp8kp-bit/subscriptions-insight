@@ -3,16 +3,19 @@
 // decomposition, daily table, and the per-day cohort drilldown. Everything on
 // screen comes from ONE reconciled server bundle (clickhouse-revenue); shares
 // cohort identity with the Cohorts page by construction.
-import { Fragment, useMemo, useState } from "react";
+import { Fragment, useMemo, useRef, useState } from "react";
 import { Area, AreaChart, Bar, CartesianGrid, ComposedChart, Line, XAxis, YAxis } from "recharts";
-import { Download, Loader2 } from "lucide-react";
+import { ChevronDown, Download, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import { KpiCard } from "@/components/KpiCard";
 import { ChartContainer, ChartTooltip, ChartTooltipContent, type ChartConfig } from "@/components/ui/chart";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { cn } from "@/lib/utils";
 import { useAuth } from "@/hooks/useAuth";
 import { hashUserScope } from "@/services/analyticsCache";
 import { useWarehouseVersion } from "@/hooks/useAnalyticsCache";
@@ -32,6 +35,10 @@ const DEFAULT_UI = {
   range: "90" as (typeof RANGE_OPTIONS)[number]["value"],
   bucket: "day" as RevenueBucket,
   basis: "gross" as "gross" | "net",
+  // Cohort-grain member filters (Cohorts semantics: they narrow the SET OF
+  // USERS; every payment of a matching user stays in).
+  funnels: [] as string[],
+  plans: [] as string[],
 };
 
 const AGE_LABELS: Record<string, string> = {
@@ -66,16 +73,18 @@ function daysAgo(days: number): string {
   return date.toISOString().slice(0, 10);
 }
 
-function downloadCsv(rows: RevenueBucketRow[], bucket: RevenueBucket): void {
+function downloadCsv(rows: RevenueBucketRow[], bucket: RevenueBucket, filtersActive: boolean): void {
   const headers = ["Date", "Spend", "Gross", "New", "Existing", "Unattributed", "New %", "Trial", "First Sub", "Renewals", "Upsells", "Tokens", "Refunds", "Net", "Profit", "Cumulative Profit"];
   const money = (value: number) => Math.round(value * 100) / 100;
+  // Spend/profit/cumulative are project-wide streams — under cohort filters
+  // they are not defined for the slice, so the file carries blanks, not zeros.
   const table = {
     headers,
     rows: rows.map((row) => [
-      row.date, money(row.spend), money(row.gross), money(row.gross_new), money(row.gross_existing), money(row.gross_unattributed),
+      row.date, filtersActive ? "" : money(row.spend), money(row.gross), money(row.gross_new), money(row.gross_existing), money(row.gross_unattributed),
       row.gross > 0 ? Number(((row.gross_new / row.gross) * 100).toFixed(1)) : "",
       money(row.by_type.trial), money(row.by_type.first_subscription), money(row.by_type.renewals), money(row.by_type.upsells), money(row.by_type.tokens),
-      money(row.refunds), money(row.net), money(row.profit), money(row.cumulative_profit),
+      money(row.refunds), money(row.net), filtersActive ? "" : money(row.profit), filtersActive ? "" : money(row.cumulative_profit),
     ].map(formatCell)),
     truncatedCells: 0,
   };
@@ -88,18 +97,66 @@ function downloadCsv(rows: RevenueBucketRow[], bucket: RevenueBucket): void {
   URL.revokeObjectURL(url);
 }
 
+function FilterMultiSelect({ label, values, options, onChange }: {
+  label: string; values: string[]; options: string[]; onChange: (values: string[]) => void;
+}): JSX.Element {
+  const selected = new Set(values);
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <Button type="button" variant="outline" size="sm" className="h-8 justify-between px-3 text-xs font-normal">
+          <span className={cn("truncate", values.length ? "text-foreground" : "text-muted-foreground")}>
+            {values.length ? `${label}: ${values.length}` : label}
+          </span>
+          <ChevronDown className="ml-1 h-3.5 w-3.5 text-muted-foreground" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent align="start" className="w-80 p-0">
+        <div className="flex items-center justify-between border-b border-border px-3 py-2">
+          <span className="text-xs font-medium text-muted-foreground">{label}</span>
+          {values.length > 0 && (
+            <Button type="button" variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={() => onChange([])}>
+              Clear
+            </Button>
+          )}
+        </div>
+        <div className="max-h-72 overflow-auto p-1">
+          {options.length ? options.map((option) => {
+            const checked = selected.has(option);
+            return (
+              <button
+                type="button"
+                key={option}
+                className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs hover:bg-muted"
+                onClick={() => onChange(checked ? values.filter((value) => value !== option) : [...values, option])}
+              >
+                <Checkbox checked={checked} className="pointer-events-none" />
+                <span className="min-w-0 flex-1 truncate">{option}</span>
+              </button>
+            );
+          }) : (
+            <div className="px-3 py-6 text-center text-xs text-muted-foreground">No options yet</div>
+          )}
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
 export function RevenueIntelligenceSection(): JSX.Element {
   const { user } = useAuth();
   const userScopeHash = useMemo(() => hashUserScope(user?.id), [user?.id]);
   const { version: warehouseVersion, ready } = useWarehouseVersion(Boolean(user));
   const [ui, setUi] = usePersistedPageState("ui_state_revenue_intel", DEFAULT_UI);
 
+  const filtersActive = ui.funnels.length > 0 || ui.plans.length > 0;
   const request = useMemo<RevenueIntelligenceRequest>(() => ({
     action: "bundle",
     bucket: ui.bucket,
     date_from: ui.range === "all" ? null : daysAgo(Number(ui.range) - 1),
     date_to: ui.range === "all" ? null : utcToday(),
-  }), [ui.bucket, ui.range]);
+    filters: { campaign_path: ui.funnels, price_plan: ui.plans },
+  }), [ui.bucket, ui.range, ui.funnels, ui.plans]);
 
   const { bundle, error, isInitialLoading, isRefreshing } = useRevenueBundle({
     request,
@@ -141,6 +198,24 @@ export function RevenueIntelligenceSection(): JSX.Element {
   const totals = bundle?.totals;
   const ageTotal = useMemo(() => (bundle?.by_age ?? []).reduce((sum, row) => sum + row.gross, 0), [bundle]);
 
+  // Filter option lists grow from every response seen (a filtered response
+  // shrinks its slices to the selected keys — accumulating keeps the full
+  // dictionary available without an extra options endpoint).
+  const funnelOptionsRef = useRef<Set<string>>(new Set());
+  const planOptionsRef = useRef<Set<string>>(new Set());
+  if (bundle?.ok) {
+    for (const row of bundle.by_funnel) if (row.key !== "Unknown" && row.key !== "Unattributed") funnelOptionsRef.current.add(row.key);
+    for (const row of bundle.by_plan) if (row.key !== "Unknown" && row.key !== "Unattributed") planOptionsRef.current.add(row.key);
+  }
+  const funnelOptions = useMemo(
+    () => [...new Set([...funnelOptionsRef.current, ...ui.funnels])].sort(),
+    [bundle, ui.funnels], // eslint-disable-line react-hooks/exhaustive-deps -- ref accumulates per bundle
+  );
+  const planOptions = useMemo(
+    () => [...new Set([...planOptionsRef.current, ...ui.plans])].sort((a, b) => (parseFloat(a.replace("$", "")) || 0) - (parseFloat(b.replace("$", "")) || 0)),
+    [bundle, ui.plans], // eslint-disable-line react-hooks/exhaustive-deps -- ref accumulates per bundle
+  );
+
   return (
     <section className="space-y-3">
       <div className="flex flex-wrap items-center gap-2">
@@ -152,6 +227,10 @@ export function RevenueIntelligenceSection(): JSX.Element {
         </div>
         <div className="ml-auto flex flex-wrap items-center gap-2">
           {isRefreshing && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
+          <FilterMultiSelect label="Funnel" values={ui.funnels} options={funnelOptions}
+            onChange={(values) => setUi((prev) => ({ ...prev, funnels: values }))} />
+          <FilterMultiSelect label="Price plan" values={ui.plans} options={planOptions}
+            onChange={(values) => setUi((prev) => ({ ...prev, plans: values }))} />
           <Tabs value={ui.bucket} onValueChange={(value) => setUi((prev) => ({ ...prev, bucket: value as RevenueBucket }))}>
             <TabsList className="h-8">
               <TabsTrigger value="day" className="text-xs">Day</TabsTrigger>
@@ -192,17 +271,25 @@ export function RevenueIntelligenceSection(): JSX.Element {
 
       {bundle?.ok && totals && (
         <>
+          {filtersActive && (
+            <Card className="border-warning/40 p-3 text-xs text-muted-foreground shadow-card">
+              Cohort filters active — showing attributed revenue of matching users only. Facebook spend, profit and the
+              Unattributed stream have no user grain, so they are excluded from this slice (not silently kept project-wide).
+            </Card>
+          )}
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 2xl:grid-cols-7">
             <KpiCard label="Gross Revenue" value={usd(totals.gross)} hint={`refunds ${usd(totals.refunds)}`} />
             <KpiCard label="Net Revenue" value={usd(totals.net)} hint={`${pct(totals.net, totals.gross)} of gross`} />
             <KpiCard label="New Cohort Revenue" value={usd(totals.gross_new)} hint={pct(totals.gross_new, totals.gross)} accent="primary" />
             <KpiCard label="Existing Cohort Revenue" value={usd(totals.gross_existing)} hint={pct(totals.gross_existing, totals.gross)} />
-            <KpiCard label="Spend (Facebook)" value={usd(totals.spend)} />
-            <KpiCard label="Profit (Net − Spend)" value={usd(totals.profit)} accent={totals.profit >= 0 ? "success" : "warning"} />
+            <KpiCard label="Spend (Facebook)" value={filtersActive ? "—" : usd(totals.spend)} hint={filtersActive ? "excluded by filters" : undefined} />
+            <KpiCard label="Profit (Net − Spend)" value={filtersActive ? "—" : usd(totals.profit)}
+              hint={filtersActive ? "excluded by filters" : undefined}
+              accent={!filtersActive && totals.profit < 0 ? "warning" : "success"} />
             <KpiCard
               label="Unattributed"
-              value={usd(totals.gross_unattributed, 2)}
-              hint={pct(totals.gross_unattributed, totals.gross)}
+              value={filtersActive ? "—" : usd(totals.gross_unattributed, 2)}
+              hint={filtersActive ? "excluded by filters" : pct(totals.gross_unattributed, totals.gross)}
               tooltip="Payments whose user has no row in the active cohort snapshot — shown explicitly, never merged into Existing."
             />
           </div>
@@ -213,7 +300,7 @@ export function RevenueIntelligenceSection(): JSX.Element {
                 <div className="text-sm font-medium">
                   {basisKey === "gross" ? "Gross" : "Net"} revenue by {ui.bucket} · New vs Existing
                 </div>
-                <div className="text-xs text-muted-foreground">line = Facebook spend</div>
+                <div className="text-xs text-muted-foreground">{filtersActive ? "spend hidden under filters" : "line = Facebook spend"}</div>
               </div>
               <ChartContainer config={chartConfig} className="h-64 w-full">
                 <ComposedChart data={chartData} margin={{ left: 8, right: 8, top: 8 }}>
@@ -224,7 +311,7 @@ export function RevenueIntelligenceSection(): JSX.Element {
                   <Bar dataKey="new_rev" stackId="rev" fill="var(--color-new_rev)" />
                   <Bar dataKey="existing_rev" stackId="rev" fill="var(--color-existing_rev)" />
                   <Bar dataKey="unatt_rev" stackId="rev" fill="var(--color-unatt_rev)" />
-                  <Line dataKey="spend" type="monotone" stroke="var(--color-spend)" strokeWidth={1.5} dot={false} />
+                  {!filtersActive && <Line dataKey="spend" type="monotone" stroke="var(--color-spend)" strokeWidth={1.5} dot={false} />}
                 </ComposedChart>
               </ChartContainer>
             </Card>
@@ -264,7 +351,7 @@ export function RevenueIntelligenceSection(): JSX.Element {
                   Refunds are restated onto the original payment day (the warehouse has no refund date).
                 </p>
               </div>
-              <Button type="button" variant="outline" size="sm" onClick={() => downloadCsv(rows, ui.bucket)} disabled={!rows.length}>
+              <Button type="button" variant="outline" size="sm" onClick={() => downloadCsv(rows, ui.bucket, filtersActive)} disabled={!rows.length}>
                 <Download className="h-4 w-4" /> CSV
               </Button>
             </div>
@@ -301,7 +388,7 @@ export function RevenueIntelligenceSection(): JSX.Element {
                             {row.date}
                             {row.partial && <span className="ml-1.5 rounded border border-warning/50 px-1 text-[10px] text-warning">partial</span>}
                           </TableCell>
-                          <TableCell className="text-right font-mono text-xs">{usd(row.spend)}</TableCell>
+                          <TableCell className="text-right font-mono text-xs">{filtersActive ? "—" : usd(row.spend)}</TableCell>
                           <TableCell className="text-right font-mono text-xs font-medium">{usd(row.gross, 2)}</TableCell>
                           <TableCell className="text-right font-mono text-xs">{usd(row.gross_new, 2)}</TableCell>
                           <TableCell className="text-right font-mono text-xs">{usd(row.gross_existing, 2)}</TableCell>
@@ -313,7 +400,9 @@ export function RevenueIntelligenceSection(): JSX.Element {
                           <TableCell className="text-right font-mono text-xs">{usd(row.by_type.tokens)}</TableCell>
                           <TableCell className="text-right font-mono text-xs">{usd(row.refunds, 2)}</TableCell>
                           <TableCell className="text-right font-mono text-xs">{usd(row.net, 2)}</TableCell>
-                          <TableCell className={`text-right font-mono text-xs ${row.profit < 0 ? "text-destructive" : "text-success"}`}>{usd(row.profit)}</TableCell>
+                          <TableCell className={`text-right font-mono text-xs ${row.profit < 0 && !filtersActive ? "text-destructive" : "text-success"}`}>
+                            {filtersActive ? "—" : usd(row.profit)}
+                          </TableCell>
                         </TableRow>
                         {expanded && (
                           <TableRow className="bg-muted/10 hover:bg-muted/10">

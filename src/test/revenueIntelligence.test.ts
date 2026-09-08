@@ -11,6 +11,7 @@ import {
   buildDayBreakdownSql,
   buildSpendDailySql,
   buildUnattributedDailySql,
+  normalizeRevenueFilters,
   normalizeRevenueRequest,
   rollupDayCohorts,
   runRevenueIntelligence,
@@ -202,6 +203,90 @@ describe("day breakdown rollup", () => {
     expect(rolled.map((row) => row.cohort)).toEqual(["2026-09-08", "2026-09-03", "2026-08", "older"]);
     expect(rolled.find((row) => row.cohort === "2026-08")?.gross).toBe(200);
     expect(rolled.reduce((sum, row) => sum + row.gross, 0)).toBeCloseTo(940, 2);
+  });
+});
+
+describe("cohort-grain filters (P8)", () => {
+  it("sanitizes filter arrays and reports whether any filter is active", () => {
+    const none = normalizeRevenueFilters(undefined);
+    expect(none.active).toBe(false);
+    const some = normalizeRevenueFilters({ campaign_path: [" path-a ", "path-a", ""], price_plan: ["$9.99"] });
+    expect(some.active).toBe(true);
+    expect(some.filters.campaign_path).toEqual(["path-a"]);
+    expect(some.filters.price_plan).toEqual(["$9.99"]);
+    expect(some.filters.refund_status).toBe("all");
+  });
+
+  it("embeds the member WHERE inside the classifier's base CTE with bound params", () => {
+    const params: Record<string, unknown> = {};
+    const sql = buildAttributedDailySql(params, "owner-1", "AND fc.campaign_path IN ({p_mcp_0:String})");
+    const baseCte = sql.slice(sql.indexOf("base AS ("), sql.indexOf("pretyped AS ("));
+    expect(baseCte).toContain("fc.campaign_path IN ({p_mcp_0:String})");
+  });
+
+  const activeSnapshotSupabase = (): SupabaseLikeClient => ({
+    from() {
+      const builder = {
+        select: () => builder,
+        eq: () => builder,
+        maybeSingle: async () => ({
+          data: {
+            status: "completed",
+            active_warehouse_version: "wh",
+            active_classification_version: "cv",
+            duplicate_users: 0,
+            diagnostics: { validation: { status: "PASS", duplicate_users: 0, dynamic_users: 10, materialized_users: 10 } },
+          },
+          error: null,
+        }),
+      };
+      return builder as never;
+    },
+  });
+
+  const recordingClickhouse = (log: Array<{ query: string; params: Record<string, unknown> }>): ClickHouseClientLike => ({
+    command: async () => undefined,
+    insert: async () => undefined,
+    query: async (input: { query: string; query_params?: Record<string, unknown> }) => {
+      log.push({ query: input.query, params: input.query_params ?? {} });
+      return { json: async () => [] };
+    },
+  });
+
+  it("an active filter narrows every classified query and EXCLUDES the user-less streams", async () => {
+    const log: Array<{ query: string; params: Record<string, unknown> }> = [];
+    const result = await runRevenueIntelligence({
+      authUserId: "owner-1",
+      supabase: activeSnapshotSupabase(),
+      clickhouse: recordingClickhouse(log),
+      request: { filters: { campaign_path: ["path-a"], price_plan: ["$9.99"] } },
+    });
+    // Attributed + funnel + plan + age only: no unattributed, no spend query.
+    expect(log).toHaveLength(4);
+    for (const entry of log) {
+      expect(entry.query).toContain("fc.campaign_path IN ({p_mcp_0:String})");
+      expect(entry.query).toContain("fc.price_plan IN ({p_mplan_0:String})");
+      expect(entry.params.p_mcp_0).toBe("path-a");
+      expect(entry.params.p_mplan_0).toBe("$9.99");
+    }
+    expect(result.ok).toBe(true);
+    expect(result.diagnostics.filters_active).toBe(true);
+    expect(result.totals.spend).toBe(0);
+    expect(result.totals.gross_unattributed).toBe(0);
+  });
+
+  it("no filters → full six-query bundle with filters_active false", async () => {
+    const log: Array<{ query: string; params: Record<string, unknown> }> = [];
+    const result = await runRevenueIntelligence({
+      authUserId: "owner-1",
+      supabase: activeSnapshotSupabase(),
+      clickhouse: recordingClickhouse(log),
+      request: {},
+    });
+    expect(log).toHaveLength(6);
+    expect(log.some((entry) => entry.query.includes("NOT IN (SELECT canonical_user_id"))).toBe(true);
+    expect(log.some((entry) => entry.query.includes("level = 'campaign'"))).toBe(true);
+    expect(result.diagnostics.filters_active).toBe(false);
   });
 });
 

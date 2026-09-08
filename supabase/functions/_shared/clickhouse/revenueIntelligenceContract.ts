@@ -127,6 +127,11 @@ export interface RevenueDiagnostics {
   snapshot_classification_version: string;
   /** Successful transactions scanned for the window. */
   rows_scanned: number;
+  /** True when cohort-grain member filters narrowed the response. The
+   * Unattributed and spend streams have no user grain, so under an active
+   * filter they are EXCLUDED (zeros) rather than silently kept project-wide —
+   * the UI must present spend/profit as not defined for the slice. */
+  filters_active: boolean;
   /** v1 does not reproduce the Cohorts email-token re-key: token purchases
    * matched only by email land in Unattributed here. This reports their size
    * so the bias is visible, not hidden. */

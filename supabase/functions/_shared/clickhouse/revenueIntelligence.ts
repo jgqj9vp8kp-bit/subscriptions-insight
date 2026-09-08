@@ -24,7 +24,8 @@
 // src/services stub.
 
 import type { ClickHouseClientLike, SupabaseLikeClient } from "./types.ts";
-import { activeCohortSnapshotVersion, getCohortSnapshotState } from "./cohortMembership.ts";
+import { activeCohortMemberWhere, activeCohortSnapshotVersion, getCohortSnapshotState } from "./cohortMembership.ts";
+import type { CohortFilters } from "./cohortContract.ts";
 import { ANALYTICS_TRANSACTIONS_TABLE, FACT_FACEBOOK_STATS_TABLE, FACT_USER_COHORTS_TABLE } from "./schema.ts";
 import {
   REVENUE_AGE_BUCKETS,
@@ -35,6 +36,7 @@ import {
   type RevenueDayBreakdown,
   type RevenueDayCohortRow,
   type RevenueIntelligenceBundle,
+  type RevenueIntelligenceFilters,
   type RevenueIntelligenceRequest,
   type RevenueSliceRow,
   type RevenueTotals,
@@ -74,12 +76,43 @@ export function normalizeRevenueRequest(req: RevenueIntelligenceRequest): {
   dateTo: string | null;
   bucket: RevenueBucket;
   day: string | null;
+  filters: CohortFilters;
+  filtersActive: boolean;
 } {
   const action = req.action === "day_breakdown" ? "day_breakdown" : "bundle";
   const bucket: RevenueBucket = req.bucket === "week" || req.bucket === "month" ? req.bucket : "day";
   const day = date(req.date, "date");
   if (action === "day_breakdown" && !day) throw new RevenueRequestError("date is required for day_breakdown.");
-  return { action, dateFrom: date(req.date_from, "date_from"), dateTo: date(req.date_to, "date_to"), bucket, day };
+  const { filters, active } = normalizeRevenueFilters(req.filters);
+  return { action, dateFrom: date(req.date_from, "date_from"), dateTo: date(req.date_to, "date_to"), bucket, day, filters, filtersActive: active };
+}
+
+/** Cohort-grain member filters, identical semantics to Cohorts (they narrow the
+ * SET OF USERS; every payment of a matching user stays in). Sanitized into the
+ * CohortFilters shape so activeCohortMemberWhere — the exact same WHERE builder
+ * Cohorts uses — can be reused verbatim. */
+export function normalizeRevenueFilters(raw?: Partial<RevenueIntelligenceFilters>): { filters: CohortFilters; active: boolean } {
+  const list = (values?: readonly unknown[]): string[] =>
+    Array.from(new Set((values ?? []).map((value) => s(value).trim()).filter(Boolean))).sort();
+  const filters: CohortFilters = {
+    funnel: list(raw?.funnel),
+    campaign_path: list(raw?.campaign_path),
+    campaign_path_exclude: [],
+    campaign_id: list(raw?.campaign_id),
+    traffic_source: list(raw?.traffic_source),
+    price_plan: list(raw?.price_plan),
+    media_buyer: list(raw?.media_buyer),
+    country: list(raw?.country),
+    card_type: list(raw?.card_type),
+    platform: list(raw?.platform),
+    currency: list(raw?.currency),
+    transaction_type: [],
+    refund_status: "all",
+  };
+  const active = [filters.funnel, filters.campaign_path, filters.campaign_id, filters.traffic_source,
+    filters.price_plan, filters.media_buyer, filters.country, filters.card_type, filters.platform,
+    filters.currency].some((values) => values.length > 0);
+  return { filters, active };
 }
 
 // ---- Classified attributed stream (verbatim classifier CTEs) ---------------
@@ -90,7 +123,7 @@ export function normalizeRevenueRequest(req: RevenueIntelligenceRequest): {
 // (c_plan). The typing runs over the user's FULL history (no date window) —
 // windowing before typing would misnumber first_subscription/renewal levels.
 
-function classifiedCTE(): string {
+function classifiedCTE(memberWhere = ""): string {
   return `
 base AS (
   SELECT a.user_id uid, a.transaction_id tid, a.event_time et, toUnixTimestamp64Milli(a.event_time) ets,
@@ -116,6 +149,7 @@ base AS (
     AND fc.warehouse_version = {warehouse_version:String}
     AND fc.classification_version = {classification_version:String}
     AND floor((toUnixTimestamp64Milli(a.event_time) - toUnixTimestamp64Milli(fc.trial_event_time)) / 86400000) >= 0
+    ${memberWhere}
 ),
 pretyped AS (
   SELECT *, floor((ets - trial_ts) / 86400000) d,
@@ -147,9 +181,9 @@ const TYPE_SUMS = `
 /** Attributed daily series over the FULL account history (52k rows — cheap;
  * full history is required for the cumulative-profit line anyway). Carries the
  * same-day, same-week and same-month new/existing pairs simultaneously. */
-export function buildAttributedDailySql(params: Record<string, unknown>, authUserId: string): string {
+export function buildAttributedDailySql(params: Record<string, unknown>, authUserId: string, memberWhere = ""): string {
   params.auth_user_id = authUserId;
-  return `WITH ${classifiedCTE()}
+  return `WITH ${classifiedCTE(memberWhere)}
 SELECT toString(toDate(et)) day,
   sumIf(g, is_success = 1) gross,
   sum(rr) refunds,
@@ -211,10 +245,10 @@ function windowWhere(params: Record<string, unknown>, dateFrom: string | null, d
 }
 
 /** Period slice by campaign_path ('' stays a distinct Unknown key). */
-export function buildByFunnelSql(params: Record<string, unknown>, authUserId: string, dateFrom: string | null, dateTo: string | null): string {
+export function buildByFunnelSql(params: Record<string, unknown>, authUserId: string, dateFrom: string | null, dateTo: string | null, memberWhere = ""): string {
   params.auth_user_id = authUserId;
   const win = windowWhere(params, dateFrom, dateTo);
-  return `WITH ${classifiedCTE()}
+  return `WITH ${classifiedCTE(memberWhere)}
 SELECT c_camp key,
   sumIf(g, is_success = 1) gross,
   sumIf(g, is_success = 1) - sum(rr) net,
@@ -226,10 +260,10 @@ GROUP BY key ORDER BY gross DESC
 FORMAT JSONEachRow`;
 }
 
-export function buildByPlanSql(params: Record<string, unknown>, authUserId: string, dateFrom: string | null, dateTo: string | null): string {
+export function buildByPlanSql(params: Record<string, unknown>, authUserId: string, dateFrom: string | null, dateTo: string | null, memberWhere = ""): string {
   params.auth_user_id = authUserId;
   const win = windowWhere(params, dateFrom, dateTo);
-  return `WITH ${classifiedCTE()}
+  return `WITH ${classifiedCTE(memberWhere)}
 SELECT c_plan key,
   sumIf(g, is_success = 1) gross,
   sumIf(g, is_success = 1) - sum(rr) net,
@@ -243,10 +277,10 @@ FORMAT JSONEachRow`;
 
 /** Cohort-age buckets of the period's revenue: d = whole days between the
  * user's trial anchor and the payment (precomputed by the classifier). */
-export function buildByAgeSql(params: Record<string, unknown>, authUserId: string, dateFrom: string | null, dateTo: string | null): string {
+export function buildByAgeSql(params: Record<string, unknown>, authUserId: string, dateFrom: string | null, dateTo: string | null, memberWhere = ""): string {
   params.auth_user_id = authUserId;
   const win = windowWhere(params, dateFrom, dateTo);
-  return `WITH ${classifiedCTE()}
+  return `WITH ${classifiedCTE(memberWhere)}
 SELECT multiIf(d = 0, 'd0', d <= 7, 'd1_7', d <= 30, 'd8_30', d <= 60, 'd31_60', d <= 90, 'd61_90', 'd90_plus') bucket,
   sumIf(g, is_success = 1) gross,
   sumIf(g, is_success = 1) - sum(rr) net
@@ -258,10 +292,10 @@ FORMAT JSONEachRow`;
 
 /** One revenue day explained: which cohorts (exact recent dates, month rollups
  * beyond DAY_BREAKDOWN_EXACT_DAYS, then "older") and funnels produced it. */
-export function buildDayBreakdownSql(params: Record<string, unknown>, authUserId: string, day: string): string {
+export function buildDayBreakdownSql(params: Record<string, unknown>, authUserId: string, day: string, memberWhere = ""): string {
   params.auth_user_id = authUserId;
   params.break_day = day;
-  return `WITH ${classifiedCTE()}
+  return `WITH ${classifiedCTE(memberWhere)}
 SELECT toString(c_d) cohort_date, c_camp campaign_path,
   sumIf(g, is_success = 1) gross,
   sumIf(g, is_success = 1) - sum(rr) net,
@@ -340,6 +374,7 @@ export function assembleRevenueBundle(input: {
   dateTo: string | null;
   snapshot: { warehouse_version: string; classification_version: string };
   now: Date;
+  filtersActive?: boolean;
 }): Omit<RevenueIntelligenceBundle, "ok" | "source" | "action" | "generated_at" | "query_duration_ms"> {
   const { bucket } = input;
   type Acc = {
@@ -505,7 +540,10 @@ export function assembleRevenueBundle(input: {
       snapshot_warehouse_version: input.snapshot.warehouse_version,
       snapshot_classification_version: input.snapshot.classification_version,
       rows_scanned: rowsScanned,
-      note: "Unattributed includes email-only token matches (v1 does not reproduce the Cohorts email-token re-key).",
+      filters_active: Boolean(input.filtersActive),
+      note: input.filtersActive
+        ? "Cohort filters active: only attributed revenue of matching users is shown; the Unattributed and Facebook-spend streams have no user grain and are excluded (so spend/profit are not defined for this slice)."
+        : "Unattributed includes email-only token matches (v1 does not reproduce the Cohorts email-token re-key).",
     },
   };
 }
@@ -538,7 +576,7 @@ export async function runRevenueIntelligence(input: {
       query_duration_ms: Date.now() - started, bucket: req.bucket, date_from: req.dateFrom, date_to: req.dateTo,
       buckets: [], totals: assembleRevenueBundle({ attributed: [], unattributed: [], spend: [], byFunnel: [], byPlan: [], byAge: [], bucket: req.bucket, dateFrom: null, dateTo: null, snapshot: { warehouse_version: "", classification_version: "" }, now: input.now ?? new Date() }).totals,
       by_funnel: [], by_plan: [], by_age: [],
-      diagnostics: { attributed_pct: 0, future_cohort_gross: 0, snapshot_warehouse_version: "", snapshot_classification_version: "", rows_scanned: 0, note: "" },
+      diagnostics: { attributed_pct: 0, future_cohort_gross: 0, snapshot_warehouse_version: "", snapshot_classification_version: "", rows_scanned: 0, filters_active: false, note: "" },
       error: "cohort_snapshot_not_ready",
     };
   }
@@ -550,12 +588,17 @@ export async function runRevenueIntelligence(input: {
   // pass ≈ 330ms, six concurrent ≈ never finishes). Serialized, the whole
   // bundle lands in ~2s.
   const pA = p(), pU = p(), pS = p(), pF = p(), pP = p(), pG = p();
-  const attributed = await jsonRows<AttributedDailyRow>(input.clickhouse, buildAttributedDailySql(pA, input.authUserId), pA);
-  const unattributed = await jsonRows<UnattributedDailyRow>(input.clickhouse, buildUnattributedDailySql(pU, input.authUserId), pU);
-  const spend = await jsonRows<SpendDailyRow>(input.clickhouse, buildSpendDailySql(pS, input.authUserId), pS);
-  const byFunnel = await jsonRows<{ key: string; gross: number; net: number; gross_new: number; gross_existing: number }>(input.clickhouse, buildByFunnelSql(pF, input.authUserId, req.dateFrom, req.dateTo), pF);
-  const byPlan = await jsonRows<{ key: string; gross: number; net: number; gross_new: number; gross_existing: number }>(input.clickhouse, buildByPlanSql(pP, input.authUserId, req.dateFrom, req.dateTo), pP);
-  const byAge = await jsonRows<{ bucket: string; gross: number; net: number }>(input.clickhouse, buildByAgeSql(pG, input.authUserId, req.dateFrom, req.dateTo), pG);
+  // Member filters narrow the SET OF USERS in the attributed stream (Cohorts
+  // semantics). The Unattributed and Facebook-spend streams have no user rows
+  // to filter — under an active filter they are EXCLUDED (never silently kept
+  // project-wide), and diagnostics.filters_active tells the UI to say so.
+  const memberWhere = (params: Record<string, unknown>) => activeCohortMemberWhere(req.filters, params);
+  const attributed = await jsonRows<AttributedDailyRow>(input.clickhouse, buildAttributedDailySql(pA, input.authUserId, memberWhere(pA)), pA);
+  const unattributed = req.filtersActive ? [] : await jsonRows<UnattributedDailyRow>(input.clickhouse, buildUnattributedDailySql(pU, input.authUserId), pU);
+  const spend = req.filtersActive ? [] : await jsonRows<SpendDailyRow>(input.clickhouse, buildSpendDailySql(pS, input.authUserId), pS);
+  const byFunnel = await jsonRows<{ key: string; gross: number; net: number; gross_new: number; gross_existing: number }>(input.clickhouse, buildByFunnelSql(pF, input.authUserId, req.dateFrom, req.dateTo, memberWhere(pF)), pF);
+  const byPlan = await jsonRows<{ key: string; gross: number; net: number; gross_new: number; gross_existing: number }>(input.clickhouse, buildByPlanSql(pP, input.authUserId, req.dateFrom, req.dateTo, memberWhere(pP)), pP);
+  const byAge = await jsonRows<{ bucket: string; gross: number; net: number }>(input.clickhouse, buildByAgeSql(pG, input.authUserId, req.dateFrom, req.dateTo, memberWhere(pG)), pG);
   const numify = <T,>(rows: T[]): T[] => rows.map((row) => {
     const out: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(row as Record<string, unknown>)) {
@@ -575,6 +618,7 @@ export async function runRevenueIntelligence(input: {
     dateTo: req.dateTo,
     snapshot: active,
     now: input.now ?? new Date(),
+    filtersActive: req.filtersActive,
   });
   return {
     ok: true, source: "clickhouse", action: "bundle",
@@ -629,8 +673,10 @@ export async function runRevenueDayBreakdown(input: {
   const pB = { ...base } as Record<string, unknown>;
   const pU = { ...base } as Record<string, unknown>;
   const [rows, [unatt]] = await Promise.all([
-    jsonRows<Record<string, unknown>>(input.clickhouse, buildDayBreakdownSql(pB, input.authUserId, day), pB),
-    jsonRows<{ gross?: unknown; net?: unknown }>(input.clickhouse, buildDayUnattributedSql(pU, input.authUserId, day), pU),
+    jsonRows<Record<string, unknown>>(input.clickhouse, buildDayBreakdownSql(pB, input.authUserId, day, activeCohortMemberWhere(req.filters, pB)), pB),
+    req.filtersActive
+      ? Promise.resolve([] as Array<{ gross?: unknown; net?: unknown }>)
+      : jsonRows<{ gross?: unknown; net?: unknown }>(input.clickhouse, buildDayUnattributedSql(pU, input.authUserId, day), pU),
   ]);
   const detailed = rows.map((row) => ({
     cohort_date: s(row.cohort_date),
