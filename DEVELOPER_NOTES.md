@@ -154,6 +154,20 @@ survives). Number rendering must stay round-trippable: `extractNumbers` sees
 space-thousands format. The Cohorts page publishes the grain the table
 shows (path items in Funnels mode); the client slices packs to 120 items.
 
+**Wave 3 additions.** §18 history: AiAnalysisPanel lazily loads past
+verdicts for its scope from the ai_recommendations snapshots
+(extractAiActionHistory collapses consecutive identical verdicts keeping the
+first date; scoped to the SAME contextHash — verdicts across filter contexts
+are not comparable; the line renders only when the verdict changed). §6
+warehouse AI Action: txByCampaignCTE additionally computes
+first_subscription_users, user-based refund_users and anyHeavyIf
+campaign_path; fbWarehouseAiAdapter maps the blend onto the engine's
+campaign input (campaign level only, no daily series → trend missing there).
+§20 Budget Planner: pure aiBudgetPlanner allocates additional budget over
+SCALE candidates only (cap = 2x the recommended step, remainder = Reserve),
+three goals (profit = net/spend, payback = observed days, risk = engine
+confidence), linear projection with explicit notes; dialog on FB Analytics.
+
 **Storage & keys.** `ai_assistant_runs` (audit, one row per call; the edge
 returns `runId`), `ai_recommendations` (append-only snapshots with a
 mutation-guard trigger), `ai_feedback`. Feedback subject ids:

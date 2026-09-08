@@ -21,7 +21,9 @@ import { Bar, BarChart, CartesianGrid, XAxis, YAxis } from "recharts";
 import { AppLayout } from "@/components/AppLayout";
 import { AiActionChip } from "@/components/ai/AiActionChip";
 import { AiAnalysisPanel } from "@/components/ai/AiAnalysisPanel";
+import { AiBudgetPlanner } from "@/components/ai/AiBudgetPlanner";
 import { AiOpportunities } from "@/components/ai/AiOpportunities";
+import { budgetCandidateFromCampaignRow, type BudgetCandidate } from "@/services/aiBudgetPlanner";
 import { useAiCampaignSignals } from "@/hooks/useAiCohortSignals";
 import { buildCampaignDailySeries } from "@/services/aiCampaignSeries";
 import { stableJson } from "@/services/aiRecommendationLog";
@@ -830,6 +832,18 @@ export default function FBAnalyticsPage() {
     warehouseVersion: aiWarehouseVersion,
     contextKey: aiContextKey,
   });
+  // Budget Planner (§20): candidates are the engine's SCALE campaigns with
+  // their observed economics; totals give the profit baseline.
+  const aiBudgetCandidates = useMemo(
+    () => result.rows
+      .map((row) => budgetCandidateFromCampaignRow(row, aiCampaigns.byCampaign.get(row.campaign_id)))
+      .filter((candidate): candidate is BudgetCandidate => candidate !== null),
+    [result.rows, aiCampaigns.byCampaign],
+  );
+  const aiBudgetTotals = useMemo(
+    () => ({ spend: result.summary.spend ?? 0, netRevenue: result.summary.netRevenue }),
+    [result.summary],
+  );
   // Single-open diagnosis (Banks accordion pattern): a campaign diagnosis is a
   // comparison against its peers, two open at once just fights for attention.
   const [aiExpandedCampaignId, setAiExpandedCampaignId] = useState<string | null>(null);
@@ -1322,6 +1336,11 @@ export default function FBAnalyticsPage() {
           </Card>
         </div>
 
+        {aiCampaigns.output && (
+          <div className="flex flex-wrap items-start gap-2">
+            <AiBudgetPlanner candidates={aiBudgetCandidates} totals={aiBudgetTotals} />
+          </div>
+        )}
         {aiCampaigns.output && (
           <AiOpportunities
             opportunities={aiCampaigns.output.opportunities}
