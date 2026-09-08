@@ -544,15 +544,18 @@ export async function runRevenueIntelligence(input: {
   }
   const base = { auth_user_id: input.authUserId, warehouse_version: active.warehouse_version, classification_version: active.classification_version };
   const p = () => ({ ...base } as Record<string, unknown>);
+  // SEQUENTIAL on purpose: four of these run the full classifier CTE chain
+  // (JOIN + window functions), and firing them in parallel exhausted the
+  // ClickHouse instance into a 25s timeout (measured live: one classifier
+  // pass ≈ 330ms, six concurrent ≈ never finishes). Serialized, the whole
+  // bundle lands in ~2s.
   const pA = p(), pU = p(), pS = p(), pF = p(), pP = p(), pG = p();
-  const [attributed, unattributed, spend, byFunnel, byPlan, byAge] = await Promise.all([
-    jsonRows<AttributedDailyRow>(input.clickhouse, buildAttributedDailySql(pA, input.authUserId), pA),
-    jsonRows<UnattributedDailyRow>(input.clickhouse, buildUnattributedDailySql(pU, input.authUserId), pU),
-    jsonRows<SpendDailyRow>(input.clickhouse, buildSpendDailySql(pS, input.authUserId), pS),
-    jsonRows<{ key: string; gross: number; net: number; gross_new: number; gross_existing: number }>(input.clickhouse, buildByFunnelSql(pF, input.authUserId, req.dateFrom, req.dateTo), pF),
-    jsonRows<{ key: string; gross: number; net: number; gross_new: number; gross_existing: number }>(input.clickhouse, buildByPlanSql(pP, input.authUserId, req.dateFrom, req.dateTo), pP),
-    jsonRows<{ bucket: string; gross: number; net: number }>(input.clickhouse, buildByAgeSql(pG, input.authUserId, req.dateFrom, req.dateTo), pG),
-  ]);
+  const attributed = await jsonRows<AttributedDailyRow>(input.clickhouse, buildAttributedDailySql(pA, input.authUserId), pA);
+  const unattributed = await jsonRows<UnattributedDailyRow>(input.clickhouse, buildUnattributedDailySql(pU, input.authUserId), pU);
+  const spend = await jsonRows<SpendDailyRow>(input.clickhouse, buildSpendDailySql(pS, input.authUserId), pS);
+  const byFunnel = await jsonRows<{ key: string; gross: number; net: number; gross_new: number; gross_existing: number }>(input.clickhouse, buildByFunnelSql(pF, input.authUserId, req.dateFrom, req.dateTo), pF);
+  const byPlan = await jsonRows<{ key: string; gross: number; net: number; gross_new: number; gross_existing: number }>(input.clickhouse, buildByPlanSql(pP, input.authUserId, req.dateFrom, req.dateTo), pP);
+  const byAge = await jsonRows<{ bucket: string; gross: number; net: number }>(input.clickhouse, buildByAgeSql(pG, input.authUserId, req.dateFrom, req.dateTo), pG);
   const numify = <T,>(rows: T[]): T[] => rows.map((row) => {
     const out: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(row as Record<string, unknown>)) {
