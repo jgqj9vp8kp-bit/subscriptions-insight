@@ -355,6 +355,26 @@ export function bucketStart(day: string, bucket: RevenueBucket): string {
   return dateObj.toISOString().slice(0, 10);
 }
 
+/** Last calendar day of the bucket containing `day`. Together with
+ * bucketStart this aligns a requested window to whole buckets — REQUIRED at
+ * week/month grain: the bucket rows always cover their full calendar span, so
+ * the slice queries (by_funnel/by_plan/by_age, windowed by raw dates) would
+ * otherwise cover a smaller span and invariant 3 (Σ slice = totals.gross)
+ * breaks. Measured live before the fix: week totals 54,920 vs Σ by_funnel
+ * 46,277 for a Wed..Thu window. */
+export function bucketEndDay(day: string, bucket: RevenueBucket): string {
+  if (bucket === "day") return day;
+  const dateObj = new Date(`${bucketStart(day, bucket)}T00:00:00Z`);
+  if (Number.isNaN(dateObj.getTime())) return day;
+  if (bucket === "week") {
+    dateObj.setUTCDate(dateObj.getUTCDate() + 6);
+  } else {
+    dateObj.setUTCMonth(dateObj.getUTCMonth() + 1);
+    dateObj.setUTCDate(dateObj.getUTCDate() - 1);
+  }
+  return dateObj.toISOString().slice(0, 10);
+}
+
 function emptyType(): RevenueByType {
   return { trial: 0, first_subscription: 0, renewals: 0, upsells: 0, tokens: 0 };
 }
@@ -582,6 +602,13 @@ export async function runRevenueIntelligence(input: {
   }
   const base = { auth_user_id: input.authUserId, warehouse_version: active.warehouse_version, classification_version: active.classification_version };
   const p = () => ({ ...base } as Record<string, unknown>);
+  // Align the requested window to WHOLE buckets: the bucket rows always cover
+  // their full calendar span (a week row is a full ISO week), so every
+  // windowed stream — the slice queries below and the assembly slicing — must
+  // see the same expanded span or invariant 3 (Σ slice = totals.gross) breaks
+  // at week/month grain with a mid-bucket window.
+  const effFrom = req.dateFrom ? bucketStart(req.dateFrom, req.bucket) : null;
+  const effTo = req.dateTo ? bucketEndDay(req.dateTo, req.bucket) : null;
   // SEQUENTIAL on purpose: four of these run the full classifier CTE chain
   // (JOIN + window functions), and firing them in parallel exhausted the
   // ClickHouse instance into a 25s timeout (measured live: one classifier
@@ -596,9 +623,9 @@ export async function runRevenueIntelligence(input: {
   const attributed = await jsonRows<AttributedDailyRow>(input.clickhouse, buildAttributedDailySql(pA, input.authUserId, memberWhere(pA)), pA);
   const unattributed = req.filtersActive ? [] : await jsonRows<UnattributedDailyRow>(input.clickhouse, buildUnattributedDailySql(pU, input.authUserId), pU);
   const spend = req.filtersActive ? [] : await jsonRows<SpendDailyRow>(input.clickhouse, buildSpendDailySql(pS, input.authUserId), pS);
-  const byFunnel = await jsonRows<{ key: string; gross: number; net: number; gross_new: number; gross_existing: number }>(input.clickhouse, buildByFunnelSql(pF, input.authUserId, req.dateFrom, req.dateTo, memberWhere(pF)), pF);
-  const byPlan = await jsonRows<{ key: string; gross: number; net: number; gross_new: number; gross_existing: number }>(input.clickhouse, buildByPlanSql(pP, input.authUserId, req.dateFrom, req.dateTo, memberWhere(pP)), pP);
-  const byAge = await jsonRows<{ bucket: string; gross: number; net: number }>(input.clickhouse, buildByAgeSql(pG, input.authUserId, req.dateFrom, req.dateTo, memberWhere(pG)), pG);
+  const byFunnel = await jsonRows<{ key: string; gross: number; net: number; gross_new: number; gross_existing: number }>(input.clickhouse, buildByFunnelSql(pF, input.authUserId, effFrom, effTo, memberWhere(pF)), pF);
+  const byPlan = await jsonRows<{ key: string; gross: number; net: number; gross_new: number; gross_existing: number }>(input.clickhouse, buildByPlanSql(pP, input.authUserId, effFrom, effTo, memberWhere(pP)), pP);
+  const byAge = await jsonRows<{ bucket: string; gross: number; net: number }>(input.clickhouse, buildByAgeSql(pG, input.authUserId, effFrom, effTo, memberWhere(pG)), pG);
   const numify = <T,>(rows: T[]): T[] => rows.map((row) => {
     const out: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(row as Record<string, unknown>)) {
@@ -614,8 +641,8 @@ export async function runRevenueIntelligence(input: {
     byPlan: numify(byPlan),
     byAge: numify(byAge),
     bucket: req.bucket,
-    dateFrom: req.dateFrom,
-    dateTo: req.dateTo,
+    dateFrom: effFrom,
+    dateTo: effTo,
     snapshot: active,
     now: input.now ?? new Date(),
     filtersActive: req.filtersActive,

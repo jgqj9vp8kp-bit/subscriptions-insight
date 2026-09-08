@@ -11,6 +11,7 @@ import {
   buildDayBreakdownSql,
   buildSpendDailySql,
   buildUnattributedDailySql,
+  bucketEndDay,
   normalizeRevenueFilters,
   normalizeRevenueRequest,
   rollupDayCohorts,
@@ -93,6 +94,16 @@ describe("bucketStart", () => {
     expect(bucketStart("2026-09-08", "week")).toBe("2026-09-07"); // Tue → Mon
     expect(bucketStart("2026-09-07", "week")).toBe("2026-09-07"); // Mon stays
     expect(bucketStart("2026-09-08", "month")).toBe("2026-09-01");
+  });
+
+  it("bucketEndDay closes the bucket: same day, ISO Sunday, month's last day", () => {
+    expect(bucketEndDay("2026-09-08", "day")).toBe("2026-09-08");
+    expect(bucketEndDay("2026-09-08", "week")).toBe("2026-09-13"); // Tue → Sun
+    expect(bucketEndDay("2026-09-13", "week")).toBe("2026-09-13"); // Sun stays
+    expect(bucketEndDay("2026-09-08", "month")).toBe("2026-09-30");
+    expect(bucketEndDay("2026-02-10", "month")).toBe("2026-02-28");
+    expect(bucketEndDay("2028-02-10", "month")).toBe("2028-02-29"); // leap year
+    expect(bucketEndDay("2026-12-15", "month")).toBe("2026-12-31"); // year boundary
   });
 });
 
@@ -273,6 +284,54 @@ describe("cohort-grain filters (P8)", () => {
     expect(result.diagnostics.filters_active).toBe(true);
     expect(result.totals.spend).toBe(0);
     expect(result.totals.gross_unattributed).toBe(0);
+  });
+
+  it("aligns the slice-query window to WHOLE buckets at week/month grain (invariant 3's fuel)", async () => {
+    // 2026-09-02 is a Wednesday, 2026-09-03 a Thursday — both mid-bucket.
+    // Before this alignment, live week totals were 54,920 while Σ by_funnel
+    // was 46,277: the bucket rows covered full weeks, the slices only the raw
+    // window. All windowed streams must see the same expanded span.
+    const week: Array<{ query: string; params: Record<string, unknown> }> = [];
+    const weekBundle = await runRevenueIntelligence({
+      authUserId: "owner-1",
+      supabase: activeSnapshotSupabase(),
+      clickhouse: recordingClickhouse(week),
+      request: { bucket: "week", date_from: "2026-09-02", date_to: "2026-09-03" },
+    });
+    const weekWindows = week.filter((entry) => "win_from" in entry.params);
+    expect(weekWindows.length).toBeGreaterThan(0);
+    for (const entry of weekWindows) {
+      expect(entry.params.win_from).toBe("2026-08-31"); // ISO Monday
+      expect(entry.params.win_to).toBe("2026-09-06"); // ISO Sunday
+    }
+    expect(weekBundle.date_from).toBe("2026-08-31");
+    expect(weekBundle.date_to).toBe("2026-09-06");
+
+    const month: Array<{ query: string; params: Record<string, unknown> }> = [];
+    await runRevenueIntelligence({
+      authUserId: "owner-1",
+      supabase: activeSnapshotSupabase(),
+      clickhouse: recordingClickhouse(month),
+      request: { bucket: "month", date_from: "2026-09-02", date_to: "2026-09-03" },
+    });
+    for (const entry of month.filter((e) => "win_from" in e.params)) {
+      expect(entry.params.win_from).toBe("2026-09-01");
+      expect(entry.params.win_to).toBe("2026-09-30");
+    }
+
+    // Day grain stays byte-identical to the request.
+    const day: Array<{ query: string; params: Record<string, unknown> }> = [];
+    const dayBundle = await runRevenueIntelligence({
+      authUserId: "owner-1",
+      supabase: activeSnapshotSupabase(),
+      clickhouse: recordingClickhouse(day),
+      request: { bucket: "day", date_from: "2026-09-02", date_to: "2026-09-03" },
+    });
+    for (const entry of day.filter((e) => "win_from" in e.params)) {
+      expect(entry.params.win_from).toBe("2026-09-02");
+      expect(entry.params.win_to).toBe("2026-09-03");
+    }
+    expect(dayBundle.date_from).toBe("2026-09-02");
   });
 
   it("no filters → full six-query bundle with filters_active false", async () => {

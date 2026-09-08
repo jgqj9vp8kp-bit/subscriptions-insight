@@ -145,6 +145,10 @@ export interface RevenueIntelligenceBundle {
   generated_at: string;
   query_duration_ms: number;
   bucket: RevenueBucket;
+  /** EFFECTIVE window, aligned to whole buckets (a mid-week date_from expands
+   * to its ISO Monday, date_to to the bucket's last day) so bucket rows,
+   * totals and the by_* slices all cover the same span — invariant 3 depends
+   * on this. At day grain these equal the requested dates. */
   date_from: string | null;
   date_to: string | null;
   buckets: RevenueBucketRow[];
