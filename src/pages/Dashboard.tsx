@@ -34,6 +34,7 @@ import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { KpiCard } from "@/components/KpiCard";
+import { RevenueIntelligenceSection } from "@/components/RevenueIntelligenceSection";
 import {
   Select,
   SelectContent,
@@ -689,6 +690,10 @@ export default function Dashboard() {
           <p className="mt-1 text-sm text-muted-foreground">Import Palmer data on the Import Data page to populate Dashboard charts.</p>
         </Card>
       )}
+
+      {/* Calendar revenue decomposition (server-side, project-wide — the global
+          filters above do not apply to it; see the section's own controls). */}
+      <RevenueIntelligenceSection />
 
       <section className="space-y-3">
         <SectionHeader
