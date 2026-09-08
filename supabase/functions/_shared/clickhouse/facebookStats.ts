@@ -940,6 +940,13 @@ export function deriveMetricTotals(row: Record<string, unknown>): FbMetricTotals
 // on campaign-level rows; every value is computed server-side in ClickHouse.
 export interface FbBlendedMetrics {
   trial_users: number;
+  /** Unique users whose first_subscription succeeded (AI engine's conversion axis). */
+  first_subscription_users: number;
+  /** Unique users with any refund (user-based, matching the campaign AI surface). */
+  refund_users: number;
+  /** Dominant campaign_path of the campaign's transactions — the AI engine's
+   * peer-pool key. '' when the transactions carry no path. */
+  campaign_path: string;
   tx_gross_revenue: number;
   tx_net_revenue: number;
   cac: number | null;
@@ -985,6 +992,9 @@ function txByCampaignCTE(filters: FbReadFilters, params: Record<string, unknown>
   return `
     SELECT campaign_id,
       uniqExactIf(user_id, is_trial = 1 AND is_success = 1) trial_users,
+      uniqExactIf(user_id, is_first_subscription = 1) first_sub_users,
+      uniqExactIf(user_id, refund_amount_usd > 0) refund_users,
+      anyHeavyIf(campaign_path, campaign_path != '') tx_campaign_path,
       sumIf(gross_amount_usd, is_success = 1) tx_gross,
       sum(refund_amount_usd) tx_refunds
     FROM ${ANALYTICS_TRANSACTIONS_TABLE} FINAL
@@ -998,6 +1008,9 @@ function blendedFromRow(r: Record<string, unknown>, spend: number): FbBlendedMet
   const net = gross - n(r.tx_refunds);
   return {
     trial_users: trials,
+    first_subscription_users: n(r.first_sub_users),
+    refund_users: n(r.refund_users),
+    campaign_path: s(r.tx_campaign_path),
     tx_gross_revenue: round2(gross),
     tx_net_revenue: round2(net),
     cac: trials > 0 && spend > 0 ? round2(spend / trials) : null,
@@ -1022,7 +1035,9 @@ export async function runFbList(client: ClickHouseClientLike, authUserId: string
   const groupBy = keys.map((k) => `${prefix}${k}`).join(", ");
   const selectKeys = keys.map((k) => `${prefix}${k} AS ${k}`).join(", ");
   const blendJoin = blend ? `LEFT JOIN (${txByCampaignCTE(filters, params)}) AS tx ON tx.campaign_id = fb.campaign_id` : "";
-  const blendCols = blend ? `, any(tx.trial_users) trial_users, any(tx.tx_gross) tx_gross, any(tx.tx_refunds) tx_refunds` : "";
+  const blendCols = blend
+    ? `, any(tx.trial_users) trial_users, any(tx.first_sub_users) first_sub_users, any(tx.refund_users) refund_users, any(tx.tx_campaign_path) tx_campaign_path, any(tx.tx_gross) tx_gross, any(tx.tx_refunds) tx_refunds`
+    : "";
   const sql = `
     SELECT ${selectKeys},
       argMax(ad_account_name, stat_date) ad_account_name,
@@ -1330,7 +1345,7 @@ export async function runFbReport(input: {
         cac: mappingSummary.blended.trial_users > 0 && totals.spend > 0 ? Math.round((totals.spend / mappingSummary.blended.trial_users) * 100) / 100 : null,
         roas: totals.spend > 0 ? Math.round((mappingSummary.blended.tx_net_revenue / totals.spend) * 100) / 100 : null,
       }
-    : { trial_users: 0, tx_gross_revenue: 0, tx_net_revenue: 0, cac: null, roas: null, revenue_per_trial: null };
+    : { trial_users: 0, first_subscription_users: 0, refund_users: 0, campaign_path: "", tx_gross_revenue: 0, tx_net_revenue: 0, cac: null, roas: null, revenue_per_trial: null };
   return {
     ok: true,
     source: "clickhouse",

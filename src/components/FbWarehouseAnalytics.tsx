@@ -3,9 +3,15 @@
 // from the clickhouse-facebook Edge Function as ONE atomic report bundle.
 // The browser performs no analytics and never sees the Capsuled token.
 
-import { useMemo, useState } from "react";
+import { Fragment, useMemo, useState } from "react";
 import { Area, AreaChart, CartesianGrid, XAxis, YAxis } from "recharts";
 import { Loader2, RefreshCw } from "lucide-react";
+import { AiActionChip } from "@/components/ai/AiActionChip";
+import { AiAnalysisPanel } from "@/components/ai/AiAnalysisPanel";
+import { useAiCampaignSignals } from "@/hooks/useAiCohortSignals";
+import { useWarehouseVersion } from "@/hooks/useAnalyticsCache";
+import { aiCampaignRowFromWarehouse } from "@/services/fbWarehouseAiAdapter";
+import { stableJson } from "@/services/aiRecommendationLog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -193,6 +199,34 @@ export function FbWarehouseAnalytics(): JSX.Element {
     }));
   };
 
+  // AI Action (brief §6): the campaign-level rows already blend FB metrics
+  // with Subengine economics, which is exactly the engine's campaign input.
+  // No daily series here — the trend axis stays "missing" and rung 5a covers
+  // converting over-ceiling campaigns; adset/ad/account levels get no verdicts
+  // (transactions carry no adset/ad ids).
+  const { version: aiWarehouseVersion } = useWarehouseVersion(Boolean(user));
+  const aiRows = useMemo(
+    () => (ui.level === "campaign"
+      ? (report?.rows ?? []).map(aiCampaignRowFromWarehouse).filter((row): row is NonNullable<typeof row> => row !== null)
+      : []),
+    [report, ui.level],
+  );
+  const aiContextKey = useMemo(
+    () => stableJson({ surface: "fb-warehouse", range: ui.range, buyer: ui.buyer, account: ui.account }),
+    [ui.range, ui.buyer, ui.account],
+  );
+  const aiCampaigns = useAiCampaignSignals({
+    rows: aiRows,
+    enabled: ui.level === "campaign" && aiRows.length > 0,
+    dateFrom: query.date_from ?? null,
+    dateTo: query.date_to ?? null,
+    userScopeHash,
+    warehouseVersion: aiWarehouseVersion,
+    contextKey: aiContextKey,
+  });
+  const [aiExpandedKey, setAiExpandedKey] = useState<string | null>(null);
+  const showAiColumn = ui.level === "campaign";
+
   const d = report?.diagnostics;
   const summary = report?.summary;
 
@@ -372,26 +406,49 @@ export function FbWarehouseAnalytics(): JSX.Element {
                     {ui.sortKey === col.key ? (ui.sortDir === "desc" ? " ↓" : " ↑") : ""}
                   </TableHead>
                 ))}
+                {showAiColumn && <TableHead className="whitespace-nowrap">AI</TableHead>}
               </TableRow>
             </TableHeader>
             <TableBody>
               {rows.map((row) => {
                 const label = entityLabel(row, ui.level);
+                const aiRec = showAiColumn ? aiCampaigns.byCampaign.get(row.campaign_id) ?? null : null;
+                const aiExpanded = aiRec != null && aiExpandedKey === row.key;
                 return (
-                  <TableRow key={row.key}>
-                    <TableCell>
-                      <div className="max-w-96 truncate font-medium" title={label.title}>{label.title}</div>
-                      <div className="max-w-96 truncate text-xs text-muted-foreground" title={label.subtitle}>{label.subtitle}</div>
-                    </TableCell>
-                    {columns.map((col) => (
-                      <TableCell key={col.key} className="text-right tabular-nums">{col.render(row)}</TableCell>
-                    ))}
-                  </TableRow>
+                  <Fragment key={row.key}>
+                    <TableRow>
+                      <TableCell>
+                        <div className="max-w-96 truncate font-medium" title={label.title}>{label.title}</div>
+                        <div className="max-w-96 truncate text-xs text-muted-foreground" title={label.subtitle}>{label.subtitle}</div>
+                      </TableCell>
+                      {columns.map((col) => (
+                        <TableCell key={col.key} className="text-right tabular-nums">{col.render(row)}</TableCell>
+                      ))}
+                      {showAiColumn && (
+                        <TableCell className="whitespace-nowrap">
+                          {aiRec ? (
+                            <button type="button" onClick={() => setAiExpandedKey(aiExpanded ? null : row.key)} aria-expanded={aiExpanded}>
+                              <AiActionChip rec={aiRec} />
+                            </button>
+                          ) : (
+                            <span className="text-xs text-muted-foreground">—</span>
+                          )}
+                        </TableCell>
+                      )}
+                    </TableRow>
+                    {aiExpanded && aiRec && (
+                      <TableRow className="bg-muted/10 hover:bg-muted/10">
+                        <TableCell colSpan={columns.length + 2} className="px-4">
+                          <AiAnalysisPanel rec={aiRec} history={{ surface: "campaign", contextHash: aiCampaigns.contextHash }} />
+                        </TableCell>
+                      </TableRow>
+                    )}
+                  </Fragment>
                 );
               })}
               {!rows.length && !isInitialLoading && (
                 <TableRow>
-                  <TableCell colSpan={columns.length + 1} className="py-8 text-center text-muted-foreground">
+                  <TableCell colSpan={columns.length + (showAiColumn ? 2 : 1)} className="py-8 text-center text-muted-foreground">
                     {status?.state ? "No rows in this scope. Try a wider date range or run a sync." : "Warehouse is empty — run Full sync to load Capsuled history."}
                   </TableCell>
                 </TableRow>

@@ -401,7 +401,8 @@ describe("blended Subengine metrics — joined BY CAMPAIGN_ID", () => {
             adset_name: "", ad_name: "", first_date: "2026-07-01", last_date: "2026-07-14", days: 14,
             spend: 500, impressions: 10000, clicks: 200, outbound_clicks: 150, fb_purchases: 10,
             purchase_value: 0, reach: 0, link_clicks: 0,
-            trial_users: 25, tx_gross: 1000, tx_refunds: 100,
+            trial_users: 25, first_sub_users: 11, refund_users: 2, tx_campaign_path: "soulmate-web",
+            tx_gross: 1000, tx_refunds: 100,
           }],
         };
       },
@@ -422,9 +423,18 @@ describe("blended Subengine metrics — joined BY CAMPAIGN_ID", () => {
     expect(captured.params?.tx_date_from).toBe("2026-07-01");
     expect(captured.params?.tx_date_to).toBe("2026-07-14");
 
+    // The AI engine's campaign fields ride the same CTE (brief §6): the SQL
+    // must compute them, and the mapper must carry them through.
+    expect(captured.sql).toContain("uniqExactIf(user_id, is_first_subscription = 1) first_sub_users");
+    expect(captured.sql).toContain("uniqExactIf(user_id, refund_amount_usd > 0) refund_users");
+    expect(captured.sql).toContain("anyHeavyIf(campaign_path, campaign_path != '') tx_campaign_path");
+
     const row = rows[0];
     expect(row.blended).toBeDefined();
     expect(row.blended!.trial_users).toBe(25);
+    expect(row.blended!.first_subscription_users).toBe(11);
+    expect(row.blended!.refund_users).toBe(2);
+    expect(row.blended!.campaign_path).toBe("soulmate-web");
     expect(row.blended!.tx_gross_revenue).toBe(1000);
     expect(row.blended!.tx_net_revenue).toBe(900); // gross - refunds
     expect(row.blended!.cac).toBe(20); // 500 / 25
@@ -533,7 +543,7 @@ describe("frontend cache versioning", () => {
       ok: true, source: "clickhouse", generated_at: "2026-07-15T12:00:00Z", query_duration_ms: 10,
       level: "campaign", rows: [], charts: [], filter_options: { buyers: [], accounts: [], campaigns: [], date_min: null, date_max: null },
       diagnostics: { engine: "clickhouse" },
-      summary: { spend: 0, blended: { trial_users: 0, tx_gross_revenue: 0, tx_net_revenue: 0, cac: null, roas: null, revenue_per_trial: null } },
+      summary: { spend: 0, blended: { trial_users: 0, first_subscription_users: 0, refund_users: 0, campaign_path: "", tx_gross_revenue: 0, tx_net_revenue: 0, cac: null, roas: null, revenue_per_trial: null } },
     } as unknown as FbReportResponse;
     expect(isCompleteFbReport(complete)).toBe(true);
     // A bundle persisted before summary.blended existed must be rejected, not crash the KPI cards.
