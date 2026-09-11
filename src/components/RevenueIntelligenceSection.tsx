@@ -273,13 +273,16 @@ export function RevenueIntelligenceSection(): JSX.Element {
     const total = basisKey === "gross" ? row.gross : row.net;
     const nw = basisKey === "gross" ? row.gross_new : row.net_new;
     const ex = basisKey === "gross" ? row.gross_existing : row.net_existing;
-    const newPct = total > 0 ? Math.round((nw / total) * 1000) / 10 : 0;
-    const existPct = total > 0 ? Math.round((ex / total) * 1000) / 10 : 0;
+    // A bucket with no revenue (today's empty partial bucket) has no
+    // composition — null leaves a gap instead of drawing a cliff to 0%.
+    if (total <= 0) return { date: row.date, new_pct: null, existing_pct: null, unatt_pct: null };
+    const newPct = Math.round((nw / total) * 1000) / 10;
+    const existPct = Math.round((ex / total) * 1000) / 10;
     return {
       date: row.date,
       new_pct: newPct,
       existing_pct: existPct,
-      unatt_pct: total > 0 ? Math.max(0, Math.round((100 - newPct - existPct) * 10) / 10) : 0,
+      unatt_pct: Math.max(0, Math.round((100 - newPct - existPct) * 10) / 10),
     };
   }), [bundle, basisKey]);
 
@@ -458,7 +461,7 @@ export function RevenueIntelligenceSection(): JSX.Element {
                 <AreaChart data={compositionData} margin={{ left: 8, right: 8, top: 8 }}>
                   <CartesianGrid vertical={false} strokeDasharray="3 3" />
                   <XAxis dataKey="date" tickLine={false} axisLine={false} minTickGap={28} fontSize={11} />
-                  <YAxis domain={[0, 100]} tickFormatter={(value) => `${value}%`} tickLine={false} axisLine={false} width={40} fontSize={11} />
+                  <YAxis domain={[0, 100]} ticks={[0, 25, 50, 75, 100]} tickFormatter={(value) => `${value}%`} tickLine={false} axisLine={false} width={44} fontSize={11} />
                   <ChartTooltip content={<ChartTooltipContent />} />
                   <Area dataKey="new_pct" stackId="pct" fill="var(--color-new_pct)" stroke="var(--color-new_pct)" fillOpacity={0.5} />
                   <Area dataKey="existing_pct" stackId="pct" fill="var(--color-existing_pct)" stroke="var(--color-existing_pct)" fillOpacity={0.35} />

@@ -1120,10 +1120,16 @@ export default function CohortsPage() {
   // "Open in Cohorts" bridge from the Dashboard Revenue Intelligence drilldown:
   // ?cohort_date=YYYY-MM-DD prefills the cohort date window once, then the
   // param is dropped from the URL so a reload keeps whatever the user set next.
+  // The date is ALSO parked in a ref: the saved-view restore below replaces
+  // the whole uiState after the session resolves (applyCohortsUiSettings), so
+  // a mount-time setUiState alone was silently wiped — the ref re-applies the
+  // date on top of the restored filters, once.
+  const pendingCohortDateRef = useRef<string | null>(null);
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const day = params.get("cohort_date");
     if (!day || !/^\d{4}-\d{2}-\d{2}$/.test(day)) return;
+    pendingCohortDateRef.current = day;
     setUiState((prev) => ({ ...prev, cohortDateFrom: day, cohortDateTo: day }));
     params.delete("cohort_date");
     const query = params.toString();
@@ -1392,7 +1398,16 @@ export default function CohortsPage() {
       setColumnWidths(sanitized.columnWidths);
       const nextCustomViews = sanitized.savedViews.map(fromCloudSavedView);
       setCustomViews(nextCustomViews);
-      setUiState({ ...DEFAULT_COHORTS_UI_STATE, ...sanitized.filters });
+      // A date handed over by the Dashboard drilldown link wins over the
+      // restored view's date window — consumed once, so a later manual
+      // "Load settings from cloud" restores the saved window untouched.
+      const pendingDay = pendingCohortDateRef.current;
+      pendingCohortDateRef.current = null;
+      setUiState({
+        ...DEFAULT_COHORTS_UI_STATE,
+        ...sanitized.filters,
+        ...(pendingDay ? { cohortDateFrom: pendingDay, cohortDateTo: pendingDay } : {}),
+      });
       setActiveViewId(sanitized.selectedView);
       return true;
     },
@@ -1516,6 +1531,10 @@ export default function CohortsPage() {
           );
         }
       } finally {
+        // Whatever the restore decided, the drilldown date has now either been
+        // merged in (cloud view applied) or the mount-time setUiState stands
+        // (no cloud view) — it must not resurface on a later manual load.
+        pendingCohortDateRef.current = null;
         if (mounted) {
           skipNextCloudSaveRef.current = true;
           setCohortsUiCloudReady(true);

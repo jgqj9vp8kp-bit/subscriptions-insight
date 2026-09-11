@@ -420,6 +420,23 @@ Client caching rides the shared analyticsCache pattern: root `"revenue"` in
 the normalized request (`revenueCache.ts`); adding the root required the
 `ANALYTICS_CACHE_SCHEMA_VERSION` bump to 15.
 
+Review-hardened rules (adversarial review 2026-09, all confirmed findings
+fixed): the slice queries (by_funnel/by_plan) take the SAME
+`sameBucketPredicate(bucket)` as the daily query — a same-day slice next to a
+same-month KPI is a visible contradiction; existing = successful − new so
+future-cohort rows never vanish from both columns. The requested window is
+expanded to WHOLE buckets (`bucketStart`/`bucketEndDay`) before any slice
+query, or Σ slice ≠ totals at week/month grain. `csvCell` must never de-fang
+numbers (a negative profit shipped as the text `'-123.45`). In the section,
+everything that captions the numbers derives from the DISPLAYED bundle
+(`diagnostics.filters_active`, `bundle.bucket`), never from the controls —
+keepPreviousData keeps the previous bundle on screen during a refetch.
+`KpiCard` colors the accent only on the icon container: no `icon`, no
+accent. The drilldown's "Open in Cohorts" link passes `?cohort_date=D`;
+Cohorts consumes it once on mount AND re-applies it inside
+`applyCohortsUiSettings`, because the saved-view restore replaces the whole
+uiState after the session resolves and silently wiped a mount-time set.
+
 ## Mail.ru Support Inbox
 
 STALE: the section below describes the original Mail.ru sync writing to
