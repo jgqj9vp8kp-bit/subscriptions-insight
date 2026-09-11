@@ -61,9 +61,13 @@ export function useRevenueDayBreakdown(params: {
   enabled: boolean;
 }): { breakdown: RevenueDayBreakdown | null; loading: boolean; error: string | null } {
   const { date, request, userScopeHash, warehouseVersion, enabled } = params;
+  // Only the day and the member filters shape a day_breakdown response — the
+  // server ignores bucket/date_from/date_to. Stripping them from the request
+  // (and hence the key) keeps a cached drilldown valid across a range or
+  // grain switch instead of refetching identical data.
   const dayRequest = useMemo<RevenueIntelligenceRequest>(
-    () => ({ ...request, action: "day_breakdown", date: date ?? undefined }),
-    [request, date],
+    () => ({ action: "day_breakdown", date: date ?? undefined, filters: request.filters }),
+    [request.filters, date],
   );
   const queryKey = useMemo(
     () => revenueDayKey({ userScopeHash, warehouseVersion, request: dayRequest }),
@@ -82,6 +86,13 @@ export function useRevenueDayBreakdown(params: {
   return {
     breakdown,
     loading: query.isFetching,
-    error: query.isError ? (query.error instanceof Error ? query.error.message : "Day breakdown failed") : null,
+    // An embedded ok:false (e.g. cohort_snapshot_not_ready) must surface the
+    // same way a transport error does — otherwise the drilldown renders a
+    // silently empty panel.
+    error: query.isError
+      ? (query.error instanceof Error ? query.error.message : "Day breakdown failed")
+      : breakdown && !breakdown.ok
+        ? breakdown.error ?? "Day breakdown failed"
+        : null,
   };
 }

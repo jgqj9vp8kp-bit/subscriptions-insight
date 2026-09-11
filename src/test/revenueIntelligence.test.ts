@@ -12,9 +12,12 @@ import {
   buildSpendDailySql,
   buildUnattributedDailySql,
   bucketEndDay,
+  buildByFunnelSql,
+  buildByPlanSql,
   normalizeRevenueFilters,
   normalizeRevenueRequest,
   rollupDayCohorts,
+  runRevenueDayBreakdown,
   runRevenueIntelligence,
   type AttributedDailyRow,
 } from "@/services/revenueIntelligence";
@@ -85,6 +88,26 @@ describe("SQL discipline", () => {
   it("rejects malformed dates and requires date for day_breakdown", () => {
     expect(() => normalizeRevenueRequest({ date_from: "08.09.2026" })).toThrow();
     expect(() => normalizeRevenueRequest({ action: "day_breakdown" })).toThrow();
+  });
+
+  it("slice queries pair New/Existing per the requested bucket — never same-day forever", () => {
+    // Review finding: the by_funnel/by_plan panels rendered next to the KPI
+    // cards must agree with them about what counts as New at every grain.
+    const day = buildByFunnelSql({}, "owner-1", null, null, "", "day");
+    expect(day).toContain("toDate(et) = c_d) gross_new");
+    const week = buildByFunnelSql({}, "owner-1", null, null, "", "week");
+    expect(week).toContain("toStartOfWeek(toDate(et), 1) = toStartOfWeek(c_d, 1)) gross_new");
+    const month = buildByPlanSql({}, "owner-1", null, null, "", "month");
+    expect(month).toContain("toStartOfMonth(toDate(et)) = toStartOfMonth(c_d)) gross_new");
+    // existing = successful − new, so future-cohort rows fold into Existing
+    // exactly as the bucket rows compute it (never dropped from both columns).
+    for (const sql of [day, week, month]) expect(sql).not.toContain("toDate(et) > c_d");
+  });
+
+  it("attributed and unattributed streams count only SUCCESSFUL rows as rows_scanned", () => {
+    for (const build of [buildAttributedDailySql, buildUnattributedDailySql]) {
+      expect(build({}, "owner-1")).toContain("countIf(is_success = 1) rows_scanned");
+    }
   });
 });
 
@@ -192,6 +215,10 @@ describe("reconciliation invariants (assembly)", () => {
     expect(windowed.buckets).toHaveLength(1);
     const fullD8 = bundle.buckets[1];
     expect(windowed.buckets[0].cumulative_profit).toBeCloseTo(fullD8.cumulative_profit, 2);
+    // rows_scanned reports the WINDOW's rows (contract), not the full history:
+    // d8 only = 60 attributed + 3 unattributed.
+    expect(windowed.diagnostics.rows_scanned).toBe(63);
+    expect(bundle.diagnostics.rows_scanned).toBe(123);
   });
 
   it("diagnostics report attribution coverage honestly", () => {
@@ -346,6 +373,52 @@ describe("cohort-grain filters (P8)", () => {
     expect(log.some((entry) => entry.query.includes("NOT IN (SELECT canonical_user_id"))).toBe(true);
     expect(log.some((entry) => entry.query.includes("level = 'campaign'"))).toBe(true);
     expect(result.diagnostics.filters_active).toBe(false);
+  });
+});
+
+describe("day breakdown reconciliation", () => {
+  it("carries the unattributed revenue in BOTH panels: by_cohort and by_funnel", async () => {
+    const supabase: SupabaseLikeClient = {
+      from() {
+        const builder = {
+          select: () => builder,
+          eq: () => builder,
+          maybeSingle: async () => ({
+            data: {
+              status: "completed",
+              active_warehouse_version: "wh",
+              active_classification_version: "cv",
+              duplicate_users: 0,
+              diagnostics: { validation: { status: "PASS", duplicate_users: 0, dynamic_users: 10, materialized_users: 10 } },
+            },
+            error: null,
+          }),
+        };
+        return builder as never;
+      },
+    };
+    const clickhouse: ClickHouseClientLike = {
+      command: async () => undefined,
+      insert: async () => undefined,
+      query: async (input: { query: string }) => ({
+        json: async () =>
+          input.query.includes("NOT IN")
+            ? [{ gross: "5.5", net: "5.5" }]
+            : [{ cohort_date: "2026-09-08", campaign_path: "soulmate-web", gross: "100", net: "98", type_trial: "100", type_first_sub: "0", type_renewals: "0", type_upsells: "0", type_tokens: "0" }],
+      }),
+    };
+    const result = await runRevenueDayBreakdown({
+      authUserId: "owner-1", supabase, clickhouse,
+      request: { action: "day_breakdown", date: "2026-09-08" },
+    });
+    expect(result.ok).toBe(true);
+    const cohortSum = result.by_cohort.reduce((sum, row) => sum + row.gross, 0);
+    const funnelSum = result.by_funnel.reduce((sum, row) => sum + row.gross, 0);
+    expect(cohortSum).toBeCloseTo(result.gross, 2);
+    // Review finding: by_funnel used to omit the unattributed 5.5, so the two
+    // panels on one screen summed to different day grosses.
+    expect(funnelSum).toBeCloseTo(result.gross, 2);
+    expect(result.by_funnel.some((row) => row.key === "Unattributed")).toBe(true);
   });
 });
 

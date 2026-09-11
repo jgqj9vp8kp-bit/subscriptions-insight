@@ -199,7 +199,7 @@ SELECT toString(toDate(et)) day,
   uniqExactIf(uid, is_success = 1 AND toDate(et) = c_d) new_paying_users_day,
   uniqExactIf(uid, is_success = 1 AND toStartOfWeek(toDate(et), 1) = toStartOfWeek(c_d, 1)) new_paying_users_week,
   uniqExactIf(uid, is_success = 1 AND toStartOfMonth(toDate(et)) = toStartOfMonth(c_d)) new_paying_users_month,
-  count() rows_scanned
+  countIf(is_success = 1) rows_scanned
 FROM fin
 GROUP BY day ORDER BY day
 FORMAT JSONEachRow`;
@@ -218,7 +218,7 @@ export function buildUnattributedDailySql(params: Record<string, unknown>, authU
 SELECT toString(toDate(event_time)) day,
   sumIf(gross_amount_usd, is_success = 1) gross,
   sum(floor(refund_amount_usd * 100 + 0.5) / 100) refunds,
-  count() rows_scanned
+  countIf(is_success = 1) rows_scanned
 FROM ${ANALYTICS_TRANSACTIONS_TABLE} FINAL
 WHERE auth_user_id = {auth_user_id:String}
   AND user_id NOT IN (SELECT canonical_user_id FROM snapshot_users)
@@ -244,31 +244,45 @@ function windowWhere(params: Record<string, unknown>, dateFrom: string | null, d
   return where;
 }
 
-/** Period slice by campaign_path ('' stays a distinct Unknown key). */
-export function buildByFunnelSql(params: Record<string, unknown>, authUserId: string, dateFrom: string | null, dateTo: string | null, memberWhere = ""): string {
+/** The same-bucket "new" pairing predicate for the requested grain — the ONE
+ * definition the slice queries share with buildAttributedDailySql, so a KPI
+ * computed from bucket rows and a slice row on the same screen can never
+ * disagree about what counts as New (§29: same-bucket, not same-day forever). */
+export function sameBucketPredicate(bucket: RevenueBucket): string {
+  if (bucket === "week") return "toStartOfWeek(toDate(et), 1) = toStartOfWeek(c_d, 1)";
+  if (bucket === "month") return "toStartOfMonth(toDate(et)) = toStartOfMonth(c_d)";
+  return "toDate(et) = c_d";
+}
+
+/** Period slice by campaign_path ('' stays a distinct Unknown key).
+ * gross_existing = successful − new (NOT `toDate(et) > c_d`), so future-cohort
+ * rows fold into Existing exactly as the bucket rows compute it. */
+export function buildByFunnelSql(params: Record<string, unknown>, authUserId: string, dateFrom: string | null, dateTo: string | null, memberWhere = "", bucket: RevenueBucket = "day"): string {
   params.auth_user_id = authUserId;
   const win = windowWhere(params, dateFrom, dateTo);
+  const pair = sameBucketPredicate(bucket);
   return `WITH ${classifiedCTE(memberWhere)}
 SELECT c_camp key,
   sumIf(g, is_success = 1) gross,
   sumIf(g, is_success = 1) - sum(rr) net,
-  sumIf(g, is_success = 1 AND toDate(et) = c_d) gross_new,
-  sumIf(g, is_success = 1 AND toDate(et) > c_d) gross_existing
+  sumIf(g, is_success = 1 AND ${pair}) gross_new,
+  sumIf(g, is_success = 1) - sumIf(g, is_success = 1 AND ${pair}) gross_existing
 FROM fin
 WHERE 1 = 1${win}
 GROUP BY key ORDER BY gross DESC
 FORMAT JSONEachRow`;
 }
 
-export function buildByPlanSql(params: Record<string, unknown>, authUserId: string, dateFrom: string | null, dateTo: string | null, memberWhere = ""): string {
+export function buildByPlanSql(params: Record<string, unknown>, authUserId: string, dateFrom: string | null, dateTo: string | null, memberWhere = "", bucket: RevenueBucket = "day"): string {
   params.auth_user_id = authUserId;
   const win = windowWhere(params, dateFrom, dateTo);
+  const pair = sameBucketPredicate(bucket);
   return `WITH ${classifiedCTE(memberWhere)}
 SELECT c_plan key,
   sumIf(g, is_success = 1) gross,
   sumIf(g, is_success = 1) - sum(rr) net,
-  sumIf(g, is_success = 1 AND toDate(et) = c_d) gross_new,
-  sumIf(g, is_success = 1 AND toDate(et) > c_d) gross_existing
+  sumIf(g, is_success = 1 AND ${pair}) gross_new,
+  sumIf(g, is_success = 1) - sumIf(g, is_success = 1 AND ${pair}) gross_existing
 FROM fin
 WHERE 1 = 1${win}
 GROUP BY key ORDER BY gross DESC
@@ -463,10 +477,12 @@ export function assembleRevenueBundle(input: {
     const net = entry.gross - entry.refunds;
     const profit = net - entry.spend;
     cumulative += profit;
-    rowsScanned += entry.rows;
     futureCohortGross += entry.futureCohortGross;
     if (fromBucket && entry.date < fromBucket) continue;
     if (toBucket && entry.date > toBucket) continue;
+    // Counted AFTER the window slice: the contract promises "successful
+    // transactions scanned for the window", not the full-history scan size.
+    rowsScanned += entry.rows;
     const grossExisting = entry.gross - entry.grossNew - entry.grossUnatt;
     const netNew = entry.grossNew - entry.refundsNew;
     const netUnatt = entry.grossUnatt - entry.refundsUnatt;
@@ -623,8 +639,8 @@ export async function runRevenueIntelligence(input: {
   const attributed = await jsonRows<AttributedDailyRow>(input.clickhouse, buildAttributedDailySql(pA, input.authUserId, memberWhere(pA)), pA);
   const unattributed = req.filtersActive ? [] : await jsonRows<UnattributedDailyRow>(input.clickhouse, buildUnattributedDailySql(pU, input.authUserId), pU);
   const spend = req.filtersActive ? [] : await jsonRows<SpendDailyRow>(input.clickhouse, buildSpendDailySql(pS, input.authUserId), pS);
-  const byFunnel = await jsonRows<{ key: string; gross: number; net: number; gross_new: number; gross_existing: number }>(input.clickhouse, buildByFunnelSql(pF, input.authUserId, effFrom, effTo, memberWhere(pF)), pF);
-  const byPlan = await jsonRows<{ key: string; gross: number; net: number; gross_new: number; gross_existing: number }>(input.clickhouse, buildByPlanSql(pP, input.authUserId, effFrom, effTo, memberWhere(pP)), pP);
+  const byFunnel = await jsonRows<{ key: string; gross: number; net: number; gross_new: number; gross_existing: number }>(input.clickhouse, buildByFunnelSql(pF, input.authUserId, effFrom, effTo, memberWhere(pF), req.bucket), pF);
+  const byPlan = await jsonRows<{ key: string; gross: number; net: number; gross_new: number; gross_existing: number }>(input.clickhouse, buildByPlanSql(pP, input.authUserId, effFrom, effTo, memberWhere(pP), req.bucket), pP);
   const byAge = await jsonRows<{ bucket: string; gross: number; net: number }>(input.clickhouse, buildByAgeSql(pG, input.authUserId, effFrom, effTo, memberWhere(pG)), pG);
   const numify = <T,>(rows: T[]): T[] => rows.map((row) => {
     const out: Record<string, unknown> = {};
@@ -729,6 +745,12 @@ export async function runRevenueDayBreakdown(input: {
     if (row.cohort_date === day) entry.gross_new = round2(entry.gross_new + row.gross);
     else entry.gross_existing = round2(entry.gross_existing + row.gross);
     byFunnelMap.set(key, entry);
+  }
+  // The cohort panel carries an explicit unattributed row; the funnel panel
+  // must reconcile to the SAME day gross, so it carries one too (an
+  // unattributed payment has no cohort funnel — never folded into Unknown).
+  if (unattGross !== 0 || round2(n(unatt?.net)) !== 0) {
+    byFunnelMap.set("Unattributed", { key: "Unattributed", gross: unattGross, net: round2(n(unatt?.net)), gross_new: 0, gross_existing: 0 });
   }
   const gross = round2(detailed.reduce((sum, row) => sum + row.gross, 0) + unattGross);
   return {

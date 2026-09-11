@@ -1117,6 +1117,19 @@ export default function CohortsPage() {
     };
   }, []);
   const [uiState, setUiState, resetUiState] = usePersistedPageState("ui_state_cohorts", DEFAULT_COHORTS_UI_STATE);
+  // "Open in Cohorts" bridge from the Dashboard Revenue Intelligence drilldown:
+  // ?cohort_date=YYYY-MM-DD prefills the cohort date window once, then the
+  // param is dropped from the URL so a reload keeps whatever the user set next.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const day = params.get("cohort_date");
+    if (!day || !/^\d{4}-\d{2}-\d{2}$/.test(day)) return;
+    setUiState((prev) => ({ ...prev, cohortDateFrom: day, cohortDateTo: day }));
+    params.delete("cohort_date");
+    const query = params.toString();
+    window.history.replaceState(null, "", `${window.location.pathname}${query ? `?${query}` : ""}`);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- one-shot URL intake on mount
+  }, []);
   const {
     selectedFunnels: rawSelectedFunnels,
     selectedCampaignPaths: rawSelectedCampaignPaths,
