@@ -136,21 +136,21 @@ function targetFieldPresence(row: JsonRecord): { presence: Record<string, boolea
   return { presence, emailPreview };
 }
 
-function sanitizeKeysDeep(value: unknown, depth = 0): unknown {
-  if (depth > 3) return "…";
-  if (Array.isArray(value)) return value.slice(0, 1).map((v) => sanitizeKeysDeep(v, depth + 1));
+function sanitizeKeysDeep(value: unknown, depth = 0, maxDepth = 3): unknown {
+  if (depth > maxDepth) return "…";
+  if (Array.isArray(value)) return value.slice(0, 2).map((v) => sanitizeKeysDeep(v, depth + 1, maxDepth));
   if (!value || typeof value !== "object") {
     return typeof value === "string" && value.includes("@") ? maskEmail(value) ?? "[str]" : typeof value;
   }
   return Object.fromEntries(
     Object.entries(value as JsonRecord).map(([k, v]) => {
       const sensitive = /secret|token|password|authorization|card|pan|cvv|cvc|payment/i.test(k);
-      return [k, sensitive ? "[redacted]" : sanitizeKeysDeep(v, depth + 1)];
+      return [k, sensitive ? "[redacted]" : sanitizeKeysDeep(v, depth + 1, maxDepth)];
     }),
   );
 }
 
-async function probe(path: string, secret: string, includeSample: boolean): Promise<JsonRecord> {
+async function probe(path: string, secret: string, includeSample: boolean, includeStructure = false): Promise<JsonRecord> {
   try {
     const { status, ok, payload } = await fetchFunnelFox(path, secret);
     const { containerKey, rows } = detectArray(payload);
@@ -174,6 +174,25 @@ async function probe(path: string, secret: string, includeSample: boolean): Prom
     };
     // Full sanitized sample (key names + value *types*, emails masked) only when server debug is on.
     if (includeSample && firstRow) result.sanitized_sample_row = sanitizeKeysDeep(firstRow);
+    // Structure discovery (screen/step audit): the whole payload reduced to key
+    // names + value TYPES (emails masked, sensitive keys redacted), deeper than
+    // the sample, plus the two public-URL fields a funnel exposes verbatim.
+    if (includeStructure) {
+      result.structure = sanitizeKeysDeep(payload, 0, 6);
+      const record = readRecord(payload);
+      result.revealed = {
+        config_url: typeof record.config_url === "string" ? record.config_url : null,
+        url: typeof record.url === "string" ? record.url : null,
+      };
+      // Volume/shape estimation: verbatim values of a fixed NON-PII whitelist
+      // (timestamps, ids, version) for up to 200 list rows, and the screen/
+      // element ids of a session's replies (never their values).
+      const SAFE_FIELD_RE = /^(id|created_at|updated_at|funnel_id|funnel_version|origin|status|screen_id|element_id)$/;
+      const pickSafe = (row: unknown): JsonRecord =>
+        Object.fromEntries(Object.entries(readRecord(row)).filter(([key]) => SAFE_FIELD_RE.test(key)));
+      result.revealed_rows = rows.slice(0, 200).map(pickSafe);
+      if (Array.isArray(record.replies)) result.revealed_replies = record.replies.map(pickSafe);
+    }
     return result;
   } catch (error) {
     return { path, status: null, ok: false, error: error instanceof Error ? error.message : "probe failed" };
@@ -190,13 +209,38 @@ Deno.serve(async (req: Request) => {
   const includeSample = isFunnelFoxDebugEnabled();
   const results: JsonRecord[] = [];
 
-  // Baseline: confirm the known-good subscriptions endpoint responds with this secret.
-  results.push({ note: "baseline (known endpoint)", ...(await probe("/subscriptions?limit=1", secret, includeSample)) });
+  // Optional POST body { paths: ["/sessions?limit=1", ...] } probes exactly
+  // those paths (discovery of screen/step endpoints) instead of the fixed
+  // listing audit below. Paths are whitelisted to a safe character set and
+  // capped so the probe can never be turned into a scraper.
+  let customPaths: string[] = [];
+  let includeStructure = false;
+  if (req.method === "POST") {
+    const body = await req.json().catch(() => null) as { paths?: unknown; include_structure?: unknown } | null;
+    includeStructure = Boolean(body && body.include_structure === true);
+    if (body && Array.isArray(body.paths)) {
+      customPaths = body.paths
+        .filter((value): value is string => typeof value === "string")
+        .map((value) => value.trim())
+        .filter((value) => /^\/[A-Za-z0-9_\-\/?=&.]{1,160}$/.test(value))
+        .slice(0, 25);
+    }
+  }
 
-  for (const endpoint of ENDPOINTS) {
-    for (const variant of VARIANTS) {
+  if (customPaths.length) {
+    for (const path of customPaths) {
       await delay(REQUEST_GAP_MS);
-      results.push(await probe(`${endpoint}${variant}`, secret, includeSample));
+      results.push(await probe(path, secret, includeSample, includeStructure));
+    }
+  } else {
+    // Baseline: confirm the known-good subscriptions endpoint responds with this secret.
+    results.push({ note: "baseline (known endpoint)", ...(await probe("/subscriptions?limit=1", secret, includeSample)) });
+
+    for (const endpoint of ENDPOINTS) {
+      for (const variant of VARIANTS) {
+        await delay(REQUEST_GAP_MS);
+        results.push(await probe(`${endpoint}${variant}`, secret, includeSample));
+      }
     }
   }
 
