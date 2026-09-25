@@ -248,6 +248,48 @@ localStorage first
 
 When app versions add or remove cohort columns, sanitize the saved payload before applying it: ignore unknown column IDs, remove duplicates, and append missing valid columns at the end.
 
+## FunnelFox subscriptions sync — staged pipeline (2026-09-25)
+
+`funnelfox-subscriptions-sync` is a resumable four-stage crawler (list →
+details → profiles → finalize) persisted in `funnelfox_subscriptions_sync_state`
+(cursor + one completed-flag per stage + `stats`), driven by pg_cron: a
+`full_reset` refresh at 05:45 UTC and an `advance` tick every 15 minutes
+(migration 202607250001). Its unit-tested twin is
+`src/services/funnelfoxSubscriptionsSyncCore.ts` — keep both in lockstep.
+
+Rules learned from the 2026-09 incident (Cohorts active-subscription overlay
+dead: `empty_source`, 0 active for every recent cohort):
+- The LIST payload carries no profile/product/customer. The list upsert must
+  write ONLY the columns it actually has (`subscriptionListUpsertColumns`);
+  upserting the enrichment columns as null wiped the detail stage's work every
+  15 minutes (8,921/8,921 rows with an email in `raw_detail` had a null column).
+- `full_reset` must persist ALL four stage flags as false. Resetting them in
+  memory while the row kept `details/profiles/finalize_completed = true` meant
+  `nextIncompleteStage()` skipped enrichment forever after the list stage.
+- `full_reset` re-opens `detail_checked` only for rows with no `raw_detail` or
+  no email (`FULL_RESET_DETAIL_REOPEN_FILTER`); re-opening everything made the
+  ~1,000-details-per-run budget chase 14.6k rows daily and never finish.
+- `campaign_path`/`funnel` come from the DETAIL's `funnel.alias` (byte-identical
+  to campaign_path elsewhere); nothing else writes them.
+- An `api_error` stop persists its diagnostic into `last_error`.
+- Downstream: the Cohorts overlay reads the RPC `active_funnelfox_subscription_emails`
+  (Supabase columns: normalized_email/renews/status/period_ends_at, sandbox from
+  raw); ClickHouse `fact_subscriptions` is read by code but nothing writes it yet.
+- The leads sync (`funnelfox-leads-sync`) has been stalled since 2026-06-21
+  (`max_pages_reached`, 157 profiles, 0 emails) and has no cron.
+
+Screen-to-screen conversion (asked 2026-09-21): the public API has no event or
+step endpoints (`/events`, `/steps`, `/screens`, `/analytics` → 404). What
+exists: `/sessions` lists every visitor session (cursor, `funnel_id`,
+`profile_id`, geo; ~3k/day), `/sessions/{id}` carries `replies[]` with
+`screen_id`/`element_id` (screens where the user submitted input), and
+`/funnels/{id}.config_url` is a public config.json with the ordered `screens[]`
+(id, customId, elements, navigate actions). A step funnel over input screens +
+email screen + purchase (`session.id` on the subscription detail) is buildable
+at ~3k detail requests/day; info-only screens leave no trace. The
+`funnelfox-endpoint-probe` function accepts `{paths, include_structure}` for
+PII-safe structure discovery.
+
 ## FunnelFox Backend Requirement
 
 The Import Data page calls `syncAllSubscriptions`, which uses a frontend-safe proxy. Production Lovable deployments should use Supabase Edge Functions:
