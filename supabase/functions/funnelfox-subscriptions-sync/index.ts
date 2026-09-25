@@ -215,10 +215,12 @@ function finalSyncStatus(allStagesCompleted: boolean, baseStatus: "ok" | "partia
 
 // ---- crawling --------------------------------------------------------------------------------
 
-interface CrawlPageResult { ok: boolean; rows: JsonRecord[]; hasMore: boolean; nextCursor: string | null; totalReported: number | null; }
+interface CrawlPageResult { ok: boolean; rows: JsonRecord[]; hasMore: boolean; nextCursor: string | null; totalReported: number | null; errorMessage?: string | null; }
 interface CrawlOutcome {
   rows: JsonRecord[]; pages: number; lastCursor: string | null; hasMoreOnLastPage: boolean;
   stoppedReason: SyncStoppedReason; totalReported: number | null;
+  /** Persisted to sync_state.last_error on api_error (was written as null). */
+  apiErrorMessage: string | null;
 }
 
 async function fetchListPage(base: string, cursor: string | undefined, limit: number, secret: string): Promise<CrawlPageResult> {
@@ -226,9 +228,11 @@ async function fetchListPage(base: string, cursor: string | undefined, limit: nu
   if (limit) params.set("limit", String(limit));
   if (cursor) params.set("cursor", cursor);
   const qs = params.toString();
-  const { ok, payload } = await fetchFunnelFox(`${base}${qs ? `?${qs}` : ""}`, secret);
+  const { ok, status, payload } = await fetchFunnelFox(`${base}${qs ? `?${qs}` : ""}`, secret);
   const root = readRecord(payload);
   const pagination = readRecord(root.pagination);
+  const upstreamMessage = str(root.message ?? root.error ?? root.detail).slice(0, 200);
+  const errorMessage = ok ? null : `FunnelFox ${base} HTTP ${status}${upstreamMessage ? `: ${upstreamMessage}` : ""}`;
   const rows = (Array.isArray(root.data) ? root.data : Array.isArray(root.subscriptions) ? root.subscriptions : [])
     .filter((r): r is JsonRecord => Boolean(r && typeof r === "object"));
   // FunnelFox's list pagination is { cursor, has_more } (verified live on
@@ -240,6 +244,7 @@ async function fetchListPage(base: string, cursor: string | undefined, limit: nu
     hasMore: Boolean(pagination.has_more),
     nextCursor: typeof rawCursor === "string" && rawCursor !== "" ? rawCursor : null,
     totalReported: readReportedTotal(pagination),
+    errorMessage,
   };
 }
 
@@ -253,13 +258,14 @@ async function crawlList(
   let lastCursor: string | null = startCursor ?? null;
   let hasMoreOnLastPage = false;
   let apiError = false;
+  let apiErrorMessage: string | null = null;
   let timedOut = false;
   let totalReported: number | null = null;
 
   while (pages < maxPages) {
     if (isExpired()) { timedOut = true; break; }
     const page = await fetchListPage(base, cursor, limit, secret);
-    if (!page.ok) { apiError = true; break; }
+    if (!page.ok) { apiError = true; apiErrorMessage = page.errorMessage ?? "FunnelFox API returned a non-2xx response."; break; }
     pages += 1;
     rows.push(...page.rows);
     hasMoreOnLastPage = page.hasMore;
@@ -277,6 +283,7 @@ async function crawlList(
     rows, pages, lastCursor, hasMoreOnLastPage,
     stoppedReason: determineStopReason({ pages, maxPages, hasMoreOnLastPage, timedOut, apiError }),
     totalReported,
+    apiErrorMessage: apiError ? apiErrorMessage : null,
   };
 }
 
@@ -392,7 +399,11 @@ Deno.serve(async (req: Request) => {
       // Re-open enrichment: all rows for details, and only email-less rows for profiles (re-checking
       // resolved emails wastes calls and — since the profile candidate filters normalized_email null —
       // would strand them permanently unchecked, blocking stage completion).
-      await db.from("funnelfox_subscriptions").update({ detail_checked: false }).eq("auth_user_id", userId);
+      // Only rows that never got a detail or still lack an email are re-opened:
+      // re-opening ALL rows made the ~900-details-per-run budget chase 14.6k
+      // rows every day and never finish (found live: details_pending 14,628).
+      await db.from("funnelfox_subscriptions").update({ detail_checked: false }).eq("auth_user_id", userId)
+        .or("raw_detail.is.null,normalized_email.is.null");
       await db.from("funnelfox_subscriptions").update({ profile_checked: false }).eq("auth_user_id", userId).is("normalized_email", null);
     }
 
@@ -413,6 +424,7 @@ Deno.serve(async (req: Request) => {
 
     let stoppedReason: SyncStoppedReason = "completed";
     let madeProgress = true;
+    let listApiError: string | null = null;
     const runStats: JsonRecord = {};
     const cursorUpdate: JsonRecord = {};
     const completionUpdate: JsonRecord = {};
@@ -422,25 +434,25 @@ Deno.serve(async (req: Request) => {
       const start = resolveStartCursor(listCursor, fullReset);
       const crawl = await crawlList("/subscriptions", start, limit, maxPages, isExpired, secret);
       stoppedReason = crawl.stoppedReason;
+      listApiError = crawl.apiErrorMessage;
       madeProgress = crawl.pages > 0;
 
       // Do NOT include detail_checked/profile_checked in the upsert — omitting them
       // preserves per-row enrichment progress on conflict (DB default false on first insert).
+      // Likewise NO enrichment columns (profile_id/customer_id/email/normalized_email/
+      // product_*): the list payload never carries them, and upserting their nulls
+      // overwrote what the detail stage had enriched — found live: 8,921/8,921 rows
+      // with an email in raw_detail had a null email column, so the Cohorts
+      // active-subscription overlay (RPC keyed by normalized_email) matched nothing.
       const rows = crawl.rows
         .map((raw) => ({ columns: subscriptionColumns(raw), raw }))
         .filter((r) => r.columns.subscription_id)
         .map((r) => ({
           auth_user_id: userId,
           subscription_id: r.columns.subscription_id,
-          profile_id: r.columns.profile_id,
-          customer_id: r.columns.customer_id,
           psp_id: r.columns.psp_id,
-          email: r.columns.email,
-          normalized_email: r.columns.normalized_email,
           status: r.columns.status,
           renews: r.columns.renews,
-          product_name: r.columns.product_name,
-          product_id: r.columns.product_id,
           price: r.columns.price,
           currency: r.columns.currency,
           created_at: r.columns.created_at,
@@ -514,6 +526,11 @@ Deno.serve(async (req: Request) => {
           const patch: JsonRecord = { detail_checked: true, raw_detail: detailRaw, synced_at: new Date().toISOString() };
           if (detailColumns.email) { patch.email = detailColumns.email; patch.normalized_email = detailColumns.normalized_email; }
           if (detailColumns.profile_id) patch.profile_id = detailColumns.profile_id;
+          // The detail's funnel alias IS the app's campaign_path (funnelfox-funnels
+          // maps alias == campaign_path); the list payload never carries it, so
+          // these columns stayed null for every row until now.
+          const funnelAlias = strOrNull(readRecord(detailRaw.funnel).alias ?? readRecord(detailRaw.funnel).slug);
+          if (funnelAlias) { patch.campaign_path = funnelAlias; patch.funnel = funnelAlias; }
           if (detailColumns.product_name) patch.product_name = detailColumns.product_name;
           if (detailColumns.product_id) patch.product_id = detailColumns.product_id;
           if (detailColumns.period_ends_at) patch.period_ends_at = detailColumns.period_ends_at;
@@ -678,13 +695,20 @@ Deno.serve(async (req: Request) => {
 
     await db.from("funnelfox_subscriptions_sync_state").upsert({
       auth_user_id: userId,
+      // A full reset must reach the DB for EVERY stage flag, not just the one the
+      // current run completed: the in-memory flags were reset while the row kept
+      // details_completed/profiles_completed/finalize_completed = true from the
+      // previous cycle, so after the list stage nextIncompleteStage() found
+      // nothing left and the enrichment stages never ran again (found live:
+      // details_completed true with details_pending 14,628).
+      ...(fullReset ? { list_completed: false, details_completed: false, profiles_completed: false, finalize_completed: false } : {}),
       ...cursorUpdate,
       ...completionUpdate,
       current_stage: remainingStage ?? stage,
       subscriptions_scanned_total: scannedTotal,
       subscriptions_total_reported_by_api: totalReportedByApi,
       last_status: persistedStatus,
-      last_error: null,
+      last_error: stoppedReason === "api_error" ? (listApiError ?? "FunnelFox API returned an error.") : null,
       stopped_reason: stoppedReason,
       started_at: new Date(startedAtMs).toISOString(),
       finished_at: new Date().toISOString(),

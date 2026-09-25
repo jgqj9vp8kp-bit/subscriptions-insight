@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+  FULL_RESET_DETAIL_REOPEN_FILTER,
+  LIST_STAGE_ENRICHMENT_COLUMNS,
   countEmailCoverage,
   crawlList,
+  funnelAliasFromSubscriptionRaw,
+  subscriptionListUpsertColumns,
   determineStopReason,
   enrichPool,
   enrichStageComplete,
@@ -275,5 +279,40 @@ describe("driver control", () => {
     expect(shouldContinueSubscriptionSync({ status: "ok", all_stages_completed: true, made_progress: true })).toBe(false);
     expect(shouldContinueSubscriptionSync({ status: "error", all_stages_completed: false, made_progress: true })).toBe(false);
     expect(shouldContinueSubscriptionSync({ status: "partial", all_stages_completed: false, made_progress: false })).toBe(false);
+  });
+});
+
+describe("enrichment must survive the list stage (found live 2026-09-21)", () => {
+  it("list upsert columns never carry profile/email/product keys — the list payload has none, and their nulls overwrote the detail stage", () => {
+    const columns = subscriptionListColumns({
+      id: "sub_1", psp_id: "psp_1", status: "active", renews: true, price: 2999, currency: "USD",
+      created_at: "2026-07-14T07:42:13Z", updated_at: "2026-09-21T05:43:04Z", period_ends_at: "2026-10-21T07:42:13Z",
+    });
+    const upsert = subscriptionListUpsertColumns(columns);
+    for (const key of LIST_STAGE_ENRICHMENT_COLUMNS) expect(key in upsert).toBe(false);
+    expect(upsert).toMatchObject({ subscription_id: "sub_1", psp_id: "psp_1", status: "active", renews: true, price: 29.99, currency: "USD" });
+  });
+
+  it("the detail's funnel alias is the campaign_path; the list row has none", () => {
+    expect(funnelAliasFromSubscriptionRaw({ funnel: { id: "f1", alias: "soulmate-month-web-es", title: "Soulmate…" } })).toBe("soulmate-month-web-es");
+    expect(funnelAliasFromSubscriptionRaw({ id: "sub_1", price: 2999 })).toBeNull();
+  });
+
+  it("a failed list page surfaces its diagnostic instead of a null last_error", async () => {
+    const outcome = await crawlList(
+      async () => ({ ok: false, rows: [], hasMore: false, nextCursor: null, totalReported: null, errorMessage: "FunnelFox /subscriptions HTTP 429: rate limited" }),
+      { startCursor: undefined, maxPages: 5, isExpired: () => false },
+    );
+    expect(outcome.stoppedReason).toBe("api_error");
+    expect(outcome.apiErrorMessage).toBe("FunnelFox /subscriptions HTTP 429: rate limited");
+    const fine = await crawlList(
+      async () => ({ ok: true, rows: [{ id: "a" }], hasMore: false, nextCursor: null, totalReported: 1 }),
+      { startCursor: undefined, maxPages: 5, isExpired: () => false },
+    );
+    expect(fine.apiErrorMessage).toBeNull();
+  });
+
+  it("the daily full refresh re-opens only rows without a detail or an email", () => {
+    expect(FULL_RESET_DETAIL_REOPEN_FILTER).toBe("raw_detail.is.null,normalized_email.is.null");
   });
 });

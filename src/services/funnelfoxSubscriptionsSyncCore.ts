@@ -256,6 +256,39 @@ export function subscriptionListColumns(raw: JsonRecord): SubscriptionListColumn
 }
 
 /**
+ * Columns the LIST stage may write. The /subscriptions list payload carries no
+ * profile/product/customer, so its normalized email/profile_id/product_* are
+ * always null — and an upsert that includes them overwrites what the DETAIL
+ * stage enriched (found live: 8,921/8,921 rows with an email in raw_detail had
+ * a null email column, so the Cohorts active-subscription overlay matched
+ * nothing). Enrichment columns are owned by the detail/profile stages only.
+ */
+export const LIST_STAGE_ENRICHMENT_COLUMNS = [
+  "profile_id", "customer_id", "email", "normalized_email", "product_name", "product_id",
+] as const;
+
+export type SubscriptionListUpsertColumns = Omit<SubscriptionListColumns, (typeof LIST_STAGE_ENRICHMENT_COLUMNS)[number]>;
+
+export function subscriptionListUpsertColumns(columns: SubscriptionListColumns): SubscriptionListUpsertColumns {
+  const { profile_id: _p, customer_id: _c, email: _e, normalized_email: _n, product_name: _pn, product_id: _pi, ...rest } = columns;
+  return rest;
+}
+
+/** The funnel alias FunnelFox attaches to a subscription DETAIL — byte-identical
+ * to campaign_path elsewhere in the app (see funnelfox-funnels). The list
+ * payload never carries it. */
+export function funnelAliasFromSubscriptionRaw(raw: JsonRecord): string | null {
+  const funnel = readRecord(raw.funnel);
+  const alias = str(funnel.alias ?? funnel.slug ?? raw.funnel_alias);
+  return alias || null;
+}
+
+/** Rows the daily full refresh re-opens for detail enrichment: only those that
+ * never got a detail or still lack an email. Re-opening ALL rows every day made
+ * the ~900-details-per-run budget chase 14.6k rows and never finish. */
+export const FULL_RESET_DETAIL_REOPEN_FILTER = "raw_detail.is.null,normalized_email.is.null";
+
+/**
  * A list row needs a /subscriptions/{id} detail call only when it is missing
  * fields details would supply. Fully-populated list rows skip enrichment.
  */
@@ -297,6 +330,8 @@ export interface CrawlPageResult {
   hasMore: boolean;
   nextCursor: string | null;
   totalReported: number | null;
+  /** Short diagnostic for a failed page (HTTP status + upstream message). */
+  errorMessage?: string | null;
 }
 
 export type FetchListPage = (cursor: string | undefined) => Promise<CrawlPageResult>;
@@ -308,6 +343,9 @@ export interface CrawlOutcome {
   hasMoreOnLastPage: boolean;
   stoppedReason: SyncStoppedReason;
   totalReported: number | null;
+  /** Why the crawl stopped on api_error — persisted to sync_state.last_error
+   * (it used to be written as null, leaving a failing tick undiagnosable). */
+  apiErrorMessage: string | null;
 }
 
 export async function crawlList(
@@ -320,6 +358,7 @@ export async function crawlList(
   let lastCursor: string | null = opts.startCursor ?? null;
   let hasMoreOnLastPage = false;
   let apiError = false;
+  let apiErrorMessage: string | null = null;
   let timedOut = false;
   let totalReported: number | null = null;
 
@@ -329,10 +368,7 @@ export async function crawlList(
       break;
     }
     const page = await fetchPage(cursor);
-    if (!page.ok) {
-      apiError = true;
-      break;
-    }
+    if (!page.ok) { apiError = true; apiErrorMessage = page.errorMessage ?? "FunnelFox API returned a non-2xx response."; break; }
     pages += 1;
     rows.push(...page.rows);
     hasMoreOnLastPage = page.hasMore;
@@ -354,6 +390,7 @@ export async function crawlList(
     lastCursor,
     hasMoreOnLastPage,
     stoppedReason: determineStopReason({ pages, maxPages: opts.maxPages, hasMoreOnLastPage, timedOut, apiError }),
+    apiErrorMessage: apiError ? apiErrorMessage : null,
     totalReported,
   };
 }
