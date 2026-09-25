@@ -12,6 +12,8 @@ import {
   saveCohortsUiSettingsLocal,
   sanitizeColumnOrder,
   type CohortsUiSettingsDefaults,
+  reorderColumnIds,
+  shiftColumnId,
 } from "@/services/cohortsUiSettings";
 import {
   loadLatestCloudSnapshot,
@@ -483,5 +485,23 @@ describe("resolveLandingView", () => {
   it("falls back only when the operator has no saved view", () => {
     expect(resolveLandingView(null, [])).toBeNull();
     expect(resolveLandingView(null, [], "default")).toBe("default");
+  });
+});
+
+describe("column reorder helpers (Columns popover + header drag share them)", () => {
+  const order = ["a", "b", "c", "d"] as const;
+  it("reorderColumnIds splices the dragged column into the drop slot, both directions", () => {
+    expect(reorderColumnIds(order, "a", "c")).toEqual(["b", "c", "a", "d"]);
+    expect(reorderColumnIds(order, "d", "b")).toEqual(["a", "d", "b", "c"]);
+  });
+  it("reorderColumnIds returns the same array when nothing can change", () => {
+    expect(reorderColumnIds(order, "b", "b")).toBe(order);
+    expect(reorderColumnIds(order, "zz" as never, "b")).toBe(order);
+  });
+  it("shiftColumnId swaps with the neighbour and is a no-op at the edges", () => {
+    expect(shiftColumnId(order, "c", -1)).toEqual(["a", "c", "b", "d"]);
+    expect(shiftColumnId(order, "c", 1)).toEqual(["a", "b", "d", "c"]);
+    expect(shiftColumnId(order, "a", -1)).toBe(order);
+    expect(shiftColumnId(order, "d", 1)).toBe(order);
   });
 });

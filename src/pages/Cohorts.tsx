@@ -93,6 +93,8 @@ import {
   type CohortsUiSavedView,
   type CohortsUiSettingsDefaults,
   type CohortsUiSettingsPayload,
+  reorderColumnIds,
+  shiftColumnId,
 } from "@/services/cohortsUiSettings";
 import {
   cohortDisplayName,
@@ -1310,6 +1312,8 @@ export default function CohortsPage() {
   });
   const [newViewName, setNewViewName] = useState("");
   const dragColRef = useRef<CohortColumnId | null>(null);
+  // Drop target highlight for the Columns popover list (the header has its own cursor feedback).
+  const [columnDragOverId, setColumnDragOverId] = useState<CohortColumnId | null>(null);
   const [columnWidths, setColumnWidths] = useState<Record<string, number>>(() => loadInitialColumnWidths(buildDefaultColumnWidths(buildDefaultColumnOrder(loadMaxRenewalColumns()))));
   const resizingRef = useRef<{ key: string; startX: number; startWidth: number } | null>(null);
   const [cohortsUiCloudReady, setCohortsUiCloudReady] = useState(false);
@@ -2359,15 +2363,20 @@ export default function CohortsPage() {
       return { ...current, expandedCohortIds: Array.from(next) };
     });
   };
-  const moveColumn = (index: number, direction: -1 | 1) => {
-    setColumnOrder((current) => {
-      const nextIndex = index + direction;
-      if (nextIndex < 0 || nextIndex >= current.length) return current;
-      const next = [...current];
-      [next[index], next[nextIndex]] = [next[nextIndex], next[index]];
-      persistColumnOrder(next);
-      return next;
-    });
+  // One commit path for every column re-order (header drag, popover drag, ↑/↓):
+  // persist, drop the active saved view (its order no longer matches) and mark
+  // the cloud settings dirty — the header drag used to be the only one doing all three.
+  const applyColumnOrder = (next: readonly CohortColumnId[]) => {
+    const order = [...next];
+    setColumnOrder(order);
+    persistColumnOrder(order);
+    setActiveViewId(null);
+    try { localStorage.removeItem(ACTIVE_VIEW_STORAGE_KEY); } catch { /* noop */ }
+    markCohortsUiSettingsUpdated();
+  };
+  const moveColumnBy = (id: CohortColumnId, direction: -1 | 1) => {
+    const next = shiftColumnId(columnOrder, id, direction);
+    if (next !== columnOrder) applyColumnOrder(next);
   };
   const resetColumnOrder = () => {
     const next = [...defaultColumnOrder];
@@ -2473,20 +2482,10 @@ export default function CohortsPage() {
   const onHeaderDrop = (targetId: CohortColumnId) => {
     const src = dragColRef.current;
     dragColRef.current = null;
+    setColumnDragOverId(null);
     if (!src || src === targetId) return;
-    setColumnOrder((cur) => {
-      const next = [...cur];
-      const from = next.indexOf(src);
-      const to = next.indexOf(targetId);
-      if (from < 0 || to < 0) return cur;
-      next.splice(from, 1);
-      next.splice(to, 0, src);
-      persistColumnOrder(next);
-      return next;
-    });
-    setActiveViewId(null);
-    try { localStorage.removeItem(ACTIVE_VIEW_STORAGE_KEY); } catch { /* noop */ }
-    markCohortsUiSettingsUpdated();
+    const next = reorderColumnIds(columnOrder, src, targetId);
+    if (next !== columnOrder) applyColumnOrder(next);
   };
 
   const visibleColumnOrder = useMemo(
@@ -3826,20 +3825,45 @@ export default function CohortsPage() {
               </PopoverTrigger>
               <PopoverContent align="end" className="w-72 p-0">
                 <div className="flex items-center justify-between px-3 py-2 border-b border-border">
-                  <span className="text-xs font-medium text-muted-foreground">Toggle columns</span>
+                  <span className="text-xs font-medium text-muted-foreground">Columns · drag or ↑↓ to reorder</span>
                   <Button type="button" variant="ghost" size="sm" className="h-7 text-xs" onClick={resetColumnOrder}>
                     Reset
                   </Button>
                 </div>
                 <div className="max-h-80 overflow-auto py-1">
-                  {columnOrder.map((id) => (
-                    <label key={id} className="flex items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted/50 cursor-pointer">
-                      <Checkbox
-                        checked={columnVisibility[id] !== false}
-                        onCheckedChange={(c) => setVisibility(id, c === true)}
-                      />
-                      <span>{columnLabel(id)}</span>
-                    </label>
+                  {/* Same drag contract as the table header (dragColRef + onHeaderDrop), so a
+                      column dragged here lands exactly where the header drag would put it;
+                      ↑/↓ buttons give the keyboard the same move. */}
+                  {columnOrder.map((id, index) => (
+                    <div
+                      key={id}
+                      draggable
+                      onDragStart={() => onHeaderDragStart(id)}
+                      onDragOver={(e) => { onHeaderDragOver(e); if (columnDragOverId !== id) setColumnDragOverId(id); }}
+                      onDragLeave={() => setColumnDragOverId((current) => (current === id ? null : current))}
+                      onDrop={() => onHeaderDrop(id)}
+                      onDragEnd={() => { dragColRef.current = null; setColumnDragOverId(null); }}
+                      className={`flex items-center gap-1.5 px-2 py-1 text-sm hover:bg-muted/50 ${columnDragOverId === id && dragColRef.current && dragColRef.current !== id ? "bg-primary/10 ring-1 ring-inset ring-primary/40" : ""}`}
+                    >
+                      <GripVertical className="h-3.5 w-3.5 shrink-0 cursor-grab text-muted-foreground opacity-60 active:cursor-grabbing" aria-hidden="true" />
+                      <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 py-0.5">
+                        <Checkbox
+                          checked={columnVisibility[id] !== false}
+                          onCheckedChange={(c) => setVisibility(id, c === true)}
+                        />
+                        <span className="truncate">{columnLabel(id)}</span>
+                      </label>
+                      <div className="flex shrink-0 items-center">
+                        <Button type="button" variant="ghost" size="icon" className="h-6 w-6" aria-label={`Move ${columnLabel(id)} up`}
+                          disabled={index === 0} onClick={() => moveColumnBy(id, -1)}>
+                          <ArrowUp className="h-3 w-3" />
+                        </Button>
+                        <Button type="button" variant="ghost" size="icon" className="h-6 w-6" aria-label={`Move ${columnLabel(id)} down`}
+                          disabled={index === columnOrder.length - 1} onClick={() => moveColumnBy(id, 1)}>
+                          <ArrowDown className="h-3 w-3" />
+                        </Button>
+                      </div>
+                    </div>
                   ))}
                 </div>
                 <div className="border-t border-border p-2 space-y-2">

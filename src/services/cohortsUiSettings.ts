@@ -343,3 +343,31 @@ export function markCohortsUiSettingsUpdated(updatedAt = new Date().toISOString(
     console.warn("Could not mark Cohorts UI settings as updated.", error);
   }
 }
+
+/**
+ * Moves `src` into `target`'s slot (splice, not swap): the dragged column
+ * lands where it was dropped and everything in between shifts by one — what
+ * the table-header drag has always done, now shared with the Columns popover.
+ * Returns the SAME array when nothing changes, so callers can skip persisting.
+ */
+export function reorderColumnIds<T extends string>(order: readonly T[], src: T, target: T): readonly T[] {
+  if (src === target) return order;
+  const from = order.indexOf(src);
+  const to = order.indexOf(target);
+  if (from < 0 || to < 0) return order;
+  const next = [...order];
+  next.splice(from, 1);
+  next.splice(to, 0, src);
+  return next;
+}
+
+/** ↑/↓ buttons (keyboard-reachable reorder): swap with the neighbour; the same
+ * array when the column is already at that edge. */
+export function shiftColumnId<T extends string>(order: readonly T[], id: T, direction: -1 | 1): readonly T[] {
+  const index = order.indexOf(id);
+  const nextIndex = index + direction;
+  if (index < 0 || nextIndex < 0 || nextIndex >= order.length) return order;
+  const next = [...order];
+  [next[index], next[nextIndex]] = [next[nextIndex], next[index]];
+  return next;
+}
