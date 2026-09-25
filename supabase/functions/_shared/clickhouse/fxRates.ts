@@ -16,6 +16,18 @@ export const FX_RATES_TO_USD: Record<string, number> = {
   ARS: 0.0008,
   // Seen in the warehouse since 2026-06-17 (not in the localization brief).
   JPY: 0.0066,
+  // Added 2026-09-25 (mid-market, open.er-api.com, 1 USD = 5.175 BRL etc.).
+  // Found live: the new *-web-pt funnels charge in BRL, and every currency
+  // without a rate here is written to ClickHouse with gross_amount_usd = 0 —
+  // the Cohorts page showed 92 trials / 31 upsells / 5 token buyers and
+  // Gross Rev $0.00. AUD/CAD/NZD/PHP/ZAR were already in the warehouse with
+  // the same silent zero.
+  BRL: 0.1932,
+  AUD: 0.7015,
+  CAD: 0.7078,
+  NZD: 0.5662,
+  PHP: 0.01592,
+  ZAR: 0.06086,
 };
 
 export const FX_RATES_AS_OF = "2026-07-01";

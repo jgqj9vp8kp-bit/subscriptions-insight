@@ -373,6 +373,29 @@ KPIs read `answer_source != ''`, not `answered_at` (flag/customer tiers carry
 no timestamp). Rollout: the operator runs "Import Sent History" on the Support
 page until complete, then one `rematch_replies {"mode":"full"}`.
 
+## FX: a currency without a rate is a silent revenue zero (2026-09-25)
+
+`fxRates.ts` is a static table and the ONLY FX source. When a warehouse
+currency has no entry, `convertAmountToUsd` returns `missing_fx_rate`, the
+ClickHouse mapper writes `gross_amount_usd = 0` (net/refund too), and every
+count-based metric still works — the Cohorts page showed 92 trials, 31
+upsells, 5 token buyers and Gross Rev $0.00 for the new `*-web-pt` funnels,
+which charge in BRL. Six currencies were in the warehouse without a rate
+(BRL, AUD, CAD, NZD, PHP, ZAR; 1,480 transactions). The Supabase rows are
+correct (normalized_payload keeps the original amount and no `fx_status`),
+so the repair is: add the rate, redeploy `clickhouse-backfill` and
+`clickhouse-validate` (they bundle the mapper), call
+`resync_transactions_for_currencies(text[])` (bumps `updated_at` — the
+incremental sync is keyset on it and re-maps the rows; the newer row_version
+wins under FINAL), then run a `continue` backfill. Deploy BEFORE the bump:
+a sync that runs in between re-maps with the old table and moves the cursor
+past the rows. Watch `fx_diagnostics.transactions_missing_fx_rate` in the
+Cohorts response — non-zero means a currency is missing again; the per-row
+`fx_missing_*` fields on materialized rows are hardcoded 0 and cannot warn.
+Rates for the pre-existing currencies were deliberately NOT refreshed
+(restating history is a product decision); the drift is visible against
+FX_RATES_AS_OF.
+
 ## Dashboard Revenue Intelligence (2026-09)
 
 The calendar projection of the SAME cohort-revenue facts Cohorts reads:
