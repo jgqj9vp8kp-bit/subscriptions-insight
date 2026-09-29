@@ -1,5 +1,6 @@
 import type { ClickHouseClientLike, SupabaseLikeClient } from "./types.ts";
 import { ANALYTICS_TRANSACTIONS_TABLE } from "./schema.ts";
+import { clickHouseBodyStringSet } from "./fbCohortStats.ts";
 import {
   buildTransactionMappingContext,
   hydrateSupabaseTransactionRows,
@@ -8,7 +9,7 @@ import {
   type SupabaseTransactionRow,
 } from "./transactionMapper.ts";
 
-export type BackfillMode = "continue" | "full_backfill" | "validate_only";
+export type BackfillMode = "continue" | "full_backfill" | "validate_only" | "dedup";
 export type SyncStatus = "never_started" | "running" | "partial" | "completed" | "completed_with_inconsistencies" | "failed";
 export type StoppedReason = "completed" | "max_batches_reached" | "soft_timeout" | "source_error" | "clickhouse_error" | "mapping_error" | "unknown";
 
@@ -49,6 +50,10 @@ export interface ClickHouseSyncState {
 export interface BackfillResult {
   mode: BackfillMode;
   dry_run: boolean;
+  /** mode=dedup: transaction_ids that had more than one physical copy in
+   * ClickHouse (different sorting keys) and were re-queued for a clean rewrite. */
+  duplicates_found?: number;
+  duplicates_requeued?: number;
   status: SyncStatus;
   stopped_reason: StoppedReason;
   current_stage: string;
@@ -82,7 +87,7 @@ function clampInt(value: unknown, fallback: number, min: number, max: number): n
 }
 
 export function normalizeBackfillParams(params: BackfillParams = {}): Required<BackfillParams> & { mode: BackfillMode } {
-  const mode = params.mode === "full_backfill" || params.mode === "validate_only" ? params.mode : "continue";
+  const mode = params.mode === "full_backfill" || params.mode === "validate_only" || params.mode === "dedup" ? params.mode : "continue";
   return {
     mode,
     batch_size: clampInt(params.batch_size, DEFAULT_BATCH_SIZE, 1, 10_000),
@@ -218,6 +223,60 @@ function lastCursor(rows: SupabaseTransactionRow[]): { cursor_updated_at: string
   };
 }
 
+/**
+ * The sorting key of analytics_transactions carries DERIVED attribution
+ * (cohort_date, funnel, campaign_path, campaign_id, user_id). When a
+ * transaction is re-synced after its derivation changed — the incremental
+ * Palmer import normalizes a day on its own, the next full pass re-derives
+ * cohort_date — the fresh row lands under a NEW key and ReplacingMergeTree
+ * keeps the old copy too. Found live 2026-09-29: the same 254.99 BRL first
+ * subscription sat in the warehouse twice, the lifecycle classifier numbered
+ * the copies lvl 1 and lvl 2 ("Sub → Renewal 2 CR" 100% three days after the
+ * trial) and doubled its revenue. Every batch therefore evicts ALL existing
+ * copies of the transaction_ids it is about to write, key-agnostic, before the
+ * insert (a lightweight DELETE; a failed insert leaves the cursor behind, so
+ * the next run rewrites the same rows).
+ */
+export function buildStaleCopiesDeleteSql(transactionIds: readonly string[]): string {
+  return `DELETE FROM ${ANALYTICS_TRANSACTIONS_TABLE} WHERE auth_user_id = {auth_user_id:String} AND transaction_id IN ${clickHouseBodyStringSet([...transactionIds])}`;
+}
+
+/** transaction_ids with more than one physical copy (FINAL collapses only
+ * same-key duplicates, so every survivor here is a key-drift copy). */
+export function buildDuplicateTransactionIdsSql(): string {
+  return `SELECT transaction_id, count() AS copies FROM ${ANALYTICS_TRANSACTIONS_TABLE} FINAL WHERE auth_user_id = {auth_user_id:String} GROUP BY transaction_id HAVING copies > 1 ORDER BY copies DESC, transaction_id LIMIT 5000 FORMAT JSONEachRow`;
+}
+
+/** mode=dedup: find key-drift copies, bump the source rows' updated_at so the
+ * keyset sync re-reads them, and let the normal batch loop rewrite each one
+ * cleanly (the eviction above removes every old copy first). */
+async function requeueDuplicateTransactions(input: {
+  supabase: SupabaseLikeClient;
+  clickhouse: ClickHouseClientLike;
+  authUserId: string;
+}): Promise<{ found: number; requeued: number }> {
+  const resultSet = await input.clickhouse.query({
+    query: buildDuplicateTransactionIdsSql(),
+    query_params: { auth_user_id: input.authUserId },
+    format: "JSONEachRow",
+  });
+  const rows = (await resultSet.json()) as Array<{ transaction_id?: string }>;
+  const ids = rows.map((row) => String(row.transaction_id ?? "")).filter(Boolean);
+  if (!ids.length) return { found: 0, requeued: 0 };
+  const builder = input.supabase.from("transactions");
+  if (!builder.update) throw new Error("Supabase client cannot update transactions (dedup needs .update).");
+  let requeued = 0;
+  for (let index = 0; index < ids.length; index += 200) {
+    const chunk = ids.slice(index, index + 200);
+    const { error } = await builder.update({ updated_at: new Date().toISOString() })
+      .eq("auth_user_id", input.authUserId)
+      .in("transaction_id", chunk);
+    if (error) throw new Error(`Could not re-queue duplicate transactions: ${error.message}`);
+    requeued += chunk.length;
+  }
+  return { found: ids.length, requeued };
+}
+
 export async function runTransactionsBackfill(input: {
   authUserId: string;
   supabase: SupabaseLikeClient;
@@ -225,6 +284,10 @@ export async function runTransactionsBackfill(input: {
   clickhouse: ClickHouseClientLike;
 }): Promise<BackfillResult> {
   const params = normalizeBackfillParams(input.params);
+  // clickhouse_transaction_sync_state.last_run_mode has a CHECK constraint for
+  // continue/full_backfill/validate_only; dedup is a continue run preceded by
+  // the duplicate re-queue, and is recorded as such.
+  const persistedRunMode: Exclude<BackfillMode, "dedup"> = params.mode === "dedup" ? "continue" : params.mode;
   const startedAt = Date.now();
   const diagnostics = emptyDiagnostics();
   const clickhouse = input.clickhouse;
@@ -239,8 +302,15 @@ export async function runTransactionsBackfill(input: {
   let batchesProcessed = 0;
   let sourceTotal = 0;
   let clickHouseTotal = 0;
+  let duplicatesFound = 0;
+  let duplicatesRequeued = 0;
 
   try {
+    if (params.mode === "dedup" && !params.dry_run) {
+      const requeue = await requeueDuplicateTransactions({ supabase: input.supabase, clickhouse, authUserId: input.authUserId });
+      duplicatesFound = requeue.found;
+      duplicatesRequeued = requeue.requeued;
+    }
     sourceTotal = await getSourceTotal(input.supabase, input.authUserId);
     const previousState = await getSyncState(input.supabase, input.authUserId);
     const resetCursor = params.mode === "full_backfill" || params.full_reset_cursor;
@@ -255,7 +325,7 @@ export async function runTransactionsBackfill(input: {
       started_at: new Date(startedAt).toISOString(),
       finished_at: null,
       last_error: null,
-      last_run_mode: params.mode,
+      last_run_mode: persistedRunMode,
       source_total: sourceTotal,
       diagnostics,
     });
@@ -298,6 +368,12 @@ export async function runTransactionsBackfill(input: {
         rowsSkipped += batch.length - mapped.rows.length;
 
         if (!params.dry_run && mapped.rows.length) {
+          // Evict every existing copy of these transaction_ids first — see
+          // buildStaleCopiesDeleteSql for why the sorting key cannot do it.
+          await clickhouse.command({
+            query: buildStaleCopiesDeleteSql(mapped.rows.map((row) => String((row as { transaction_id?: unknown }).transaction_id ?? ""))),
+            query_params: { auth_user_id: input.authUserId },
+          });
           await clickhouse.insert({
             table: ANALYTICS_TRANSACTIONS_TABLE,
             values: mapped.rows,
@@ -349,7 +425,7 @@ export async function runTransactionsBackfill(input: {
       rows_inserted: (previousState?.rows_inserted ?? 0) + rowsInserted,
       rows_skipped: (previousState?.rows_skipped ?? 0) + rowsSkipped,
       batches_processed: (previousState?.batches_processed ?? 0) + batchesProcessed,
-      last_run_mode: params.mode,
+      last_run_mode: persistedRunMode,
       source_total: sourceTotal,
       clickhouse_total: clickHouseTotal,
       parity_status: sourceTotal === clickHouseTotal ? "unknown_until_validation" : "needs_validation",
@@ -357,8 +433,14 @@ export async function runTransactionsBackfill(input: {
     });
 
     return {
+
       mode: params.mode,
+
       dry_run: params.dry_run,
+
+      duplicates_found: duplicatesFound,
+
+      duplicates_requeued: duplicatesRequeued,
       status,
       stopped_reason: stoppedReason,
       current_stage: stoppedReason,
@@ -396,7 +478,7 @@ export async function runTransactionsBackfill(input: {
       rows_skipped: rowsSkipped,
       batches_processed: batchesProcessed,
       last_error: message,
-      last_run_mode: params.mode,
+      last_run_mode: persistedRunMode,
       source_total: sourceTotal,
       clickhouse_total: clickHouseTotal,
       diagnostics,
