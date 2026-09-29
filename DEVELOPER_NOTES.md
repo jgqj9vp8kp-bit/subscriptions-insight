@@ -15,6 +15,27 @@
 - Views never take `FINAL`; ReplacingMergeTree tables read through views must
   apply `FINAL` inside the view definition (or use argMax-per-key views).
 
+## ClickHouse transactions: sorting-key drift makes duplicates (2026-09-29)
+
+`analytics_transactions` is ReplacingMergeTree keyed by
+`(auth_user_id, cohort_date, funnel, campaign_path, campaign_id, user_id,
+event_time, transaction_id)` — five of those columns are DERIVED at mapping
+time. A transaction re-synced after its derivation changed (the incremental
+Palmer import normalizes a day on its own: `cohort_date` = own day, type
+`trial`; the next full pass re-derives `cohort_date`) lands under a NEW key
+and FINAL keeps the old copy too. Symptom found live: one 254.99 BRL first
+subscription stored twice, the lifecycle classifier numbered the copies
+lvl 1 and lvl 2 ("Sub → Renewal 2 CR" 100% three days after the trial), the
+`USING(uid, tid)` join fanned each out again, and first-subscription revenue
+doubled. Rule: the backfill evicts EVERY existing copy of a batch's
+transaction_ids (lightweight `DELETE`, key-agnostic) before inserting;
+`clickhouse-backfill {mode:"dedup"}` finds ids with >1 copy through FINAL,
+bumps their `updated_at` so the keyset sync re-reads them, and rewrites them.
+Parity signal: `clickhouse-summary.transaction_count` must equal the count
+of non-deleted Supabase transactions (66,370 == 66,370 after the cleanup);
+a gap means copies again. Do not "fix" this in the classifier — deduping
+`(uid, tid)` there would hide doubled revenue rather than remove it.
+
 ## Known Limitations
 
 - Palmer column names can vary by export. `palmerTransform.ts` supports common aliases, but new exports may require additional aliases.
