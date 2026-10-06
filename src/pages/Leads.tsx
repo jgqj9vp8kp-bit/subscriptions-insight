@@ -24,6 +24,7 @@ import { useTransactions } from "@/services/sheets";
 import { useDataStore } from "@/store/dataStore";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
+import { useAccess } from "@/hooks/useAccess";
 import { mediaBuyerLabel } from "@/services/userMediaBuyer";
 import { backfillTransactionCardTypesFromRawRows } from "@/services/palmerTransform";
 import { isSupabaseConfigured } from "@/services/supabaseClient";
@@ -118,6 +119,12 @@ export default function LeadsPage() {
   const txs = useTransactions();
   const subscriptions = useDataStore((s) => s.subscriptions);
   const rawPalmerRows = useDataStore((s) => s.rawPalmerRows);
+  // The page itself is data-owner only (route guard). The FunnelFox leads sync
+  // is a manual trigger only (nothing syncs on mount) and needs admin.sync.run;
+  // its reconcile stage uses the browser's own warehouse, so raw access too
+  // (funnelfox-leads-sync policy). Owner / legacy: both true.
+  const access = useAccess();
+  const canSync = access.rawAccess && access.can("admin.sync.run");
 
   const [uiState, setUiState, resetUiState] = usePersistedPageState("ui_state_leads", DEFAULT_LEADS_UI_STATE);
 
@@ -157,6 +164,7 @@ export default function LeadsPage() {
 
   const runSync = useCallback(
     async (fullReset: boolean) => {
+      if (!canSync) return;
       setSyncing(true);
       setError(null);
       try {
@@ -168,7 +176,7 @@ export default function LeadsPage() {
         setSyncing(false);
       }
     },
-    [analyticsTxs, subscriptions, refresh],
+    [canSync, analyticsTxs, subscriptions, refresh],
   );
 
   const handleContinue = useCallback(() => runSync(false), [runSync]);
@@ -299,15 +307,17 @@ export default function LeadsPage() {
               {currentStageLabel ? ` · stage ${currentStageLabel}` : ""}
             </div>
           </div>
-          <div className="flex gap-2">
-            <Button onClick={handleContinue} disabled={syncing || !isSupabaseConfigured} size="sm">
-              {syncing ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
-              Continue Sync
-            </Button>
-            <Button onClick={handleFullResync} disabled={syncing || !isSupabaseConfigured} size="sm" variant="outline">
-              Full Resync
-            </Button>
-          </div>
+          {canSync && (
+            <div className="flex gap-2">
+              <Button onClick={handleContinue} disabled={syncing || !isSupabaseConfigured} size="sm">
+                {syncing ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
+                Continue Sync
+              </Button>
+              <Button onClick={handleFullResync} disabled={syncing || !isSupabaseConfigured} size="sm" variant="outline">
+                Full Resync
+              </Button>
+            </div>
+          )}
         </div>
 
         {error && <div className="mt-2 text-xs text-destructive">{error}</div>}

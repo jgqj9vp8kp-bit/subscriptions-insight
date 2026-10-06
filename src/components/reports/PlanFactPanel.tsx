@@ -45,10 +45,12 @@ const STATUS_TONE: Partial<Record<ReportTaskStatus, string>> = {
   paused: "text-warning",
 };
 
-export function PlanFactPanel({ period, reportId, onTasksChange }: {
+export function PlanFactPanel({ period, reportId, onTasksChange, readOnly = false }: {
   period: { from: string; to: string };
   reportId: string | null;
   onTasksChange?: (tasks: { closed: ReportTask[]; open: ReportTask[] }) => void;
+  /** Without reports.edit: tasks are listed, never added, changed or deleted. */
+  readOnly?: boolean;
 }) {
   const { toast } = useToast();
   const [tasks, setTasks] = useState<ReportTask[]>([]);
@@ -136,6 +138,7 @@ export function PlanFactPanel({ period, reportId, onTasksChange }: {
             <TableCell>
               <Select
                 value={task.status}
+                disabled={readOnly}
                 onValueChange={(value) => void patch(task, { status: value as ReportTaskStatus,
                   // Closing a task stamps the date the report uses to decide
                   // which week it belongs to.
@@ -161,7 +164,9 @@ export function PlanFactPanel({ period, reportId, onTasksChange }: {
                 className="h-8 text-xs"
                 defaultValue={task.status === "moved" ? (task.movedReason ?? "") : (task.comment ?? "")}
                 placeholder={task.status === "moved" ? "причина переноса" : "комментарий"}
+                readOnly={readOnly}
                 onBlur={(e) => {
+                  if (readOnly) return;
                   const value = e.target.value.trim() || null;
                   const current = task.status === "moved" ? task.movedReason : task.comment;
                   if (value === current) return;
@@ -170,16 +175,18 @@ export function PlanFactPanel({ period, reportId, onTasksChange }: {
               />
             </TableCell>
             <TableCell className="text-right">
-              <Button type="button" variant="ghost" size="icon" className="h-7 w-7"
-                aria-label={`Удалить задачу ${task.title}`}
-                disabled={busyId === task.id}
-                onClick={() => void (async () => {
-                  setBusyId(task.id);
-                  try { await deleteReportTask(task.id); await refresh(); }
-                  finally { setBusyId(null); }
-                })()}>
-                <X className="h-3.5 w-3.5" />
-              </Button>
+              {!readOnly && (
+                <Button type="button" variant="ghost" size="icon" className="h-7 w-7"
+                  aria-label={`Удалить задачу ${task.title}`}
+                  disabled={busyId === task.id}
+                  onClick={() => void (async () => {
+                    setBusyId(task.id);
+                    try { await deleteReportTask(task.id); await refresh(); }
+                    finally { setBusyId(null); }
+                  })()}>
+                  <X className="h-3.5 w-3.5" />
+                </Button>
+              )}
             </TableCell>
           </TableRow>
         ))}
@@ -189,27 +196,29 @@ export function PlanFactPanel({ period, reportId, onTasksChange }: {
 
   return (
     <Card className="p-0 shadow-card">
-      <div className="flex flex-wrap items-center gap-2 border-b border-border px-4 py-3">
-        <Input
-          className="h-9 flex-1 min-w-[220px]"
-          placeholder="Новая задача на следующую неделю…"
-          value={newTitle}
-          onChange={(e) => setNewTitle(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter") void onAdd(); }}
-        />
-        <Select value={newPriority} onValueChange={(v) => setNewPriority(v as ReportTaskPriority)}>
-          <SelectTrigger className="h-9 w-[130px]"><SelectValue /></SelectTrigger>
-          <SelectContent>
-            {(Object.keys(PRIORITY_LABELS) as ReportTaskPriority[]).map((p) => (
-              <SelectItem key={p} value={p}>{PRIORITY_LABELS[p]}</SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        <Button type="button" onClick={() => void onAdd()} disabled={busyId === "new" || !newTitle.trim()}>
-          {busyId === "new" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-          Добавить
-        </Button>
-      </div>
+      {!readOnly && (
+        <div className="flex flex-wrap items-center gap-2 border-b border-border px-4 py-3">
+          <Input
+            className="h-9 flex-1 min-w-[220px]"
+            placeholder="Новая задача на следующую неделю…"
+            value={newTitle}
+            onChange={(e) => setNewTitle(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") void onAdd(); }}
+          />
+          <Select value={newPriority} onValueChange={(v) => setNewPriority(v as ReportTaskPriority)}>
+            <SelectTrigger className="h-9 w-[130px]"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {(Object.keys(PRIORITY_LABELS) as ReportTaskPriority[]).map((p) => (
+                <SelectItem key={p} value={p}>{PRIORITY_LABELS[p]}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Button type="button" onClick={() => void onAdd()} disabled={busyId === "new" || !newTitle.trim()}>
+            {busyId === "new" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+            Добавить
+          </Button>
+        </div>
+      )}
 
       {loading ? (
         <div className="flex items-center gap-2 px-4 py-6 text-sm text-muted-foreground">

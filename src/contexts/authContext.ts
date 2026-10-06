@@ -18,7 +18,10 @@ export type AuthContextValue = {
   session: Session | null;
   user: AuthUser | null;
   signIn: (login: string, password: string) => Promise<void>;
-  signOut: () => Promise<void>;
+  /** Default scope "global" (the logout button: every device). "local" ends
+   * only this browser's session — for automatic sign-outs, so one rejected
+   * request never revokes the user's sessions on other devices. */
+  signOut: (options?: { scope?: "global" | "local" }) => Promise<void>;
 };
 
 export const AuthContext = createContext<AuthContextValue | null>(null);

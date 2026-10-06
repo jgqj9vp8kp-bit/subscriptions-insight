@@ -1,68 +1,68 @@
 /* global Deno */
 
-import { createClickHouseClient } from "../_shared/clickhouse/client.ts";
-import { jsonResponse, methodNotAllowed, optionsResponse, requireSupabaseUser } from "../_shared/clickhouse/http.ts";
-import { getClickHouseSummary } from "../_shared/clickhouse/summary.ts";
+// clickhouse-summary: the warehouse probe. The browser fingerprints its cache
+// versions from the state rows in this response, and the data owner's
+// Integrations panel shows the tenant KPI aggregate.
+//
+// Access (policies/clickhouse-summary.ts): any member who can open a page that
+// runs the probe. With raw access or admin.diagnostics.view the body is exactly
+// today's (KPIs + states, and the 200 { connected: false, error } shape when
+// ClickHouse fails); everyone else gets the version-only member view and no
+// KPI query runs on their behalf.
 
-async function getSyncState(auth: Awaited<ReturnType<typeof requireSupabaseUser>>) {
-  if ("status" in auth) return null;
-  const { data } = await auth.supabase
-    .from("clickhouse_transaction_sync_state")
-    .select("*")
-    .eq("auth_user_id", auth.id)
-    .eq("sync_name", "analytics_transactions_backfill")
-    .maybeSingle();
-  return data ?? null;
+import { serveWithAccess } from "../_shared/clickhouse/http.ts";
+import {
+  getClickHouseSummary,
+  getCohortSnapshotStateRow,
+  getSupportSyncState,
+  getTransactionSyncState,
+  memberWarehouseSummary,
+} from "../_shared/clickhouse/summary.ts";
+import { createKeyedHasher } from "../_shared/clickhouse/cohortSubscriptions.ts";
+import { ScopeViolation } from "../_shared/clickhouse/scopedClient.ts";
+import {
+  CLICKHOUSE_SUMMARY_POLICY,
+  summaryKpisVisible,
+  summaryVersionHashLabel,
+} from "../_shared/access/policies/clickhouse-summary.ts";
+
+/** Best-effort state read: null on an ordinary error, a ScopeViolation propagates. */
+function orNull(error: unknown): null {
+  if (error instanceof ScopeViolation) throw error;
+  return null;
 }
 
-async function getCohortSnapshotState(auth: Awaited<ReturnType<typeof requireSupabaseUser>>) {
-  if ("status" in auth) return null;
-  const { data } = await auth.supabase
-    .from("clickhouse_cohort_snapshot_state")
-    .select("*")
-    .eq("auth_user_id", auth.id)
-    .eq("snapshot_name", "fact_user_cohorts")
-    .maybeSingle();
-  return data ?? null;
-}
+serveWithAccess(CLICKHOUSE_SUMMARY_POLICY, async ({ ctx, pg, clickhouse }) => {
+  const tenantKey = ctx.tenantKey;
 
-async function getSupportSyncState(auth: Awaited<ReturnType<typeof requireSupabaseUser>>) {
-  if ("status" in auth) return null;
-  const { data } = await auth.supabase
-    .from("clickhouse_transaction_sync_state")
-    .select("*")
-    .eq("auth_user_id", auth.id)
-    .eq("sync_name", "fact_support_requests_sync")
-    .maybeSingle();
-  return data ?? null;
-}
-
-Deno.serve(async (req: Request) => {
-  if (req.method === "OPTIONS") return optionsResponse();
-  if (req.method !== "GET" && req.method !== "POST") return methodNotAllowed("GET, POST");
-
-  const auth = await requireSupabaseUser(req);
-  if ("status" in auth) return jsonResponse(auth.body, auth.status);
-
-  let client: ReturnType<typeof createClickHouseClient> | null = null;
-  try {
-    client = createClickHouseClient();
-    const [summary, syncState, cohortSnapshotState, supportSyncState] = await Promise.all([
-      getClickHouseSummary({ authUserId: auth.id, supabase: auth.supabase, clickhouse: client }),
-      getSyncState(auth),
-      getCohortSnapshotState(auth),
-      getSupportSyncState(auth),
+  if (!summaryKpisVisible(ctx)) {
+    const [syncState, cohortSnapshotState, supportSyncState] = await Promise.all([
+      getTransactionSyncState(pg, tenantKey).catch(orNull),
+      getCohortSnapshotStateRow(pg, tenantKey).catch(orNull),
+      getSupportSyncState(pg, tenantKey).catch(orNull),
     ]);
-    return jsonResponse({ ...summary, sync_state: syncState, cohort_snapshot_state: cohortSnapshotState, support_sync_state: supportSyncState });
+    // The service-role key never leaves the isolate; it only keys the HMAC that
+    // makes the version tokens opaque (summary.ts "Member view").
+    const hasher = await createKeyedHasher(Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "", summaryVersionHashLabel(tenantKey));
+    return memberWarehouseSummary({ hasher, syncState, cohortSnapshotState, supportSyncState });
+  }
+
+  try {
+    const [summary, syncState, cohortSnapshotState, supportSyncState] = await Promise.all([
+      getClickHouseSummary({ authUserId: tenantKey, supabase: pg, clickhouse: clickhouse() }),
+      getTransactionSyncState(pg, tenantKey),
+      getCohortSnapshotStateRow(pg, tenantKey),
+      getSupportSyncState(pg, tenantKey),
+    ]);
+    return { ...summary, sync_state: syncState, cohort_snapshot_state: cohortSnapshotState, support_sync_state: supportSyncState };
   } catch (error) {
-    return jsonResponse({
+    if (error instanceof ScopeViolation) throw error;
+    return {
       connected: false,
       error: error instanceof Error ? error.message : "Could not load ClickHouse summary.",
-      sync_state: await getSyncState(auth).catch(() => null),
-      cohort_snapshot_state: await getCohortSnapshotState(auth).catch(() => null),
-      support_sync_state: await getSupportSyncState(auth).catch(() => null),
-    });
-  } finally {
-    await client?.close?.().catch(() => undefined);
+      sync_state: await getTransactionSyncState(pg, tenantKey).catch(orNull),
+      cohort_snapshot_state: await getCohortSnapshotStateRow(pg, tenantKey).catch(orNull),
+      support_sync_state: await getSupportSyncState(pg, tenantKey).catch(orNull),
+    };
   }
 });

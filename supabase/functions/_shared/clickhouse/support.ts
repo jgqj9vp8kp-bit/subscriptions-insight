@@ -6,8 +6,10 @@ import {
   ensureFactSupportRequestsSchema,
 } from "./schema.ts";
 import { activeCohortSnapshotVersion, getCohortSnapshotState } from "./cohortMembership.ts";
+import { ScopeViolation } from "./scopedClient.ts";
 import {
   EMPTY_CAMPAIGN_PATH,
+  supportSearchTerm,
   type SupportAnalyticsBundle,
   type SupportDetailsResponse,
   type SupportExportResponse,
@@ -136,6 +138,17 @@ type Classification = {
 };
 
 export class SupportRequestError extends Error {}
+
+/** clickhouse-support's error mapping (serveWithAccess onError): the status and
+ * body the function has always returned — 400 for a malformed request, 502 for
+ * anything else. The gate replaces the body with a generic one for everyone but
+ * the data owner, and a recorded ScopeViolation still becomes a 500. */
+export function clickHouseSupportErrorResponse(error: unknown): { status: number; body: Record<string, unknown> } {
+  return {
+    status: error instanceof SupportRequestError ? 400 : 502,
+    body: { ok: false, source: "clickhouse", error: error instanceof Error ? error.message : "ClickHouse support request failed." },
+  };
+}
 
 function s(value: unknown): string {
   return typeof value === "string" ? value : value == null ? "" : String(value);
@@ -310,7 +323,8 @@ export function normalizeSupportRequest(req: SupportRequest): NormalizedRequest 
       manual_status: f.manual_status === "manual" || f.manual_status === "automatic" ? f.manual_status : "all",
       answered: tri(f.answered),
       import_batch_id: arr(f.import_batch_id, "import_batch_id"),
-      search: s(f.search).trim().slice(0, 300),
+      // Shared with the access policy (a search is its own action there).
+      search: supportSearchTerm(req.filters),
     },
     sortField,
     sortDir: req.sort?.direction === "asc" ? "asc" : "desc",
@@ -1474,7 +1488,11 @@ export async function runSupportStatus(input: { authUserId: string; supabase: Su
   const [state, sourceRowsTotal, chTotal] = await Promise.all([
     getSyncState(input.supabase, input.authUserId).catch(() => null),
     sourceTotal(input.supabase, input.authUserId).catch(() => 0),
-    clickhouseTotal(input.clickhouse, input.authUserId).catch(() => 0),
+    // A warehouse hiccup still reads as 0; a scope violation fails the request.
+    clickhouseTotal(input.clickhouse, input.authUserId).catch((error) => {
+      if (error instanceof ScopeViolation) throw error;
+      return 0;
+    }),
   ]);
   return {
     ok: true,

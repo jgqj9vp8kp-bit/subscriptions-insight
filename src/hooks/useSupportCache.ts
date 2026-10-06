@@ -1,7 +1,7 @@
 import { useEffect, useMemo } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { recordDuration } from "@/services/analyticsProgress";
-import { GC_MS, STALE_MS, transientRetry, useAnalyticsProgress } from "@/hooks/useAnalyticsCache";
+import { GC_MS, STALE_MS, transientRetry, useAnalyticsProgress, useCacheScope } from "@/hooks/useAnalyticsCache";
 import {
   loadSupportBundle,
   loadSupportPage,
@@ -29,8 +29,16 @@ export function useSupportData(params: {
   userScopeHash: string;
   warehouseVersion: string;
   enabled: boolean;
+  /** Load the request list next to the bundle (default true). The list needs
+   * support.messages.view server-side; a support.view-only member passes false
+   * so the page never fires a request the gate refuses (403). Progress and the
+   * loading flags then follow the bundle query. */
+  listEnabled?: boolean;
 }): UseSupportDataResult {
-  const { query, userScopeHash, warehouseVersion, enabled } = params;
+  const { query, warehouseVersion } = params;
+  const userScopeHash = useCacheScope(params.userScopeHash);
+  const enabled = params.enabled && userScopeHash !== "";
+  const listEnabled = enabled && params.listEnabled !== false;
   const bundleKey = useMemo(() => supportBundleKey({ userScopeHash, warehouseVersion, request: query }), [userScopeHash, warehouseVersion, query]);
   const listKey = useMemo(() => supportListKey({ userScopeHash, warehouseVersion, request: query }), [userScopeHash, warehouseVersion, query]);
   const bundleHash = useMemo(() => traceHash(bundleKey), [bundleKey]);
@@ -65,13 +73,18 @@ export function useSupportData(params: {
     },
     placeholderData: keepPreviousData,
     ...common,
+    enabled: listEnabled,
   });
 
   const bundle = (bundleQ.data as SupportAnalyticsBundle | undefined) ?? null;
   const page = (listQ.data as SupportListResponse | undefined) ?? null;
   const erroring = [bundleQ, listQ].find((q) => q.isError);
   const error = erroring ? (erroring.error instanceof Error ? erroring.error.message : "ClickHouse support request failed") : null;
-  const progress = useAnalyticsProgress({ isFetching: listQ.isFetching && enabled, status: listQ.status, activeKey, ns: NS });
+  // The query that drives progress / loading: the list, or the bundle when the
+  // list is not loaded for this member.
+  const leadQ = listEnabled ? listQ : bundleQ;
+  const leadHasData = listEnabled ? page != null : bundle != null;
+  const progress = useAnalyticsProgress({ isFetching: leadQ.isFetching && enabled, status: leadQ.status, activeKey, ns: NS });
 
   useEffect(() => {
     traceEvent("support.query_state", {
@@ -93,8 +106,8 @@ export function useSupportData(params: {
     bundle,
     page,
     status: { loading: enabled && (bundleQ.isFetching || listQ.isFetching), error },
-    isBackgroundRefreshing: listQ.isFetching && page != null,
-    isInitialLoading: listQ.isFetching && page == null,
+    isBackgroundRefreshing: leadQ.isFetching && leadHasData,
+    isInitialLoading: leadQ.isFetching && !leadHasData,
     progressPercent: progress.percent,
     dataUpdatedAt: Math.max(bundleQ.dataUpdatedAt, listQ.dataUpdatedAt),
   };

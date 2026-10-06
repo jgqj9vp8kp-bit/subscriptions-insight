@@ -13,7 +13,9 @@
     "lint": "eslint .",
     "preview": "vite preview",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "deploy:functions": "node scripts/deploy-functions.mjs",
+    "verify:functions": "node scripts/deploy-functions.mjs --verify-only"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.10.0",
@@ -72,6 +74,7 @@
     "zustand": "^5.0.12"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8",
     "@eslint/js": "^9.32.0",
     "@tailwindcss/typography": "^0.5.16",
     "@testing-library/jest-dom": "^6.6.0",

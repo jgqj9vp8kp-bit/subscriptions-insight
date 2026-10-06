@@ -6,6 +6,22 @@ export type SupportAction = "bundle" | "list" | "details" | "options" | "sync" |
 export type SupportSortDirection = "asc" | "desc";
 export type SupportTriState = "all" | "yes" | "no";
 export const EMPTY_CAMPAIGN_PATH = "—";
+export const SUPPORT_SEARCH_MAX_LENGTH = 300;
+
+/**
+ * The free-text search term the server applies for a request's `filters`
+ * (sender, addresses, subject, message body, contact name). One definition for
+ * the SQL builder (normalizeSupportRequest) and the access policy: a non-empty
+ * term is a content / PII oracle through the counts it changes, so the policy
+ * gives such requests their own action — the two must never disagree about
+ * whether a request searches. Mirrors the original `s(f.search).trim()` over
+ * `f = filters ?? {}` exactly, including its handling of non-string values.
+ */
+export function supportSearchTerm(filters: unknown): string {
+  const value = ((filters ?? {}) as { search?: unknown }).search;
+  const text = typeof value === "string" ? value : value == null ? "" : String(value);
+  return text.trim().slice(0, SUPPORT_SEARCH_MAX_LENGTH);
+}
 
 export interface SupportFilters {
   funnel: string[];

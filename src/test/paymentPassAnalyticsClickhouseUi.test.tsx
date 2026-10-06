@@ -15,6 +15,13 @@ Object.defineProperty(window, "ResizeObserver", {
 });
 
 vi.mock("@/hooks/useAuth", () => ({ useAuth: () => ({ user: { id: "user-1" } }) }));
+// The component reads useAccess(); this test covers the data owner's view
+// (legacy access: every permission, raw access on — exactly today's behaviour).
+vi.mock("@/hooks/useAccess", async () => {
+  const { buildAccessValue } = await import("@/contexts/accessContext");
+  const owner = buildAccessValue({ status: "legacy", access: null, userId: "user-1" });
+  return { useAccess: () => owner, useOptionalAccess: () => owner, useCan: (key: string) => owner.can(key) };
+});
 vi.mock("@/hooks/useAnalyticsCache", () => ({ useWarehouseVersion: () => ({ version: "whv_test", ready: true }) }));
 vi.mock("@/services/paymentAnalyticsDataSource", async (importActual) => {
   const actual = await importActual<typeof import("@/services/paymentAnalyticsDataSource")>();

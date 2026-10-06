@@ -23,9 +23,20 @@ import {
   type TrafficCachePayload,
 } from "@/services/trafficCache";
 import { useDataStore } from "@/store/dataStore";
+import { useOptionalAccess } from "@/hooks/useAccess";
 import type { TrafficMetric } from "@/services/trafficImport";
 import type { SubscriptionClean } from "@/types/subscriptions";
 import { traceAsync, traceEvent } from "@/services/performanceTrace";
+
+// Restores the data owner's raw datasets (warehouse transactions, Palmer, FunnelFox
+// subscriptions, FB traffic) into the in-memory store. Raw downloads are data-owner
+// only (plan D8): without raw access — or before access has resolved — nothing loads.
+//
+// Every restore runs for ONE access partition. The local IndexedDB copies are read
+// and (re)written only under that partition (the cache modules ignore and delete an
+// entry stamped for any other partition, i.e. another principal's local copy), and
+// when the partition changes (the purge registry has just reset the store and
+// deleted the caches) the restore runs again for the new partition.
 
 type AutoLoadStatus = "idle" | "loading" | "loaded" | "warning";
 
@@ -40,8 +51,11 @@ type TrafficCloudPayload = {
 };
 
 export function SavedDataAutoLoader({ loadTransactions = true }: { loadTransactions?: boolean }) {
-  const didRun = useRef(false);
-  const transactionDidRun = useRef(false);
+  const access = useOptionalAccess();
+  const partition = access && !access.loading && access.rawAccess ? access.partition : "";
+  /** Partition the dataset restore / the warehouse load last ran for. */
+  const didRunFor = useRef<string | null>(null);
+  const transactionDidRunFor = useRef<string | null>(null);
   const setImported = useDataStore((state) => state.setImported);
   const setSubscriptions = useDataStore((state) => state.setSubscriptions);
   const setTrafficMetrics = useDataStore((state) => state.setTrafficMetrics);
@@ -49,8 +63,9 @@ export function SavedDataAutoLoader({ loadTransactions = true }: { loadTransacti
   const [message, setMessage] = useState<string | null>(null);
 
   useEffect(() => {
-    if (didRun.current) return;
-    didRun.current = true;
+    if (!partition || didRunFor.current === partition) return;
+    didRunFor.current = partition;
+    const cacheScope = { partition };
 
     let mounted = true;
 
@@ -68,8 +83,8 @@ export function SavedDataAutoLoader({ loadTransactions = true }: { loadTransacti
       // from DB". Loading the warehouse up front makes in-app analytics match the Export API (full
       // history across every import batch) with no manual refresh. The Palmer cache below is only a
       // fallback for when the warehouse is disabled, empty, or errors.
-      if (mounted && loadTransactions && !transactionDidRun.current) {
-        transactionDidRun.current = true;
+      if (mounted && loadTransactions && transactionDidRunFor.current !== partition) {
+        transactionDidRunFor.current = partition;
         const warehouse = await autoLoadWarehouseIntoStore();
         if (warehouse.status === "loaded") {
           loadedCount += 1;
@@ -96,7 +111,7 @@ export function SavedDataAutoLoader({ loadTransactions = true }: { loadTransacti
           let cached: PalmerDatasetCachePayload | null = null;
           let source: RestoreSource = "local cache";
           try {
-            cached = await traceAsync("palmer.persisted_cache_load", loadLastPalmerDatasetFromCache);
+            cached = await traceAsync("palmer.persisted_cache_load", () => loadLastPalmerDatasetFromCache(cacheScope));
           } catch (error) {
             console.warn("Could not read Palmer IndexedDB cache.", error);
             warnings.push("Palmer local cache");
@@ -129,6 +144,7 @@ export function SavedDataAutoLoader({ loadTransactions = true }: { loadTransacti
               void savePalmerDatasetToCache(
                 { transactions, rawPalmerRows: payload.rawPalmerRows },
                 cached.metadata,
+                cacheScope,
               ).catch((error) => console.warn("Could not warm Palmer IndexedDB cache.", error));
               source = "cloud";
             }
@@ -187,7 +203,7 @@ export function SavedDataAutoLoader({ loadTransactions = true }: { loadTransacti
               email_coverage: 0,
               last_sync_at: new Date().toISOString(),
             };
-            void saveSubscriptionsToCache(dbSubscriptions, metadata).catch((error) =>
+            void saveSubscriptionsToCache(dbSubscriptions, metadata, cacheScope).catch((error) =>
               console.warn("Could not warm FunnelFox IndexedDB cache.", error),
             );
           }
@@ -197,7 +213,7 @@ export function SavedDataAutoLoader({ loadTransactions = true }: { loadTransacti
         let cached: SubscriptionCachePayload | null = null;
         let source: RestoreSource = "local cache";
         try {
-          cached = await traceAsync("subscriptions.persisted_cache_load", loadSubscriptionsFromCache);
+          cached = await traceAsync("subscriptions.persisted_cache_load", () => loadSubscriptionsFromCache(cacheScope));
         } catch (error) {
           console.warn("Could not read FunnelFox IndexedDB cache.", error);
           warnings.push("FunnelFox local cache");
@@ -221,7 +237,7 @@ export function SavedDataAutoLoader({ loadTransactions = true }: { loadTransacti
                 last_sync_at: String(cloud.metadata.last_sync_at ?? cloud.updated_at),
               },
             };
-            void saveSubscriptionsToCache(subscriptions, cached.metadata).catch((error) =>
+            void saveSubscriptionsToCache(subscriptions, cached.metadata, cacheScope).catch((error) =>
               console.warn("Could not warm FunnelFox IndexedDB cache.", error),
             );
             source = "cloud";
@@ -253,7 +269,7 @@ export function SavedDataAutoLoader({ loadTransactions = true }: { loadTransacti
         let cached: TrafficCachePayload | null = null;
         let source: RestoreSource = "local cache";
         try {
-          cached = await traceAsync("traffic.persisted_cache_load", loadLastTrafficDataFromCache);
+          cached = await traceAsync("traffic.persisted_cache_load", () => loadLastTrafficDataFromCache(cacheScope));
         } catch (error) {
           console.warn("Could not read Facebook traffic IndexedDB cache.", error);
           warnings.push("Facebook traffic local cache");
@@ -279,7 +295,7 @@ export function SavedDataAutoLoader({ loadTransactions = true }: { loadTransacti
                 year: typeof cloud.metadata.year === "number" ? cloud.metadata.year : undefined,
               },
             };
-            void saveTrafficDataToCache(trafficMetrics, cached.metadata).catch((error) =>
+            void saveTrafficDataToCache(trafficMetrics, cached.metadata, cacheScope).catch((error) =>
               console.warn("Could not warm Facebook traffic IndexedDB cache.", error),
             );
             source = "cloud";
@@ -343,11 +359,11 @@ export function SavedDataAutoLoader({ loadTransactions = true }: { loadTransacti
     return () => {
       mounted = false;
     };
-  }, [loadTransactions, setImported, setSubscriptions, setTrafficMetrics]);
+  }, [partition, loadTransactions, setImported, setSubscriptions, setTrafficMetrics]);
 
   useEffect(() => {
-    if (!loadTransactions || transactionDidRun.current) return;
-    transactionDidRun.current = true;
+    if (!partition || !loadTransactions || transactionDidRunFor.current === partition) return;
+    transactionDidRunFor.current = partition;
     let mounted = true;
     setStatus("loading");
     setMessage("Loading saved transaction data...");
@@ -370,7 +386,7 @@ export function SavedDataAutoLoader({ loadTransactions = true }: { loadTransacti
     return () => {
       mounted = false;
     };
-  }, [loadTransactions]);
+  }, [partition, loadTransactions]);
 
   if (status === "idle" || !message) return null;
 

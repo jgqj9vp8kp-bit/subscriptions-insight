@@ -21,6 +21,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useToast } from "@/hooks/use-toast";
+import { useAccess } from "@/hooks/useAccess";
 import { validationStaleness } from "@/services/validationStaleness";
 import { CampaignIdSplitDiagnostics } from "@/components/CampaignIdSplitDiagnostics";
 import { ExportApiHealth } from "@/components/ExportApiHealth";
@@ -43,6 +44,7 @@ import {
 } from "@/services/capsuledFacebook";
 import {
   clickHouseStatusLabel,
+  describeClickHouseBackfillResult,
   getClickHouseSummary,
   initializeClickHouseSchema,
   invalidateClickHouseSummaryCache,
@@ -131,6 +133,8 @@ const exampleResponse = JSON.stringify(
   2,
 );
 
+const NO_TRANSACTIONS: ReturnType<typeof useTransactions> = [];
+
 function CodeBlock({ value }: { value: string }) {
   return (
     <pre className="overflow-auto rounded-md bg-muted p-3 text-xs text-muted-foreground">
@@ -141,7 +145,35 @@ function CodeBlock({ value }: { value: string }) {
 
 export default function IntegrationsPage() {
   const { toast } = useToast();
-  const txs = useTransactions();
+  const access = useAccess();
+  // Every control is shown by the permission its server call enforces (UX only;
+  // the Edge gate and RLS re-check every request). The owner and legacy access
+  // pass every check, so the page is unchanged for them. The page itself needs
+  // admin.integrations.view (route guard), which also covers the ClickHouse
+  // connection test and the warehouse summary.
+  //   admin.sync.run          — Capsuled sync;
+  //   admin.warehouse.manage  — backfill and validation;
+  //   Owner role + raw access — schema initialization (clickhouse-init is
+  //                             ownerOnly + rawOnly: platform DDL);
+  //   raw access              — everything read or written straight through
+  //                             PostgREST / the browser store under the caller:
+  //                             Capsuled sync rows, the Export API data status,
+  //                             the payload repairs (with admin.warehouse.manage),
+  //                             the campaign-id split diagnostics;
+  //   admin.api_keys.manage + raw access — API keys, the test export and the
+  //                             export logs (keys are still minted through
+  //                             PostgREST in Phase 1).
+  const isOwnerRole = access.legacy || (access.status === "ok" && access.access?.role?.is_owner === true);
+  const ownerData = access.rawAccess;
+  const canRunSync = access.can("admin.sync.run");
+  const canManageWarehouse = access.can("admin.warehouse.manage");
+  const canInitWarehouse = canManageWarehouse && ownerData && isOwnerRole;
+  const canRepairPayloads = canManageWarehouse && ownerData;
+  const canManageApiKeys = ownerData && access.can("admin.api_keys.manage");
+  const storeTxs = useTransactions();
+  // Only the data owner hydrates the browser store; for anyone else it holds
+  // demo rows that must not feed the Capsuled match diagnostics.
+  const txs = ownerData ? storeTxs : NO_TRANSACTIONS;
   const endpoint = useMemo(() => exportCampaignPerformanceEndpoint(), []);
   const [apiKeys, setApiKeys] = useState<ApiKeyRecord[]>([]);
   const [logs, setLogs] = useState<ApiExportLogRecord[]>([]);
@@ -225,10 +257,10 @@ export default function IntegrationsPage() {
     invalidateClickHouseSummaryCache();
     try {
       const [keys, exportLogs, status, rows, chSummary] = await Promise.all([
-        listApiKeys(),
-        listApiExportLogs(20),
-        getCapsuledFacebookStatus().catch(() => null),
-        listCapsuledFacebookRows().catch(() => []),
+        canManageApiKeys ? listApiKeys() : Promise.resolve<ApiKeyRecord[]>([]),
+        canManageApiKeys ? listApiExportLogs(20) : Promise.resolve<ApiExportLogRecord[]>([]),
+        ownerData ? getCapsuledFacebookStatus().catch(() => null) : Promise.resolve(null),
+        ownerData ? listCapsuledFacebookRows().catch(() => []) : Promise.resolve([]),
         getClickHouseSummary().catch(() => null),
       ]);
       setApiKeys(keys);
@@ -249,7 +281,7 @@ export default function IntegrationsPage() {
     } finally {
       setLoading(false);
     }
-  }, [toast, txs]);
+  }, [toast, txs, canManageApiKeys, ownerData]);
 
   useEffect(() => {
     void refresh();
@@ -408,7 +440,7 @@ export default function IntegrationsPage() {
         dry_run: false,
         full_reset_cursor: mode === "full_backfill",
       }),
-      (backfill) => `${backfill.status}: inserted ${backfill.rows_inserted.toLocaleString("en-US")} rows, stopped: ${backfill.stopped_reason}.`,
+      (backfill) => describeClickHouseBackfillResult(backfill),
     );
     if (result) setClickHouseLastBackfill(result);
   }
@@ -528,10 +560,13 @@ export default function IntegrationsPage() {
 
   return (
     <AppLayout title="Integrations" description="Secure export access for external platforms">
-      <section className="mb-4">
-        <ExportApiHealth />
-      </section>
+      {ownerData && (
+        <section className="mb-4">
+          <ExportApiHealth />
+        </section>
+      )}
 
+      {(ownerData || canRunSync) && (
       <section className="mb-4">
         <Card className="p-4 shadow-card">
           <div className="flex flex-wrap items-start justify-between gap-3">
@@ -551,6 +586,8 @@ export default function IntegrationsPage() {
           </div>
 
           <div className="mt-4 grid gap-3 md:grid-cols-3 xl:grid-cols-6">
+            {canRunSync && (
+            <>
             <div className="space-y-2">
               <Label className="text-xs text-muted-foreground">dateFrom</Label>
               <Input
@@ -595,6 +632,8 @@ export default function IntegrationsPage() {
                 Force Resync
               </Button>
             </div>
+            </>
+            )}
             <div className="flex items-end">
               <Button type="button" variant="outline" className="w-full" onClick={refresh} disabled={loading || Boolean(capsuledSyncing)}>
                 {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
@@ -623,6 +662,7 @@ export default function IntegrationsPage() {
           </div>
         </Card>
       </section>
+      )}
 
       <section className="mb-4">
         <Card className="p-4 shadow-card">
@@ -657,56 +697,66 @@ export default function IntegrationsPage() {
               {clickHouseTesting ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
               Test Connection
             </Button>
-            <Button type="button" variant="outline" onClick={onInitializeClickHouse} disabled={Boolean(clickHouseAction)}>
-              {clickHouseAction === "init" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
-              Initialize Schema
-            </Button>
-            <Button type="button" variant="outline" onClick={() => onBackfillClickHouse("continue", true)} disabled={Boolean(clickHouseAction)}>
-              {clickHouseAction === "controlled_backfill" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-              Run Controlled Backfill
-            </Button>
-            <Button type="button" variant="outline" onClick={() => onBackfillClickHouse("continue")} disabled={Boolean(clickHouseAction)}>
-              {clickHouseAction === "continue" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-              Continue Backfill
-            </Button>
-            <Button type="button" variant="outline" onClick={() => onBackfillClickHouse("full_backfill")} disabled={Boolean(clickHouseAction)}>
-              {clickHouseAction === "full_backfill" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-              Run Full Backfill
-            </Button>
-            <Button type="button" variant="outline" onClick={onStartValidation} disabled={clickHouseValidationRunning || Boolean(clickHouseAction)}>
-              {clickHouseValidationRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
-              Start Validation
-            </Button>
-            <Button type="button" variant="outline" onClick={onContinueValidation} disabled={clickHouseValidationRunning || Boolean(clickHouseAction)}>
-              <RefreshCw className="h-4 w-4" />
-              Continue Validation
-            </Button>
-            {clickHouseValidationRunning && (
-              <Button type="button" variant="outline" onClick={onStopValidation}>
-                Stop Validation
+            {canInitWarehouse && (
+              <Button type="button" variant="outline" onClick={onInitializeClickHouse} disabled={Boolean(clickHouseAction)}>
+                {clickHouseAction === "init" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
+                Initialize Schema
               </Button>
             )}
-            <Button type="button" variant="outline" onClick={onResetValidation} disabled={clickHouseValidationRunning}>
-              <ShieldOff className="h-4 w-4" />
-              Reset Validation
-            </Button>
+            {canManageWarehouse && (
+              <>
+                <Button type="button" variant="outline" onClick={() => onBackfillClickHouse("continue", true)} disabled={Boolean(clickHouseAction)}>
+                  {clickHouseAction === "controlled_backfill" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                  Run Controlled Backfill
+                </Button>
+                <Button type="button" variant="outline" onClick={() => onBackfillClickHouse("continue")} disabled={Boolean(clickHouseAction)}>
+                  {clickHouseAction === "continue" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                  Continue Backfill
+                </Button>
+                <Button type="button" variant="outline" onClick={() => onBackfillClickHouse("full_backfill")} disabled={Boolean(clickHouseAction)}>
+                  {clickHouseAction === "full_backfill" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                  Run Full Backfill
+                </Button>
+                <Button type="button" variant="outline" onClick={onStartValidation} disabled={clickHouseValidationRunning || Boolean(clickHouseAction)}>
+                  {clickHouseValidationRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
+                  Start Validation
+                </Button>
+                <Button type="button" variant="outline" onClick={onContinueValidation} disabled={clickHouseValidationRunning || Boolean(clickHouseAction)}>
+                  <RefreshCw className="h-4 w-4" />
+                  Continue Validation
+                </Button>
+                {clickHouseValidationRunning && (
+                  <Button type="button" variant="outline" onClick={onStopValidation}>
+                    Stop Validation
+                  </Button>
+                )}
+                <Button type="button" variant="outline" onClick={onResetValidation} disabled={clickHouseValidationRunning}>
+                  <ShieldOff className="h-4 w-4" />
+                  Reset Validation
+                </Button>
+              </>
+            )}
             <Button type="button" variant="outline" onClick={refresh} disabled={loading || Boolean(clickHouseAction)}>
               {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
               Refresh Status
             </Button>
-            <Button type="button" variant="outline" onClick={() => void onRepairLegacyPayloads()} disabled={payloadRepair.running}>
-              {payloadRepair.running ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-              Repair Legacy Payloads
-            </Button>
+            {canRepairPayloads && (
+              <Button type="button" variant="outline" onClick={() => void onRepairLegacyPayloads()} disabled={payloadRepair.running}>
+                {payloadRepair.running ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                Repair Legacy Payloads
+              </Button>
+            )}
             {(payloadRepair.progress || payloadRepair.result) && (
               <span className="self-center text-xs text-muted-foreground">
                 {payloadRepair.progress ?? `Repair done: ${payloadRepair.result?.repaired.toLocaleString()} of ${payloadRepair.result?.scanned.toLocaleString()} rows updated.`}
               </span>
             )}
-            <Button type="button" variant="outline" onClick={() => void onRepairZeroDecimalAmounts()} disabled={zeroDecimalRepair.running}>
-              {zeroDecimalRepair.running ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-              Repair Zero-Decimal Amounts
-            </Button>
+            {canRepairPayloads && (
+              <Button type="button" variant="outline" onClick={() => void onRepairZeroDecimalAmounts()} disabled={zeroDecimalRepair.running}>
+                {zeroDecimalRepair.running ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                Repair Zero-Decimal Amounts
+              </Button>
+            )}
             {zeroDecimalRepair.result && (
               <span className="self-center text-xs text-muted-foreground">
                 {`${zeroDecimalRepair.result.repaired.toLocaleString()} rows re-derived from raw (JPY-class currencies).`}
@@ -735,7 +785,7 @@ export default function IntegrationsPage() {
             <div><span className="text-xs text-muted-foreground">Connection</span><div className="text-sm font-medium">{clickHouseStatusLabel(clickHouseHealth)}</div></div>
             <div><span className="text-xs text-muted-foreground">Database</span><div className="text-sm font-medium">{clickHouseHealth?.database ?? "-"}</div></div>
             <div><span className="text-xs text-muted-foreground">Latency</span><div className="text-sm font-medium">{clickHouseHealth?.latency_ms == null ? "-" : `${clickHouseHealth.latency_ms} ms`}</div></div>
-            <div><span className="text-xs text-muted-foreground">Table exists</span><div className="text-sm font-medium">{clickHouseSummary?.error ? "Unknown" : clickHouseSummary ? "Yes" : "-"}</div></div>
+            <div><span className="text-xs text-muted-foreground">Table exists</span><div className="text-sm font-medium">{clickHouseSummary?.redacted ? "—" : clickHouseSummary?.error ? "Unknown" : clickHouseSummary ? "Yes" : "-"}</div></div>
             <div><span className="text-xs text-muted-foreground">Current ClickHouse rows</span><div className="text-sm font-medium">{formatNumber(clickHouseSummary?.transaction_count ?? clickHouseSummary?.sync_state?.clickhouse_total ?? null)}</div></div>
             <div><span className="text-xs text-muted-foreground">Status</span><div className="text-sm font-medium">{clickHouseSummary?.sync_state?.status ?? "never_started"}</div></div>
             <div><span className="text-xs text-muted-foreground">Current stage</span><div className="text-sm font-medium">{clickHouseSummary?.sync_state?.current_stage ?? "-"}</div></div>
@@ -788,6 +838,7 @@ export default function IntegrationsPage() {
         </Card>
       </section>
 
+      {canManageApiKeys && (
       <section className="grid gap-4 xl:grid-cols-[minmax(0,1.1fr)_minmax(360px,0.9fr)]">
         <div className="space-y-4">
           <Card className="p-4 shadow-card">
@@ -975,10 +1026,13 @@ export default function IntegrationsPage() {
           </Card>
         </div>
       </section>
+      )}
 
-      <section className="mt-4">
-        <CampaignIdSplitDiagnostics />
-      </section>
+      {ownerData && (
+        <section className="mt-4">
+          <CampaignIdSplitDiagnostics />
+        </section>
+      )}
     </AppLayout>
   );
 }

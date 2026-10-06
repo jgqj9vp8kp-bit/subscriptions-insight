@@ -12,6 +12,7 @@
 
 import type { ClickHouseClientLike } from "./types.ts";
 import { classifierSQL, CLASSIFIER_TABLE } from "./classifier.ts";
+import { ScopeViolation } from "./scopedClient.ts";
 
 const CH = CLASSIFIER_TABLE;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -223,7 +224,12 @@ async function materializeStaged(client: ClickHouseClientLike, authUserId: strin
 }
 
 async function dropStagedTable(client: ClickHouseClientLike, table: string): Promise<void> {
-  try { await client.command({ query: `DROP TABLE IF EXISTS ${table}` }); } catch { /* best-effort cleanup */ }
+  try {
+    await client.command({ query: `DROP TABLE IF EXISTS ${table}` });
+  } catch (error) {
+    if (error instanceof ScopeViolation) throw error;
+    /* best-effort cleanup */
+  }
 }
 
 // Self-heal: drop scratch tables orphaned by an isolate that was torn down before
@@ -240,7 +246,10 @@ async function sweepStaleTables(client: ClickHouseClientLike): Promise<void> {
       const name = String(r.name ?? "");
       if (/^pp_staged_[0-9a-f]{32}$/.test(name)) await client.command({ query: `DROP TABLE IF EXISTS ${name}` });
     }
-  } catch { /* best-effort */ }
+  } catch (error) {
+    if (error instanceof ScopeViolation) throw error;
+    /* best-effort */
+  }
 }
 
 const EMPTY_FILTERS: PaymentAnalyticsFilters = {
@@ -482,6 +491,50 @@ export async function runPaymentAnalytics(input: { authUserId: string; clickhous
   } finally {
     await dropStagedTable(c, table);
   }
+}
+
+// ---- AI pass-rate signals (action ai_pass_rates) ---------------------------
+// The AI signal chips on Cohorts / FB Analytics read ONE panel of the bundle:
+// pass rates per campaign_path (Cohorts) or campaign_id (FB Analytics), i.e.
+// segment_rows. A member who may not open Payment Pass gets exactly that: the
+// request is reduced to the date window + that grouping, and every other panel
+// is emptied. The bundle SHAPE is kept, so the browser's completeness check
+// (paymentAnalyticsDataSource validateRawBundle) still passes. The data owner
+// and payment_pass.view holders get the full bundle of their own request —
+// identical to action "analytics".
+
+export const AI_PASS_RATE_DIMENSIONS: readonly SegmentDimension[] = ["campaign_path", "campaign_id"];
+
+export function aiPassRatesRequest(req: PaymentAnalyticsRequest): PaymentAnalyticsRequest {
+  const groupBy = req.group_by;
+  if (!AI_PASS_RATE_DIMENSIONS.includes(groupBy as SegmentDimension)) {
+    throw new PaymentAnalyticsRequestError(`AI pass rates are grouped by campaign_path or campaign_id, not ${s(groupBy) || "nothing"}.`);
+  }
+  const f = req.filters ?? {};
+  return {
+    action: "analytics",
+    filters: { date_basis: f.date_basis, date_from: f.date_from ?? null, date_to: f.date_to ?? null },
+    group_by: groupBy,
+    first_tx_dimension: "funnel",
+    renewal_dimension: "funnel",
+  };
+}
+
+export function projectAiPassRatesBundle(bundle: PaymentAnalyticsBundle): PaymentAnalyticsBundle {
+  return {
+    ...bundle,
+    funnel_rows: [], stage_rows: [], first_tx_rows: [], first_transaction_rows: [],
+    renewal_rows: [], renewal_segment_rows: [], decline_rows: [], first_decline_rows: [],
+    time_points: [], trial_by_country: [], filter_options: {},
+  };
+}
+
+export async function runAiPassRates(input: {
+  authUserId: string; clickhouse: ClickHouseClientLike; request: PaymentAnalyticsRequest; fullBundle: boolean;
+}): Promise<PaymentAnalyticsBundle> {
+  const common = { authUserId: input.authUserId, clickhouse: input.clickhouse };
+  if (input.fullBundle) return runPaymentAnalytics({ ...common, request: input.request });
+  return projectAiPassRatesBundle(await runPaymentAnalytics({ ...common, request: aiPassRatesRequest(input.request) }));
 }
 
 export {

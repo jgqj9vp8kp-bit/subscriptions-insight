@@ -1,5 +1,18 @@
 /* global Deno */
 
+// The ONLY ClickHouse transport (plan §13 layer 2). It holds the warehouse
+// password and binds whatever auth_user_id it is given, so it must never be
+// handed to request code directly: Edge functions receive a ScopedReader
+// (scopedClient.ts) bound to the request's AccessContext through
+// serveWithAccess, which forces {auth_user_id:String} = ctx.tenantKey.
+//
+// Export surface:
+//   * internalCreateClickHouseClient — only scopedClient.ts may import it (the
+//     transport unit tests — src/test/clickhouseClientRetry.test.ts,
+//     fbCohortUserCostArchitecture.test.ts — call it with an explicit fake
+//     `config`, so no Deno secret is read);
+//   * clickHouseEnv / isClickHouseConfigured — config probes, no secret exposed.
+
 import type { ClickHouseClientLike, ClickHouseEnv, ClickHouseResultSet } from "./types.ts";
 
 function readSecret(name: string): string {
@@ -93,7 +106,9 @@ class FetchClickHouseResultSet implements ClickHouseResultSet {
   }
 }
 
-export class FetchClickHouseClient implements ClickHouseClientLike {
+/** Transport class. Not exported: built only by internalCreateClickHouseClient —
+ * Edge code must use the ScopedReader handed out by serveWithAccess. */
+class FetchClickHouseClient implements ClickHouseClientLike {
   private readonly endpoint: string;
   private readonly authHeader: string;
   private readonly database: string;
@@ -163,16 +178,22 @@ export class FetchClickHouseClient implements ClickHouseClientLike {
   }
 }
 
-export function createClickHouseClient(): ClickHouseClientLike {
-  const host = readSecret("CLICKHOUSE_HOST");
-  const password = readSecret("CLICKHOUSE_PASSWORD");
+/** @internal ONLY scopedClient.ts may import this. Everything else receives a
+ * ScopedReader (request code via serveWithAccess's `clickhouse()`), so no code
+ * path can bind a tenant other than ctx.tenantKey. `config` lets tests build a
+ * client without Deno secrets. */
+export function internalCreateClickHouseClient(
+  config?: { host: string; username?: string; password: string; database?: string },
+): ClickHouseClientLike {
+  const host = config ? config.host : readSecret("CLICKHOUSE_HOST");
+  const password = config ? config.password : readSecret("CLICKHOUSE_PASSWORD");
   if (!host) throw new Error("CLICKHOUSE_HOST is not configured in Supabase Secrets.");
   if (!password) throw new Error("CLICKHOUSE_PASSWORD is not configured in Supabase Secrets.");
 
   return new FetchClickHouseClient({
     host,
-    username: readSecret("CLICKHOUSE_USERNAME") || "default",
+    username: (config ? config.username : readSecret("CLICKHOUSE_USERNAME")) || "default",
     password,
-    database: readSecret("CLICKHOUSE_DATABASE") || "default",
+    database: (config ? config.database : readSecret("CLICKHOUSE_DATABASE")) || "default",
   });
 }

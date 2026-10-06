@@ -1,11 +1,28 @@
 /* global Deno */
 
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { createClickHouseClient } from "../_shared/clickhouse/client.ts";
+// sync-support-mail: SpaceMail IMAP ingestion of the workspace support mailbox
+// (INBOX requests, Sent-folder replies, reply matching) into Postgres, mirrored
+// to ClickHouse through the shared support sync.
+//
+// Access (policies/sync-support-mail.ts): every user call requires
+// admin.sync.run. The pg_cron ticks authenticate with the internal secret header
+// through the gate's cron branch (checked in constant time before the body is
+// read). Either way the mailbox is imported for the workspace data key
+// (ctx.tenantKey), never for the caller or a looked-up "mailbox owner".
+
+import type { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { serveWithAccess } from "../_shared/clickhouse/http.ts";
+import { buildCorsHeaders } from "../_shared/access/cors.ts";
+import {
+  SUPPORT_MAIL_INTERNAL_SECRET_HEADER,
+  SYNC_SUPPORT_MAIL_POLICY,
+  type SyncSupportMailAction,
+} from "../_shared/access/policies/sync-support-mail.ts";
+import { ScopeViolation } from "../_shared/clickhouse/scopedClient.ts";
 import { runSupportSync } from "../_shared/clickhouse/support.ts";
 import { classifySupportRequestServer } from "../_shared/clickhouse/support.ts";
 import { runReplyMatching } from "../_shared/clickhouse/supportReplyMatching.ts";
-import type { SupabaseLikeClient } from "../_shared/clickhouse/types.ts";
+import type { ClickHouseClientLike, SupabaseLikeClient } from "../_shared/clickhouse/types.ts";
 import {
   extractEmailLiterals,
   htmlToPlainText,
@@ -15,11 +32,9 @@ import {
   type ParsedMailMessage,
 } from "./support.ts";
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-support-mail-internal-secret",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-};
+// The shared builder; the internal secret header stays allowed as before. (The
+// gate answers the OPTIONS preflight itself; only pg_net ever sends the header.)
+const corsHeaders = buildCorsHeaders({ methods: ["POST"], extraAllowedHeaders: [SUPPORT_MAIL_INTERNAL_SECRET_HEADER] });
 
 const PROVIDER = "spacemail";
 const DEFAULT_FOLDER = "INBOX";
@@ -29,20 +44,11 @@ const MAX_MESSAGES_PER_INVOCATION = 150;
 const MAX_MESSAGE_BYTES = 1024 * 1024;
 const RUNNING_TTL_MS = 15 * 60 * 1000;
 
+/** The gate's service-role client (a supabase-js client; typed narrowly there). */
 type SupabaseClient = ReturnType<typeof createClient>;
-type MailAction =
-  | "test_connection"
-  | "status"
-  | "list_folders"
-  | "initial_sync"
-  | "continue_sync"
-  | "sync_new"
-  | "stop"
-  | "reset_cursor"
-  | "sent_initial_sync"
-  | "sent_continue_sync"
-  | "sent_sync_new"
-  | "rematch_replies";
+type MailAction = SyncSupportMailAction;
+/** The request's ScopedReader (created lazily by the gate, closed by it). */
+type WarehouseClient = () => ClickHouseClientLike;
 
 type SyncStatus =
   | "idle"
@@ -116,10 +122,6 @@ function jsonResponse(body: unknown, status = 200): Response {
       "Cache-Control": "no-store",
     },
   });
-}
-
-function bearerToken(req: Request): string {
-  return (req.headers.get("Authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
 }
 
 function s(value: unknown): string {
@@ -416,53 +418,6 @@ class ImapConnection {
   }
 }
 
-async function authenticatedUser(req: Request): Promise<{ authUserId: string; supabase: SupabaseClient }> {
-  const supabaseUrl = requireSecret("SUPABASE_URL");
-  const serviceRoleKey = requireSecret("SUPABASE_SERVICE_ROLE_KEY");
-  const token = bearerToken(req);
-  if (!token) throw new SupportMailError("AUTH_REQUIRED", "Authentication required.", 401);
-  const supabase = createClient(supabaseUrl, serviceRoleKey, { auth: { persistSession: false, autoRefreshToken: false } });
-  const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data.user?.id) throw new SupportMailError("AUTH_INVALID", "Invalid or expired session.", 401);
-  return { authUserId: data.user.id, supabase };
-}
-
-function serviceClient(): SupabaseClient {
-  return createClient(requireSecret("SUPABASE_URL"), requireSecret("SUPABASE_SERVICE_ROLE_KEY"), {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
-}
-
-function normalizeAction(value: unknown): MailAction {
-  switch (value) {
-    case "test_connection":
-    case "status":
-    case "list_folders":
-    case "initial_sync":
-    case "continue_sync":
-    case "sync_new":
-    case "stop":
-    case "reset_cursor":
-    case "sent_initial_sync":
-    case "sent_continue_sync":
-    case "sent_sync_new":
-    case "rematch_replies":
-      return value;
-    case undefined:
-    case null:
-      return "sync_new";
-    default:
-      throw new SupportMailError("UNSUPPORTED_ACTION", `Unsupported support mail action: ${s(value)}`, 400);
-  }
-}
-
-async function readBody(req: Request): Promise<Record<string, unknown>> {
-  const text = await req.text().catch(() => "");
-  if (!text.trim()) return {};
-  const parsed = JSON.parse(text) as unknown;
-  return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
-}
-
 async function stateFor(client: SupabaseClient, authUserId: string, cfg = configStatus()): Promise<MailSyncState | null> {
   const { data, error } = await client
     .from("support_mail_sync_state")
@@ -713,18 +668,15 @@ function pctSpeed(processed: number, startedAt: number): number {
   return Math.round((processed / elapsedSeconds) * 100) / 100;
 }
 
-async function syncClickHouse(input: { authUserId: string; supabase: SupabaseClient }) {
-  const clickhouse = createClickHouseClient();
-  try {
-    return await runSupportSync({
-      authUserId: input.authUserId,
-      supabase: input.supabase,
-      clickhouse,
-      request: { action: "sync", sync: { batch_size: 2000, max_batches: 20, full_reset_cursor: false } },
-    });
-  } finally {
-    await clickhouse.close?.().catch(() => undefined);
-  }
+/** Mirrors the tenant's support_requests to ClickHouse through the request's
+ * ScopedReader (the gate closes it when the request ends). */
+async function syncClickHouse(input: { authUserId: string; supabase: SupabaseClient; warehouse: WarehouseClient }) {
+  return await runSupportSync({
+    authUserId: input.authUserId,
+    supabase: input.supabase,
+    clickhouse: input.warehouse(),
+    request: { action: "sync", sync: { batch_size: 2000, max_batches: 20, full_reset_cursor: false } },
+  });
 }
 
 function boundedSyncParams(body: Record<string, unknown>) {
@@ -745,6 +697,7 @@ async function runMailSync(input: {
   action: Extract<MailAction, "initial_sync" | "continue_sync" | "sync_new">;
   authUserId: string;
   supabase: SupabaseClient;
+  warehouse: WarehouseClient;
   body: Record<string, unknown>;
 }) {
   const cfg = configStatus();
@@ -874,7 +827,7 @@ async function runMailSync(input: {
         };
       }
       if (selectedUids.length === 0) {
-        const clickhouse = importedBefore > 0 ? await syncClickHouse({ authUserId: input.authUserId, supabase: input.supabase }) : null;
+        const clickhouse = importedBefore > 0 ? await syncClickHouse({ authUserId: input.authUserId, supabase: input.supabase, warehouse: input.warehouse }) : null;
         const completedAt = input.action === "sync_new" ? existingState?.history_completed_at ?? null : existingState?.history_completed_at ?? nowIso();
         return {
           discovered,
@@ -964,8 +917,9 @@ async function runMailSync(input: {
         });
         activeBatchFinalized = true;
         try {
-          clickhouse = await syncClickHouse({ authUserId: input.authUserId, supabase: input.supabase });
-        } catch {
+          clickhouse = await syncClickHouse({ authUserId: input.authUserId, supabase: input.supabase, warehouse: input.warehouse });
+        } catch (error) {
+          if (error instanceof ScopeViolation) throw error;
           await upsertState(input.supabase, input.authUserId, {
             status: "partial",
             completed_at: nowIso(),
@@ -1413,7 +1367,7 @@ async function refreshInboxFlags(input: { authUserId: string; supabase: Supabase
  * Sent delta → flag refresh → reply matching → one ClickHouse sync if anything
  * changed. Each stage is fenced: a Sent/flags/matching hiccup must never fail
  * the INBOX import whose cursor has already been committed. */
-async function runPostStages(input: { authUserId: string; supabase: SupabaseClient; startedMs: number }) {
+async function runPostStages(input: { authUserId: string; supabase: SupabaseClient; warehouse: WarehouseClient; startedMs: number }) {
   const stages: Record<string, unknown> = {};
   const withinBudget = () => Date.now() - input.startedMs < POST_STAGE_DEADLINE_MS;
   let mutated = false;
@@ -1448,8 +1402,9 @@ async function runPostStages(input: { authUserId: string; supabase: SupabaseClie
   }
   if (mutated) {
     try {
-      stages.clickhouse = await syncClickHouse({ authUserId: input.authUserId, supabase: input.supabase });
+      stages.clickhouse = await syncClickHouse({ authUserId: input.authUserId, supabase: input.supabase, warehouse: input.warehouse });
     } catch (error) {
+      if (error instanceof ScopeViolation) throw error;
       stages.clickhouse = { ok: false, error_code: sanitizeError(error).code };
     }
   }
@@ -1481,39 +1436,13 @@ async function statusResponse(client: SupabaseClient, authUserId: string) {
   };
 }
 
-Deno.serve(async (req: Request) => {
-  if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders });
-  if (req.method !== "POST") return jsonResponse({ ok: false, error: "Method not allowed." }, 405);
-
-  try {
-    const body = await readBody(req);
-    const action = normalizeAction(body.action);
-    const internalSecret = Deno.env.get("SUPPORT_MAIL_SYNC_INTERNAL_SECRET")?.trim();
-    const requestInternalSecret = req.headers.get("x-support-mail-internal-secret")?.trim();
-    let authUserId: string;
-    let supabase: SupabaseClient;
-
-    if (body.internal === true) {
-      if (!internalSecret || requestInternalSecret !== internalSecret) {
-        throw new SupportMailError("AUTH_INVALID", "Invalid internal sync secret.", 401);
-      }
-      supabase = serviceClient();
-      const cfg = configStatus();
-      const { data, error } = await supabase
-        .from("support_mail_sync_state")
-        .select("auth_user_id")
-        .eq("mailbox_key", cfg.mailbox_key)
-        .eq("folder", cfg.folder)
-        .limit(1)
-        .maybeSingle();
-      if (error) throw new SupportMailError("SUPABASE_WRITE_FAILED", "Could not resolve mailbox owner.", 500);
-      if (!data?.auth_user_id) return jsonResponse({ ok: true, action, status: "no_mailbox_owner" });
-      authUserId = String(data.auth_user_id);
-    } else {
-      const auth = await authenticatedUser(req);
-      authUserId = auth.authUserId;
-      supabase = auth.supabase;
-    }
+serveWithAccess(
+  SYNC_SUPPORT_MAIL_POLICY,
+  async ({ ctx, action, body, pg, clickhouse }) => {
+    // The workspace data key — for a user call and for a cron tick alike.
+    const authUserId = ctx.tenantKey;
+    const supabase = pg as unknown as SupabaseClient;
+    const warehouse: WarehouseClient = clickhouse;
 
     if (action === "status") return jsonResponse(await statusResponse(supabase, authUserId));
     if (action === "stop") {
@@ -1583,20 +1512,28 @@ Deno.serve(async (req: Request) => {
       const mode = body.mode === "incremental" ? "incremental" as const : "full" as const;
       const matching = await runReplyMatching({ supabase: supabase as unknown as SupabaseLikeClient, authUserId, mode });
       const clickhouse = matching.applied > 0
-        ? await syncClickHouse({ authUserId, supabase }).catch((error) => ({ ok: false, error_code: sanitizeError(error).code }))
+        ? await syncClickHouse({ authUserId, supabase, warehouse }).catch((error) => {
+          if (error instanceof ScopeViolation) throw error;
+          return { ok: false, error_code: sanitizeError(error).code };
+        })
         : null;
       return jsonResponse({ ok: true, action, mode, ...matching, clickhouse });
     }
     const startedMs = Date.now();
-    const syncResult = await runMailSync({ action, authUserId, supabase, body });
+    const syncResult = await runMailSync({ action, authUserId, supabase, warehouse, body });
     // Answered-analytics stages ride every successful sync_new (cron + manual):
     // the INBOX cursor is already committed, these only ADD data.
     if (action === "sync_new" && (syncResult as { ok?: boolean }).ok !== false) {
-      (syncResult as Record<string, unknown>).post_stages = await runPostStages({ authUserId, supabase, startedMs });
+      (syncResult as Record<string, unknown>).post_stages = await runPostStages({ authUserId, supabase, warehouse, startedMs });
     }
     return jsonResponse(syncResult);
-  } catch (error) {
-    const safe = sanitizeError(error);
-    return jsonResponse({ ok: false, error: safe.message, error_code: safe.code }, safe.status);
-  }
-});
+  },
+  {
+    // Same status / body as before access control; the gate sanitizes the body
+    // for everyone but the data owner (a recorded ScopeViolation is a 500).
+    onError: (error) => {
+      const safe = sanitizeError(error);
+      return { status: safe.status, body: { ok: false, error: safe.message, error_code: safe.code } };
+    },
+  },
+);

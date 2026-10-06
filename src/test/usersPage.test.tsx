@@ -27,6 +27,14 @@ vi.mock("@/services/usersDataSource", async (importOriginal) => {
 // legacy render path (queries disabled in legacy mode) mounts without providers.
 vi.mock("@/hooks/useAuth", () => ({ useAuth: () => ({ user: { id: "test-user" } }) }));
 
+// The page reads useAccess(); the legacy fallback exercised here is the data
+// owner's (legacy access: every permission, raw access on — today's behaviour).
+vi.mock("@/hooks/useAccess", async () => {
+  const { buildAccessValue } = await import("@/contexts/accessContext");
+  const owner = buildAccessValue({ status: "legacy", access: null, userId: "test-user" });
+  return { useAccess: () => owner, useOptionalAccess: () => owner, useCan: (key: string) => owner.can(key) };
+});
+
 import { useTransactions } from "@/services/sheets";
 
 function renderPage() {

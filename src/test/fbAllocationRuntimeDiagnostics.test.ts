@@ -140,10 +140,17 @@ describe("runtime diagnostics authentication and security", () => {
     const payload = JSON.stringify(buildFbAllocationDiagnostics([diagnosticRow(1)]));
     expect(payload).not.toContain(secret);
   });
+  // Access control: the endpoint now runs behind serveWithAccess, whose gate
+  // authenticates (and resolves membership) before it reads the body at all —
+  // the handler never parses the request itself. The diagnostics payload also
+  // needs raw access or admin.diagnostics.view on top of the env flag.
   it("existing endpoint authenticates before reading diagnostics controls", () => {
     const source = readFileSync("supabase/functions/clickhouse-cohorts/index.ts", "utf8");
-    expect(source.indexOf("const auth = await requireSupabaseUser(req)")).toBeLessThan(source.indexOf("request = (await parseJsonBody"));
+    expect(source).toContain("serveWithAccess(CLICKHOUSE_COHORTS_POLICY");
+    expect(source).not.toContain("requireSupabaseUser");
+    expect(source).not.toContain("parseJsonBody");
     expect(source).toContain("FB_COHORT_ALLOCATION_DIAGNOSTICS_ENABLED");
+    expect(source).toMatch(/FB_COHORT_ALLOCATION_DIAGNOSTICS_ENABLED"\),\s*\)\s*&& canServeFbAllocationDiagnostics\(ctx\)/);
     expect(source).not.toMatch(/request\.(sql|query)/);
   });
 });

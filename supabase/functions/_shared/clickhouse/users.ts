@@ -12,6 +12,7 @@
 
 import type { ClickHouseClientLike } from "./types.ts";
 import { classifierSQL, CLASSIFIER_TABLE } from "./classifier.ts";
+import { ScopeViolation } from "./scopedClient.ts";
 import { FACT_SUBSCRIPTIONS_TABLE } from "./factSubscriptions.ts";
 import {
   activeSubscriptionWhereClause,
@@ -467,7 +468,8 @@ async function subscriptionDataStatus(client: ClickHouseClientLike, authUserId: 
     });
     const rows = (await rs.json()) as Array<{ c?: number | string }>;
     return n(rows[0]?.c) > 0 ? "ready" : "empty_source";
-  } catch {
+  } catch (error) {
+    if (error instanceof ScopeViolation) throw error;
     return "failed";
   }
 }
@@ -506,7 +508,10 @@ FORMAT JSONEachRow`;
   const [rs, subStatus, scan] = await Promise.all([
     input.clickhouse.query({ query: sql, query_params: params, format: "JSONEachRow" }),
     subscriptionDataStatus(input.clickhouse, input.authUserId),
-    scanDiag(input.clickhouse, input.authUserId).catch(() => ({ users_scanned: 0, transactions_scanned: 0, missing_fx: 0 })),
+    scanDiag(input.clickhouse, input.authUserId).catch((error) => {
+      if (error instanceof ScopeViolation) throw error;
+      return { users_scanned: 0, transactions_scanned: 0, missing_fx: 0 };
+    }),
   ]);
   const raw = (await rs.json()) as Array<Record<string, unknown>>;
   const totalRows = raw.length ? n(raw[0].total_rows) : 0;
@@ -745,7 +750,12 @@ FROM seqd`;
 }
 
 async function dropDeclineScratch(client: ClickHouseClientLike, table: string): Promise<void> {
-  try { await client.command({ query: `DROP TABLE IF EXISTS ${table}` }); } catch { /* best-effort cleanup */ }
+  try {
+    await client.command({ query: `DROP TABLE IF EXISTS ${table}` });
+  } catch (error) {
+    if (error instanceof ScopeViolation) throw error;
+    /* best-effort cleanup */
+  }
 }
 
 // Self-heal orphaned scratch tables (isolate torn down before its DROP ran).
@@ -760,7 +770,10 @@ async function sweepStaleDeclineTables(client: ClickHouseClientLike): Promise<vo
       const name = String(r.name ?? "");
       if (/^ud_staged_[0-9a-f]{32}$/.test(name)) await client.command({ query: `DROP TABLE IF EXISTS ${name}` });
     }
-  } catch { /* best-effort */ }
+  } catch (error) {
+    if (error instanceof ScopeViolation) throw error;
+    /* best-effort */
+  }
 }
 
 // Reason/stage display filters narrow ONLY the failed-transaction aggregations

@@ -482,8 +482,8 @@ type CountRow = {
   columns_count?: number | string;
 };
 
-async function jsonRows<T>(client: ClickHouseClientLike, query: string): Promise<T[]> {
-  const resultSet = await client.query({ query, format: "JSONEachRow" });
+async function jsonRows<T>(client: ClickHouseClientLike, query: string, params?: Record<string, unknown>): Promise<T[]> {
+  const resultSet = await client.query({ query, ...(params ? { query_params: params } : {}), format: "JSONEachRow" });
   return (await resultSet.json()) as T[];
 }
 
@@ -491,9 +491,23 @@ function quoteSql(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
 }
 
-export async function initializeClickHouseSchema(input: { client: ClickHouseClientLike; env: ClickHouseEnv }): Promise<ClickHouseInitResult> {
+/** Tenant row counts reported by init. The tables hold every tenant's rows;
+ * an unfiltered count() reported the WHOLE warehouse to whoever ran init
+ * (Phase 0 fix), so both counts are bound to the workspace tenant. */
+export const INIT_TENANT_ROW_COUNT_SQL = `SELECT count() AS count FROM ${ANALYTICS_TRANSACTIONS_TABLE} FINAL WHERE auth_user_id = {auth_user_id:String}`;
+export const INIT_TENANT_COHORT_ROW_COUNT_SQL = `SELECT count() AS count FROM ${FACT_USER_COHORTS_TABLE} FINAL WHERE auth_user_id = {auth_user_id:String}`;
+
+export async function initializeClickHouseSchema(input: {
+  client: ClickHouseClientLike;
+  /** The workspace tenant (ctx.tenantKey) whose row counts are reported. */
+  authUserId: string;
+  /** Optional: without it the database name is read from the warehouse
+   * (currentDatabase() — the same CLICKHOUSE_DATABASE the transport selects). */
+  env?: Pick<ClickHouseEnv, "database">;
+}): Promise<ClickHouseInitResult> {
   const startedAt = Date.now();
   const client = input.client;
+  if (!input.authUserId) throw new Error("initializeClickHouseSchema requires the workspace tenant (authUserId).");
 
   await client.command({ query: CREATE_ANALYTICS_TRANSACTIONS_SQL });
   // One-time migration of legacy hash row_versions onto the monotonic
@@ -507,7 +521,9 @@ export async function initializeClickHouseSchema(input: { client: ClickHouseClie
   await ensureFactFacebookStatsSchema(client);
   // Warehouse V2 Phase 0: additive, idempotent, zero readers until later phases.
   await ensureFbWarehouseV2Schema(client);
-  const database = input.env.database || "default";
+  const database = input.env
+    ? input.env.database || "default"
+    : String((await jsonRows<{ database?: string }>(client, "SELECT currentDatabase() AS database"))[0]?.database || "default");
   const table = ANALYTICS_TRANSACTIONS_TABLE;
   const [metadata] = await jsonRows<TableMetadataRow>(
     client,
@@ -528,8 +544,9 @@ export async function initializeClickHouseSchema(input: { client: ClickHouseClie
           AND table = ${quoteSql(table)}
       `,
   );
-  const [rows] = await jsonRows<CountRow>(client, `SELECT count() AS count FROM ${table} FINAL`);
-  const [cohortRows] = await jsonRows<CountRow>(client, `SELECT count() AS count FROM ${FACT_USER_COHORTS_TABLE} FINAL`);
+  const tenant = { auth_user_id: input.authUserId };
+  const [rows] = await jsonRows<CountRow>(client, INIT_TENANT_ROW_COUNT_SQL, tenant);
+  const [cohortRows] = await jsonRows<CountRow>(client, INIT_TENANT_COHORT_ROW_COUNT_SQL, tenant);
 
   return {
     connected: true,

@@ -55,7 +55,9 @@ export interface BackfillResult {
   duplicates_found?: number;
   duplicates_requeued?: number;
   status: SyncStatus;
-  stopped_reason: StoppedReason;
+  /** "already_running" is response-only (another run holds the lease) and is
+   * never persisted — the sync-state CHECK constraint does not allow it. */
+  stopped_reason: StoppedReason | "already_running";
   current_stage: string;
   batch_size: number;
   max_batches: number;
@@ -70,9 +72,15 @@ export interface BackfillResult {
   clickhouse_total: number;
   diagnostics: MapperDiagnostics & { failed_batches: string[] };
   duration_ms: number;
+  /** "already_running" only: when the held lease turns stale (the holder's
+   * last write + BACKFILL_LEASE_STALE_MS), i.e. the latest time a retry can
+   * succeed if the holder was killed. null when the holder's write time is
+   * unknown. */
+  lease_retry_after?: string | null;
 }
 
 const SYNC_NAME = "analytics_transactions_backfill";
+const SYNC_STATE_TABLE = "clickhouse_transaction_sync_state";
 const DEFAULT_BATCH_SIZE = 2000;
 const DEFAULT_MAX_BATCHES = 10;
 const DEFAULT_SOFT_TIMEOUT_MS = 45_000;
@@ -169,6 +177,100 @@ async function upsertSyncState(supabase: SupabaseLikeClient, patch: Partial<Clic
       { onConflict: "auth_user_id,sync_name" },
     );
   if (error) throw new Error(`Could not update ClickHouse sync state: ${error.message}`);
+}
+
+// ---- run lease ----------------------------------------------------------------
+//
+// Two runs for one tenant (a manual Continue racing the post-import auto-sync,
+// two admins, two tabs) used to interleave freely: each read the same cursor,
+// re-wrote the same batches and overwrote the other's counters. The sync-state
+// row doubles as the lease, compare-and-set through PostgREST (no migration):
+//   * a run HOLDS the lease while current_stage is one of BACKFILL_RUN_STAGES —
+//     every write of a live run keeps it there ("running" → "partial" status
+//     changes are untouched), the final write sets "idle", a failure "failed";
+//   * the claim is one conditional UPDATE … WHERE the row is free, so of two
+//     concurrent claims Postgres lets exactly one match (the loser re-checks
+//     the WHERE after the winner's row lock and matches nothing);
+//   * a run killed mid-flight (isolate wall-clock limit) leaves its stage
+//     behind; the lease is free again once the row's updated_at — refreshed by
+//     the table trigger on every batch write — is older than
+//     BACKFILL_LEASE_STALE_MS, which exceeds the Edge wall-clock limit (400 s)
+//     so a live run is never taken over.
+
+/** current_stage values written while a run is in progress. */
+export const BACKFILL_RUN_STAGES = ["backfilling", "dry_run", "validate_only"] as const;
+export const BACKFILL_LEASE_STALE_MS = 10 * 60_000;
+
+/** PostgREST `or` filter of a claimable row: no run stage, or a stale one. */
+export function backfillLeaseClaimFilter(staleBeforeIso: string): string {
+  return `current_stage.is.null,current_stage.not.in.(${BACKFILL_RUN_STAGES.join(",")}),updated_at.lt.${staleBeforeIso}`;
+}
+
+/** Claims the run lease, writing `claim` (the run's "running" fields) in the
+ * same statement. false = another live run holds it. */
+async function claimBackfillLease(
+  supabase: SupabaseLikeClient,
+  authUserId: string,
+  claim: Partial<ClickHouseSyncState>,
+  nowMs: number,
+): Promise<boolean> {
+  // The first run of a tenant has no row to compare against: create the empty
+  // row first without touching an existing one (INSERT … ON CONFLICT DO NOTHING).
+  const seeded = await supabase
+    .from(SYNC_STATE_TABLE)
+    .upsert({ auth_user_id: authUserId, sync_name: SYNC_NAME }, { onConflict: "auth_user_id,sync_name", ignoreDuplicates: true });
+  if (seeded.error) throw new Error(`Could not claim the ClickHouse backfill run: ${seeded.error.message}`);
+
+  const builder = supabase.from(SYNC_STATE_TABLE);
+  if (!builder.update) throw new Error("Supabase client cannot update the ClickHouse sync state (the backfill run lease needs .update).");
+  const { data, error } = await builder
+    .update({ ...claim, updated_at: new Date(nowMs).toISOString() })
+    .eq("auth_user_id", authUserId)
+    .eq("sync_name", SYNC_NAME)
+    .or(backfillLeaseClaimFilter(new Date(nowMs - BACKFILL_LEASE_STALE_MS).toISOString()))
+    .select("sync_name");
+  if (error) throw new Error(`Could not claim the ClickHouse backfill run: ${error.message}`);
+  return Array.isArray(data) && data.length > 0;
+}
+
+/** The answer to a run that found the lease held: nothing was read, written or
+ * re-queued. batches_processed 0 ends the browser's auto-sync loop. */
+async function alreadyRunningResult(
+  supabase: SupabaseLikeClient,
+  authUserId: string,
+  params: ReturnType<typeof normalizeBackfillParams>,
+  startedAt: number,
+): Promise<BackfillResult> {
+  const state = await getSyncState(supabase, authUserId).catch(() => null);
+  return {
+    mode: params.mode,
+    dry_run: params.dry_run,
+    duplicates_found: 0,
+    duplicates_requeued: 0,
+    status: "running",
+    stopped_reason: "already_running",
+    current_stage: "already_running",
+    batch_size: params.batch_size,
+    max_batches: params.max_batches,
+    rows_scanned: 0,
+    rows_mapped: 0,
+    rows_inserted: 0,
+    rows_skipped: 0,
+    batches_processed: 0,
+    cursor_updated_at: state?.cursor_updated_at ?? null,
+    cursor_transaction_id: state?.cursor_transaction_id ?? null,
+    source_total: Number(state?.source_total ?? 0),
+    clickhouse_total: Number(state?.clickhouse_total ?? 0),
+    diagnostics: emptyDiagnostics(),
+    duration_ms: Date.now() - startedAt,
+    lease_retry_after: backfillLeaseRetryAfter(state?.updated_at ?? null),
+  };
+}
+
+/** When a lease last written at `updatedAt` becomes claimable again. */
+export function backfillLeaseRetryAfter(updatedAt: string | null | undefined): string | null {
+  const writtenAt = updatedAt ? Date.parse(updatedAt) : Number.NaN;
+  return Number.isFinite(writtenAt) ? new Date(writtenAt + BACKFILL_LEASE_STALE_MS).toISOString() : null;
 }
 
 async function readTransactionBatch(input: {
@@ -304,6 +406,20 @@ export async function runTransactionsBackfill(input: {
   let clickHouseTotal = 0;
   let duplicatesFound = 0;
   let duplicatesRequeued = 0;
+
+  // One run per tenant: claim the lease before anything is read, re-queued or
+  // written. A claim failure is thrown as-is — this run never held the lease,
+  // so it must not write the "failed" state over the holder's row.
+  const claimed = await claimBackfillLease(input.supabase, input.authUserId, {
+    status: "running",
+    current_stage: params.mode === "validate_only" ? "validate_only" : params.dry_run ? "dry_run" : "backfilling",
+    stopped_reason: null,
+    started_at: new Date(startedAt).toISOString(),
+    finished_at: null,
+    last_error: null,
+    last_run_mode: persistedRunMode,
+  }, startedAt);
+  if (!claimed) return alreadyRunningResult(input.supabase, input.authUserId, params, startedAt);
 
   try {
     if (params.mode === "dedup" && !params.dry_run) {
@@ -459,6 +575,8 @@ export async function runTransactionsBackfill(input: {
       duration_ms: durationMs,
     };
   } catch (error) {
+    // Every failure — a ScopeViolation included — records "failed", which also
+    // releases the run lease, and is rethrown unchanged (never swallowed).
     const message = error instanceof Error ? error.message : "Unknown ClickHouse backfill error.";
     const durationMs = Date.now() - startedAt;
     diagnostics.failed_batches.push(message);

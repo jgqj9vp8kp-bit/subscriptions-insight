@@ -10,6 +10,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   AGGREGATE_MEASURES,
+  PRICE_BREAKDOWN_FAILED,
   runCohortDetails,
   toAggregateRow,
 } from "../../supabase/functions/_shared/clickhouse/cohorts.ts";
@@ -57,12 +58,17 @@ function fakeClickHouse(planRows: Record<string, unknown>[], opts: { planRejects
   return { client, queries };
 }
 
-async function runDetails(planRows: Record<string, unknown>[], filters: Record<string, unknown> = {}, opts: { planRejects?: boolean } = {}) {
+async function runDetails(
+  planRows: Record<string, unknown>[],
+  filters: Record<string, unknown> = {},
+  opts: { planRejects?: boolean; detailedErrors?: boolean } = {},
+) {
   const { client, queries } = fakeClickHouse(planRows, opts);
   const response = await runCohortDetails({
     authUserId: "user-1",
     clickhouse: client,
     request: { action: "details", cohort_key: KEY, filters } as never,
+    detailedErrors: opts.detailedErrors,
   });
   const planQuery = queries.find((q) => q.query.includes("plankey"));
   return { response, queries, planQuery };
@@ -171,12 +177,22 @@ describe("plan rows in the details response", () => {
     expect(response.price_breakdown.map((p) => p.plan_name)).toEqual(["$7.49", "Unknown"]);
   });
 
-  it("surfaces a plan-query failure instead of silently showing no breakdown", async () => {
-    const { response } = await runDetails([], {}, { planRejects: true });
+  it("surfaces a plan-query failure instead of silently showing no breakdown (data owner: the warehouse text)", async () => {
+    const { response } = await runDetails([], {}, { planRejects: true, detailedErrors: true });
     expect(response.ok).toBe(true);
     expect(response.price_breakdown).toEqual([]);
     expect(response.error).toContain("price_breakdown");
     expect(response.error).toContain("plan query exploded");
+  });
+
+  it("anyone else gets a fixed code in the 200 body, never the warehouse text (plan §12.7 / T19)", async () => {
+    for (const detailedErrors of [undefined, false]) {
+      const { response } = await runDetails([], {}, { planRejects: true, detailedErrors });
+      expect(response.ok).toBe(true);
+      expect(response.price_breakdown).toEqual([]);
+      expect(response.error).toBe(PRICE_BREAKDOWN_FAILED);
+      expect(JSON.stringify(response)).not.toContain("plan query exploded");
+    }
   });
 });
 

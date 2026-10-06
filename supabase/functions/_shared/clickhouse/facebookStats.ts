@@ -33,6 +33,7 @@ import {
 } from "./fbSyncHistory.ts";
 import { buildFbV2DqChecks, createFbWarehouseV2Writer } from "./fbWarehouseV2Writer.ts";
 import { V_FB_STATS_V2_ACCOUNT_COMPAT, V_FB_STATS_V2_AD_COMPAT, V_FB_STATS_V2_ADSET_COMPAT, V_FB_STATS_V2_CAMPAIGN_COMPAT } from "./fbWarehouseV2Schema.ts";
+import { ScopeViolation } from "./scopedClient.ts";
 
 export const FB_SYNC_NAME = "fact_facebook_stats_sync";
 export const FB_LEVELS = ["account", "campaign", "adset", "ad", "day"] as const;
@@ -61,6 +62,25 @@ export class FacebookStatsValidationError extends Error {
     super("Facebook export validation failed: Spend mismatch between entity and day levels.");
     this.name = "FacebookStatsValidationError";
   }
+}
+
+/** The clickhouse-facebook error response of a failed warehouse action — the
+ * status / body the function has always returned. Request errors (400) and the
+ * spend validation (422) carry their own safe text; anything else is a generic
+ * 502 so warehouse messages never leave the server. `action` is the body's own
+ * action name (what the response echoes). */
+export function fbWarehouseErrorResponse(error: unknown, action: string): { status: number; body: Record<string, unknown> } {
+  const status = error instanceof FacebookStatsRequestError ? 400 : error instanceof FacebookStatsValidationError ? 422 : 502;
+  const errorCode = error instanceof FacebookStatsValidationError ? error.code : undefined;
+  const safeError = error instanceof FacebookStatsValidationError
+    ? error.safeMessage
+    : error instanceof FacebookStatsRequestError
+      ? error.message
+      : "Facebook warehouse action failed.";
+  return {
+    status,
+    body: { ok: false, action, source: "clickhouse", ...(errorCode ? { error_code: errorCode } : {}), error: safeError },
+  };
 }
 
 const n = (v: unknown): number => {
@@ -1334,7 +1354,12 @@ export async function runFbReport(input: {
       params,
     ),
     buildFbDiagnostics({ clickhouse: input.clickhouse, supabase: input.supabase, authUserId: input.authUserId, level, filters }),
-    runFbMappingSummary(input.clickhouse, input.authUserId, filters).catch(() => null),
+    // Best-effort (the report renders without the mapping block) — except a
+    // ScopeViolation, which must fail the request.
+    runFbMappingSummary(input.clickhouse, input.authUserId, filters).catch((error) => {
+      if (error instanceof ScopeViolation) throw error;
+      return null;
+    }),
   ]);
   const sr = summaryRows[0] ?? {};
   const totals = deriveMetricTotals(sr);

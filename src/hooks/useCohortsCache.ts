@@ -7,13 +7,15 @@ import { useEffect, useMemo } from "react";
 import { keepPreviousData, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { getClickHouseSummary } from "@/services/clickhouse";
 import { loadCohortsFromClickHouse, cohortFilterReproductionStatus, type CohortsSourceResult } from "@/services/cohortsDataSource";
-import { cohortsListKey, normalizeCohortRequest, warehouseVersionFromSummary, WAREHOUSE_VERSION_KEY } from "@/services/cohortsCache";
+import { cohortsListKey, normalizeCohortRequest, warehouseVersionFromSummary } from "@/services/cohortsCache";
+import { warehouseVersionKey } from "@/services/analyticsCache";
 import { recordDuration, type ProgressPhase } from "@/services/analyticsProgress";
 import {
   GC_MS,
   STALE_MS,
   transientRetry,
   useAnalyticsProgress,
+  useCacheScope,
   useWarehouseVersion,
 } from "@/hooks/useAnalyticsCache";
 import { traceEvent, traceHash, traceRequest } from "@/services/performanceTrace";
@@ -73,7 +75,9 @@ export function useCohortsListQuery(params: {
   fbWarehouseVersion?: string;
   enabled: boolean;
 }): UseCohortsListResult {
-  const { request, dataSource, userScopeHash, warehouseVersion, fbWarehouseVersion, enabled } = params;
+  const { request, dataSource, warehouseVersion, fbWarehouseVersion } = params;
+  const userScopeHash = useCacheScope(params.userScopeHash);
+  const enabled = params.enabled && userScopeHash !== "";
   const queryKey = useMemo(
     () => cohortsListKey({ userScopeHash, dataSource, warehouseVersion, fbWarehouseVersion, request }),
     [userScopeHash, dataSource, warehouseVersion, fbWarehouseVersion, request],
@@ -210,9 +214,12 @@ export function prefetchCohortsList(
   });
 }
 
+/** `userScopeHash` must be the access partition (useAccess().partition) so the
+ * prefetched entries are the ones the page's hooks read; "" prefetches nothing. */
 export function prefetchCohortsNav(client: QueryClient, userScopeHash: string, maxRenewalDepth: number): void {
+  if (!userScopeHash) return;
   void client.ensureQueryData({
-    queryKey: WAREHOUSE_VERSION_KEY,
+    queryKey: warehouseVersionKey(userScopeHash),
     queryFn: async () => warehouseVersionFromSummary(await getClickHouseSummary()),
     staleTime: STALE_MS,
   }).then((warehouseVersion) => {

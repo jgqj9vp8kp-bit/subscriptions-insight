@@ -1,6 +1,13 @@
 import type { SubscriptionClean } from "@/types/subscriptions";
+import { deleteIndexedDbDatabase, rawCacheStamp, type CacheScopeOptions } from "@/services/analyticsCache";
+import { registerPurgeHandler } from "@/services/sessionPurge";
+import { traceEvent } from "@/services/performanceTrace";
 
-const DB_NAME = "subscriptions-insight-cache";
+// Raw FunnelFox subscriptions (customer emails) — data owner only (plan D8).
+// Partition-stamped and purged exactly like palmerCache.ts.
+
+export const SUBSCRIPTION_CACHE_DB_NAME = "subscriptions-insight-cache";
+const DB_NAME = SUBSCRIPTION_CACHE_DB_NAME;
 const DB_VERSION = 1;
 const STORE_NAME = "funnelfox-subscriptions";
 const CACHE_KEY = "latest";
@@ -16,6 +23,8 @@ export interface SubscriptionCacheMetadata {
 export interface SubscriptionCachePayload {
   subscriptions: SubscriptionClean[];
   metadata: SubscriptionCacheMetadata;
+  /** Access partition the entry was written under. */
+  partition?: string;
 }
 
 function openDb(): Promise<IDBDatabase> {
@@ -67,15 +76,31 @@ function buildMetadata(subscriptions: SubscriptionClean[], metadata?: Partial<Su
 export async function saveSubscriptionsToCache(
   subscriptions: SubscriptionClean[],
   metadata?: Partial<SubscriptionCacheMetadata>,
+  options: CacheScopeOptions = {},
 ): Promise<SubscriptionCacheMetadata> {
   const nextMetadata = buildMetadata(subscriptions, metadata);
-  await withStore("readwrite", (store) => store.put({ subscriptions, metadata: nextMetadata }, CACHE_KEY));
+  const partition = rawCacheStamp(options);
+  if (!partition) {
+    traceEvent("subscriptions.cache_write_skipped", { reason: "no_raw_access" });
+    return nextMetadata;
+  }
+  await withStore("readwrite", (store) =>
+    store.put({ subscriptions, metadata: nextMetadata, partition } satisfies SubscriptionCachePayload, CACHE_KEY),
+  );
   return nextMetadata;
 }
 
-export async function loadSubscriptionsFromCache(): Promise<SubscriptionCachePayload | null> {
+export async function loadSubscriptionsFromCache(options: CacheScopeOptions = {}): Promise<SubscriptionCachePayload | null> {
+  const partition = rawCacheStamp(options);
+  if (!partition) return null;
   const payload = await withStore<SubscriptionCachePayload | undefined>("readonly", (store) => store.get(CACHE_KEY));
-  return payload ?? null;
+  if (!payload) return null;
+  if (payload.partition !== partition) {
+    traceEvent("subscriptions.cache_partition_mismatch", {});
+    await withStore("readwrite", (store) => store.delete(CACHE_KEY)).catch(() => undefined);
+    return null;
+  }
+  return payload;
 }
 
 export async function clearSubscriptionsCache(): Promise<void> {
@@ -86,3 +111,5 @@ export async function getSubscriptionsCacheInfo(): Promise<SubscriptionCacheMeta
   const payload = await loadSubscriptionsFromCache();
   return payload?.metadata ?? null;
 }
+
+registerPurgeHandler("subscriptions-indexeddb", () => deleteIndexedDbDatabase(DB_NAME));

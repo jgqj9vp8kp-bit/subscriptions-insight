@@ -21,10 +21,19 @@ import { traceEvent, traceRequest } from "@/services/performanceTrace";
 import {
   hydrateWarehouseTransactionsForAnalytics,
   loadWarehouseRecords,
+  WAREHOUSE_TRANSACTIONS_CACHE_DB_NAME,
   type WarehouseRecord,
   type WarehouseTransactionsLoadProgress,
 } from "@/services/transactionWarehouse";
+import { rawCacheStamp } from "@/services/analyticsCache";
 import type { Transaction } from "@/services/types";
+
+// Access (plan §20, D8): the cache holds the data owner's raw warehouse, so it
+// is read and written only while the active access grants raw access, and every
+// entry is stamped with the access partition it was written under. No stamp
+// (member, unresolved access) ⇒ the cache is not touched at all; a different
+// stamp ⇒ the entry is ignored and replaced. The session purge deletes the
+// whole database (transactionWarehouse.ts "warehouse-indexeddb").
 
 export const WAREHOUSE_CACHE_SCHEMA_VERSION = 1;
 
@@ -32,7 +41,7 @@ export const WAREHOUSE_CACHE_SCHEMA_VERSION = 1;
  * reload (deltas page sequentially); it also signals a bulk re-import. */
 export const WAREHOUSE_CACHE_DELTA_RELOAD_THRESHOLD = 5000;
 
-const DB_NAME = "subscriptions-insight-warehouse-cache";
+const DB_NAME = WAREHOUSE_TRANSACTIONS_CACHE_DB_NAME;
 const DB_VERSION = 1;
 const STORE_NAME = "warehouse-transactions";
 const CACHE_KEY = "latest";
@@ -41,6 +50,8 @@ const DELTA_PAGE_SIZE = 1000;
 export interface WarehouseCachePayload {
   schema_version: number;
   auth_user_id: string;
+  /** Access partition the entry was written under (rawCacheStamp()). */
+  partition?: string;
   saved_at: string;
   max_updated_at: string;
   row_count: number;
@@ -67,12 +78,14 @@ export function maxUpdatedAt(records: Array<{ updated_at: string }>): string | n
   return max;
 }
 
-export function isWarehouseCachePayloadUsable(payload: unknown, authUserId: string): payload is WarehouseCachePayload {
+/** `partition`, when given, must equal the entry's stamp (a missing stamp never matches). */
+export function isWarehouseCachePayloadUsable(payload: unknown, authUserId: string, partition?: string): payload is WarehouseCachePayload {
   if (!payload || typeof payload !== "object") return false;
   const p = payload as WarehouseCachePayload;
   return (
     p.schema_version === WAREHOUSE_CACHE_SCHEMA_VERSION &&
     p.auth_user_id === authUserId &&
+    (partition === undefined || p.partition === partition) &&
     typeof p.max_updated_at === "string" &&
     p.max_updated_at.length > 0 &&
     Array.isArray(p.records) &&
@@ -190,6 +203,9 @@ export async function clearWarehouseTransactionsCache(): Promise<void> {
 export interface WarehouseCacheDeps {
   store: WarehouseCacheStore;
   currentUserId(): Promise<string | null>;
+  /** The partition stamp the cache may use right now, or null when it must not
+   * be touched (default: rawCacheStamp()). */
+  cacheStamp(): string | null;
   loadRecords: typeof loadWarehouseRecords;
   countDeltaRows(cursor: string): Promise<number | null>;
   fetchDeltaRows(cursor: string): Promise<WarehouseDeltaRow[]>;
@@ -209,6 +225,7 @@ const defaultDeps: WarehouseCacheDeps = {
     const { data } = await supabase.auth.getSession();
     return data.session?.user?.id ?? null;
   },
+  cacheStamp: () => rawCacheStamp(),
   loadRecords: loadWarehouseRecords,
   async countDeltaRows(cursor) {
     const client = ensureSupabase();
@@ -267,7 +284,13 @@ export interface CachedWarehouseLoadOptions {
   onProgress?: (progress: WarehouseTransactionsLoadProgress) => void;
 }
 
-function persistInBackground(deps: WarehouseCacheDeps, records: WarehouseRecord[], authUserId: string): void {
+function persistInBackground(deps: WarehouseCacheDeps, records: WarehouseRecord[], authUserId: string, partition: string): void {
+  // The access may have changed (purge) while the load ran: never write a
+  // result loaded under another partition.
+  if (deps.cacheStamp() !== partition) {
+    traceEvent("warehouse.cache_persist_skipped", { rows: records.length, reason: "partition_changed" });
+    return;
+  }
   const cursor = maxUpdatedAt(records);
   const complete = records.every((r) => typeof r.id === "string" && r.id && typeof r.updated_at === "string" && r.updated_at);
   if (!cursor || !complete) {
@@ -277,6 +300,7 @@ function persistInBackground(deps: WarehouseCacheDeps, records: WarehouseRecord[
   const payload: WarehouseCachePayload = {
     schema_version: WAREHOUSE_CACHE_SCHEMA_VERSION,
     auth_user_id: authUserId,
+    partition,
     saved_at: deps.now(),
     max_updated_at: cursor,
     row_count: records.length,
@@ -321,6 +345,8 @@ export async function loadWarehouseTransactionsCached(
   } catch {
     authUserId = null;
   }
+  // Without raw access (or before access resolved) the cache is never touched.
+  const partition = deps.cacheStamp();
 
   const loadFullAndSeed = async (reason: string): Promise<Transaction[]> => {
     traceEvent("warehouse.cache_full_load", { reason });
@@ -330,17 +356,18 @@ export async function loadWarehouseTransactionsCached(
     });
     const hydrated = hydrateWarehouseTransactionsForAnalytics(records);
     traceEvent("warehouse.transactions_hydrated", { source_rows: records.length, hydrated_rows: hydrated.length });
-    if (authUserId) persistInBackground(deps, records, authUserId);
+    if (authUserId && partition) persistInBackground(deps, records, authUserId, partition);
     return hydrated;
   };
 
   // Without a session the cache cannot be scoped to a user — do not touch it.
   if (!authUserId) return loadFullAndSeed("no_session");
+  if (!partition) return loadFullAndSeed("no_raw_access");
 
   let payload: WarehouseCachePayload | null = null;
   try {
     const raw = await deps.store.read();
-    payload = isWarehouseCachePayloadUsable(raw, authUserId) ? raw : null;
+    payload = isWarehouseCachePayloadUsable(raw, authUserId, partition) ? raw : null;
     if (raw != null && !payload) traceEvent("warehouse.cache_unusable", {});
   } catch (error) {
     traceEvent("warehouse.cache_read_failed", { message: error instanceof Error ? error.message : String(error) });
@@ -368,7 +395,7 @@ export async function loadWarehouseTransactionsCached(
       return await loadFullAndSeed("count_mismatch");
     }
 
-    if (applied.changed) persistInBackground(deps, applied.records, authUserId);
+    if (applied.changed) persistInBackground(deps, applied.records, authUserId, partition);
     emitWarmProgress(options, applied.records.length, delta.length, startedAt);
     const hydrated = hydrateWarehouseTransactionsForAnalytics(applied.records);
     traceEvent("warehouse.cache_warm_load", {

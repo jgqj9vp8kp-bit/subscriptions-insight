@@ -2,6 +2,7 @@ import {
   loadLatestCloudSnapshot,
   saveCloudSnapshot,
 } from "@/services/dataSnapshots";
+import { principalHash } from "@/services/sessionPurge";
 
 export const COHORTS_UI_SETTINGS_DATASET_TYPE = "cohorts_ui_settings";
 export const COHORTS_UI_STATE_STORAGE_KEY = "ui_state_cohorts";
@@ -226,16 +227,57 @@ export function buildCohortsUiSettingsPayload(
   };
 }
 
-export function loadCohortsUiSettingsLocal(defaults: CohortsUiSettingsDefaults): CohortsUiSettingsPayload | null {
+/** Who the local copy belongs to (plan §20): the column/view keys above carry
+ * no owner, so the page stamps them with the signed-in user's principal hash and
+ * ignores a copy another account left in this browser (it is never applied or
+ * uploaded to this user's cloud snapshot). */
+export const COHORTS_UI_SETTINGS_OWNER_KEY = "cohorts_ui_settings_owner";
+
+export interface CohortsUiSettingsLocalScope {
+  /** Signed-in user id. When given, a copy stamped for anyone else (or not
+   * stamped at all) reads as null, and saves stamp it. */
+  owner?: string | null;
+  /** Storage key of the filters slot (default COHORTS_UI_STATE_STORAGE_KEY).
+   * The page passes its per-principal usePersistedPageState key so both write
+   * the same entry. */
+  filtersKey?: string;
+  /** Adopt a copy that carries NO owner stamp (written before stamps existed)
+   * as `owner`'s, and stamp it. The page passes the data owner's rawAccess:
+   * before access control the app was theirs, so their local layout keeps
+   * winning over an older cloud copy exactly as before. A copy stamped for
+   * someone else is never adopted. */
+  adoptUnstamped?: boolean;
+}
+
+function localOwnerStamp(owner: string): string {
+  return principalHash(owner.toLowerCase());
+}
+
+export function loadCohortsUiSettingsLocal(
+  defaults: CohortsUiSettingsDefaults,
+  scope: CohortsUiSettingsLocalScope = {},
+): CohortsUiSettingsPayload | null {
   try {
     const updatedAt = localStorage.getItem(COHORTS_UI_SETTINGS_UPDATED_AT_KEY);
     if (!updatedAt) return null;
+    let adopted = false;
+    if (scope.owner) {
+      const stamp = localStorage.getItem(COHORTS_UI_SETTINGS_OWNER_KEY);
+      if (stamp !== localOwnerStamp(scope.owner)) {
+        if (!(stamp === null && scope.adoptUnstamped === true)) return null;
+        localStorage.setItem(COHORTS_UI_SETTINGS_OWNER_KEY, localOwnerStamp(scope.owner));
+        adopted = true;
+      }
+    }
 
     const readJson = (key: string) => {
       const raw = localStorage.getItem(key);
       return raw ? JSON.parse(raw) : null;
     };
-    const rawFilters = readJson(COHORTS_UI_STATE_STORAGE_KEY);
+    // An adopted pre-stamp copy kept its filters under the bare key; the
+    // per-principal key wins once it exists.
+    const filtersKey = scope.filtersKey ?? COHORTS_UI_STATE_STORAGE_KEY;
+    const rawFilters = readJson(filtersKey) ?? (adopted && filtersKey !== COHORTS_UI_STATE_STORAGE_KEY ? readJson(COHORTS_UI_STATE_STORAGE_KEY) : null);
     const filters =
       rawFilters && typeof rawFilters === "object" && !Array.isArray(rawFilters)
         ? (rawFilters as Record<string, unknown>)
@@ -261,14 +303,15 @@ export function loadCohortsUiSettingsLocal(defaults: CohortsUiSettingsDefaults):
   }
 }
 
-export function saveCohortsUiSettingsLocal(payload: CohortsUiSettingsPayload) {
+export function saveCohortsUiSettingsLocal(payload: CohortsUiSettingsPayload, scope: CohortsUiSettingsLocalScope = {}) {
   try {
     localStorage.setItem(COLUMN_ORDER_STORAGE_KEY, JSON.stringify(payload.columnOrder));
     localStorage.setItem(COLUMN_WIDTHS_STORAGE_KEY, JSON.stringify(payload.columnWidths));
     localStorage.setItem(COLUMN_VISIBILITY_STORAGE_KEY, JSON.stringify(payload.columnVisibility));
     localStorage.setItem(SAVED_VIEWS_STORAGE_KEY, JSON.stringify(payload.savedViews));
+    if (scope.owner) localStorage.setItem(COHORTS_UI_SETTINGS_OWNER_KEY, localOwnerStamp(scope.owner));
     localStorage.setItem(
-      COHORTS_UI_STATE_STORAGE_KEY,
+      scope.filtersKey ?? COHORTS_UI_STATE_STORAGE_KEY,
       JSON.stringify({
         ...payload.filters,
         sortColumn: payload.sortColumn,

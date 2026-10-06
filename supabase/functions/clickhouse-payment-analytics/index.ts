@@ -2,13 +2,22 @@
 
 // clickhouse-payment-analytics: server-side Payment Pass Analytics. ClickHouse is
 // the single source of truth for ALL metrics (decline_reason is canonical). Runs
-// the shared parity-proven classifier + sequential stage state machine, scoped to
-// the authenticated user. Returns aggregate-only bundles — never raw payloads,
-// emails, ids, SQL, or credentials.
+// the shared parity-proven classifier + sequential stage state machine over the
+// workspace data (ctx.tenantKey, never the caller). Returns aggregate-only
+// bundles — never raw payloads, emails, ids, SQL, or credentials.
+//
+// Access is decided by CLICKHOUSE_PAYMENT_ANALYTICS_POLICY before the handler
+// runs: the bundle needs payment_pass.view, the Banks actions
+// payment_pass.banks.view, and the AI pass-rate call ai.use on Cohorts / FB
+// Analytics. An unrecognized action is a 400 — it no longer falls back to the
+// bundle.
 
-import { createClickHouseClient } from "../_shared/clickhouse/client.ts";
-import { jsonResponse, methodNotAllowed, optionsResponse, parseJsonBody, requireSupabaseUser } from "../_shared/clickhouse/http.ts";
-import { PaymentAnalyticsRequestError, runPaymentAnalytics } from "../_shared/clickhouse/paymentAnalytics.ts";
+import { serveWithAccess } from "../_shared/clickhouse/http.ts";
+import {
+  CLICKHOUSE_PAYMENT_ANALYTICS_POLICY,
+  paymentPassFullBundleAllowed,
+} from "../_shared/access/policies/clickhouse-payment-analytics.ts";
+import { PaymentAnalyticsRequestError, runAiPassRates, runPaymentAnalytics } from "../_shared/clickhouse/paymentAnalytics.ts";
 import { runBankAnalytics, runBankDetail } from "../_shared/clickhouse/bankAnalytics.ts";
 import type { PaymentAnalyticsRequest } from "../_shared/clickhouse/paymentAnalytics.ts";
 
@@ -23,40 +32,24 @@ function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
   ]);
 }
 
-Deno.serve(async (req: Request) => {
-  if (req.method === "OPTIONS") return optionsResponse();
-  if (req.method !== "POST") return methodNotAllowed("POST");
-
-  const auth = await requireSupabaseUser(req);
-  if ("status" in auth) return jsonResponse(auth.body, auth.status);
-
-  let request: PaymentAnalyticsRequest;
-  try {
-    request = (await parseJsonBody<Record<string, unknown>>(req)) as PaymentAnalyticsRequest;
-  } catch {
-    return jsonResponse({ ok: false, error: "Invalid JSON request body." }, 400);
-  }
-
-  let client: ReturnType<typeof createClickHouseClient> | null = null;
-  try {
-    client = createClickHouseClient();
-    const common = { authUserId: auth.id, clickhouse: client };
-    const action = String((request as { action?: unknown }).action ?? "");
-    // Banks actions branch BEFORE the default: runPaymentAnalytics answers any
-    // unrecognized action with the full bundle, so a missing branch here would
-    // hand the Banks tab an analytics bundle with ok:true and no issuer rows.
-    if (action === "banks") {
-      return jsonResponse(await withTimeout(runBankAnalytics({ ...common, request }), QUERY_TIMEOUT_MS));
+serveWithAccess(
+  CLICKHOUSE_PAYMENT_ANALYTICS_POLICY,
+  async ({ ctx, action, body, clickhouse }) => {
+    const request = body as PaymentAnalyticsRequest;
+    const common = { authUserId: ctx.tenantKey, clickhouse: clickhouse() };
+    if (action === "banks") return await withTimeout(runBankAnalytics({ ...common, request }), QUERY_TIMEOUT_MS);
+    if (action === "bank_detail") return await withTimeout(runBankDetail({ ...common, request }), QUERY_TIMEOUT_MS);
+    if (action === "ai_pass_rates") {
+      return await withTimeout(runAiPassRates({ ...common, request, fullBundle: paymentPassFullBundleAllowed(ctx) }), QUERY_TIMEOUT_MS);
     }
-    if (action === "bank_detail") {
-      return jsonResponse(await withTimeout(runBankDetail({ ...common, request }), QUERY_TIMEOUT_MS));
-    }
-    const result = await withTimeout(runPaymentAnalytics({ ...common, request }), QUERY_TIMEOUT_MS);
-    return jsonResponse(result);
-  } catch (error) {
-    const status = error instanceof PaymentAnalyticsRequestError ? 400 : 502;
-    return jsonResponse({ ok: false, source: "clickhouse", error: error instanceof Error ? error.message : "ClickHouse payment-analytics query failed." }, status);
-  } finally {
-    await client?.close?.().catch(() => undefined);
-  }
-});
+    return await withTimeout(runPaymentAnalytics({ ...common, request }), QUERY_TIMEOUT_MS);
+  },
+  {
+    // Same status / body as before access control; the gate sanitizes the
+    // body for everyone but the data owner.
+    onError: (error) => ({
+      status: error instanceof PaymentAnalyticsRequestError ? 400 : 502,
+      body: { ok: false, source: "clickhouse", error: error instanceof Error ? error.message : "ClickHouse payment-analytics query failed." },
+    }),
+  },
+);

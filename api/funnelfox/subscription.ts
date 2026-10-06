@@ -1,6 +1,9 @@
 /* global process */
 
-import { handleFunnelFoxSubscriptionDetails } from "./subscriptionsCore";
+// Dev-only (see subscriptionsCore.ts): refuses to run unless
+// FUNNELFOX_LOCAL_PROXY_ENABLED=true. Production uses the gated Edge function.
+
+import { handleFunnelFoxSubscriptionDetails, isFunnelFoxLocalProxyEnabled } from "./subscriptionsCore";
 
 type ApiRequest = {
   method?: string;
@@ -35,6 +38,7 @@ function getSubscriptionId(req: ApiRequest): string {
 }
 
 export default async function handler(req: ApiRequest, res: ApiResponse) {
+  if (!isFunnelFoxLocalProxyEnabled()) return res.status(404).json({ error: "Not found." });
   if (req.method && req.method !== "GET") {
     res.setHeader("Allow", "GET");
     return res.status(405).json({ error: "Method not allowed." });

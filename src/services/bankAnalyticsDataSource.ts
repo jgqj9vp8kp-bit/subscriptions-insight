@@ -61,9 +61,10 @@ export function buildBankAnalyticsRequest(q: BankAnalyticsQuery): Record<string,
 export async function loadBankAnalytics(query: BankAnalyticsQuery): Promise<BankAnalyticsBundle> {
   const response = await runClickHouseBankAnalytics<BankAnalyticsBundle>(buildBankAnalyticsRequest(query));
   if (!response.ok) throw new Error(response.error || "ClickHouse bank analytics failed.");
-  // The edge router falls through to the Payment Pass bundle on any
-  // unrecognized action — which is ok:true and carries no issuer rows. The
-  // discriminator turns that silent empty table into an error.
+  // The access-gated router now answers an unrecognized action with 400
+  // unknown_action, but an older deployment fell through to the Payment Pass
+  // bundle (ok:true, no issuer rows). The discriminator keeps turning that
+  // silent empty table into an error.
   if (response.action !== "banks" || !Array.isArray(response.issuer_rows)) {
     throw new Error("Сервер вернул не банковскую аналитику — обновите Edge-функцию clickhouse-payment-analytics.");
   }

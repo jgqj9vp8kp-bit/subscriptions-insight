@@ -20,6 +20,7 @@ import { ForecastPeriodTable } from "@/components/forecasting/ForecastPeriodTabl
 import { ProvenanceBadge } from "@/components/forecasting/ProvenanceBadge";
 import { fmtInt, fmtMoney, fmtPctValue, fmtRatio } from "@/components/forecasting/forecastFormat";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
+import { useAccess, useCan } from "@/hooks/useAccess";
 import { useTransactions } from "@/services/sheets";
 import { useDataStore } from "@/store/dataStore";
 import { computeCohorts, formatCurrency } from "@/services/analytics";
@@ -112,12 +113,15 @@ function PlanInput({ label, value, seeded, provenance, onChange, suffix }: {
 }
 
 /** Save the frozen snapshot as a named scenario and/or push it into the Compare tab's
- * working set. The snapshot is fully serializable — what you save is what re-runs. */
-function ScenarioActions({ frozen, funnel, defaultLabel }: {
+ * working set. The snapshot is fully serializable — what you save is what re-runs.
+ * Saving creates a forecast_scenarios row: forecasting.create (UX only — RLS is
+ * authoritative). The Compare working set is local to this browser. */
+export function ScenarioActions({ frozen, funnel, defaultLabel }: {
   frozen: NonNullable<ReturnType<typeof createFrozenForecastInputs>>;
   funnel: string;
   defaultLabel: string;
 }) {
+  const canCreate = useCan("forecasting.create");
   const [label, setLabel] = useState("");
   const [status, setStatus] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -159,23 +163,36 @@ function ScenarioActions({ frozen, funnel, defaultLabel }: {
           <Input className="h-8" placeholder={defaultLabel} value={label} onChange={(event) => setLabel(event.target.value)} />
         </div>
         <Button variant="outline" size="sm" onClick={handleAddToComparison}>Add to comparison</Button>
-        <Button size="sm" onClick={handleSave} disabled={saving}>{saving ? "Saving…" : "Save scenario"}</Button>
+        {canCreate && <Button size="sm" onClick={handleSave} disabled={saving}>{saving ? "Saving…" : "Save scenario"}</Button>}
         {status && <span className="text-xs text-muted-foreground">{status}</span>}
       </div>
     </Card>
   );
 }
 
+// Stable empty inputs for principals without raw access (see PlanMode).
+const NO_COHORTS: CohortRow[] = [];
+const NO_TRAFFIC_METRICS: ReturnType<typeof useDataStore.getState>["trafficMetrics"] = [];
+
 export function PlanMode() {
+  // The in-memory seed (computeCohorts over the downloaded transaction
+  // warehouse and the imported traffic sheet) is a client compute: data owner
+  // only (rawAccess; legacy ⇒ true, D8). Everyone else seeds from the
+  // ClickHouse cohort endpoint alone. UX only — the Edge gate is authoritative.
+  const { rawAccess } = useAccess();
   const txs = useTransactions();
   const subscriptions = useDataStore((state) => state.subscriptions);
-  const trafficMetrics = useDataStore((state) => state.trafficMetrics);
+  const storeTrafficMetrics = useDataStore((state) => state.trafficMetrics);
+  const trafficMetrics = rawAccess ? storeTrafficMetrics : NO_TRAFFIC_METRICS;
   const [ui, setUi, resetUi] = usePersistedPageState<PlanUiState>("ui_state_forecasting_plan_v1", DEFAULT_PLAN_UI_STATE);
   const update = (patch: Partial<PlanUiState>) => setUi((current) => ({ ...current, ...patch }));
   // Stable reference instant for the session (deterministic seeding while mounted).
   const [asOf] = useState(() => new Date().toISOString());
 
-  const localCohorts = useMemo(() => computeCohorts(txs, subscriptions, {}), [txs, subscriptions]);
+  const localCohorts = useMemo(
+    () => (rawAccess ? computeCohorts(txs, subscriptions, {}) : NO_COHORTS),
+    [rawAccess, txs, subscriptions],
+  );
   const trafficByKey = useMemo(() => aggregateTrafficMetrics(trafficMetrics), [trafficMetrics]);
 
   // Live seed: the ClickHouse cohort endpoint carries FB spend attributed per
@@ -420,7 +437,9 @@ export function PlanMode() {
             Seed: funnel {pathOptions.find((option) => option.path === campaignPath)?.funnel ?? "—"} · {seed.coverage.cohorts} cohorts · {fmtInt(seed.coverage.trialUsers)} trials · maturity {seed.coverage.maturityDays}d · spend coverage {seed.coverage.spendCoverage == null ? "—" : fmtPctValue(seed.coverage.spendCoverage, 0)}
           </span>
           <Badge variant="outline" className="text-[10px] font-normal">
-            {warehouse.loading ? "loading warehouse…" : usingWarehouse ? "warehouse (FB spend attributed)" : "in-memory cohorts"}
+            {warehouse.loading
+              ? "loading warehouse…"
+              : usingWarehouse ? "warehouse (FB spend attributed)" : rawAccess ? "in-memory cohorts" : "no warehouse cohorts"}
           </Badge>
           {warehouse.error && (
             <span className="text-warning">Warehouse seed unavailable: {warehouse.error}</span>

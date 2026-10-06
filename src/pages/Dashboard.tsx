@@ -72,6 +72,7 @@ import {
 import { useDataStore } from "@/store/dataStore";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
+import { useAccess } from "@/hooks/useAccess";
 import { autoLoadWarehouseIntoStoreWithOptions } from "@/services/analyticsAdapters";
 
 const FILTER_DEBOUNCE_MS = 300;
@@ -341,7 +342,29 @@ function TrialsUpsellsTooltip({
   );
 }
 
+/** Dashboard (plan §14, §19, D8). Everything below Revenue Intelligence is
+ * computed in the browser over the whole downloaded transaction warehouse
+ * (plus the auto-load that downloads it), so that body is the data owner's view
+ * only (rawAccess; legacy ⇒ true). Everyone else gets the server-computed
+ * Revenue Intelligence section. UX only — the Edge gate is authoritative. */
 export default function Dashboard() {
+  const access = useAccess();
+  return access.rawAccess ? <OwnerDashboard /> : <ServerDashboard />;
+}
+
+function ServerDashboard() {
+  return (
+    <AppLayout title="Dashboard" description="Cohort-based business overview">
+      <Card className="mb-4 p-3 text-xs text-muted-foreground shadow-card" data-testid="dashboard-server-only-note">
+        The cohort KPIs and charts of this page are computed from the full transaction warehouse and are available to the
+        data owner only. Revenue Intelligence below is computed on the server.
+      </Card>
+      <RevenueIntelligenceSection />
+    </AppLayout>
+  );
+}
+
+function OwnerDashboard() {
   const txs = useTransactions();
   const dataStoreSource = useDataStore((s) => s.meta.source);
   const subscriptions = useDataStore((s) => s.subscriptions);
@@ -547,10 +570,12 @@ export default function Dashboard() {
   // summary and, in DEV, reconcile it against the client compute. Rendering stays on
   // the client compute until real-data parity is confirmed (log-only phase).
   const serverDashboardEnabled = dashboardSource() === "server";
+  // Keyed by the access partition (plan §20) so an entry never outlives its principal.
+  const partition = useAccess().partition;
   const serverDashboardQuery = useQuery({
-    queryKey: ["dashboard-summary", appliedFilters],
+    queryKey: ["dashboard-summary", partition, appliedFilters],
     queryFn: () => fetchDashboardSummary(appliedFilters),
-    enabled: serverDashboardEnabled,
+    enabled: serverDashboardEnabled && partition !== "",
     staleTime: 60_000,
   });
   useEffect(() => {

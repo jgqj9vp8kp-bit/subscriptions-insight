@@ -65,15 +65,16 @@ import { listFunnels } from "@/services/funnels";
 import type { CohortRequest } from "../../supabase/functions/_shared/clickhouse/cohortContract";
 import type { FbAllocationStatus, FbTimezoneSource } from "../../supabase/functions/_shared/clickhouse/fbCohortStats";
 import { useAuth } from "@/hooks/useAuth";
-import { hashUserScope } from "@/services/cohortsCache";
+import { useAccess } from "@/hooks/useAccess";
 import { useCohortsListQuery, useWarehouseVersion } from "@/hooks/useCohortsCache";
 import { formatUpdatedAgo } from "@/services/analyticsProgress";
 import { Progress } from "@/components/ui/progress";
 import { useDataStore } from "@/store/dataStore";
-import { usePersistedPageState } from "@/hooks/usePersistedPageState";
+import { principalPageStateKey, usePersistedPageState } from "@/hooks/usePersistedPageState";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import {
   ACTIVE_VIEW_STORAGE_KEY,
+  COHORTS_UI_STATE_STORAGE_KEY,
   COLUMN_ORDER_STORAGE_KEY,
   COLUMN_VISIBILITY_STORAGE_KEY,
   COLUMN_WIDTHS_STORAGE_KEY,
@@ -1025,8 +1026,33 @@ const FB_ALLOCATION_STATUSES: FbAllocationStatus[] = [
 ];
 const FB_TIMEZONE_SOURCES: FbTimezoneSource[] = ["payload", "account_config", "default_config", "unverified"];
 
+// Stable empty inputs for principals without raw access (see `rawAccess` below).
+const NO_TRANSACTIONS: ReturnType<typeof useTransactions> = [];
+const NO_SUBSCRIPTIONS: ReturnType<typeof useDataStore.getState>["subscriptions"] = [];
+const NO_TRAFFIC_METRICS: ReturnType<typeof useDataStore.getState>["trafficMetrics"] = [];
+const NO_RAW_PALMER_ROWS: ReturnType<typeof useDataStore.getState>["rawPalmerRows"] = [];
+
 export default function CohortsPage() {
-  const txs = useTransactions();
+  // Access (plan §14, UX only — the Edge gate is authoritative). The legacy
+  // in-browser engine downloads and scans the whole transaction warehouse, so
+  // only the data owner (rawAccess; legacy ⇒ true) may use it or the store's
+  // browser-side datasets (D8). Everyone else is served by ClickHouse alone and
+  // sees the server's state (error / unsupported filter) instead of a silent
+  // switch to the legacy engine.
+  const access = useAccess();
+  const rawAccess = access.rawAccess;
+  const canExportCohorts = access.can("cohorts.export");
+  // The stale-snapshot auto-rebuild writes the warehouse (clickhouse-cohort-membership rebuild).
+  const canRebuildSnapshot = access.can("admin.warehouse.manage");
+  // The diagnostics payload is stripped server-side for everyone else; don't ask for it.
+  const canViewFbAllocationDiagnostics = rawAccess || access.can("admin.diagnostics.view");
+  const canUseAi = access.can("ai.use");
+  // Cloud copies of the Cohorts view live in data_snapshots, a data-owner
+  // table (plan §7, RESTRICTIVE data_key policy): everyone else keeps their
+  // view in this browser only.
+  const cloudSettingsEnabled = rawAccess;
+  const storeTxs = useTransactions();
+  const txs = rawAccess ? storeTxs : NO_TRANSACTIONS;
   const mountedRef = useRef(false);
   const firstRowsRef = useRef(false);
   if (!mountedRef.current) {
@@ -1040,15 +1066,21 @@ export default function CohortsPage() {
   // known-partial. Silent when there is no sync-state row (legacy snapshot).
   const [subscriptionSyncWarning, setSubscriptionSyncWarning] = useState<string | null>(null);
   useEffect(() => {
+    // The owner's FunnelFox sync state is a PostgREST read of the data owner's
+    // rows; nobody else has one.
+    if (!rawAccess) return;
     let mounted = true;
     getFunnelFoxSubscriptionsSyncState()
       .then((state) => { if (mounted) setSubscriptionSyncWarning(subscriptionSyncCompletenessWarning(state)); })
       .catch(() => { /* no sync-state table / not signed in → no warning */ });
     return () => { mounted = false; };
-  }, []);
-  const subscriptions = useDataStore((s) => s.subscriptions);
-  const trafficMetrics = useDataStore((s) => s.trafficMetrics);
-  const rawPalmerRows = useDataStore((s) => s.rawPalmerRows);
+  }, [rawAccess]);
+  const storeSubscriptions = useDataStore((s) => s.subscriptions);
+  const storeTrafficMetrics = useDataStore((s) => s.trafficMetrics);
+  const storeRawPalmerRows = useDataStore((s) => s.rawPalmerRows);
+  const subscriptions = rawAccess ? storeSubscriptions : NO_SUBSCRIPTIONS;
+  const trafficMetrics = rawAccess ? storeTrafficMetrics : NO_TRAFFIC_METRICS;
+  const rawPalmerRows = rawAccess ? storeRawPalmerRows : NO_RAW_PALMER_ROWS;
   const dataStoreSource = useDataStore((s) => s.meta.source);
   const [legacyWarehouseLoadState, setLegacyWarehouseLoadState] = useState<"idle" | "loading" | "settled">("idle");
   const [fbAllocationDiagnosticsUi, setFbAllocationDiagnosticsUi] = useState({
@@ -1073,11 +1105,26 @@ export default function CohortsPage() {
   // (real transactions) only as the fallback when ClickHouse errors or a
   // not-yet-server-reproduced filter is active.
   const cohortsSource = useMemo(() => cohortsDataSourceMode(), []);
-  const { user, loading: authLoading } = useAuth();
-  // Non-reversible per-user scope for cache isolation; hashed warehouse version so
-  // a warehouse advance busts stale cache. chResult / chStatus (+ progress) are
-  // produced by the cached cohorts query defined just above `needLegacy` below.
-  const userScopeHash = useMemo(() => hashUserScope(user?.id), [user?.id]);
+  const { loading: authLoading, user: authUser } = useAuth();
+  // The local Cohorts view copy belongs to the signed-in user (owner stamp), and
+  // its filters slot is the same per-principal key usePersistedPageState writes.
+  const authUserId = authUser?.id ?? null;
+  // The data owner adopts an unstamped (pre-access-control) local copy as their
+  // own, so their local layout keeps beating an older cloud copy as before.
+  const localSettingsScope = useMemo(
+    () => ({
+      owner: authUserId,
+      filtersKey: principalPageStateKey(COHORTS_UI_STATE_STORAGE_KEY, authUserId),
+      adoptUnstamped: access.rawAccess,
+    }),
+    [authUserId, access.rawAccess],
+  );
+  // Cache isolation by the server-issued access partition (plan §20; legacy ⇒
+  // a per-user key) — the same key the sidebar hover prefetch uses; hashed
+  // warehouse version so a warehouse advance busts stale cache. chResult /
+  // chStatus (+ progress) are produced by the cached cohorts query defined just
+  // above `needLegacy` below.
+  const userScopeHash = access.partition;
   const { version: warehouseVersion, ready: warehouseVersionReady } = useWarehouseVersion(cohortsSource === "clickhouse");
   // FB warehouse fingerprint (separate lifecycle from the cohort snapshot): an
   // FB sync re-keys this report so cached Spend can never outlive the sync.
@@ -1396,7 +1443,7 @@ export default function CohortsPage() {
       if (!sanitized) return false;
 
       skipNextCloudSaveRef.current = true;
-      writeLocalCohortsUiSettings(sanitized);
+      writeLocalCohortsUiSettings(sanitized, localSettingsScope);
       setColumnOrder(sanitized.columnOrder as CohortColumnId[]);
       setColumnVisibility(sanitized.columnVisibility as Record<CohortColumnId, boolean>);
       setColumnWidths(sanitized.columnWidths);
@@ -1415,7 +1462,7 @@ export default function CohortsPage() {
       setActiveViewId(sanitized.selectedView);
       return true;
     },
-    [cohortsUiSettingsDefaults, setUiState],
+    [cohortsUiSettingsDefaults, setUiState, localSettingsScope],
   );
 
   const buildCurrentCohortsUiSettings = useCallback(
@@ -1449,7 +1496,7 @@ export default function CohortsPage() {
       setCohortsUiCloudLoading(true);
       setCohortsUiCloudError(null);
       const payload = buildCurrentCohortsUiSettings();
-      writeLocalCohortsUiSettings(payload);
+      writeLocalCohortsUiSettings(payload, localSettingsScope);
       const info = await saveCohortsUiSettingsToCloud(payload);
       setCohortsUiCloudMessage(
         info ? "Cohorts view saved to cloud." : "Sign in with Supabase to save Cohorts view to cloud.",
@@ -1491,14 +1538,16 @@ export default function CohortsPage() {
     defaults: cohortsUiSettingsDefaults,
     apply: applyCohortsUiSettings,
     saveToCloud: saveCohortsUiSettingsToCloud,
+    localScope: localSettingsScope,
   });
   useEffect(() => {
     restoreDepsRef.current = {
       defaults: cohortsUiSettingsDefaults,
       apply: applyCohortsUiSettings,
       saveToCloud: saveCohortsUiSettingsToCloud,
+      localScope: localSettingsScope,
     };
-  }, [applyCohortsUiSettings, cohortsUiSettingsDefaults, saveCohortsUiSettingsToCloud]);
+  }, [applyCohortsUiSettings, cohortsUiSettingsDefaults, saveCohortsUiSettingsToCloud, localSettingsScope]);
 
   useEffect(() => {
     // Wait for AuthProvider to resolve the session before reading the cloud
@@ -1512,24 +1561,27 @@ export default function CohortsPage() {
     let mounted = true;
 
     async function restoreCohortsUiSettings() {
-      const { defaults, apply, saveToCloud } = restoreDepsRef.current;
+      const { defaults, apply, saveToCloud, localScope } = restoreDepsRef.current;
       try {
-        const local = readLocalCohortsUiSettings(defaults);
-        const cloud = await loadCohortsUiSettingsCloud(defaults).catch((error) => {
-          console.warn("Could not load Cohorts UI settings cloud snapshot.", error);
-          return null;
-        });
+        // Another account's local copy reads as null: never applied, never uploaded.
+        const local = readLocalCohortsUiSettings(defaults, localScope);
+        const cloud = cloudSettingsEnabled
+          ? await loadCohortsUiSettingsCloud(defaults).catch((error) => {
+            console.warn("Could not load Cohorts UI settings cloud snapshot.", error);
+            return null;
+          })
+          : null;
         if (!mounted) return;
 
         const merged = mergeCohortsUiSettings(local, cloud);
         if (merged.source === "cloud" && merged.settings) {
           apply(merged.settings);
           setCohortsUiCloudMessage("Cohorts view loaded from cloud.");
-        } else if (merged.source === "local" && merged.settings && cloud) {
+        } else if (cloudSettingsEnabled && merged.source === "local" && merged.settings && cloud) {
           void saveToCloud(merged.settings).catch((error) =>
             console.warn("Could not sync local Cohorts UI settings to cloud.", error),
           );
-        } else if (merged.source === "local" && merged.settings && !cloud) {
+        } else if (cloudSettingsEnabled && merged.source === "local" && merged.settings && !cloud) {
           void saveToCloud(merged.settings).catch((error) =>
             console.warn("Could not save local Cohorts UI settings to cloud.", error),
           );
@@ -1551,7 +1603,7 @@ export default function CohortsPage() {
     return () => {
       mounted = false;
     };
-  }, [authLoading]);
+  }, [authLoading, cloudSettingsEnabled]);
 
   useEffect(() => {
     if (!cohortsUiCloudReady) return;
@@ -1561,9 +1613,10 @@ export default function CohortsPage() {
     }
 
     const payload = buildCurrentCohortsUiSettings();
-    writeLocalCohortsUiSettings(payload);
+    writeLocalCohortsUiSettings(payload, localSettingsScope);
     setCohortsUiCloudMessage("Saved locally");
     setCohortsUiCloudError(null);
+    if (!cloudSettingsEnabled) return;
 
     const timer = window.setTimeout(() => {
       void saveCohortsUiSettingsToCloud(payload)
@@ -1577,7 +1630,7 @@ export default function CohortsPage() {
     }, 800);
 
     return () => window.clearTimeout(timer);
-  }, [buildCurrentCohortsUiSettings, cohortsUiCloudReady, saveCohortsUiSettingsToCloud]);
+  }, [buildCurrentCohortsUiSettings, cohortsUiCloudReady, saveCohortsUiSettingsToCloud, cloudSettingsEnabled, localSettingsScope]);
 
   useEffect(() => {
     const syncMaxRenewalColumns = () => setMaxRenewalColumns(loadMaxRenewalColumns());
@@ -1645,21 +1698,29 @@ export default function CohortsPage() {
         refund_status: refundFilter === "has" ? "has" : refundFilter === "none" ? "none" : "all",
       },
       max_renewal_depth: maxRenewalColumns,
-      fb_allocation_diagnostics: {
-        page: fbAllocationDiagnosticsUi.page,
-        page_size: 100,
-        filters: {
-          date_from: fbAllocationDiagnosticsUi.dateFrom || null,
-          date_to: fbAllocationDiagnosticsUi.dateTo || null,
-          campaign_id: fbAllocationDiagnosticsUi.campaignId.trim() || null,
-          campaign_name: fbAllocationDiagnosticsUi.campaignName.trim() || null,
-          ad_account_id: fbAllocationDiagnosticsUi.adAccountId.trim() || null,
-          allocation_status: fbAllocationDiagnosticsUi.allocationStatus,
-          timezone_source: fbAllocationDiagnosticsUi.timezoneSource,
-        },
-      },
+      // Asked for only by those allowed to see it (raw access or
+      // admin.diagnostics.view): the block is its own policy action
+      // (list_fb_allocation_diagnostics) and its payload is stripped for
+      // everyone else anyway.
+      ...(canViewFbAllocationDiagnostics
+        ? {
+          fb_allocation_diagnostics: {
+            page: fbAllocationDiagnosticsUi.page,
+            page_size: 100,
+            filters: {
+              date_from: fbAllocationDiagnosticsUi.dateFrom || null,
+              date_to: fbAllocationDiagnosticsUi.dateTo || null,
+              campaign_id: fbAllocationDiagnosticsUi.campaignId.trim() || null,
+              campaign_name: fbAllocationDiagnosticsUi.campaignName.trim() || null,
+              ad_account_id: fbAllocationDiagnosticsUi.adAccountId.trim() || null,
+              allocation_status: fbAllocationDiagnosticsUi.allocationStatus,
+              timezone_source: fbAllocationDiagnosticsUi.timezoneSource,
+            },
+          },
+        }
+        : {}),
     }),
-    [cohortDateFrom, cohortDateTo, selectedFunnels, selectedCampaignPaths, excludedCampaignPaths, appliedSelectedCampaignIds, appliedTrafficSourceFilter, effectiveSelectedMediaBuyers, appliedSelectedCountries, effectiveSelectedCardTypes, effectiveSelectedPlatforms, selectedCurrencies, refundFilter, maxRenewalColumns, fbAllocationDiagnosticsUi],
+    [cohortDateFrom, cohortDateTo, selectedFunnels, selectedCampaignPaths, excludedCampaignPaths, appliedSelectedCampaignIds, appliedTrafficSourceFilter, effectiveSelectedMediaBuyers, appliedSelectedCountries, effectiveSelectedCardTypes, effectiveSelectedPlatforms, selectedCurrencies, refundFilter, maxRenewalColumns, fbAllocationDiagnosticsUi, canViewFbAllocationDiagnostics],
   );
   const {
     chResult,
@@ -1691,11 +1752,14 @@ export default function CohortsPage() {
   // left a render window where the table showed the loading takeover and the
   // filter dropdowns showed "No … data" even though every transaction was
   // already in memory.
-  const needLegacy =
+  // Only the data owner may switch to that engine (see `rawAccess` above):
+  // for anyone else the same conditions surface as `serverOnlyNotice` below.
+  const legacyFallbackWanted =
     cohortsSource !== "clickhouse" ||
     (chStatus.error !== null && chResult == null) ||
     !chStatus.applicable ||
     (chResult == null && isClickHouseCircuitOpen());
+  const needLegacy = rawAccess && legacyFallbackWanted;
   const legacyWarehouseLoadInProgress =
     legacyWarehouseProgress.status === "counting" ||
     legacyWarehouseProgress.status === "loading" ||
@@ -1777,8 +1841,22 @@ export default function CohortsPage() {
     };
   }, [needLegacy, dataStoreSource, legacyWarehouseLoadState, chStatus.fallbackReason, appliedTrafficSourceFilter]);
   // True when ClickHouse aggregates drive the table, options and diagnostics
-  // (so the legacy client compute below runs on an empty list).
-  const clickHouseDriving = cohortsSource === "clickhouse" && chResult != null && !legacyRowsReady;
+  // (so the legacy client compute below runs on an empty list). Without raw
+  // access a response that does not reproduce the active filters is never
+  // shown as if it did (the owner falls back to legacy for those instead).
+  const clickHouseDriving =
+    cohortsSource === "clickhouse" && chResult != null && !legacyRowsReady && (rawAccess || chStatus.applicable);
+  // Why a principal without raw access sees no rows where the owner would get
+  // the legacy engine — rendered in place of the empty-table message.
+  const serverOnlyNotice: string | null = rawAccess
+    ? null
+    : cohortsSource !== "clickhouse"
+      ? "Cohorts are computed in the browser in this deployment, which only the data owner can use."
+      : chStatus.error !== null && chResult == null
+        ? `Cohorts could not be loaded from the server: ${chStatus.error}`
+        : chResult != null && !chStatus.applicable
+          ? `The server cannot apply the active filters (${chStatus.unsupportedFilters.join(", ")}). Clear them to see cohorts.`
+          : null;
   const fbAllocationDiagnostics = clickHouseDriving ? chResult?.fbAllocationDiagnostics : undefined;
   // In ClickHouse mode with ClickHouse driving, feed an EMPTY list to the legacy
   // compute + option builders so the browser performs NO transaction scan.
@@ -1827,9 +1905,11 @@ export default function CohortsPage() {
     [chResult, effectiveSelectedMediaBuyers],
   );
   useEffect(() => {
-    if (!clickHouseDriving || snapshotHealth.status !== "stale") return;
+    // The rebuild writes the warehouse: admin.warehouse.manage only. For
+    // everyone else the snapshot simply renders as stale.
+    if (!canRebuildSnapshot || !clickHouseDriving || snapshotHealth.status !== "stale") return;
     ensureCohortSnapshotRebuild(snapshotHealth);
-  }, [clickHouseDriving, snapshotHealth]);
+  }, [canRebuildSnapshot, clickHouseDriving, snapshotHealth]);
   const trafficByKey = useMemo(() => aggregateTrafficMetrics(trafficMetrics), [trafficMetrics]);
   // Funnel / campaign-path dropdowns: from server-built options when driving from
   // ClickHouse (unfiltered lists), else derived from the legacy cohorts.
@@ -2201,7 +2281,8 @@ export default function CohortsPage() {
   );
   const aiSignals = useAiCohortSignals({
     rows: effectiveFilteredCohorts,
-    enabled: clickHouseDriving && effectiveFilteredCohorts.length > 0,
+    // AI features (and their pass-rate call) need ai.use, like the drawer.
+    enabled: canUseAi && clickHouseDriving && effectiveFilteredCohorts.length > 0,
     dateFrom: cohortDateFrom || null,
     dateTo: cohortDateTo || null,
     trialDurationDaysByPath: trialDurationsByPath,
@@ -3778,29 +3859,31 @@ export default function CohortsPage() {
                   </Button>
                 </div>
                 <div className="border-t border-border p-2">
-                  <div className="grid grid-cols-2 gap-2">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      className="h-8 text-xs"
-                      onClick={onSaveCohortsViewToCloud}
-                      disabled={cohortsUiCloudLoading}
-                    >
-                      {cohortsUiCloudLoading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-                      Save settings to cloud
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      className="h-8 text-xs"
-                      onClick={onLoadCohortsViewFromCloud}
-                      disabled={cohortsUiCloudLoading}
-                    >
-                      Load settings from cloud
-                    </Button>
-                  </div>
+                  {cloudSettingsEnabled && (
+                    <div className="grid grid-cols-2 gap-2">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-8 text-xs"
+                        onClick={onSaveCohortsViewToCloud}
+                        disabled={cohortsUiCloudLoading}
+                      >
+                        {cohortsUiCloudLoading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                        Save settings to cloud
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-8 text-xs"
+                        onClick={onLoadCohortsViewFromCloud}
+                        disabled={cohortsUiCloudLoading}
+                      >
+                        Load settings from cloud
+                      </Button>
+                    </div>
+                  )}
                   <Button type="button" variant="ghost" size="sm" className="mt-2 w-full h-8" onClick={resetToDefault}>
                     Reset to default
                   </Button>
@@ -3813,12 +3896,16 @@ export default function CohortsPage() {
                 </div>
               </PopoverContent>
             </Popover>
-            <Button type="button" variant="outline" size="sm" className="h-9" onClick={() => void exportCohortsTable("csv")}>
-              Export CSV
-            </Button>
-            <Button type="button" variant="outline" size="sm" className="h-9" onClick={() => void exportCohortsTable("xlsx")}>
-              Export XLSX
-            </Button>
+            {canExportCohorts && (
+              <>
+                <Button type="button" variant="outline" size="sm" className="h-9" onClick={() => void exportCohortsTable("csv")}>
+                  Export CSV
+                </Button>
+                <Button type="button" variant="outline" size="sm" className="h-9" onClick={() => void exportCohortsTable("xlsx")}>
+                  Export XLSX
+                </Button>
+              </>
+            )}
             <Popover open={columnsPopoverOpen} onOpenChange={setColumnsPopoverOpen}>
               <PopoverTrigger asChild>
                 <Button type="button" variant="outline" size="sm" className="h-9">Columns</Button>
@@ -3867,29 +3954,31 @@ export default function CohortsPage() {
                   ))}
                 </div>
                 <div className="border-t border-border p-2 space-y-2">
-                  <div className="grid grid-cols-2 gap-2">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      className="h-8 text-xs"
-                      onClick={onSaveCohortsViewToCloud}
-                      disabled={cohortsUiCloudLoading}
-                    >
-                      {cohortsUiCloudLoading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-                      Save settings to cloud
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      className="h-8 text-xs"
-                      onClick={onLoadCohortsViewFromCloud}
-                      disabled={cohortsUiCloudLoading}
-                    >
-                      Load settings from cloud
-                    </Button>
-                  </div>
+                  {cloudSettingsEnabled && (
+                    <div className="grid grid-cols-2 gap-2">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-8 text-xs"
+                        onClick={onSaveCohortsViewToCloud}
+                        disabled={cohortsUiCloudLoading}
+                      >
+                        {cohortsUiCloudLoading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                        Save settings to cloud
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-8 text-xs"
+                        onClick={onLoadCohortsViewFromCloud}
+                        disabled={cohortsUiCloudLoading}
+                      >
+                        Load settings from cloud
+                      </Button>
+                    </div>
+                  )}
                   <Button type="button" variant="ghost" size="sm" className="h-8 w-full text-xs" onClick={resetToDefault}>
                     Reset to default
                   </Button>
@@ -3975,7 +4064,9 @@ export default function CohortsPage() {
                   )}
                   <span>snapshot rows: {formatRowsCount(snapshotHealth.snapshotSourceTransactions)}</span>
                   <span>cohort users: {formatRowsCount(snapshotHealth.cohortUsers)}</span>
-                  {snapshotHealth.status === "stale" && <span className="text-warning">rebuild pending</span>}
+                  {snapshotHealth.status === "stale" && (
+                    <span className="text-warning">{canRebuildSnapshot ? "rebuild pending" : "rebuild needed"}</span>
+                  )}
                   <span>
                     report:{" "}
                     <span className={snapshotHealth.reportComplete ? "font-mono text-foreground" : "font-mono text-warning"}>
@@ -3988,10 +4079,16 @@ export default function CohortsPage() {
                 </>
               )}
               {chStatus.error && chResult == null && (
-                <span className="text-destructive">ClickHouse error — using legacy: {chStatus.error}</span>
+                <span className="text-destructive">
+                  {rawAccess ? "ClickHouse error — using legacy" : "ClickHouse error"}: {chStatus.error}
+                </span>
               )}
               {!chStatus.applicable && !chStatus.error && (
-                <span className="text-warning">active filter not reproduced server-side — using legacy for this view</span>
+                <span className="text-warning">
+                  {rawAccess
+                    ? "active filter not reproduced server-side — using legacy for this view"
+                    : "active filter not reproduced server-side"}
+                </span>
               )}
               {needLegacy && legacyWarehouseLoadInProgress && (
                 <span className="flex items-center gap-2 text-muted-foreground">
@@ -4570,9 +4667,10 @@ export default function CohortsPage() {
               {cohorts.length === 0 && !isInitialLoading && (
                 <TableRow>
                   <TableCell colSpan={visibleColumnOrder.length + 1} className="text-center text-sm text-muted-foreground py-10">
-                    {hasUsers && allCohorts.length === 0
-                      ? "No cohorts found. Check whether trial transactions were detected."
-                      : "No cohorts to display."}
+                    {serverOnlyNotice
+                      ?? (hasUsers && allCohorts.length === 0
+                        ? "No cohorts found. Check whether trial transactions were detected."
+                        : "No cohorts to display.")}
                   </TableCell>
                 </TableRow>
               )}

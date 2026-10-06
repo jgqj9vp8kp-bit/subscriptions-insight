@@ -19,6 +19,7 @@ import {
 } from "./fbCampaignResolution.ts";
 import { ANALYTICS_TRANSACTIONS_TABLE, FACT_FACEBOOK_STATS_TABLE } from "./schema.ts";
 import { runFbV2Parity } from "./fbV2ParityHarness.ts";
+import { ScopeViolation } from "./scopedClient.ts";
 
 export const RECON_COVERAGE_RED_THRESHOLD = 0.9;
 export const RECON_UNKNOWN_CAMPAIGN_RED_SHARE = 0.25;
@@ -43,7 +44,7 @@ export interface FbReconComputeInput {
   /** Layer A: observed user-side campaign id -> source campaign id. */
   aliasMap: Record<string, string>;
   /** Authoritative trial users per OBSERVED campaign id. */
-  authoritativeUsers: readonly Array<{ campaign_id: string; users: number }>;
+  authoritativeUsers: ReadonlyArray<{ campaign_id: string; users: number }>;
   /** Distinct stat dates with spend rows inside the window. */
   coveredDays: number;
   /** Window days already explained by facebook_known_gaps records. */
@@ -239,9 +240,13 @@ export async function runFbReconSnapshot(input: {
        WHERE auth_user_id = {auth_user_id:String}
          AND batch_id = (SELECT argMax(batch_id, computed_at) FROM facebook_dq_results WHERE auth_user_id = {auth_user_id:String})`,
       params,
-    ).catch(() => [{ warn_count: 0, fail_count: 0 }]),
+    ).catch((error) => {
+      // A missing DQ table degrades to "no DQ findings"; a ScopeViolation fails.
+      if (error instanceof ScopeViolation) throw error;
+      return [{ warn_count: 0, fail_count: 0 }];
+    }),
     // Wave 5 gate: record the daily V1<->V2 parity with the snapshot. Fail-safe —
-    // a missing V2 schema must not break reconciliation.
+    // a missing V2 schema must not break reconciliation (a ScopeViolation must).
     runFbV2Parity({ clickhouse: input.clickhouse, authUserId: input.authUserId, dateFrom: input.dateFrom, dateTo: input.dateTo })
       .then((report) => ({
         verdict: report.verdict,
@@ -250,7 +255,10 @@ export async function runFbReconSnapshot(input: {
         mismatched_count: report.mismatched_days.length,
         overlap_spend_diff: report.totals.overlap_spend_diff,
       }))
-      .catch(() => null),
+      .catch((error) => {
+        if (error instanceof ScopeViolation) throw error;
+        return null;
+      }),
   ]);
 
   const knownGapDays = gaps.reduce((total, gap) => {

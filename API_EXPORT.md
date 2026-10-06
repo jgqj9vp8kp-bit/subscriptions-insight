@@ -178,8 +178,12 @@ GET /functions/v1/export-campaign-performance?breakdown=country&date_from=2026-0
 | Код | Тело | Причина |
 |---|---|---|
 | `401` | `{"error":"Invalid API key."}` | Ключ отсутствует, не существует, отозван или без нужного scope |
+| `403` | `{"ok":false,"error_code":"…","error":"…"}` | Ключ действителен, но его создатель больше не может выгружать данные: `no_membership` (не участник workspace), `membership_disabled` (отключён), `scope_not_supported` (доступ только к части воронок), `permission_denied` (роль без `api_export.use`) |
 | `405` | `{"error":"Method not allowed."}` | Любой метод кроме `GET`/`OPTIONS` |
 | `500` | `{"error":"Export failed."}` | Внутренняя ошибка; детали — в Export Logs на странице Integrations |
+| `503` | `{"ok":false,"error_code":"…","error":"…"}` | Временная ошибка проверки доступа (`access_service_error`) или workspace ещё не настроен (`workspace_not_bootstrapped`); повторите позже |
+
+Доступ ключа проверяется при каждом запросе по текущим правам его создателя: отключение участника или смена его роли сразу останавливает ключ. Все ответы приходят с `Cache-Control: no-store`.
 
 Каждый запрос логируется (время, ключ, статус, число строк) — журнал виден в блоке **Export Logs**.
 

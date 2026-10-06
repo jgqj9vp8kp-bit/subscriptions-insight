@@ -28,8 +28,7 @@ import { useAiCampaignSignals } from "@/hooks/useAiCohortSignals";
 import { buildCampaignDailySeries } from "@/services/aiCampaignSeries";
 import { stableJson } from "@/services/aiRecommendationLog";
 import { useAiAssistantStore } from "@/store/aiAssistantStore";
-import { useAuth } from "@/hooks/useAuth";
-import { hashUserScope } from "@/services/analyticsCache";
+import { useAccess } from "@/hooks/useAccess";
 import { useWarehouseVersion } from "@/hooks/useAnalyticsCache";
 import { KpiCard } from "@/components/KpiCard";
 import { Button } from "@/components/ui/button";
@@ -499,8 +498,38 @@ const roasChartConfig = {
   roas: { label: "ROAS", color: "hsl(var(--accent))" },
 } satisfies ChartConfig;
 
+/** FB Analytics (plan §14, D8). The filter card, KPI strip, FB Data
+ * Diagnostics and the Blended / Diagnostics tabs are computed in the browser
+ * over the downloaded transaction warehouse and the raw Capsuled tables, so
+ * they are the data owner's view only (rawAccess; legacy ⇒ true). Everyone else
+ * gets the server-driven warehouse tab alone — there is no other tab to land on.
+ * UX only — the Edge gate is authoritative. */
 export default function FBAnalyticsPage() {
+  const access = useAccess();
+  return access.rawAccess ? <FBAnalyticsOwnerPage /> : <FBAnalyticsWarehousePage />;
+}
+
+function FBAnalyticsWarehousePage() {
+  const access = useAccess();
+  return (
+    <AppLayout title="FB-Analytics" description="Facebook traffic performance by Campaign ID">
+      <section className="space-y-4">
+        <Card className="p-3 text-xs text-muted-foreground shadow-card" data-testid="fb-analytics-server-only-note">
+          Showing the server-computed Facebook warehouse. The blended (browser-computed) views are available to the data owner only.
+        </Card>
+        {/* Reconciliation history is a diagnostics surface (recon_history). */}
+        {access.can("admin.diagnostics.view") && <FbWarehouseHealth />}
+        <FbWarehouseAnalytics />
+      </section>
+    </AppLayout>
+  );
+}
+
+function FBAnalyticsOwnerPage() {
   const { toast } = useToast();
+  const access = useAccess();
+  // Capsuled sync writes the warehouse (capsuled-facebook-sync): admin.sync.run.
+  const canSync = access.can("admin.sync.run");
   const txs = useTransactions();
   const subscriptions = useDataStore((state) => state.subscriptions);
   const trafficMetrics = useDataStore((state) => state.trafficMetrics);
@@ -633,9 +662,10 @@ export default function FBAnalyticsPage() {
   // reconcile both so formula drift is caught before the client compute is ever gated off.
   const serverSummaryEnabled = fbAnalyticsSource() === "server";
   const serverSummaryQuery = useQuery({
-    queryKey: ["fb-analytics-summary", appliedFbFilters],
+    // Keyed by the access partition (plan §20) so an entry never outlives its principal.
+    queryKey: ["fb-analytics-summary", access.partition, appliedFbFilters],
     queryFn: () => fetchFbAnalyticsSummary(appliedFbFilters),
-    enabled: serverSummaryEnabled,
+    enabled: serverSummaryEnabled && access.partition !== "",
     staleTime: 60_000,
   });
   const serverSummary = serverSummaryEnabled && serverSummaryQuery.data?.ok ? serverSummaryQuery.data : null;
@@ -794,8 +824,9 @@ export default function FBAnalyticsPage() {
 
   // AI action layer: deterministic engine over the campaign rows already
   // computed above; pass rates by campaign_id arrive in the background.
-  const { user } = useAuth();
-  const aiUserScopeHash = useMemo(() => hashUserScope(user?.id), [user?.id]);
+  // Keyed by the access partition (plan §20); AI features need ai.use.
+  const aiUserScopeHash = access.partition;
+  const canUseAi = access.can("ai.use");
   const { version: aiWarehouseVersion } = useWarehouseVersion(true);
   // Daily spend/purchases per campaign from the Capsuled rows already in
   // state — the AI engine's trend axis (direction-only CPA_fb).
@@ -824,7 +855,7 @@ export default function FBAnalyticsPage() {
   );
   const aiCampaigns = useAiCampaignSignals({
     rows: result.rows,
-    enabled: result.rows.length > 0,
+    enabled: canUseAi && result.rows.length > 0,
     dateFrom: uiState.cohortDateFrom || null,
     dateTo: uiState.cohortDateTo || null,
     dailySeries: aiDailySeries,
@@ -1106,10 +1137,12 @@ export default function FBAnalyticsPage() {
           <div className="flex flex-wrap items-start justify-between gap-3">
             <SectionHeader title="FB Data Diagnostics" description="Campaign matching between Subengine warehouse and Capsuled Facebook data" />
             <div className="flex flex-wrap gap-2">
-              <Button type="button" size="sm" onClick={runFacebookSync} disabled={syncState.status === "syncing"}>
-                <RotateCcw className={cn("h-4 w-4", syncState.status === "syncing" && "animate-spin")} />
-                {syncState.status === "syncing" ? "Syncing Facebook data..." : "Sync Facebook Data"}
-              </Button>
+              {canSync && (
+                <Button type="button" size="sm" onClick={runFacebookSync} disabled={syncState.status === "syncing"}>
+                  <RotateCcw className={cn("h-4 w-4", syncState.status === "syncing" && "animate-spin")} />
+                  {syncState.status === "syncing" ? "Syncing Facebook data..." : "Sync Facebook Data"}
+                </Button>
+              )}
               <Button
                 type="button"
                 variant="outline"
@@ -1128,12 +1161,16 @@ export default function FBAnalyticsPage() {
               <div className="rounded-md border border-dashed border-border bg-muted/30 p-4">
                 <div className="text-sm font-semibold text-foreground">No Facebook data available.</div>
                 <p className="mt-1 text-sm text-muted-foreground">
-                  Click "Sync Facebook Data" to import the latest campaign statistics from Capsuled.
+                  {canSync
+                    ? 'Click "Sync Facebook Data" to import the latest campaign statistics from Capsuled.'
+                    : "Ask a workspace admin to sync Facebook data from Capsuled."}
                 </p>
-                <Button type="button" className="mt-3" onClick={runFacebookSync} disabled={syncState.status === "syncing"}>
-                  <RotateCcw className={cn("h-4 w-4", syncState.status === "syncing" && "animate-spin")} />
-                  {syncState.status === "syncing" ? "Syncing Facebook data..." : "Sync Facebook Data"}
-                </Button>
+                {canSync && (
+                  <Button type="button" className="mt-3" onClick={runFacebookSync} disabled={syncState.status === "syncing"}>
+                    <RotateCcw className={cn("h-4 w-4", syncState.status === "syncing" && "animate-spin")} />
+                    {syncState.status === "syncing" ? "Syncing Facebook data..." : "Sync Facebook Data"}
+                  </Button>
+                )}
               </div>
             ) : null}
             {trafficDiagnostics.summary.latest_sync_at && trafficDiagnostics.summary.api_level !== "campaign" && (
@@ -1218,10 +1255,12 @@ export default function FBAnalyticsPage() {
                 <div className="text-sm">
                   Reason: <span className="font-medium">{syncState.report.error ?? "Unknown error"}</span>
                 </div>
-                <Button type="button" variant="outline" size="sm" onClick={runFacebookSync}>
-                  <RotateCcw className="h-4 w-4" />
-                  Retry
-                </Button>
+                {canSync && (
+                  <Button type="button" variant="outline" size="sm" onClick={runFacebookSync}>
+                    <RotateCcw className="h-4 w-4" />
+                    Retry
+                  </Button>
+                )}
               </div>
             ) : (
               <div className="space-y-3">
@@ -1286,7 +1325,7 @@ export default function FBAnalyticsPage() {
 
           {/* Server-driven FB warehouse analytics — no browser calculations. */}
           <TabsContent value="warehouse" className="space-y-4">
-            <FbWarehouseHealth />
+            {access.can("admin.diagnostics.view") && <FbWarehouseHealth />}
             <FbWarehouseAnalytics />
           </TabsContent>
 

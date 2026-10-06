@@ -54,13 +54,43 @@ function SaveStatus({ state }: { state: BlockSaveState }) {
   return <span className="text-xs text-muted-foreground">Сохранено в {state.at}</span>;
 }
 
-export function BlockEditor({ blocks, onChange, saveState }: {
+/** Read-only rendering: hidden blocks stay out, exactly as in the export. */
+function BlockReader({ blocks }: { blocks: ReportBlock[] }) {
+  const visible = blocks.filter((block) => !block.hidden);
+  const sections = usedSections(visible);
+  if (sections.length === 0) {
+    return <Card className="p-4 text-sm text-muted-foreground">Блоков нет.</Card>;
+  }
+  return (
+    <div className="space-y-3" data-testid="report-blocks-readonly">
+      {sections.map((section) => (
+        <section key={section} className="space-y-2">
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            {SECTION_LABELS[section]}
+          </h3>
+          {blocksInSection(visible, section).map((block) => (
+            <Card key={block.id} className="space-y-1 p-3">
+              {block.title && <div className="text-sm font-medium">{block.title}</div>}
+              <p className="whitespace-pre-wrap text-sm">{block.content}</p>
+            </Card>
+          ))}
+        </section>
+      ))}
+    </div>
+  );
+}
+
+export function BlockEditor({ blocks, onChange, saveState, readOnly = false }: {
   blocks: ReportBlock[];
   onChange: (next: ReportBlock[]) => void;
   saveState: BlockSaveState;
+  /** Without reports.edit: the blocks as they will print, no editing controls. */
+  readOnly?: boolean;
 }) {
   const [newSection, setNewSection] = useState<ReportSectionKey>("executive_summary");
   const [dragId, setDragId] = useState<string | null>(null);
+
+  if (readOnly) return <BlockReader blocks={blocks} />;
 
   const now = () => new Date().toISOString();
 

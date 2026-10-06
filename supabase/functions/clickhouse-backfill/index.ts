@@ -1,38 +1,25 @@
 /* global Deno */
 
-import { createClickHouseClient } from "../_shared/clickhouse/client.ts";
-import { jsonResponse, methodNotAllowed, optionsResponse, parseJsonBody, requireSupabaseUser } from "../_shared/clickhouse/http.ts";
+// clickhouse-backfill: Postgres transactions → ClickHouse analytics_transactions
+// for the workspace tenant (ctx.tenantKey, never the caller). One run per
+// tenant at a time: the runner claims a compare-and-set lease on its sync-state
+// row and answers "already_running" instead of overlapping another run.
+//
+// Access (policies/clickhouse-backfill.ts): every mode — continue, full
+// backfill, validate-only, dedup repair — needs admin.warehouse.manage.
+
+import { serveWithAccess } from "../_shared/clickhouse/http.ts";
 import { runTransactionsBackfill, type BackfillParams } from "../_shared/clickhouse/backfill.ts";
+import { CLICKHOUSE_BACKFILL_POLICY, clickHouseBackfillErrorResponse } from "../_shared/access/policies/clickhouse-backfill.ts";
 
-Deno.serve(async (req: Request) => {
-  if (req.method === "OPTIONS") return optionsResponse();
-  if (req.method !== "POST") return methodNotAllowed("POST");
-
-  const auth = await requireSupabaseUser(req);
-  if ("status" in auth) return jsonResponse(auth.body, auth.status);
-
-  let params: BackfillParams;
-  try {
-    params = await parseJsonBody<Record<string, unknown>>(req) as BackfillParams;
-  } catch {
-    return jsonResponse({ error: "Invalid JSON request body." }, 400);
-  }
-
-  let client: ReturnType<typeof createClickHouseClient> | null = null;
-  try {
-    client = createClickHouseClient();
-    const result = await runTransactionsBackfill({
-      authUserId: auth.id,
-      supabase: auth.supabase,
-      clickhouse: client,
-      params,
-    });
-    return jsonResponse(result);
-  } catch (error) {
-    return jsonResponse({
-      error: error instanceof Error ? error.message : "ClickHouse transaction backfill failed.",
-    }, 502);
-  } finally {
-    await client?.close?.().catch(() => undefined);
-  }
-});
+serveWithAccess(
+  CLICKHOUSE_BACKFILL_POLICY,
+  async ({ ctx, body, pg, clickhouse }) =>
+    await runTransactionsBackfill({
+      authUserId: ctx.tenantKey,
+      supabase: pg,
+      clickhouse: clickhouse(),
+      params: body as BackfillParams,
+    }),
+  { onError: clickHouseBackfillErrorResponse },
+);

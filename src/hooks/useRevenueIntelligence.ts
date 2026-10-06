@@ -3,7 +3,7 @@
 // a transaction sync invalidates the calendar view exactly like Cohorts.
 import { useMemo } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import { GC_MS, STALE_MS, transientRetry } from "@/hooks/useAnalyticsCache";
+import { GC_MS, STALE_MS, transientRetry, useCacheScope } from "@/hooks/useAnalyticsCache";
 import { runClickHouseRevenue } from "@/services/clickhouse";
 import { revenueBundleKey, revenueDayKey } from "@/services/revenueCache";
 import type {
@@ -23,7 +23,9 @@ export function useRevenueBundle(params: {
   isInitialLoading: boolean;
   isRefreshing: boolean;
 } {
-  const { request, userScopeHash, warehouseVersion, enabled } = params;
+  const { request, warehouseVersion } = params;
+  const userScopeHash = useCacheScope(params.userScopeHash);
+  const enabled = params.enabled && userScopeHash !== "";
   const queryKey = useMemo(
     () => revenueBundleKey({ userScopeHash, warehouseVersion, request: { ...request, action: "bundle" } }),
     [userScopeHash, warehouseVersion, request],
@@ -60,7 +62,9 @@ export function useRevenueDayBreakdown(params: {
   warehouseVersion: string;
   enabled: boolean;
 }): { breakdown: RevenueDayBreakdown | null; loading: boolean; error: string | null } {
-  const { date, request, userScopeHash, warehouseVersion, enabled } = params;
+  const { date, request, warehouseVersion } = params;
+  const userScopeHash = useCacheScope(params.userScopeHash);
+  const enabled = params.enabled && userScopeHash !== "";
   // Only the day and the member filters shape a day_breakdown response — the
   // server ignores bucket/date_from/date_to. Stripping them from the request
   // (and hence the key) keeps a cached drilldown valid across a range or

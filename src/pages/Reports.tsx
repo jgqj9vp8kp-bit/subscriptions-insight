@@ -17,6 +17,7 @@ import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "@/components/ui/table";
 import { useToast } from "@/hooks/use-toast";
+import { useAccess } from "@/hooks/useAccess";
 import {
   REPORT_ENGINE_VERSION, REPORT_SCHEMA_VERSION, emptyReportBindings, provisionalReasonLabel,
 } from "@/services/reportContract";
@@ -254,6 +255,18 @@ function DataQualityPanel({ snapshot }: { snapshot: ReportSnapshot }) {
 
 export default function ReportsPage() {
   const { toast } = useToast();
+  // Report controls by permission (plan §8; UX only — RLS and the Edge gate are
+  // authoritative): collecting a new report creates one (reports.create);
+  // re-collecting, prose blocks and plan/fact tasks edit it (reports.edit);
+  // publishing freezes a version (reports.publish); copy / print / Markdown
+  // export it (reports.export); AI prose is an edit that spends model budget
+  // (reports.edit ∧ ai.use, the reports-generate policy).
+  const access = useAccess();
+  const canCreate = access.can("reports.create");
+  const canEdit = access.can("reports.edit");
+  const canPublish = access.can("reports.publish");
+  const canExport = access.can("reports.export");
+  const canUseAiProse = canEdit && access.can("ai.use");
   const [items, setItems] = useState<ReportListItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [open, setOpen] = useState<Report | null>(null);
@@ -291,7 +304,7 @@ export default function ReportsPage() {
 
   useEffect(() => {
     const reportId = open?.id;
-    if (!reportId) return undefined;
+    if (!reportId || !canEdit) return undefined;
     const serialized = JSON.stringify(blocksDebounced);
     if (serialized === savedBlocksRef.current) return undefined;
 
@@ -314,7 +327,7 @@ export default function ReportsPage() {
         });
       });
     return () => { cancelled = true; };
-  }, [blocksDebounced, open?.id]);
+  }, [blocksDebounced, open?.id, canEdit]);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -560,40 +573,50 @@ export default function ReportsPage() {
             <Button type="button" variant="ghost" size="sm" onClick={() => setOpen(null)}>
               <ArrowLeft className="h-4 w-4" /> К списку
             </Button>
-            <Button type="button" variant="outline" size="sm"
-              onClick={() => void onRecollect()} disabled={busy !== null}>
-              {busy === "recollect" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-              Пересобрать
-            </Button>
-            <Button type="button" variant="outline" size="sm" title="Скопировать для Google Docs"
-              onClick={() => void onCopyForDocs()} disabled={!snapshot}>
-              <ClipboardCopy className="h-4 w-4" />
-            </Button>
-            <Button type="button" variant="outline" size="sm" title="Печать / PDF"
-              onClick={() => { const p = renderInput(); if (p) printReport(p); }} disabled={!snapshot}>
-              <Printer className="h-4 w-4" />
-            </Button>
-            <Button type="button" variant="outline" size="sm" title="Скачать Markdown"
-              onClick={() => { const p = renderInput(); if (p) downloadReportMarkdown(p); }} disabled={!snapshot}>
-              <Download className="h-4 w-4" />
-            </Button>
-            <Button type="button" variant="outline" size="sm"
-              onClick={() => void onGenerate()}
-              disabled={busy !== null || !snapshot || aiUnavailable !== null}
-              title={aiUnavailable ?? "Модель переформулирует найденное правилами. Числа она не считает."}>
-              {busy === "ai" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
-              Сформулировать
-            </Button>
-            <Button type="button" size="sm" onClick={() => void onPublish()} disabled={busy !== null || !snapshot}>
-              {busy === "publish" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-              Опубликовать
-            </Button>
+            {canEdit && (
+              <Button type="button" variant="outline" size="sm"
+                onClick={() => void onRecollect()} disabled={busy !== null}>
+                {busy === "recollect" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                Пересобрать
+              </Button>
+            )}
+            {canExport && (
+              <>
+                <Button type="button" variant="outline" size="sm" title="Скопировать для Google Docs"
+                  onClick={() => void onCopyForDocs()} disabled={!snapshot}>
+                  <ClipboardCopy className="h-4 w-4" />
+                </Button>
+                <Button type="button" variant="outline" size="sm" title="Печать / PDF"
+                  onClick={() => { const p = renderInput(); if (p) printReport(p); }} disabled={!snapshot}>
+                  <Printer className="h-4 w-4" />
+                </Button>
+                <Button type="button" variant="outline" size="sm" title="Скачать Markdown"
+                  onClick={() => { const p = renderInput(); if (p) downloadReportMarkdown(p); }} disabled={!snapshot}>
+                  <Download className="h-4 w-4" />
+                </Button>
+              </>
+            )}
+            {canUseAiProse && (
+              <Button type="button" variant="outline" size="sm"
+                onClick={() => void onGenerate()}
+                disabled={busy !== null || !snapshot || aiUnavailable !== null}
+                title={aiUnavailable ?? "Модель переформулирует найденное правилами. Числа она не считает."}>
+                {busy === "ai" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
+                Сформулировать
+              </Button>
+            )}
+            {canPublish && (
+              <Button type="button" size="sm" onClick={() => void onPublish()} disabled={busy !== null || !snapshot}>
+                {busy === "publish" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                Опубликовать
+              </Button>
+            )}
           </div>
         }
       >
         {!snapshot ? (
           <Card className="p-6 text-sm text-muted-foreground">
-            Данные ещё не собраны. Нажмите «Пересобрать».
+            {canEdit ? "Данные ещё не собраны. Нажмите «Пересобрать»." : "Данные ещё не собраны."}
           </Card>
         ) : (
           <div className="space-y-5">
@@ -670,12 +693,13 @@ export default function ReportsPage() {
                 blocks={blocks}
                 onChange={setBlocks}
                 saveState={blocksPending && saveState.kind !== "saving" ? { kind: "pending" } : saveState}
+                readOnly={!canEdit}
               />
             </section>
 
             <section className="space-y-2">
               <h2 className="text-sm font-semibold">План / Факт и задачи на следующую неделю</h2>
-              <PlanFactPanel period={open.period} reportId={open.id} onTasksChange={setTasks} />
+              <PlanFactPanel period={open.period} reportId={open.id} onTasksChange={setTasks} readOnly={!canEdit} />
             </section>
 
             {findings.length > highlights.length && (
@@ -704,13 +728,17 @@ export default function ReportsPage() {
             <Label htmlFor="r-to" className="text-xs text-muted-foreground">по</Label>
             <Input id="r-to" type="date" value={to} onChange={(e) => setTo(e.target.value)} className="h-9 w-[150px]" />
           </div>
-          <Button type="button" onClick={() => void onCreate()} disabled={busy !== null}>
-            {busy === "create" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-            Собрать отчёт
-          </Button>
-          <span className="text-xs text-muted-foreground">
-            По умолчанию — прошедшая неделя, сравнение с предыдущей.
-          </span>
+          {canCreate && (
+            <>
+              <Button type="button" onClick={() => void onCreate()} disabled={busy !== null}>
+                {busy === "create" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+                Собрать отчёт
+              </Button>
+              <span className="text-xs text-muted-foreground">
+                По умолчанию — прошедшая неделя, сравнение с предыдущей.
+              </span>
+            </>
+          )}
         </div>
       </Card>
 

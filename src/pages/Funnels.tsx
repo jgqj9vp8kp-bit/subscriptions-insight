@@ -29,6 +29,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useToast } from "@/hooks/use-toast";
+import { useCan } from "@/hooks/useAccess";
 import {
   importFunnelFoxFunnels,
   isPassportComplete,
@@ -57,6 +58,10 @@ function formatDateTime(value: string | null): string {
 
 export default function FunnelsPage() {
   const { toast } = useToast();
+  // Registry writes (status switch, recompute, FunnelFox import, passport edits)
+  // need funnels.manage; funnels.view alone is a read-only registry. UX only —
+  // the server (RLS / Edge) is authoritative.
+  const canManage = useCan("funnels.manage");
   const [funnels, setFunnels] = useState<FunnelRecord[]>([]);
   const [tags, setTags] = useState<TagRecord[]>([]);
   const [loading, setLoading] = useState(false);
@@ -353,21 +358,25 @@ export default function FunnelsPage() {
               {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
               Refresh
             </Button>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => void onRecomputeActive()}
-              disabled={recomputing}
-              title={`Set Active from successful traffic in the last ${ACTIVE_WINDOW_DAYS} days`}
-            >
-              {recomputing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Activity className="h-4 w-4" />}
-              Recompute Active
-            </Button>
-            <Button type="button" size="sm" onClick={() => void onOpenImport()}>
-              <Download className="h-4 w-4" />
-              Import from FunnelFox
-            </Button>
+            {canManage && (
+              <>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void onRecomputeActive()}
+                  disabled={recomputing}
+                  title={`Set Active from successful traffic in the last ${ACTIVE_WINDOW_DAYS} days`}
+                >
+                  {recomputing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Activity className="h-4 w-4" />}
+                  Recompute Active
+                </Button>
+                <Button type="button" size="sm" onClick={() => void onOpenImport()}>
+                  <Download className="h-4 w-4" />
+                  Import from FunnelFox
+                </Button>
+              </>
+            )}
           </div>
         </div>
 
@@ -426,8 +435,8 @@ export default function FunnelsPage() {
                       <div className="flex items-center gap-2">
                         <Switch
                           checked={funnel.is_active}
-                          disabled={togglingId === funnel.id}
-                          onCheckedChange={() => void onToggleActive(funnel)}
+                          disabled={!canManage || togglingId === funnel.id}
+                          onCheckedChange={() => { if (canManage) void onToggleActive(funnel); }}
                           aria-label={`${funnel.is_active ? "Deactivate" : "Activate"} ${funnel.display_name || funnel.funnel_path}`}
                         />
                         <span className={`text-xs ${funnel.is_active ? "text-success" : "text-muted-foreground"}`}>
@@ -458,19 +467,25 @@ export default function FunnelsPage() {
                       )}
                     </TableCell>
                     <TableCell>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        className="h-7 px-2 text-xs"
-                        onClick={() => setPassportFunnel(funnel)}
-                      >
-                        {isPassportComplete(funnel) ? (
-                          <Badge variant="secondary" className="text-xs font-normal">Заполнен</Badge>
-                        ) : (
-                          <Badge variant="outline" className="text-xs font-normal text-warning">Не заполнен</Badge>
-                        )}
-                      </Button>
+                      {canManage ? (
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          className="h-7 px-2 text-xs"
+                          onClick={() => setPassportFunnel(funnel)}
+                        >
+                          {isPassportComplete(funnel) ? (
+                            <Badge variant="secondary" className="text-xs font-normal">Заполнен</Badge>
+                          ) : (
+                            <Badge variant="outline" className="text-xs font-normal text-warning">Не заполнен</Badge>
+                          )}
+                        </Button>
+                      ) : isPassportComplete(funnel) ? (
+                        <Badge variant="secondary" className="text-xs font-normal">Заполнен</Badge>
+                      ) : (
+                        <Badge variant="outline" className="text-xs font-normal text-warning">Не заполнен</Badge>
+                      )}
                     </TableCell>
                     <TableCell className="text-xs text-muted-foreground">{formatDateTime(funnel.created_at)}</TableCell>
                     <TableCell className="text-xs text-muted-foreground">{formatDateTime(funnel.updated_at)}</TableCell>

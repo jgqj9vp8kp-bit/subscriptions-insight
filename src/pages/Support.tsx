@@ -41,9 +41,10 @@ import {
 import { useToast } from "@/hooks/use-toast";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
 import { useAuth } from "@/hooks/useAuth";
+import { useAccess } from "@/hooks/useAccess";
 import { invalidateSupportAnalyticsCache, useSupportWarehouseVersion } from "@/hooks/useAnalyticsCache";
 import { useSupportData } from "@/hooks/useSupportCache";
-import { hashUserScope } from "@/services/analyticsCache";
+import { supportAnsweredReplyKey, supportImportBatchesKey } from "@/services/supportCache";
 import {
   getSupportMailStatus,
   syncSupportMail,
@@ -345,7 +346,25 @@ function formatEta(remaining: number, speed: number | null | undefined): string 
 export default function SupportPage() {
   const { toast } = useToast();
   const { user } = useAuth();
+  const access = useAccess();
   const queryClient = useQueryClient();
+  // What this member may see and run here (UX only — clickhouse-support,
+  // sync-support-mail and classify-support-requests re-check every call; the
+  // owner and legacy access pass every check, so the page is unchanged for them):
+  //   support.view          — the aggregates (route guard);
+  //   support.messages.view — the request list, the message dialog, search;
+  //   support.export        — the message export and the unanswered-contacts file;
+  //   admin.sync.run        — the mailbox sync, the classification job and the
+  //                           ClickHouse mirror sync (status reads included).
+  // The spreadsheet import, the import-batch list, the answered-reply lookup and
+  // manual corrections read or write the support tables directly through
+  // PostgREST under the caller, so they stay with the data owner until their
+  // Edge replacements ship (plan §12.6).
+  const canReadMessages = access.can("support.messages.view");
+  const canExport = access.can("support.export");
+  const canRunSync = access.can("admin.sync.run");
+  const canImport = access.rawAccess && access.can("admin.data.import") && canRunSync;
+  const canEditClassification = access.rawAccess && access.can("support.classification.edit");
   const [filters, setFilters, resetFilters] = usePersistedPageState<SupportAnalyticsFilters>("ui_state_support_analytics", DEFAULT_FILTERS);
   const [sortState, setSortState] = usePersistedPageState<SupportSortState>("ui_state_support_sort", { sortBy: "received_at", sortDir: "desc" });
   const [page, setPage] = useState(1);
@@ -369,20 +388,37 @@ export default function SupportPage() {
 
   useEffect(() => setPage(1), [filters]);
 
-  const userScopeHash = useMemo(() => hashUserScope(user?.id), [user?.id]);
+  // Search matches senders, addresses, subjects and bodies, so its counts are a
+  // content oracle: without support.messages.view the term is never sent (the
+  // server would answer 403). The import-batch filter is hidden without raw
+  // access (the batch list is the owner's PostgREST rows), so it is not applied
+  // invisibly either. A term persisted under another role is ignored, not erased.
+  const effectiveFilters = useMemo<SupportAnalyticsFilters>(() => {
+    const dropSearch = !canReadMessages && Boolean(filters.search);
+    const dropBatch = !access.rawAccess && Boolean(filters.importBatchId);
+    if (!dropSearch && !dropBatch) return filters;
+    return { ...filters, ...(dropSearch ? { search: "" } : {}), ...(dropBatch ? { importBatchId: "" } : {}) };
+  }, [filters, canReadMessages, access.rawAccess]);
+
+  // The access partition (plan §20): every Support cache key is per principal,
+  // role and funnel scope.
+  const userScopeHash = access.partition;
   const { version: warehouseVersion, ready: warehouseVersionReady } = useSupportWarehouseVersion(Boolean(user?.id));
   const supportQuery = useMemo<SupportQuery>(() => ({
-    filters,
+    filters: effectiveFilters,
     page,
     pageSize: PAGE_SIZE,
     sortBy: sortState.sortBy,
     sortDir: sortState.sortDir,
-  }), [filters, page, sortState.sortBy, sortState.sortDir]);
+  }), [effectiveFilters, page, sortState.sortBy, sortState.sortDir]);
   const supportData = useSupportData({
     query: supportQuery,
     userScopeHash,
     warehouseVersion,
     enabled: Boolean(user?.id) && warehouseVersionReady,
+    // The request list needs support.messages.view server-side; without it the
+    // list is never requested (no refused 403 per filter change).
+    listEnabled: canReadMessages,
   });
   // --- export -------------------------------------------------------------
   // Exports what the filter panel currently selects, which with no filters set
@@ -392,6 +428,7 @@ export default function SupportPage() {
     { busy: null, loaded: 0, total: 0 });
 
   async function onExport(format: "csv" | "xlsx") {
+    if (!canExport) return;
     setExportState({ busy: format, loaded: 0, total: 0 });
     try {
       // How far the mirror lags Postgres. Read first so the file can say it,
@@ -410,7 +447,7 @@ export default function SupportPage() {
         totalRows: collected.totalRows,
         exportedRows: collected.rows.length,
         truncatedCells: table.truncatedCells,
-        filterSummary: describeSupportFilters(filters).join("; ") || "без фильтров — все письма",
+        filterSummary: describeSupportFilters(effectiveFilters).join("; ") || "без фильтров — все письма",
         sortSummary: `${sortState.sortBy} ${sortState.sortDir}`,
         pendingSync,
       };
@@ -448,6 +485,7 @@ export default function SupportPage() {
   // the same filters the screen shows (contact grain, one server call).
   const [unansweredBusy, setUnansweredBusy] = useState(false);
   async function onExportUnanswered(format: "csv" | "xlsx") {
+    if (!canExport) return;
     setUnansweredBusy(true);
     try {
       const response = await loadUnansweredContacts(supportQuery);
@@ -456,7 +494,7 @@ export default function SupportPage() {
         generatedAt: response.generated_at,
         totalContacts: response.total_contacts,
         contactsWithoutEmail: response.contacts_without_email,
-        filterSummary: describeSupportFilters(filters).join("; ") || "без фильтров",
+        filterSummary: describeSupportFilters(effectiveFilters).join("; ") || "без фильтров",
       };
       if (format === "csv") downloadUnansweredContactsCsv(table, meta);
       else await downloadUnansweredContactsXlsx(table, meta);
@@ -477,6 +515,9 @@ export default function SupportPage() {
     }
   }
 
+  // Without support.messages.view the list is not loaded at all (listEnabled
+  // above), so any error here is the bundle's or the list's own.
+  const supportLoadError = supportData.status.error;
   const dashboard = supportData.bundle?.summary ?? EMPTY_DASHBOARD;
   // Rate over ANSWERABLE mail only (spam/auto excluded server-side); days with
   // nothing answerable carry null so the line skips them instead of dropping to 0.
@@ -490,14 +531,17 @@ export default function SupportPage() {
   );
   const pageData = supportData.page;
   const batchesQuery = useQuery({
-    queryKey: ["support-import-batches"],
+    queryKey: supportImportBatchesKey(userScopeHash),
     queryFn: listSupportImportBatches,
+    enabled: access.rawAccess,
     staleTime: 5 * 60 * 1000,
   });
+  // The mailbox status (sync-support-mail `status`) is a sync diagnostic:
+  // admin.sync.run only, so a plain support.view member never calls it on mount.
   const mailStatusQuery = useQuery({
     queryKey: ["support-mail-sync-status", userScopeHash],
     queryFn: getSupportMailStatus,
-    enabled: Boolean(user?.id),
+    enabled: Boolean(user?.id) && canRunSync,
     staleTime: 30 * 1000,
     refetchInterval: (query) => {
       const status = query.state.data?.state?.status ?? query.state.data?.status;
@@ -517,13 +561,14 @@ export default function SupportPage() {
   const detailQuery = useQuery({
     queryKey: ["support", "details", userScopeHash, warehouseVersion, selectedId],
     queryFn: async () => (await loadSupportDetails(selectedId as string)).row,
-    enabled: Boolean(selectedId) && warehouseVersionReady,
+    enabled: Boolean(selectedId) && warehouseVersionReady && canReadMessages,
   });
   // The matched Sent reply (subject) — lazy, only for an answered open dialog.
+  // A direct PostgREST read of the support tables: data owner only.
   const answeredReplyQuery = useQuery({
-    queryKey: ["support", "answered-reply", selectedId],
+    queryKey: supportAnsweredReplyKey({ userScopeHash, requestId: selectedId }),
     queryFn: () => getAnsweredReplyForRequest(selectedId as string),
-    enabled: Boolean(selectedId) && Boolean(detailQuery.data?.answered),
+    enabled: Boolean(selectedId) && Boolean(detailQuery.data?.answered) && access.rawAccess,
     staleTime: 5 * 60 * 1000,
   });
 
@@ -647,7 +692,10 @@ export default function SupportPage() {
   const [classifying, setClassifying] = useState(false);
   const classifyStopRef = useRef(false);
 
+  // The job status is admin.sync.run on the server (classify-support-requests),
+  // so only members who can run the job read it on mount.
   useEffect(() => {
+    if (!canRunSync) return;
     let cancelled = false;
     void runSupportClassification("status")
       .then((progress) => {
@@ -657,7 +705,7 @@ export default function SupportPage() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [canRunSync]);
 
   async function runClassification(initial: "start" | "continue") {
     if (classifying) return;
@@ -710,15 +758,19 @@ export default function SupportPage() {
     }
   }
 
+  // Corrections write support_requests through PostgREST, then mirror them to
+  // ClickHouse; the mirror sync needs admin.sync.run (otherwise the scheduled
+  // sync picks the row up).
   const manualMutation = useMutation({
     mutationFn: async () => {
       if (!selectedId) throw new Error("No selected support request.");
+      if (!canEditClassification) throw new Error("Your role cannot edit support classification.");
       await updateSupportRequestManualClassification(selectedId, {
         category: manualCategory,
         subcategory: manualSubcategory.trim() || "other_unclear",
         urgency: manualUrgency,
       });
-      return syncSupportToClickHouse(false);
+      return canRunSync ? syncSupportToClickHouse(false) : null;
     },
     onSuccess: () => {
       invalidateSupport();
@@ -729,8 +781,9 @@ export default function SupportPage() {
   const resetManualMutation = useMutation({
     mutationFn: async () => {
       if (!selectedId) throw new Error("No selected support request.");
+      if (!canEditClassification) throw new Error("Your role cannot edit support classification.");
       await resetSupportRequestManualClassification(selectedId);
-      return syncSupportToClickHouse(false);
+      return canRunSync ? syncSupportToClickHouse(false) : null;
     },
     onSuccess: () => {
       invalidateSupport();
@@ -827,19 +880,20 @@ export default function SupportPage() {
         {/* A failed read used to render exactly like "no rows": empty KPIs, empty table,
             no message. Surface it — an unreachable warehouse must not look like an
             empty inbox. */}
-        {supportData.status.error && (
+        {supportLoadError && (
           <Card className="border-destructive/50 bg-destructive/5 p-4 shadow-card">
             <div className="flex items-start gap-3">
               <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
               <div className="text-sm">
                 <p className="font-medium text-destructive">Could not load support data</p>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  {supportData.status.error} — the figures below may be stale or empty. Try Refresh; if it persists, run a sync.
+                  {supportLoadError} — the figures below may be stale or empty. Try Refresh; if it persists, run a sync.
                 </p>
               </div>
             </div>
           </Card>
         )}
+        {canRunSync && (
         <Card className="p-4 shadow-card">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="flex items-start gap-3">
@@ -926,7 +980,9 @@ export default function SupportPage() {
             </div>
           </div>
         </Card>
+        )}
 
+        {canRunSync && (
         <Card className="p-4 shadow-card">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="flex items-start gap-3">
@@ -998,7 +1054,9 @@ export default function SupportPage() {
             </>
           )}
         </Card>
+        )}
 
+        {canImport && (
         <Card className="p-4 shadow-card">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="flex items-start gap-3">
@@ -1087,6 +1145,7 @@ export default function SupportPage() {
             <ImportSummary summary={lastImport} />
           </div>
         </Card>
+        )}
 
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
           <StatCard label="Total Requests" value={dashboard.kpis.totalRequests} caption={`${dashboard.kpis.requestsPerDay} / day`} />
@@ -1220,20 +1279,24 @@ export default function SupportPage() {
                 </SelectContent>
               </Select>
             </div>
-            <div className="space-y-1">
-              <Label>Search</Label>
-              <Input value={filters.search ?? ""} onChange={(event) => updateFilter("search", event.target.value)} placeholder="Sender, email, subject, message" />
-            </div>
-            <div className="space-y-1">
-              <Label>Import batch</Label>
-              <Select value={filters.importBatchId || "all"} onValueChange={(value) => updateFilter("importBatchId", value === "all" ? "" : value)}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">All batches</SelectItem>
-                  {(batchesQuery.data ?? []).map((batch) => <SelectItem key={batch.id} value={batch.id}>{batch.filename}</SelectItem>)}
-                </SelectContent>
-              </Select>
-            </div>
+            {canReadMessages && (
+              <div className="space-y-1">
+                <Label>Search</Label>
+                <Input value={filters.search ?? ""} onChange={(event) => updateFilter("search", event.target.value)} placeholder="Sender, email, subject, message" />
+              </div>
+            )}
+            {access.rawAccess && (
+              <div className="space-y-1">
+                <Label>Import batch</Label>
+                <Select value={filters.importBatchId || "all"} onValueChange={(value) => updateFilter("importBatchId", value === "all" ? "" : value)}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All batches</SelectItem>
+                    {(batchesQuery.data ?? []).map((batch) => <SelectItem key={batch.id} value={batch.id}>{batch.filename}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
             {[
               ["requiresCancellation", "Requires cancellation"],
               ["requiresRefund", "Requires refund"],
@@ -1506,6 +1569,7 @@ export default function SupportPage() {
           {attributionDiagnostics?.support_rate_diagnostic && <p className="mt-3 text-xs text-muted-foreground">{attributionDiagnostics.support_rate_diagnostic}</p>}
         </Card>
 
+        {canReadMessages ? (
         <Card className="shadow-card">
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border p-4">
             <div>
@@ -1513,29 +1577,33 @@ export default function SupportPage() {
               <p className="mt-1 text-xs text-muted-foreground">{totalRows} requests · page {page} of {totalPages}</p>
             </div>
             <div className="flex flex-wrap items-center gap-2">
-              {exportState.busy && (
-                <span className="text-xs text-muted-foreground">
-                  {exportState.loaded}{exportState.total ? ` / ${exportState.total}` : ""} писем…
-                </span>
+              {canExport && (
+                <>
+                  {exportState.busy && (
+                    <span className="text-xs text-muted-foreground">
+                      {exportState.loaded}{exportState.total ? ` / ${exportState.total}` : ""} писем…
+                    </span>
+                  )}
+                  <Button type="button" variant="outline" size="sm"
+                    onClick={() => void onExport("xlsx")} disabled={exportState.busy !== null || totalRows === 0}
+                    title="Все письма под текущим фильтром, вместе с текстом. XLSX — читаемее для длинных писем.">
+                    {exportState.busy === "xlsx" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+                    Выгрузить XLSX
+                  </Button>
+                  <Button type="button" variant="outline" size="sm"
+                    onClick={() => void onExport("csv")} disabled={exportState.busy !== null || totalRows === 0}
+                    title="Тот же набор писем в CSV (RFC 4180, разделитель — запятая).">
+                    {exportState.busy === "csv" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+                    CSV
+                  </Button>
+                  <Button type="button" variant="outline" size="sm"
+                    onClick={() => void onExportUnanswered("xlsx")} disabled={unansweredBusy}
+                    title="Уникальные адреса, на которые мы не отправили ни одного письма (спам и автоуведомления не считаются). Учитывает текущие фильтры.">
+                    {unansweredBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+                    E-mail без ответа
+                  </Button>
+                </>
               )}
-              <Button type="button" variant="outline" size="sm"
-                onClick={() => void onExport("xlsx")} disabled={exportState.busy !== null || totalRows === 0}
-                title="Все письма под текущим фильтром, вместе с текстом. XLSX — читаемее для длинных писем.">
-                {exportState.busy === "xlsx" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
-                Выгрузить XLSX
-              </Button>
-              <Button type="button" variant="outline" size="sm"
-                onClick={() => void onExport("csv")} disabled={exportState.busy !== null || totalRows === 0}
-                title="Тот же набор писем в CSV (RFC 4180, разделитель — запятая).">
-                {exportState.busy === "csv" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
-                CSV
-              </Button>
-              <Button type="button" variant="outline" size="sm"
-                onClick={() => void onExportUnanswered("xlsx")} disabled={unansweredBusy}
-                title="Уникальные адреса, на которые мы не отправили ни одного письма (спам и автоуведомления не считаются). Учитывает текущие фильтры.">
-                {unansweredBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
-                E-mail без ответа
-              </Button>
               <Button type="button" variant="outline" size="sm" onClick={() => setPage((value) => Math.max(1, value - 1))} disabled={page <= 1}>Previous</Button>
               <Button type="button" variant="outline" size="sm" onClick={() => setPage((value) => Math.min(totalPages, value + 1))} disabled={page >= totalPages}>Next</Button>
             </div>
@@ -1594,9 +1662,18 @@ export default function SupportPage() {
             </Table>
           </div>
         </Card>
+        ) : (
+          <Card className="p-4 shadow-card">
+            <h2 className="text-sm font-semibold text-foreground">Support Requests</h2>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Individual requests (senders, addresses and message text) are not included in your role. The figures above
+              cover every request under the current filters.
+            </p>
+          </Card>
+        )}
       </div>
 
-      <Dialog open={Boolean(selectedId)} onOpenChange={(open) => !open && setSelectedId(null)}>
+      <Dialog open={Boolean(selectedId) && canReadMessages} onOpenChange={(open) => !open && setSelectedId(null)}>
         <DialogContent className="max-h-[85vh] max-w-4xl overflow-auto">
           <DialogHeader>
             <DialogTitle>{selected?.subject || "Support request"}</DialogTitle>
@@ -1664,6 +1741,8 @@ export default function SupportPage() {
                 <div className="rounded-md border border-border p-3">
                   <h3 className="text-xs font-semibold text-muted-foreground">Classification Explanation</h3>
                   <p className="mt-2 text-sm text-foreground">{selected.classification_reason ?? "-"}</p>
+                  {canEditClassification && (
+                  <>
                   <div className="mt-3 grid gap-3 sm:grid-cols-3">
                     <div className="space-y-1">
                       <Label>Category</Label>
@@ -1697,6 +1776,8 @@ export default function SupportPage() {
                       Reset to automatic classification
                     </Button>
                   </div>
+                  </>
+                  )}
                 </div>
               </div>
             </>

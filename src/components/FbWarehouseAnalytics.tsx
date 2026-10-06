@@ -24,7 +24,7 @@ import { ChartContainer, ChartTooltip, ChartTooltipContent, type ChartConfig } f
 import { Input } from "@/components/ui/input";
 import { useToast } from "@/hooks/use-toast";
 import { useAuth } from "@/hooks/useAuth";
-import { hashUserScope } from "@/services/analyticsCache";
+import { useAccess } from "@/hooks/useAccess";
 import { formatUpdatedAgo } from "@/services/analyticsProgress";
 import { useFbReportQuery, useFbWarehouseStatus, useInvalidateFbWarehouse } from "@/hooks/useFbWarehouse";
 import { runFbReconSnapshot, runFbSync, type FbLevel, type FbListRow, type FbReportQuery } from "@/services/fbWarehouse";
@@ -115,7 +115,12 @@ function entityLabel(row: FbListRow, level: FbLevel): { title: string; subtitle:
 export function FbWarehouseAnalytics(): JSX.Element {
   const { toast } = useToast();
   const { user } = useAuth();
-  const userScopeHash = hashUserScope(user?.id);
+  const access = useAccess();
+  // Cache isolation by the server-issued access partition (plan §20).
+  const userScopeHash = access.partition;
+  // Sync writes the warehouse (clickhouse-facebook sync): admin.sync.run. UX
+  // only — the Edge gate is authoritative.
+  const canSync = access.can("admin.sync.run");
   const [ui, setUi] = usePersistedPageState("ui_state_fb_warehouse", DEFAULT_UI_STATE);
   const [syncRunning, setSyncRunning] = useState<null | "incremental" | "full">(null);
   const invalidateFbWarehouse = useInvalidateFbWarehouse();
@@ -217,7 +222,8 @@ export function FbWarehouseAnalytics(): JSX.Element {
   );
   const aiCampaigns = useAiCampaignSignals({
     rows: aiRows,
-    enabled: ui.level === "campaign" && aiRows.length > 0,
+    // AI features (and their pass-rate call) need ai.use, like the drawer.
+    enabled: access.can("ai.use") && ui.level === "campaign" && aiRows.length > 0,
     dateFrom: query.date_from ?? null,
     dateTo: query.date_to ?? null,
     userScopeHash,
@@ -316,16 +322,18 @@ export function FbWarehouseAnalytics(): JSX.Element {
               </SelectContent>
             </Select>
           </div>
-          <div className="ml-auto flex items-center gap-2">
-            <Button variant="outline" size="sm" disabled={syncRunning != null} onClick={() => void runSync("incremental")}>
-              {syncRunning === "incremental" ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
-              Sync now
-            </Button>
-            <Button variant="outline" size="sm" disabled={syncRunning != null} onClick={() => void runSync("full")}>
-              {syncRunning === "full" ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
-              Full sync
-            </Button>
-          </div>
+          {canSync && (
+            <div className="ml-auto flex items-center gap-2">
+              <Button variant="outline" size="sm" disabled={syncRunning != null} onClick={() => void runSync("incremental")}>
+                {syncRunning === "incremental" ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
+                Sync now
+              </Button>
+              <Button variant="outline" size="sm" disabled={syncRunning != null} onClick={() => void runSync("full")}>
+                {syncRunning === "full" ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                Full sync
+              </Button>
+            </div>
+          )}
         </div>
       </Card>
 
@@ -449,7 +457,9 @@ export function FbWarehouseAnalytics(): JSX.Element {
               {!rows.length && !isInitialLoading && (
                 <TableRow>
                   <TableCell colSpan={columns.length + (showAiColumn ? 2 : 1)} className="py-8 text-center text-muted-foreground">
-                    {status?.state ? "No rows in this scope. Try a wider date range or run a sync." : "Warehouse is empty — run Full sync to load Capsuled history."}
+                    {status?.state
+                      ? canSync ? "No rows in this scope. Try a wider date range or run a sync." : "No rows in this scope. Try a wider date range."
+                      : canSync ? "Warehouse is empty — run Full sync to load Capsuled history." : "Warehouse is empty — ask a workspace admin to run a sync."}
                   </TableCell>
                 </TableRow>
               )}

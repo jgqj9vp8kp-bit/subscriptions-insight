@@ -9,17 +9,22 @@
 // (so a funnel could not be registered before launch, and its display name
 // would have to be machine-derived from the path).
 //
-// Deploy WITHOUT --no-verify-jwt so only an authenticated user can call it,
-// matching the other funnelfox-* functions. FUNNELFOX_SECRET is read from Edge
+// Access (policies/funnelfox-funnels.ts): `list` needs funnels.manage (the
+// import dialog is the first step of a registry write); the `inspect` diagnostic
+// (raw first upstream row) also needs admin.diagnostics.view. The gate
+// authenticates before anything runs; CORS, OPTIONS and the GET / POST method
+// check come from it. Error bodies stay the data owner's; anyone else gets the
+// gate's generic body with the same status. FUNNELFOX_SECRET is read from Edge
 // env and never returned to the caller.
 
+import { serveWithAccess } from "../_shared/clickhouse/http.ts";
+import { FUNNELFOX_FUNNELS_POLICY } from "../_shared/access/policies/funnelfox-funnels.ts";
 import {
+  FunnelFoxEdgeError,
   fetchFunnelFox,
+  funnelFoxErrorResponse,
+  funnelFoxFailure,
   getFunnelFoxSecret,
-  jsonResponse,
-  methodNotAllowed,
-  optionsResponse,
-  readRequestParams,
 } from "../_shared/funnelfox.ts";
 
 type JsonRecord = Record<string, unknown>;
@@ -99,18 +104,14 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-Deno.serve(async (req: Request) => {
-  if (req.method === "OPTIONS") return optionsResponse();
-  if (req.method !== "GET" && req.method !== "POST") return methodNotAllowed();
-
+serveWithAccess(FUNNELFOX_FUNNELS_POLICY, async ({ ctx, action }) => {
   const secret = getFunnelFoxSecret();
-  if (!secret) return jsonResponse({ error: "FunnelFox is not configured." }, 500);
+  if (!secret) return funnelFoxFailure(ctx, 500, { error: "FunnelFox is not configured." });
 
-  const params = await readRequestParams(req);
-  // Diagnostic escape hatch: returns the RAW first-page keys so the exact
-  // upstream field names can be confirmed without guessing. No PII — funnels
-  // are configuration objects, not people.
-  const inspect = params.get("inspect") === "1" || params.get("inspect") === "true";
+  // Diagnostic escape hatch (the `inspect` flag, its own action): returns the
+  // RAW first-page keys so the exact upstream field names can be confirmed
+  // without guessing. No PII — funnels are configuration objects, not people.
+  const inspect = action === "inspect";
 
   try {
     const funnels: ReturnType<typeof normalizeFunnel>[] = [];
@@ -125,9 +126,10 @@ Deno.serve(async (req: Request) => {
       const upstream = await fetchFunnelFox(`/funnels?${query.toString()}`, secret);
 
       if (!upstream.ok) {
-        return jsonResponse(
-          { error: "FunnelFox API request failed.", status: upstream.status, page: pages + 1 },
+        return funnelFoxFailure(
+          ctx,
           upstream.status === 404 ? 404 : 502,
+          { error: "FunnelFox API request failed.", status: upstream.status, page: pages + 1 },
         );
       }
 
@@ -146,24 +148,26 @@ Deno.serve(async (req: Request) => {
     }
 
     if (inspect) {
-      return jsonResponse({
+      return {
         pages_fetched: pages,
         total_rows: funnels.length,
         first_page_raw_keys: firstPageKeys,
         first_row_sample: firstPageSample,
         normalized_sample: funnels.slice(0, 3),
-      });
+      };
     }
 
-    return jsonResponse({
+    return {
       funnels: funnels.filter((funnel) => funnel.id),
       pages_fetched: pages,
       truncated: pages >= MAX_PAGES,
-    });
+    };
   } catch (error) {
-    return jsonResponse(
-      { error: error instanceof Error ? error.message : "FunnelFox API request failed." },
+    if (error instanceof FunnelFoxEdgeError) throw error;
+    return funnelFoxFailure(
+      ctx,
       502,
+      { error: error instanceof Error ? error.message : "FunnelFox API request failed." },
     );
   }
-});
+}, { onError: funnelFoxErrorResponse });

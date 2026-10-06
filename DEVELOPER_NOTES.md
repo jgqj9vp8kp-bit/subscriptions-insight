@@ -307,9 +307,10 @@ exists: `/sessions` lists every visitor session (cursor, `funnel_id`,
 `/funnels/{id}.config_url` is a public config.json with the ordered `screens[]`
 (id, customId, elements, navigate actions). A step funnel over input screens +
 email screen + purchase (`session.id` on the subscription detail) is buildable
-at ~3k detail requests/day; info-only screens leave no trace. The
-`funnelfox-endpoint-probe` function accepts `{paths, include_structure}` for
-PII-safe structure discovery.
+at ~3k detail requests/day; info-only screens leave no trace. (The former
+`funnelfox-endpoint-probe` discovery function was removed with access control:
+it had no in-function auth. Delete it from the deployed project too:
+`supabase functions delete funnelfox-endpoint-probe`.)
 
 ## FunnelFox Backend Requirement
 
@@ -325,8 +326,15 @@ This repository includes multiple proxy runtimes:
   - `supabase/functions/funnelfox-subscriptions/index.ts`
   - `supabase/functions/funnelfox-subscription/index.ts`
   - `supabase/functions/funnelfox-profile/index.ts`
-- Vercel/serverless routes remain available for backwards compatibility: `api/funnelfox/*.ts`
-- Local Vite dev server: `vite.config.ts` registers a dev-only middleware for `/api/funnelfox/subscriptions`
+- `api/funnelfox/*.ts` (serverless) and the Vite middleware for `/api/funnelfox/subscriptions` are
+  **dev-only**: every handler answers 404 unless `FUNNELFOX_LOCAL_PROXY_ENABLED=true`, which only
+  `vite.config.ts` sets for `vite serve` when the dev server binds to loopback
+  (`npm run dev -- --host localhost`; the default `::` bind for the Lovable preview leaves it off).
+  Never set that variable on a deployment or in the Lovable sandbox.
+
+Access (Phase 1): the three Edge proxies require the data owner (raw access) plus
+`admin.sync.run`; `funnelfox-funnels` requires `funnels.manage`. Every function goes through
+`serveWithAccess` and its policy in `supabase/functions/_shared/access/policies/`.
 
 A plain static Vite build does not execute `api/` files by itself. Production real sync requires a backend runtime. For Lovable, deploy the Supabase Edge Functions and point the frontend at the Supabase Functions base URL.
 
@@ -344,9 +352,8 @@ Deploy the functions:
 
 ```text
 supabase link --project-ref wsjbpkderyhdefukppvb
-supabase functions deploy funnelfox-subscriptions
-supabase functions deploy funnelfox-subscription
-supabase functions deploy funnelfox-profile
+# Always all functions at once (one BUILD_ID, no old caller-as-tenant build left live):
+SUPABASE_SERVICE_ROLE_KEY=... npm run deploy:functions -- --project-ref wsjbpkderyhdefukppvb
 ```
 
 After the Edge Functions are available, enable real sync in the frontend environment:
@@ -555,7 +562,7 @@ supabase secrets set MAILRU_IMAP_HOST=imap.mail.ru
 supabase secrets set MAILRU_IMAP_PORT=993
 supabase secrets set MAILRU_IMAP_USER=support@azora-astro.com
 supabase secrets set MAILRU_IMAP_PASSWORD=...
-supabase functions deploy sync-support-mail
+npm run deploy:functions -- --project-ref wsjbpkderyhdefukppvb
 ```
 
 If Mail.ru 2FA is enabled, use a Mail.ru app password. The frontend calls only `/functions/v1/sync-support-mail`; it never connects to IMAP directly.

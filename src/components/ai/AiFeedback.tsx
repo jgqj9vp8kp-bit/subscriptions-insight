@@ -2,8 +2,10 @@
 // click into ai_feedback; the payload snapshot lets later evaluation compare
 // what the engine said with what the operator thought of it. No undo UI —
 // clicking the other thumb records a second row (history, not state).
+// Rendered only with ai.use (it rates AI output; the row is the actor's own).
 import { useState } from "react";
 import { ThumbsDown, ThumbsUp } from "lucide-react";
+import { useAccess } from "@/hooks/useAccess";
 import { supabase } from "@/services/supabaseClient";
 import { cn } from "@/lib/utils";
 
@@ -12,7 +14,10 @@ export function AiFeedback({ subjectKind, subjectId, payload }: {
   subjectId: string;
   payload?: Record<string, unknown>;
 }) {
+  const canUseAi = useAccess().can("ai.use");
   const [sent, setSent] = useState<"up" | "down" | null>(null);
+
+  if (!canUseAi) return null;
 
   const send = async (verdict: "up" | "down") => {
     setSent(verdict);

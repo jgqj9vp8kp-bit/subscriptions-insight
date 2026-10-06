@@ -28,7 +28,7 @@ import { KpiCard } from "@/components/KpiCard";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/hooks/useAuth";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
-import { hashUserScope } from "@/services/analyticsCache";
+import { useAccess } from "@/hooks/useAccess";
 import { useWarehouseVersion } from "@/hooks/useAnalyticsCache";
 import { useBankAnalyticsBundle, useBankDetail } from "@/hooks/useBankAnalyticsCache";
 import {
@@ -210,7 +210,8 @@ function BankDetailPanel({ query, issuerKey, userScopeHash, warehouseVersion }: 
 
 export function BankAnalytics() {
   const { user } = useAuth();
-  const userScopeHash = useMemo(() => hashUserScope(user?.id), [user?.id]);
+  // The access partition (plan §20): the cache key is per principal, role and scope.
+  const userScopeHash = useAccess().partition;
   const { version: warehouseVersion, ready: warehouseVersionReady } = useWarehouseVersion(true);
   const [uiState, setUiState] = usePersistedPageState("ui_state_transactions_banks", DEFAULT_UI_STATE);
   const update = (patch: Partial<typeof DEFAULT_UI_STATE>) => setUiState((cur) => ({ ...cur, ...patch }));

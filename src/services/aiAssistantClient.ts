@@ -6,6 +6,7 @@
 // touches this path; only free-form questions do.
 import { supabase } from "@/services/supabaseClient";
 import { MAX_CONTEXT_ITEMS, type AssistantAnswer, type AssistantInput, type AssistantViolation } from "@/services/aiAssistant";
+import { isUnavailableRefusal, readEdgeInvokeRefusal } from "@/services/edgeInvokeError";
 
 export const AI_ANALYTICS_FUNCTION = "ai-analytics";
 
@@ -44,6 +45,10 @@ export async function askAssistant(input: AssistantInput): Promise<AssistantOutc
   });
 
   if (error) {
+    // A refusal by the access gate (no ai.use, restricted funnel scope) is an
+    // expected state for this member: calm "unavailable", not an error.
+    const refusal = await readEdgeInvokeRefusal(error);
+    if (isUnavailableRefusal(refusal)) return { kind: "unavailable", reason: "The assistant is not available for your role." };
     // The function answers 200 with a reason for every expected outcome, so
     // reaching here means transport failed — most often not deployed yet.
     return { kind: "error", message: error.message };

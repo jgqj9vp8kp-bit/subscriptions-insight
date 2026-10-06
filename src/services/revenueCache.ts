@@ -1,5 +1,5 @@
 // Query-key composition for the Dashboard Revenue Intelligence root.
-// Mirrors cohortsCache.ts: keys carry the non-reversible user scope, the
+// Mirrors cohortsCache.ts: keys carry the access partition (userScopeHash), the
 // warehouse-version fingerprint (so a sync re-keys everything), and a
 // canonicalized request — logically identical requests are byte-identical.
 import { sortUniq } from "@/services/analyticsCache";

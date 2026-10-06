@@ -1,9 +1,9 @@
-import { BarChart3, FileText, Headphones, LayoutDashboard, Receipt, Users, UserPlus, Layers, Upload, Repeat, Calculator, Plug, Route } from "lucide-react";
+import { BarChart3, FileText, Headphones, LayoutDashboard, Receipt, Users, UserPlus, Layers, Upload, Repeat, Calculator, Plug, Route, UserCog, ShieldCheck, ScrollText, type LucideIcon } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { NavLink } from "@/components/NavLink";
-import { useAuth } from "@/hooks/useAuth";
-import { hashUserScope } from "@/services/cohortsCache";
+import { useAccess } from "@/hooks/useAccess";
 import { prefetchCohortsNav } from "@/hooks/useCohortsCache";
+import { canAccessRoute } from "@/services/accessRoutes";
 import { cohortsDataSourceMode } from "@/services/cohortsDataSource";
 import { loadMaxRenewalColumns } from "@/services/dataSettings";
 import {
@@ -19,7 +19,14 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar";
 
-const items = [
+interface NavItem {
+  title: string;
+  url: string;
+  icon: LucideIcon;
+  end: boolean;
+}
+
+const items: NavItem[] = [
   { title: "Dashboard", url: "/", icon: LayoutDashboard, end: true },
   { title: "Transactions", url: "/transactions", icon: Receipt, end: false },
   { title: "Users", url: "/users", icon: Users, end: false },
@@ -35,18 +42,56 @@ const items = [
   { title: "Import data", url: "/import", icon: Upload, end: false },
 ];
 
+const adminItems: NavItem[] = [
+  { title: "Members", url: "/admin/members", icon: UserCog, end: false },
+  { title: "Roles", url: "/admin/roles", icon: ShieldCheck, end: false },
+  { title: "Audit log", url: "/admin/audit", icon: ScrollText, end: false },
+];
+
+const ADMIN_VIEW_PERMISSIONS = ["admin.users.view", "admin.roles.view", "admin.audit.view"] as const;
+
 export function AppSidebar() {
   const { state } = useSidebar();
   const collapsed = state === "collapsed";
   const queryClient = useQueryClient();
-  const { user } = useAuth();
+  const access = useAccess();
+
+  // UX only (the Edge gate is authoritative): show the pages this member may
+  // open, from the same ROUTE_ACCESS table as the route guards. Legacy access
+  // (server not bootstrapped) shows every page, as today.
+  const visibleItems = items.filter((item) => canAccessRoute(item.url, access));
+  // The admin pages manage workspace members; before bootstrap (legacy) there
+  // is nothing to manage, so the group stays hidden and the sidebar is today's.
+  const showAdmin = !access.legacy && access.canAny(ADMIN_VIEW_PERMISSIONS);
+  const visibleAdminItems = showAdmin ? adminItems.filter((item) => canAccessRoute(item.url, access)) : [];
 
   // Warm the Cohorts cache when the user shows intent to navigate there. Only in
-  // ClickHouse mode; respects staleTime (no duplicate when already fresh).
+  // ClickHouse mode; respects staleTime (no duplicate when already fresh). Keyed
+  // by the access partition, and never for a member without Cohorts or before
+  // access has resolved (empty partition).
   const prefetchCohorts = () => {
+    if (!access.can("cohorts.view") || !access.partition) return;
     if (cohortsDataSourceMode() !== "clickhouse") return;
-    prefetchCohortsNav(queryClient, hashUserScope(user?.id), loadMaxRenewalColumns());
+    prefetchCohortsNav(queryClient, access.partition, loadMaxRenewalColumns());
   };
+
+  const renderItem = (item: NavItem) => (
+    <SidebarMenuItem key={item.title}>
+      <SidebarMenuButton asChild tooltip={item.title}>
+        <NavLink
+          to={item.url}
+          end={item.end}
+          onMouseEnter={item.url === "/cohorts" ? prefetchCohorts : undefined}
+          onFocus={item.url === "/cohorts" ? prefetchCohorts : undefined}
+          className="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+          activeClassName="bg-sidebar-accent text-sidebar-accent-foreground font-medium"
+        >
+          <item.icon className="h-4 w-4" />
+          {!collapsed && <span>{item.title}</span>}
+        </NavLink>
+      </SidebarMenuButton>
+    </SidebarMenuItem>
+  );
 
   return (
     <Sidebar collapsible="icon" className="border-r border-sidebar-border">
@@ -67,30 +112,22 @@ export function AppSidebar() {
         </div>
       </SidebarHeader>
       <SidebarContent>
-        <SidebarGroup>
-          <SidebarGroupLabel>Workspace</SidebarGroupLabel>
-          <SidebarGroupContent>
-            <SidebarMenu>
-              {items.map((item) => (
-                <SidebarMenuItem key={item.title}>
-                  <SidebarMenuButton asChild tooltip={item.title}>
-                    <NavLink
-                      to={item.url}
-                      end={item.end}
-                      onMouseEnter={item.url === "/cohorts" ? prefetchCohorts : undefined}
-                      onFocus={item.url === "/cohorts" ? prefetchCohorts : undefined}
-                      className="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
-                      activeClassName="bg-sidebar-accent text-sidebar-accent-foreground font-medium"
-                    >
-                      <item.icon className="h-4 w-4" />
-                      {!collapsed && <span>{item.title}</span>}
-                    </NavLink>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-              ))}
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
+        {visibleItems.length > 0 && (
+          <SidebarGroup>
+            <SidebarGroupLabel>Workspace</SidebarGroupLabel>
+            <SidebarGroupContent>
+              <SidebarMenu>{visibleItems.map(renderItem)}</SidebarMenu>
+            </SidebarGroupContent>
+          </SidebarGroup>
+        )}
+        {visibleAdminItems.length > 0 && (
+          <SidebarGroup>
+            <SidebarGroupLabel>Administration</SidebarGroupLabel>
+            <SidebarGroupContent>
+              <SidebarMenu>{visibleAdminItems.map(renderItem)}</SidebarMenu>
+            </SidebarGroupContent>
+          </SidebarGroup>
+        )}
       </SidebarContent>
     </Sidebar>
   );

@@ -10,6 +10,7 @@
 // Cohort membership and first-touch attribution never change here.
 
 import type { ClickHouseClientLike, SupabaseLikeClient } from "./types.ts";
+import { ScopeViolation } from "./scopedClient.ts";
 import { ANALYTICS_TRANSACTIONS_TABLE, FACT_FACEBOOK_STATS_TABLE, FACT_USER_COHORTS_TABLE } from "./schema.ts";
 import { getFbSyncState, fbWarehouseVersionFromState } from "./facebookStats.ts";
 import type { CohortFilters } from "./cohortContract.ts";
@@ -1365,7 +1366,10 @@ export async function computeFbCohortStats(input: {
     input.clickhouse.query({ query: metricSql, query_params: metricParams, format: "JSONEachRow" }),
     input.clickhouse.query({ query: fbSourceStatsSql(), query_params: { auth_user_id: input.authUserId }, format: "JSONEachRow" }),
     input.clickhouse.query({ query: sourceScopedSql, query_params: params, format: "JSONEachRow" }),
-    getFbSyncState(input.supabase, input.authUserId).catch(() => null),
+    getFbSyncState(input.supabase, input.authUserId).catch((error) => {
+      if (error instanceof ScopeViolation) throw error;
+      return null;
+    }),
   ]);
   const snapshotRow = ((await snapshotRs.json()) as Array<Record<string, unknown>>)[0] ?? {};
   const snapshot = assertFbSnapshotUnique(snapshotRow);

@@ -1,8 +1,18 @@
 import { computeCohorts, computeUsers } from "@/services/analytics";
 import type { CohortRow, Transaction, UserAggregate } from "@/services/types";
 import type { RawPalmerRow } from "@/services/palmerTransform";
+import { deleteIndexedDbDatabase, rawCacheStamp, type CacheScopeOptions } from "@/services/analyticsCache";
+import { registerPurgeHandler } from "@/services/sessionPurge";
+import { traceEvent } from "@/services/performanceTrace";
 
-const DB_NAME = "subscriptions-insight-palmer-cache";
+// Raw Palmer dataset (transactions + customer rows) — data owner only (plan D8).
+// Entries are stamped with the access partition they were written under: a
+// read under any other partition deletes the entry instead of returning it, and
+// nothing is read or written without raw access (see rawCacheStamp). The whole
+// database is deleted by the session purge.
+
+export const PALMER_CACHE_DB_NAME = "subscriptions-insight-palmer-cache";
+const DB_NAME = PALMER_CACHE_DB_NAME;
 const DB_VERSION = 1;
 const STORE_NAME = "palmer-datasets";
 const CACHE_KEY = "latest";
@@ -23,6 +33,8 @@ export interface PalmerDatasetCachePayload {
   cohorts: CohortRow[];
   rawPalmerRows?: RawPalmerRow[];
   metadata: PalmerCacheMetadata;
+  /** Access partition the entry was written under. */
+  partition?: string;
 }
 
 export interface PalmerDatasetCacheInput {
@@ -84,10 +96,16 @@ function buildMetadata(data: PalmerDatasetCacheInput, metadata: Partial<PalmerCa
 export async function savePalmerDatasetToCache(
   data: PalmerDatasetCacheInput,
   metadata: Partial<PalmerCacheMetadata> = {},
+  options: CacheScopeOptions = {},
 ): Promise<PalmerCacheMetadata> {
   const users = data.users ?? computeUsers(data.transactions);
   const cohorts = data.cohorts ?? computeCohorts(data.transactions);
   const nextMetadata = buildMetadata({ ...data, users, cohorts }, metadata);
+  const partition = rawCacheStamp(options);
+  if (!partition) {
+    traceEvent("palmer.cache_write_skipped", { reason: "no_raw_access" });
+    return nextMetadata;
+  }
   await withStore("readwrite", (store) =>
     store.put(
       {
@@ -96,6 +114,7 @@ export async function savePalmerDatasetToCache(
         cohorts,
         rawPalmerRows: data.rawPalmerRows,
         metadata: nextMetadata,
+        partition,
       } satisfies PalmerDatasetCachePayload,
       CACHE_KEY,
     ),
@@ -103,9 +122,17 @@ export async function savePalmerDatasetToCache(
   return nextMetadata;
 }
 
-export async function loadLastPalmerDatasetFromCache(): Promise<PalmerDatasetCachePayload | null> {
+export async function loadLastPalmerDatasetFromCache(options: CacheScopeOptions = {}): Promise<PalmerDatasetCachePayload | null> {
+  const partition = rawCacheStamp(options);
+  if (!partition) return null;
   const payload = await withStore<PalmerDatasetCachePayload | undefined>("readonly", (store) => store.get(CACHE_KEY));
-  return payload ?? null;
+  if (!payload) return null;
+  if (payload.partition !== partition) {
+    traceEvent("palmer.cache_partition_mismatch", {});
+    await withStore("readwrite", (store) => store.delete(CACHE_KEY)).catch(() => undefined);
+    return null;
+  }
+  return payload;
 }
 
 export async function clearPalmerDatasetCache(): Promise<void> {
@@ -116,3 +143,5 @@ export async function getPalmerCacheInfo(): Promise<PalmerCacheMetadata | null> 
   const payload = await loadLastPalmerDatasetFromCache();
   return payload?.metadata ?? null;
 }
+
+registerPurgeHandler("palmer-indexeddb", () => deleteIndexedDbDatabase(DB_NAME));

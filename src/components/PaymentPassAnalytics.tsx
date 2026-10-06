@@ -51,8 +51,7 @@ import {
   paymentAnalyticsMode,
   type PaymentAnalyticsQuery,
 } from "@/services/paymentAnalyticsDataSource";
-import { useAuth } from "@/hooks/useAuth";
-import { hashUserScope } from "@/services/analyticsCache";
+import { useAccess } from "@/hooks/useAccess";
 import { useWarehouseVersion } from "@/hooks/useAnalyticsCache";
 import { usePaymentAnalyticsBundle } from "@/hooks/usePaymentAnalyticsCache";
 import { formatUpdatedAgo } from "@/services/analyticsProgress";
@@ -176,9 +175,15 @@ export function PaymentPassAnalytics({ txs }: { txs: Transaction[] }) {
   // clickhouse (default): the Edge Function is the single source of truth (incl.
   // canonical warehouse decline metrics) and the browser performs NO transaction
   // scan. Legacy is the emergency fallback if the Edge request fails.
-  const paMode = useMemo(() => paymentAnalyticsMode(), []);
-  const { user } = useAuth();
-  const userScopeHash = useMemo(() => hashUserScope(user?.id), [user?.id]);
+  //
+  // The legacy path recomputes from the browser transaction store, which only
+  // the data owner hydrates (D8): everyone else always reads the Edge function
+  // (the legacy flag is ignored) and an Edge error is shown, never recomputed.
+  const { rawAccess, partition } = useAccess();
+  const legacyFallbackAllowed = rawAccess;
+  const paMode = useMemo(() => (legacyFallbackAllowed ? paymentAnalyticsMode() : "clickhouse"), [legacyFallbackAllowed]);
+  // The access partition (plan §20): the cache key is per principal, role and scope.
+  const userScopeHash = partition;
   const { version: warehouseVersion, ready: warehouseVersionReady } = useWarehouseVersion(paMode === "clickhouse");
   const paQuery = useMemo<PaymentAnalyticsQuery>(
     () => ({
@@ -214,13 +219,16 @@ export function PaymentPassAnalytics({ txs }: { txs: Transaction[] }) {
       driving_clickhouse: paDriving,
       has_clickhouse_bundle: chBundle != null,
       has_error: chStatus.error != null,
-      legacy_fallback_active: !paDriving && (paMode !== "clickhouse" || chStatus.error != null),
+      legacy_fallback_active: legacyFallbackAllowed && !paDriving && (paMode !== "clickhouse" || chStatus.error != null),
     });
-  }, [paMode, paDriving, chBundle, chStatus.error]);
+  }, [legacyFallbackAllowed, paMode, paDriving, chBundle, chStatus.error]);
 
   // Heavy step: classify the full warehouse once per data load. In ClickHouse
   // mode this runs on an EMPTY list — the browser performs no transaction scan.
-  const allAttempts = useMemo(() => (paDriving || (paMode === "clickhouse" && chStatus.error === null) ? [] : buildPaymentAttempts(txs)), [paDriving, paMode, chStatus.error, txs]);
+  const allAttempts = useMemo(
+    () => (!legacyFallbackAllowed || paDriving || (paMode === "clickhouse" && chStatus.error === null) ? [] : buildPaymentAttempts(txs)),
+    [legacyFallbackAllowed, paDriving, paMode, chStatus.error, txs],
+  );
 
   const options = useMemo(
     () =>
@@ -675,7 +683,7 @@ export function PaymentPassAnalytics({ txs }: { txs: Transaction[] }) {
         {paMode === "clickhouse" && (
           <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
             <span className="font-medium text-foreground">Data source</span>
-            <span>engine: <span className="font-mono text-foreground">{paDriving ? "clickhouse" : "legacy (fallback)"}</span></span>
+            <span>engine: <span className="font-mono text-foreground">{paDriving || !legacyFallbackAllowed ? "clickhouse" : "legacy (fallback)"}</span></span>
             {/* Honest staged progress (estimated; no server row-level progress). */}
             {isInitialLoading && (
               <span className="flex items-center gap-2">Loading… {progressPercent}%<Progress value={progressPercent} className="h-1.5 w-24" /></span>
@@ -690,7 +698,9 @@ export function PaymentPassAnalytics({ txs }: { txs: Transaction[] }) {
               <span>ClickHouse {chBundle.durationMs} ms{dataUpdatedAt ? ` · updated ${formatUpdatedAgo(dataUpdatedAt)}` : ""}</span>
             )}
             {paDriving && <span>total attempts: <span className="font-mono text-foreground">{num(paymentAnalyticsViewModel.authoritativeAttempts)}</span></span>}
-            {chStatus.error && chBundle == null && <span className="text-destructive">ClickHouse error — using legacy: {chStatus.error}</span>}
+            {chStatus.error && chBundle == null && (
+              <span className="text-destructive">{legacyFallbackAllowed ? "ClickHouse error — using legacy" : "ClickHouse error"}: {chStatus.error}</span>
+            )}
             <span className="text-muted-foreground/70">decline metrics: warehouse-canonical</span>
           </div>
         )}

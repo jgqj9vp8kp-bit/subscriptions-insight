@@ -6,7 +6,8 @@
 import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Card } from "@/components/ui/card";
-import { loadFbReconHistory } from "@/services/fbWarehouse";
+import { fbReconHistoryKey, loadFbReconHistory } from "@/services/fbWarehouse";
+import { useAccess } from "@/hooks/useAccess";
 import { buildWarehouseHealthView, PARITY_GATE_REQUIRED_DAYS } from "@/services/fbWarehouseHealth";
 
 const HEALTH_STYLES: Record<string, string> = {
@@ -34,9 +35,12 @@ function Bucket({ label, value, hint }: { label: string; value: string; hint?: s
 }
 
 export function FbWarehouseHealth() {
+  // Keyed by the access partition (plan §20) so an entry never outlives its principal.
+  const partition = useAccess().partition;
   const historyQuery = useQuery({
-    queryKey: ["fb-recon-history"],
+    queryKey: fbReconHistoryKey(partition),
     queryFn: () => loadFbReconHistory(60),
+    enabled: partition !== "",
     staleTime: 60_000,
   });
 

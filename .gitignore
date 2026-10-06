@@ -30,3 +30,6 @@ supabase/.temp/
 *.njsproj
 *.sln
 *.sw?
+
+# Local payment exports (customer data) - never commit
+/payments*.csv

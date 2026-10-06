@@ -1,10 +1,18 @@
 /* global Deno */
 
-export const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-};
+// Shared helpers of the funnelfox-* Edge functions. Every one of them is served
+// through the access gate (serveWithAccess + policies/funnelfox-*.ts), which
+// answers OPTIONS / wrong methods, authenticates before the body is read and
+// hands the handler the parsed body — so there is no per-function preflight,
+// method check or body reader here any more. Pure apart from Deno.env reads
+// inside functions: vitest imports it.
+
+import { buildCorsHeaders } from "./access/cors.ts";
+import { ActionNormalizeError } from "./access/errors.ts";
+
+/** The shared CORS builder (GET, POST, OPTIONS — the methods these functions
+ * have always accepted). The gate stamps the same set on every response. */
+export const corsHeaders: Record<string, string> = buildCorsHeaders({ methods: ["GET", "POST"] });
 
 const FUNNELFOX_BASE_URL = "https://api.funnelfox.io/public/v1";
 
@@ -21,12 +29,64 @@ export function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
-export function optionsResponse(): Response {
-  return new Response("ok", { headers: corsHeaders });
+// ---- access-gate plumbing -----------------------------------------------------------
+
+/** A failed request carrying the status and body the function has always
+ * returned. Thrown only for callers without raw access; the onError mapping
+ * below hands it to the gate, which keeps the status and replaces the body with
+ * its generic { error_code, request_id } (upstream / database text never reaches
+ * employees). */
+export class FunnelFoxEdgeError extends Error {
+  readonly status: number;
+  readonly body: Record<string, unknown>;
+
+  constructor(status: number, body: Record<string, unknown>) {
+    super(typeof body.error === "string" && body.error ? body.error : "FunnelFox request failed.");
+    this.name = "FunnelFoxEdgeError";
+    this.status = status;
+    this.body = body;
+  }
 }
 
-export function methodNotAllowed(): Response {
-  return jsonResponse({ error: "Method not allowed." }, 405);
+/** serveWithAccess onError: reproduces a FunnelFoxEdgeError's status / body. */
+export function funnelFoxErrorResponse(error: unknown): { status: number; body: Record<string, unknown> } | null {
+  if (!(error instanceof FunnelFoxEdgeError)) return null;
+  return { status: error.status, body: { ...error.body } };
+}
+
+/** An error response: today's exact body for the data owner (returned as is, so
+ * it stays byte-identical), a thrown FunnelFoxEdgeError for everyone else (the
+ * gate sanitizes it, same status). */
+export function funnelFoxFailure(ctx: { rawAccess: boolean }, status: number, body: Record<string, unknown>): Response {
+  if (ctx.rawAccess) return jsonResponse(body, status);
+  throw new FunnelFoxEdgeError(status, body);
+}
+
+/** The request parameters exactly as the functions have always read them: the
+ * query string wins, then every non-null body key that the query does not carry
+ * (stringified). The gate has already parsed the body (GET → {}). */
+export function funnelFoxRequestParams(url: URL, body: Record<string, unknown>): URLSearchParams {
+  const params = new URLSearchParams(url.search);
+  for (const [key, value] of Object.entries(body)) {
+    if (value != null && !params.has(key)) params.set(key, String(value));
+  }
+  return params;
+}
+
+/** The staged syncs' flag parsing (unchanged): a JSON `true` in the body or the
+ * string "true" (any case) in the query string. The policy normalizer and the
+ * handler both use it, so the authorized action and the branch that runs can
+ * never disagree. */
+export function funnelFoxSyncFlags(body: Record<string, unknown>, url: URL): { dryRun: boolean; fullReset: boolean } {
+  const flag = (name: string) => body[name] === true || String(url.searchParams.get(name) ?? "").toLowerCase() === "true";
+  return { dryRun: flag("dry_run"), fullReset: flag("full_reset") };
+}
+
+/** None of the callers names an action — the flags decide it. A body `action`
+ * may only repeat the derived name; anything else is a 400 (rule R3). */
+export function funnelFoxDerivedAction<A extends string>(body: Record<string, unknown>, derived: A): A {
+  if (body.action === undefined || body.action === null || body.action === derived) return derived;
+  throw new ActionNormalizeError();
 }
 
 export function getFunnelFoxSecret(): string | null {
@@ -40,24 +100,6 @@ export function getFunnelFoxSecret(): string | null {
 export function isFunnelFoxDebugEnabled(): boolean {
   const flag = Deno.env.get("FUNNELFOX_DEBUG")?.trim().toLowerCase();
   return flag === "1" || flag === "true";
-}
-
-export async function readRequestParams(req: Request): Promise<URLSearchParams> {
-  const url = new URL(req.url);
-  const params = new URLSearchParams(url.search);
-
-  if (req.method === "POST") {
-    try {
-      const body = await req.json() as JsonRecord;
-      for (const [key, value] of Object.entries(body)) {
-        if (value != null && !params.has(key)) params.set(key, String(value));
-      }
-    } catch {
-      // Empty or non-JSON POST bodies are allowed; query params remain the source of truth.
-    }
-  }
-
-  return params;
 }
 
 export async function fetchFunnelFox(path: string, secret: string): Promise<{ status: number; ok: boolean; payload: unknown }> {

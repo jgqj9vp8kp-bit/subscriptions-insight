@@ -60,6 +60,7 @@ import {
 import { cn } from "@/lib/utils";
 import { useToast } from "@/hooks/use-toast";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
+import { useAccess } from "@/hooks/useAccess";
 import { useDataStore } from "@/store/dataStore";
 import {
   applyMapping,
@@ -257,6 +258,17 @@ function duplicateBatchIds(batches: ImportBatchInfo[]): Set<string> {
 export default function ImportPage() {
   const { toast } = useToast();
   const queryClient = useQueryClient();
+  // The page is data-owner only and needs admin.data.import (route guard), which
+  // covers every file / sheet import and the local and cloud dataset controls.
+  // Two server-side follow-ups need more (UX only; the Edge gate re-checks):
+  //   admin.sync.run         — the FunnelFox subscriptions sync, its connection
+  //                            test and the staged-sync state read on mount;
+  //   admin.warehouse.manage — the automatic post-import ClickHouse sync
+  //                            (clickhouse-backfill + the cohort rebuild).
+  // The owner and legacy access pass both, so nothing changes for them.
+  const access = useAccess();
+  const canRunSync = access.can("admin.sync.run");
+  const canManageWarehouse = access.can("admin.warehouse.manage");
   const fileRef = useRef<HTMLInputElement>(null);
   const meta = useDataStore((s) => s.meta);
   const transactions = useDataStore((s) => s.transactions);
@@ -590,6 +602,10 @@ export default function ImportPage() {
       setClickHouseSyncPhase(phase);
       setClickHouseSyncMessage(message);
     };
+    if (!canManageWarehouse) {
+      setPhase("skipped", "Transactions are saved. Syncing them into ClickHouse needs warehouse access — ask an admin to run Continue Backfill on Integrations.");
+      return;
+    }
     console.info("[auto-sync] Import completed → starting automatic ClickHouse synchronization");
     setPhase("syncing", "Synchronizing ClickHouse…");
     try {
@@ -941,12 +957,13 @@ export default function ImportPage() {
   }, []);
 
   // Load durable sync state + restore subscriptions from the durable table on mount.
+  // Sync diagnostics: only for members who can run the sync (its card is hidden otherwise).
   const stagedSyncLoadedRef = useRef(false);
   useEffect(() => {
-    if (stagedSyncLoadedRef.current) return;
+    if (!canRunSync || stagedSyncLoadedRef.current) return;
     stagedSyncLoadedRef.current = true;
     void refreshStagedSyncState();
-  }, [refreshStagedSyncState]);
+  }, [canRunSync, refreshStagedSyncState]);
 
   // Reload the store's subscriptions from the durable table after a sync (no manual "refresh cache").
   const reloadSubscriptionsFromDurable = useCallback(async () => {
@@ -2231,6 +2248,7 @@ export default function ImportPage() {
         )}
       </Card>
 
+      {canRunSync && (
       <Card className="mt-3 p-4 shadow-card">
         <div className="mb-3 flex items-center gap-2">
           <KeyRound className="h-4 w-4 text-muted-foreground" />
@@ -2464,6 +2482,7 @@ export default function ImportPage() {
           );
         })()}
       </Card>
+      )}
 
       <Card className="mt-3 p-4 shadow-card">
         <div className="mb-3">

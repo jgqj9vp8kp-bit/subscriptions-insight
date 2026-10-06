@@ -1,6 +1,13 @@
 import type { TrafficMetric } from "@/services/trafficImport";
+import { deleteIndexedDbDatabase, rawCacheStamp, type CacheScopeOptions } from "@/services/analyticsCache";
+import { registerPurgeHandler } from "@/services/sessionPurge";
+import { traceEvent } from "@/services/performanceTrace";
 
-const DB_NAME = "subscriptions-insight-traffic-cache";
+// Raw Facebook traffic import — data owner only (plan D8). Partition-stamped
+// and purged exactly like palmerCache.ts.
+
+export const TRAFFIC_CACHE_DB_NAME = "subscriptions-insight-traffic-cache";
+const DB_NAME = TRAFFIC_CACHE_DB_NAME;
 const DB_VERSION = 1;
 const STORE_NAME = "facebook-traffic";
 const CACHE_KEY = "latest";
@@ -24,6 +31,8 @@ export interface TrafficCacheMetadata {
 export interface TrafficCachePayload {
   trafficMetrics: TrafficMetric[];
   metadata: TrafficCacheMetadata;
+  /** Access partition the entry was written under. */
+  partition?: string;
 }
 
 function openDb(): Promise<IDBDatabase> {
@@ -85,17 +94,31 @@ function buildMetadata(
 export async function saveTrafficDataToCache(
   trafficMetrics: TrafficMetric[],
   metadata: Partial<TrafficCacheMetadata> = {},
+  options: CacheScopeOptions = {},
 ): Promise<TrafficCacheMetadata> {
   const nextMetadata = buildMetadata(trafficMetrics, metadata);
+  const partition = rawCacheStamp(options);
+  if (!partition) {
+    traceEvent("traffic.cache_write_skipped", { reason: "no_raw_access" });
+    return nextMetadata;
+  }
   await withStore("readwrite", (store) =>
-    store.put({ trafficMetrics, metadata: nextMetadata } satisfies TrafficCachePayload, CACHE_KEY),
+    store.put({ trafficMetrics, metadata: nextMetadata, partition } satisfies TrafficCachePayload, CACHE_KEY),
   );
   return nextMetadata;
 }
 
-export async function loadLastTrafficDataFromCache(): Promise<TrafficCachePayload | null> {
+export async function loadLastTrafficDataFromCache(options: CacheScopeOptions = {}): Promise<TrafficCachePayload | null> {
+  const partition = rawCacheStamp(options);
+  if (!partition) return null;
   const payload = await withStore<TrafficCachePayload | undefined>("readonly", (store) => store.get(CACHE_KEY));
-  return payload ?? null;
+  if (!payload) return null;
+  if (payload.partition !== partition) {
+    traceEvent("traffic.cache_partition_mismatch", {});
+    await withStore("readwrite", (store) => store.delete(CACHE_KEY)).catch(() => undefined);
+    return null;
+  }
+  return payload;
 }
 
 export async function clearTrafficDataCache(): Promise<void> {
@@ -106,3 +129,5 @@ export async function getTrafficCacheInfo(): Promise<TrafficCacheMetadata | null
   const payload = await loadLastTrafficDataFromCache();
   return payload?.metadata ?? null;
 }
+
+registerPurgeHandler("traffic-indexeddb", () => deleteIndexedDbDatabase(DB_NAME));

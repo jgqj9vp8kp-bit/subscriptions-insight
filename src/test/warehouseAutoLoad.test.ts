@@ -23,6 +23,7 @@ import {
   isTransactionWarehouseEnabled,
 } from "@/services/transactionWarehouse";
 import { loadWarehouseTransactionsCached } from "@/services/transactionWarehouseCache";
+import { setActiveCacheAccess } from "@/services/analyticsCache";
 import { useDataStore } from "@/store/dataStore";
 import type { Transaction } from "@/services/types";
 
@@ -56,6 +57,7 @@ function whTx(id: string): Transaction {
 
 describe("autoLoadWarehouseIntoStore (P0-2)", () => {
   beforeEach(() => {
+    setActiveCacheAccess(null);
     useDataStore.getState().resetToMock();
     enabledMock.mockReset();
     countMock.mockReset();
@@ -196,5 +198,23 @@ describe("autoLoadWarehouseIntoStore (P0-2)", () => {
     // Critically: source remains "mock" so the UI keeps the visible "Sample data mode" banner
     // rather than silently showing mock numbers as if they were real.
     expect(useDataStore.getState().meta.source).toBe("mock");
+  });
+
+  it("drops a result that outlives its access partition (purge during the download)", async () => {
+    setActiveCacheAccess({ partition: "p-owner", rawAccess: true });
+    enabledMock.mockReturnValue(true);
+    countMock.mockResolvedValue(2);
+    loadMock.mockImplementation(async () => {
+      // Sign-out / account switch / access change while the download ran.
+      setActiveCacheAccess(null);
+      return [whTx("a"), whTx("b")];
+    });
+
+    const result = await autoLoadWarehouseIntoStore();
+
+    expect(result.status).toBe("skipped");
+    expect(getLegacyWarehouseLoadProgress().stopped_reason).toBe("access_changed_during_fetch");
+    expect(useDataStore.getState().meta.source).toBe("mock");
+    expect(useDataStore.getState().transactions.map((tx) => tx.transaction_id)).not.toContain("a");
   });
 });

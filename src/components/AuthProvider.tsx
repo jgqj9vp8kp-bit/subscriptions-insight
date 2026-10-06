@@ -117,11 +117,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
         throw new Error("Supabase is not configured.");
       },
-      async signOut() {
+      async signOut(options?: { scope?: "global" | "local" }) {
         sessionStorage.removeItem(LOCAL_AUTH_SESSION_KEY);
         setLocalUser(null);
         if (supabase) {
-          const { error } = await supabase.auth.signOut();
+          // No options: supabase-js's default (global), exactly as before.
+          const { error } = options?.scope ? await supabase.auth.signOut({ scope: options.scope }) : await supabase.auth.signOut();
           if (error) throw error;
         }
       },

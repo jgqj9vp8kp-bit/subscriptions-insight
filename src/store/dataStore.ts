@@ -5,6 +5,7 @@ import type { Transaction } from "@/services/types";
 import { backfillTransactionCardTypesFromRawRows, type PalmerImportDiagnostics, type RawPalmerRow } from "@/services/palmerTransform";
 import type { SubscriptionClean } from "@/types/subscriptions";
 import type { TrafficMetric } from "@/services/trafficImport";
+import { registerPurgeHandler } from "@/services/sessionPurge";
 
 export type DataSource = "mock" | "csv" | "google_sheet" | "palmer_raw" | "transaction_warehouse";
 export type ImportMode = "clean_template" | "palmer_raw" | "warehouse";
@@ -111,3 +112,27 @@ export const useDataStore = create<DataState>()(
     }
   )
 );
+
+/** Back to the signed-out initial state, persisted slice included. */
+export function resetDataStore(): void {
+  useDataStore.setState({
+    transactions: MOCK_TRANSACTIONS,
+    rawPalmerRows: [],
+    trafficMetrics: [],
+    trafficMeta: { importedAt: null, rowCount: 0 },
+    subscriptions: [],
+    lastSubscriptionSyncAt: null,
+    meta: initialMeta,
+  });
+  try {
+    useDataStore.persist.clearStorage();
+  } catch {
+    // storage unavailable — the in-memory reset above is what matters
+  }
+}
+
+// The store holds the data owner's raw datasets (warehouse transactions, Palmer
+// rows, FunnelFox subscriptions with emails, traffic). Drop them on sign-out,
+// account switch and access change (plan §20); SavedDataAutoLoader reloads them
+// for the new partition when it still has raw access.
+registerPurgeHandler("data-store", resetDataStore);

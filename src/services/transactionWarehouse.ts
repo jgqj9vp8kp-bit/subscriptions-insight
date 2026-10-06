@@ -5,9 +5,18 @@ import { declineDetailsForTransaction } from "@/services/paymentFailures";
 import { sha256Hex } from "@/services/sha256";
 import { traceAsync, traceEvent, traceRequest } from "@/services/performanceTrace";
 import { fetchRangesConcurrently } from "@/services/supabasePagination";
+import { deleteIndexedDbDatabase } from "@/services/analyticsCache";
+import { registerPurgeHandler } from "@/services/sessionPurge";
 import type { TrafficSource, Transaction } from "@/services/types";
 
 export const USE_TRANSACTION_WAREHOUSE = publicRuntimeConfig.useTransactionWarehouse;
+
+// IndexedDB delta cache of the warehouse records (transactionWarehouseCache.ts
+// DB_NAME — keep the two in sync). It holds the data owner's raw transactions,
+// so the session purge deletes the whole database (plan §20). Registered here
+// because this module is loaded at app start with the auto-loader.
+export const WAREHOUSE_TRANSACTIONS_CACHE_DB_NAME = "subscriptions-insight-warehouse-cache";
+registerPurgeHandler("warehouse-indexeddb", () => deleteIndexedDbDatabase(WAREHOUSE_TRANSACTIONS_CACHE_DB_NAME));
 export const TRANSACTION_WAREHOUSE_CHUNK_SIZE = 1000;
 export const TRANSACTION_WAREHOUSE_SELECT_PAGE_SIZE = 1000;
 

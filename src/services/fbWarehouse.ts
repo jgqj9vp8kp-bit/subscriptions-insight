@@ -26,6 +26,7 @@ export type {
   FbLevel,
   FbListRow,
   FbReportResponse,
+  FbSourceProbeResult,
   FbSyncResult,
 };
 
@@ -61,12 +62,18 @@ export function normalizeFbReportQuery(query: FbReportQuery): NormalizedFbReport
   };
 }
 
+// `userScopeHash` is the access partition (useAccess().partition).
 export function fbReportKey(parts: {
   userScopeHash: string;
   warehouseVersion: string;
   query: FbReportQuery;
 }): [string, "report", string, string, NormalizedFbReportQuery] {
   return [FB_ANALYTICS_QUERY_ROOT, "report", parts.userScopeHash, parts.warehouseVersion, normalizeFbReportQuery(parts.query)];
+}
+
+/** FB reconciliation history (admin diagnostics) — keyed by the access partition. */
+export function fbReconHistoryKey(partition: string) {
+  return ["fb-recon-history", partition] as const;
 }
 
 // Non-reversible fingerprint of the FB warehouse state — changes after every

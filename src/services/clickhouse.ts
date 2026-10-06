@@ -16,6 +16,8 @@ import type {
   SupportResponse,
 } from "../../supabase/functions/_shared/clickhouse/supportContract";
 import { traceEvent, traceRequest } from "@/services/performanceTrace";
+import { registerPurgeHandler } from "@/services/sessionPurge";
+import { ACCESS_ERROR } from "../../supabase/functions/_shared/access/errors";
 
 // Frontend bridge to Supabase Edge Functions. This module NEVER sees
 // ClickHouse credentials — it only invokes authenticated Edge Functions.
@@ -88,6 +90,23 @@ export interface ClickHouseBackfillResult {
   clickhouse_total: number;
   diagnostics?: Record<string, unknown>;
   duration_ms: number;
+  /** stopped_reason "already_running": when the other run's lease turns stale. */
+  lease_retry_after?: string | null;
+}
+
+/** Toast line for a backfill result. "already_running" means another run holds
+ * the server-side lease — it is still running, or it was killed and the lease
+ * frees itself once stale — so say that, and when a retry can succeed, instead
+ * of "inserted 0 rows". */
+export function describeClickHouseBackfillResult(result: ClickHouseBackfillResult, locale = "en-US"): string {
+  if (result.stopped_reason === "already_running") {
+    const retryAt = result.lease_retry_after ? new Date(result.lease_retry_after) : null;
+    const when = retryAt && !Number.isNaN(retryAt.getTime())
+      ? ` Retry after ${retryAt.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" })} if it was interrupted.`
+      : " Retry in a few minutes if it was interrupted.";
+    return `Another backfill run holds the lease (still running, or interrupted).${when}`;
+  }
+  return `${result.status}: inserted ${result.rows_inserted.toLocaleString(locale)} rows, stopped: ${result.stopped_reason}.`;
 }
 
 export interface ClickHouseSyncState {
@@ -134,6 +153,10 @@ export interface ClickHouseSummary {
   cohort_snapshot_state?: ClickHouseCohortSnapshotState | null;
   support_sync_state?: ClickHouseSyncState | null;
   error?: string;
+  /** True for the member view of clickhouse-summary (no raw access and no
+   * admin.diagnostics.view): only lifecycle status, timestamps and opaque
+   * version tokens are present — no KPIs, counts or error text. */
+  redacted?: boolean;
 }
 
 export interface ClickHouseValidationMetric {
@@ -227,23 +250,137 @@ async function sessionToken(): Promise<string> {
   return token;
 }
 
-async function readStructuredText(text: string): Promise<string> {
-  if (!text) return "Edge Function returned an empty error body.";
-  try {
-    const payload = JSON.parse(text) as { error?: unknown; message?: unknown };
-    return String(payload.error ?? payload.message ?? text);
-  } catch {
-    return text.slice(0, 500);
+// --- Typed Edge errors (plan §14 "Typed errors", §27 R12) -------------------
+// A non-2xx Edge response becomes a ClickHouseRequestError carrying the HTTP
+// status and the gate's error_code / request_id, so callers branch on the code
+// instead of parsing prose. The message stays the exact text it always was
+// ("ClickHouse Edge Function failed: <server error>"), so existing UI and tests
+// keep working. A failure with no HTTP response at all (network, CORS) stays a
+// plain Error.
+
+/** error_code values of an access DENIAL: the request was refused because of who
+ * is asking (session, membership, role, funnel scope), never because the
+ * warehouse failed. "not_found" (R11: out-of-scope entity ids answer 404),
+ * "scope_snapshot_not_ready" (R8, 409) and "escalation_denied" (admin API) are
+ * the plan's codes beyond the gate's own list. */
+const ACCESS_DENIAL_CODES: ReadonlySet<string> = new Set<string>([
+  ACCESS_ERROR.INVALID_SESSION,
+  ACCESS_ERROR.NO_MEMBERSHIP,
+  ACCESS_ERROR.MEMBERSHIP_DISABLED,
+  ACCESS_ERROR.PERMISSION_DENIED,
+  ACCESS_ERROR.RAW_ACCESS_REQUIRED,
+  ACCESS_ERROR.OWNER_REQUIRED,
+  ACCESS_ERROR.FULL_SCOPE_REQUIRED,
+  ACCESS_ERROR.SCOPE_NOT_SUPPORTED,
+  ACCESS_ERROR.POLICY_MISSING,
+  ACCESS_ERROR.INVALID_CRON_SECRET,
+  ACCESS_ERROR.TENANT_MISMATCH,
+  ACCESS_ERROR.CRON_ACTION_NOT_ALLOWED,
+  "not_found",
+  "scope_snapshot_not_ready",
+  "escalation_denied",
+]);
+
+/** 503 codes the gate answers while resolving WHO is asking (auth service,
+ * access resolver, missing workspace, missing config). Retry later — never a
+ * sign-out, never a warehouse outage. */
+export const ACCESS_SERVICE_ERROR_CODES: ReadonlySet<string> = new Set<string>([
+  ACCESS_ERROR.AUTH_SERVICE_ERROR,
+  ACCESS_ERROR.ACCESS_SERVICE_ERROR,
+  ACCESS_ERROR.WORKSPACE_NOT_BOOTSTRAPPED,
+  ACCESS_ERROR.SERVER_NOT_CONFIGURED,
+  ACCESS_ERROR.CRON_NOT_CONFIGURED,
+]);
+
+const ACCESS_ERROR_STATUSES: ReadonlySet<number> = new Set([401, 403, 404, 409]);
+
+/** True for any access-layer error_code (a denial or an access-service 503). */
+export function isAccessErrorCode(code: string | null | undefined): boolean {
+  return typeof code === "string" && (ACCESS_DENIAL_CODES.has(code) || ACCESS_SERVICE_ERROR_CODES.has(code));
+}
+
+export class ClickHouseRequestError extends Error {
+  /** HTTP status of the Edge response (always a non-2xx status). */
+  readonly status: number;
+  /** The gate's error_code, when the body carried one. */
+  readonly errorCode: string | null;
+  /** body.request_id, else the x-request-id response header. */
+  readonly requestId: string | null;
+
+  constructor(message: string, details: { status: number; errorCode?: string | null; requestId?: string | null }) {
+    super(message);
+    this.name = "ClickHouseRequestError";
+    this.status = details.status;
+    this.errorCode = details.errorCode ?? null;
+    this.requestId = details.requestId ?? null;
   }
 }
 
-async function readFunctionError(error: unknown): Promise<string> {
+/** 401/403/404/409 with an access error_code: the server refused this principal.
+ * Never retried, never a legacy fallback, never opens the breaker (R12). */
+export function isAccessError(error: unknown): error is ClickHouseRequestError {
+  return (
+    error instanceof ClickHouseRequestError &&
+    ACCESS_ERROR_STATUSES.has(error.status) &&
+    typeof error.errorCode === "string" &&
+    ACCESS_DENIAL_CODES.has(error.errorCode)
+  );
+}
+
+/** 503 from the access layer (auth/access service, workspace not bootstrapped):
+ * retry later through the access refresh, not per query. */
+export function isAccessServiceError(error: unknown): error is ClickHouseRequestError {
+  return (
+    error instanceof ClickHouseRequestError &&
+    error.status === 503 &&
+    typeof error.errorCode === "string" &&
+    ACCESS_SERVICE_ERROR_CODES.has(error.errorCode)
+  );
+}
+
+interface EdgeFailure {
+  message: string;
+  /** null when no HTTP response arrived (network / CORS / relay without context). */
+  status: number | null;
+  errorCode: string | null;
+  requestId: string | null;
+}
+
+function nonEmptyText(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function readStructuredText(text: string): Pick<EdgeFailure, "message" | "errorCode" | "requestId"> {
+  if (!text) return { message: "Edge Function returned an empty error body.", errorCode: null, requestId: null };
+  try {
+    const payload = JSON.parse(text) as { error?: unknown; message?: unknown; error_code?: unknown; request_id?: unknown };
+    return {
+      message: String(payload.error ?? payload.message ?? text),
+      errorCode: nonEmptyText(payload.error_code),
+      requestId: nonEmptyText(payload.request_id),
+    };
+  } catch {
+    return { message: text.slice(0, 500), errorCode: null, requestId: null };
+  }
+}
+
+async function readFunctionFailure(error: unknown): Promise<EdgeFailure> {
   const context = (error as { context?: unknown })?.context;
   if (context instanceof Response) {
     const text = await context.clone().text().catch(() => "");
-    return readStructuredText(text);
+    const parsed = readStructuredText(text);
+    return {
+      ...parsed,
+      status: context.status,
+      requestId: parsed.requestId ?? nonEmptyText(context.headers.get("x-request-id")),
+    };
   }
-  return error instanceof Error ? error.message : "ClickHouse Edge Function request failed.";
+  return {
+    message: error instanceof Error ? error.message : "ClickHouse Edge Function request failed.",
+    status: null,
+    errorCode: null,
+    requestId: null,
+  };
 }
 
 // --- ClickHouse circuit breaker (client-side) ------------------------------
@@ -258,7 +395,11 @@ async function readFunctionError(error: unknown): Promise<string> {
 // Maintenance calls (health/init/backfill/validation) are never gated: they
 // must be able to probe the real state. Any successful edge response closes
 // the breaker, so recovery is automatic once the warehouse is back.
+// Only transport failures (no HTTP response) and 502/504 can open it: an access
+// refusal (401/403/404/409) or an access-service 503 says nothing about the
+// warehouse, so it must never push the owner onto the legacy engine (R12).
 const CLICKHOUSE_BREAKER_COOLDOWN_MS = 45_000;
+const BREAKER_HTTP_STATUSES: ReadonlySet<number> = new Set([502, 504]);
 let clickHouseBreakerOpenUntil = 0;
 
 export const CLICKHOUSE_UNAVAILABLE_MESSAGE =
@@ -278,6 +419,16 @@ export function noteClickHouseReachable(): void {
  * query/auth/validation problem. Only these open the breaker. */
 export function isWarehouseDownError(message: string): boolean {
   return /connection reset|connection refused|connection closed|econnreset|econnrefused|etimedout|timed out|timeout|tls|handshake|socket hang|network error|failed to fetch|fetch failed|unavailable|bad gateway|status 50[234]|50[234] /i.test(message);
+}
+
+/** Whether one failed Edge call may open the breaker: never for an access
+ * error_code, never for an HTTP status other than 502/504, and otherwise only
+ * when the message has the warehouse-down shape. `status` null = no HTTP
+ * response (transport failure). */
+export function shouldOpenClickHouseCircuit(failure: { status: number | null; errorCode?: string | null; message: string }): boolean {
+  if (isAccessErrorCode(failure.errorCode)) return false;
+  if (failure.status !== null && !BREAKER_HTTP_STATUSES.has(failure.status)) return false;
+  return isWarehouseDownError(failure.message);
 }
 
 function openClickHouseCircuit(functionName: string, message: string): void {
@@ -303,9 +454,12 @@ async function clickHouseRequest<T>(
     request_bytes: JSON.stringify(body).length,
   });
   if (error) {
-    const message = await readFunctionError(error);
-    if (isWarehouseDownError(message)) openClickHouseCircuit(functionName, message);
-    throw new Error(`ClickHouse Edge Function failed: ${message}`);
+    const failure = await readFunctionFailure(error);
+    if (shouldOpenClickHouseCircuit(failure)) openClickHouseCircuit(functionName, failure.message);
+    const message = `ClickHouse Edge Function failed: ${failure.message}`;
+    if (failure.status === null) throw new Error(message);
+    if (failure.errorCode) traceEvent("clickhouse.edge_error", { edge_function: functionName, status: failure.status, error_code: failure.errorCode });
+    throw new ClickHouseRequestError(message, failure as EdgeFailure & { status: number });
   }
   if (!data || typeof data !== "object") throw new Error("Invalid ClickHouse Edge Function response.");
   // Some endpoints report failures as 200 + {ok:false,error}: never treat those
@@ -314,7 +468,8 @@ async function clickHouseRequest<T>(
   // testClickHouseConnection closes the breaker only on connected=true.
   const embedded = (data as { ok?: unknown; error?: unknown }).ok === false ? String((data as { error?: unknown }).error ?? "") : null;
   if (embedded != null) {
-    if (isWarehouseDownError(embedded)) openClickHouseCircuit(functionName, embedded);
+    const embeddedCode = nonEmptyText((data as { error_code?: unknown }).error_code);
+    if (!isAccessErrorCode(embeddedCode) && isWarehouseDownError(embedded)) openClickHouseCircuit(functionName, embedded);
   } else if (functionName !== CLICKHOUSE_HEALTH_FUNCTION) {
     noteClickHouseReachable();
   }
@@ -473,6 +628,9 @@ export async function autoSyncClickHouseAfterImport(): Promise<AutoSyncResult> {
   try {
     for (let loop = 0; loop < AUTO_SYNC_MAX_LOOPS; loop += 1) {
       const result = await runClickHouseBackfill(AUTO_SYNC_CONTINUE_REQUEST);
+      // The server's run lease is held by another backfill (it read and wrote
+      // nothing): the same outcome as the sync_state probe above.
+      if (result.stopped_reason === "already_running" && loop === 0) return skipped("already_running_server");
       last = result;
       rowsInserted += result.rows_inserted;
       rowsScanned += result.rows_scanned;
@@ -526,25 +684,42 @@ export async function validateClickHouseTransactions(validationScope: "full_data
 const SUMMARY_TTL_MS = 30_000;
 let summaryCache: { at: number; value: ClickHouseSummary } | null = null;
 let summaryInFlight: Promise<ClickHouseSummary> | null = null;
+/** Bumped by the session purge: a summary requested for the previous principal
+ * may still resolve, but it is never memoized for whoever is signed in now. */
+let summaryGeneration = 0;
 
 export async function getClickHouseSummary(): Promise<ClickHouseSummary> {
   if (summaryCache && Date.now() - summaryCache.at < SUMMARY_TTL_MS) return summaryCache.value;
   if (summaryInFlight) return summaryInFlight;
-  summaryInFlight = clickHouseRequest<ClickHouseSummary>(CLICKHOUSE_SUMMARY_FUNCTION, {}, { breakerGated: true })
+  const generation = summaryGeneration;
+  const pending: Promise<ClickHouseSummary> = clickHouseRequest<ClickHouseSummary>(CLICKHOUSE_SUMMARY_FUNCTION, {}, { breakerGated: true })
     .then((value) => {
-      summaryCache = { at: Date.now(), value };
+      if (generation === summaryGeneration) summaryCache = { at: Date.now(), value };
       return value;
     })
     .finally(() => {
-      summaryInFlight = null;
+      if (summaryInFlight === pending) summaryInFlight = null;
     });
-  return summaryInFlight;
+  summaryInFlight = pending;
+  return pending;
 }
 
 /** Drop the memoized summary so the next call refetches (post-sync refresh). */
 export function invalidateClickHouseSummaryCache(): void {
   summaryCache = null;
 }
+
+/** Forget every module memo of this bridge: the summary (memo + in-flight) and
+ * the breaker state. Both were observed by the previous principal / access
+ * partition, so the session purge resets them (plan §20). */
+export function resetClickHouseClientState(): void {
+  summaryGeneration += 1;
+  summaryCache = null;
+  summaryInFlight = null;
+  clickHouseBreakerOpenUntil = 0;
+}
+
+registerPurgeHandler("clickhouse-client-memos", resetClickHouseClientState);
 
 // --- Revenue Intelligence read path (clickhouse-revenue Edge Function) -----
 

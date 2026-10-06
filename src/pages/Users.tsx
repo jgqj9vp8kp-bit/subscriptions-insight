@@ -25,8 +25,7 @@ import {
 import { useTransactions } from "@/services/sheets";
 import { computeCohorts, computeUsers, formatCurrency } from "@/services/analytics";
 import { UNKNOWN_COUNTRY, buildLegacyCountryOptions, usersDataSourceMode, type UsersDeclineQuery, type UsersQuery } from "@/services/usersDataSource";
-import { useAuth } from "@/hooks/useAuth";
-import { hashUserScope } from "@/services/analyticsCache";
+import { useAccess } from "@/hooks/useAccess";
 import { useWarehouseVersion } from "@/hooks/useAnalyticsCache";
 import { useUsersData, useUsersDeclineData } from "@/hooks/useUsersCache";
 import { formatUpdatedAgo } from "@/services/analyticsProgress";
@@ -497,9 +496,16 @@ export default function UsersPage() {
   // performs NO transaction scan. Legacy is the fallback when: the flag is
   // legacy, ClickHouse errors, or a cohort selection is active (not reproduced
   // server-side).
-  const usersSource = useMemo(() => usersDataSourceMode(), []);
-  const { user } = useAuth();
-  const userScopeHash = useMemo(() => hashUserScope(user?.id), [user?.id]);
+  //
+  // The legacy fallback recomputes from the browser transaction store, which
+  // only the data owner hydrates (D8). Everyone else always reads the Edge
+  // function (the legacy flag is ignored) and an Edge error is shown as an
+  // error, never recomputed in the browser.
+  const { rawAccess, partition } = useAccess();
+  const legacyFallbackAllowed = rawAccess;
+  const usersSource = useMemo(() => (legacyFallbackAllowed ? usersDataSourceMode() : "clickhouse"), [legacyFallbackAllowed]);
+  // The access partition (plan §20): the cache key is per principal, role and scope.
+  const userScopeHash = partition;
   const { version: warehouseVersion, ready: warehouseVersionReady } = useWarehouseVersion(usersSource === "clickhouse");
   const [appliedSearch] = useDebouncedValue(search, 300);
   const [page, setPage] = useState(1);
@@ -601,11 +607,14 @@ export default function UsersPage() {
   });
   // Legacy fallback (unchanged emergency path): legacy flag, a cohort selection
   // (not reproduced server-side), or a ClickHouse error WITH no cached data to
-  // keep showing. A failed background refresh keeps the cached rows.
+  // keep showing. A failed background refresh keeps the cached rows. Data owner
+  // only (see usersSource).
   const usersNeedLegacy =
-    (!usersServerEligible && !declineServerEligible) ||
-    (usersServerEligible && chStatus.error !== null && chUsers == null) ||
-    (declineServerEligible && chDeclineStatus.error !== null && chDecline == null);
+    legacyFallbackAllowed && (
+      (!usersServerEligible && !declineServerEligible) ||
+      (usersServerEligible && chStatus.error !== null && chUsers == null) ||
+      (declineServerEligible && chDeclineStatus.error !== null && chDecline == null)
+    );
   const usersClickHouseDriving = usersServerEligible && chUsers != null;
   const declineClickHouseDriving = declineServerEligible && chDecline != null;
   // Platform is a server-only filter, by the same rule the Cohorts page already
@@ -1568,7 +1577,7 @@ export default function UsersPage() {
             <span className="font-medium text-foreground">Users data source</span>
             <span>
               engine:{" "}
-              <span className="font-mono text-foreground">{usersClickHouseDriving ? "clickhouse" : "legacy (fallback)"}</span>
+              <span className="font-mono text-foreground">{usersClickHouseDriving || !legacyFallbackAllowed ? "clickhouse" : "legacy (fallback)"}</span>
             </span>
             {/* Honest staged progress (estimated; no server row-level progress). */}
             {isInitialLoading && (
@@ -1593,8 +1602,10 @@ export default function UsersPage() {
             {chUsers?.subscriptionDataStatus && (
               <span>subscriptions: <span className="font-mono text-foreground">{chUsers.subscriptionDataStatus}</span></span>
             )}
-            {chStatus.error && chUsers == null && <span className="text-destructive">ClickHouse error — using legacy: {chStatus.error}</span>}
-            {!usersClickHouseDriving && !chStatus.error && hasSelectedCohortsRaw && (
+            {chStatus.error && chUsers == null && (
+              <span className="text-destructive">{legacyFallbackAllowed ? "ClickHouse error — using legacy" : "ClickHouse error"}: {chStatus.error}</span>
+            )}
+            {legacyFallbackAllowed && !usersClickHouseDriving && !chStatus.error && hasSelectedCohortsRaw && (
               <span className="text-warning">cohort selection uses the client dataset</span>
             )}
           </div>
@@ -1869,7 +1880,7 @@ export default function UsersPage() {
                 <span className="font-medium text-foreground">Decline data source</span>
                 <span>
                   engine:{" "}
-                  <span className="font-mono text-foreground">{declineClickHouseDriving ? "clickhouse" : "legacy (fallback)"}</span>
+                  <span className="font-mono text-foreground">{declineClickHouseDriving || !legacyFallbackAllowed ? "clickhouse" : "legacy (fallback)"}</span>
                 </span>
                 {isDeclineInitialLoading && (
                   <span className="flex items-center gap-2 text-muted-foreground">
@@ -1897,9 +1908,9 @@ export default function UsersPage() {
                   </span>
                 )}
                 {chDeclineStatus.error && chDecline == null && (
-                  <span className="text-destructive">ClickHouse error — using legacy: {chDeclineStatus.error}</span>
+                  <span className="text-destructive">{legacyFallbackAllowed ? "ClickHouse error — using legacy" : "ClickHouse error"}: {chDeclineStatus.error}</span>
                 )}
-                {!declineClickHouseDriving && !chDeclineStatus.error && hasSelectedCohortsRaw && (
+                {legacyFallbackAllowed && !declineClickHouseDriving && !chDeclineStatus.error && hasSelectedCohortsRaw && (
                   <span className="text-warning">cohort selection uses the client dataset</span>
                 )}
               </div>

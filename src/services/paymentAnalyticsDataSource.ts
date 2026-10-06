@@ -25,6 +25,11 @@ export interface PaymentAnalyticsQuery {
   funnel: string; campaignPath: string; campaignId: string; mediaBuyer: string; country: string; cardType: string;
   stage: string; declineReason: string; transactionType: string; outcome: "all" | "success" | "failed";
   groupBy: SegmentDimension; firstTxDimension: SegmentDimension; renewalDimension: SegmentDimension;
+  /** Set only by the AI signal chips (useAiCohortSignals): the server routes the
+   * call to its `ai_pass_rates` action (ai.use + the hosting page, not
+   * payment_pass.view) and may answer a reduced bundle. Mirrors
+   * PAYMENT_ANALYTICS_AI_PURPOSE in policies/clickhouse-payment-analytics.ts. */
+  purpose?: "ai_pass_rates";
 }
 
 export interface PaymentAnalyticsBundle {
@@ -51,6 +56,8 @@ export function buildPaymentAnalyticsRequest(q: PaymentAnalyticsQuery): Record<s
       outcome: q.outcome,
     },
     group_by: q.groupBy, first_tx_dimension: q.firstTxDimension, renewal_dimension: q.renewalDimension,
+    // Only the AI pass-rate call carries it; every other request is unchanged.
+    ...(q.purpose ? { purpose: q.purpose } : {}),
   };
 }
 

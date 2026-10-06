@@ -10,6 +10,7 @@
 // state of the page — the report is complete without prose — and must never be
 // shown as an error.
 import { supabase } from "@/services/supabaseClient";
+import { isUnavailableRefusal, readEdgeInvokeRefusal } from "@/services/edgeInvokeError";
 import type {
   NarrativeInput, NarrativeResponse, NarrativeViolation,
 } from "@/services/reportNarrative";
@@ -53,6 +54,14 @@ export async function generateNarrative(options: {
   });
 
   if (error) {
+    // A refusal by the access gate (no reports.edit / ai.use, restricted funnel
+    // scope) is an expected state for this member: calm "unavailable".
+    const refusal = await readEdgeInvokeRefusal(error);
+    if (isUnavailableRefusal(refusal)) return { kind: "unavailable", reason: "Генерация текста недоступна для вашей роли." };
+    // The report is not the caller's (or no longer exists): a real error.
+    if (refusal?.status === 404 && refusal.errorCode === "report_not_found") {
+      return { kind: "error", message: refusal.message ?? "Report not found." };
+    }
     // The function is deployed to answer 200 with a reason, so reaching here
     // means the call itself failed — most often the function is not deployed.
     return { kind: "error", message: error.message };

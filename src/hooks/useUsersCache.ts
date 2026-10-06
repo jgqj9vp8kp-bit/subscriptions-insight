@@ -20,7 +20,7 @@ import {
 } from "@/services/usersDataSource";
 import { usersListKey, usersSummaryKey, usersOptionsKey, usersDeclineKey, normalizeUsersRequest, normalizeUsersDeclineRequest } from "@/services/usersCache";
 import { recordDuration } from "@/services/analyticsProgress";
-import { GC_MS, STALE_MS, transientRetry, useAnalyticsProgress } from "@/hooks/useAnalyticsCache";
+import { GC_MS, STALE_MS, transientRetry, useAnalyticsProgress, useCacheScope } from "@/hooks/useAnalyticsCache";
 import { traceEvent, traceHash, traceRequest } from "@/services/performanceTrace";
 
 const NS = "users";
@@ -49,8 +49,10 @@ export function useUsersData(params: {
   /** Options can stay live (e.g. on the Decline tab) while list/summary are off. */
   optionsEnabled?: boolean;
 }): UseUsersDataResult {
-  const { query, userScopeHash, warehouseVersion, enabled } = params;
-  const optionsEnabled = params.optionsEnabled ?? enabled;
+  const { query, warehouseVersion } = params;
+  const userScopeHash = useCacheScope(params.userScopeHash);
+  const enabled = params.enabled && userScopeHash !== "";
+  const optionsEnabled = (params.optionsEnabled ?? params.enabled) && userScopeHash !== "";
 
   const listKey = useMemo(() => usersListKey({ userScopeHash, warehouseVersion, request: query }), [userScopeHash, warehouseVersion, query]);
   const summaryKey = useMemo(() => usersSummaryKey({ userScopeHash, warehouseVersion, request: query }), [userScopeHash, warehouseVersion, query]);
@@ -164,7 +166,9 @@ export function useUsersDeclineData(params: {
   warehouseVersion: string;
   enabled: boolean;
 }): UseUsersDeclineDataResult {
-  const { query, userScopeHash, warehouseVersion, enabled } = params;
+  const { query, warehouseVersion } = params;
+  const userScopeHash = useCacheScope(params.userScopeHash);
+  const enabled = params.enabled && userScopeHash !== "";
   const declineKey = useMemo(() => usersDeclineKey({ userScopeHash, warehouseVersion, request: query }), [userScopeHash, warehouseVersion, query]);
   const declineHash = useMemo(() => traceHash(declineKey), [declineKey]);
   const activeKey = useMemo(() => JSON.stringify(normalizeUsersDeclineRequest(query)), [query]);

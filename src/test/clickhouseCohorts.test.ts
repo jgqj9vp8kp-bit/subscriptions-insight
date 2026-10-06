@@ -250,11 +250,29 @@ describe("clickhouse-cohorts support data status", () => {
     expect(status).toEqual({ support_data_status: "ready", support_requests: 3, support_unique_emails: 2 });
   });
 
-  it("reports empty_source, sync_pending, and unavailable without throwing", async () => {
-    await expect(supportDataStatus(clientFor([[{ c: 1 }], [{ support_requests: 0, support_unique_emails: 0 }], [{ c: 0 }]]) as never, "u"))
-      .resolves.toMatchObject({ support_data_status: "empty_source" });
-    await expect(supportDataStatus(clientFor([[{ c: 1 }], [{ support_requests: 0, support_unique_emails: 0 }], [{ c: 9 }]]) as never, "u"))
-      .resolves.toMatchObject({ support_data_status: "sync_pending" });
+  // Phase 0 (access control): the probe used to fall back to a count over
+  // EVERY tenant's support rows to report "sync_pending". That cross-tenant
+  // read is gone — a tenant without support rows is empty_source, whatever
+  // other tenants hold, and no query runs without the tenant predicate.
+  it("reports empty_source and unavailable without throwing, never reading other tenants", async () => {
+    const queries: Array<{ query: string; query_params?: Record<string, unknown> }> = [];
+    const rows: Array<unknown[]> = [[{ c: 1 }], [{ support_requests: 0, support_unique_emails: 0 }], [{ c: 9 }]];
+    const recording = {
+      query: async (input: { query: string; query_params?: Record<string, unknown> }) => {
+        queries.push(input);
+        const result = rows[queries.length - 1] ?? [];
+        return { json: async () => result };
+      },
+    };
+    await expect(supportDataStatus(recording as never, "u")).resolves.toEqual({
+      support_data_status: "empty_source",
+      support_requests: 0,
+      support_unique_emails: 0,
+    });
+    expect(queries).toHaveLength(2);
+    expect(queries[0].query).toContain("system.tables");
+    expect(queries[1].query).toContain("WHERE auth_user_id = {auth_user_id:String}");
+    expect(queries[1].query_params).toEqual({ auth_user_id: "u" });
     await expect(supportDataStatus({ query: async () => { throw new Error("no table"); } } as never, "u"))
       .resolves.toMatchObject({ support_data_status: "unavailable" });
   });

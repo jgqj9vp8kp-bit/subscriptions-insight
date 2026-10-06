@@ -6,11 +6,14 @@ import {
 
 // Fakes: the RPC returns the jsonb {email: [sub_ids]}; the ClickHouse query
 // returns the snapshot's (email, cohort_date, funnel, campaign_path) rows.
+// The RPC must be the tenant-scoped overload (Phase 0): the Edge client is
+// service-role, so the legacy no-arg form read every account's subscriptions.
 function fakeSupabase(rpcData: unknown) {
   return {
     from: () => { throw new Error("unexpected .from()"); },
-    rpc: async (fn: string) => {
+    rpc: async (fn: string, params?: Record<string, unknown>) => {
       expect(fn).toBe("active_funnelfox_subscription_emails");
+      expect(params).toEqual({ p_data_key: "u" });
       return { data: rpcData, error: null };
     },
   } as never;

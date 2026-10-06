@@ -8,8 +8,10 @@
 import { useEffect, useMemo } from "react";
 import { computeAiSignals, type AiEngineOutput, type AiPassRateSlice, type AiRecommendation } from "@/services/aiSignals";
 import type { AiCampaignDailyPoint } from "@/services/aiCampaignSeries";
-import { computeAiContextHash, maybeWriteAiRecommendations } from "@/services/aiRecommendationLog";
+import { aiAccessScopeKey, computeAiContextHash, maybeWriteAiRecommendations } from "@/services/aiRecommendationLog";
+import { useOptionalAccess } from "@/hooks/useAccess";
 import { usePaymentAnalyticsBundle } from "@/hooks/usePaymentAnalyticsCache";
+import { useCacheScope } from "@/hooks/useAnalyticsCache";
 import type { PaymentAnalyticsQuery } from "@/services/paymentAnalyticsDataSource";
 import type { SegmentRow } from "@/services/paymentPassAnalytics";
 import type { FbAnalyticsRow } from "@/services/fbAnalytics";
@@ -46,6 +48,9 @@ function basePaymentQuery(dateFrom: string | null, dateTo: string | null, groupB
     country: "all", cardType: "all", stage: "all", declineReason: "all",
     transactionType: "all", outcome: "all",
     groupBy, firstTxDimension: "funnel", renewalDimension: "funnel",
+    // Routes to the server's ai_pass_rates action (ai.use + the hosting page)
+    // instead of the Payment Pass bundle (payment_pass.view).
+    purpose: "ai_pass_rates",
   };
 }
 
@@ -59,11 +64,20 @@ function useAiContextHash(params: {
   contextKey: string | undefined;
   dateFrom: string | null;
   dateTo: string | null;
+  /** Caller's cache scope (inside the AccessProvider the access partition
+   * wins); used only to wait for resolved access. Principals never share
+   * history rows (own-row RLS); funnel scopes never share a hash. */
+  userScopeHash: string;
 }): string | null {
   const { surface, contextKey, dateFrom, dateTo } = params;
+  // The partition only gates WHEN a hash exists (access resolved); the hash
+  // itself keys on the funnel scope, which survives role edits and the
+  // legacy → bootstrapped switch (aiAccessScopeKey).
+  const partition = useCacheScope(params.userScopeHash);
+  const accessScope = aiAccessScopeKey(useOptionalAccess());
   return useMemo(
-    () => (contextKey === undefined ? null : computeAiContextHash({ surface, dateFrom, dateTo, contextKey })),
-    [surface, contextKey, dateFrom, dateTo],
+    () => (contextKey === undefined || !partition ? null : computeAiContextHash({ surface, dateFrom, dateTo, contextKey, accessScope })),
+    [surface, contextKey, dateFrom, dateTo, partition, accessScope],
   );
 }
 
@@ -157,7 +171,7 @@ export function useAiCohortSignals(params: {
     return map;
   }, [output]);
 
-  const contextHash = useAiContextHash({ surface: "cohort", contextKey, dateFrom, dateTo });
+  const contextHash = useAiContextHash({ surface: "cohort", contextKey, dateFrom, dateTo, userScopeHash });
   useAiSnapshotWriter({ output, contextHash, warehouseVersion, settled: !payment.isInitialLoading });
 
   return { output, byCohort, byPath, contextHash, paymentLoading: payment.isInitialLoading };
@@ -224,7 +238,7 @@ export function useAiCampaignSignals(params: {
     return map;
   }, [output]);
 
-  const contextHash = useAiContextHash({ surface: "campaign", contextKey, dateFrom, dateTo });
+  const contextHash = useAiContextHash({ surface: "campaign", contextKey, dateFrom, dateTo, userScopeHash });
   useAiSnapshotWriter({ output, contextHash, warehouseVersion, settled: !payment.isInitialLoading });
 
   return { output, byCampaign, contextHash, paymentLoading: payment.isInitialLoading };

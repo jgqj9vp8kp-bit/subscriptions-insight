@@ -1,3 +1,7 @@
+// clickhouse-summary runner: the tenant KPI aggregate, the warehouse state rows
+// the browser fingerprints into its cache versions, and the redacted "member
+// view" of those states for callers who may run the version probe but not see
+// tenant totals (policies/clickhouse-summary.ts decides which view applies).
 import type { ClickHouseClientLike, SupabaseLikeClient } from "./types.ts";
 import { ANALYTICS_TRANSACTIONS_TABLE } from "./schema.ts";
 
@@ -103,5 +107,106 @@ export async function getClickHouseSummary(input: {
       source_duration_ms: sourceDuration,
       clickhouse_duration_ms: ch.duration,
     },
+  };
+}
+
+// ---- Warehouse state rows (Postgres, service role → always tenant-filtered) ---
+
+export type WarehouseStateRow = Record<string, unknown> | null;
+
+async function stateRow(
+  supabase: SupabaseLikeClient,
+  table: string,
+  nameColumn: string,
+  name: string,
+  tenantKey: string,
+): Promise<WarehouseStateRow> {
+  const { data } = await supabase
+    .from(table)
+    .select("*")
+    .eq("auth_user_id", tenantKey)
+    .eq(nameColumn, name)
+    .maybeSingle();
+  return (data as WarehouseStateRow) ?? null;
+}
+
+/** The analytics_transactions backfill state (cursor + counters). */
+export function getTransactionSyncState(supabase: SupabaseLikeClient, tenantKey: string): Promise<WarehouseStateRow> {
+  return stateRow(supabase, "clickhouse_transaction_sync_state", "sync_name", "analytics_transactions_backfill", tenantKey);
+}
+
+/** The fact_user_cohorts snapshot state. */
+export function getCohortSnapshotStateRow(supabase: SupabaseLikeClient, tenantKey: string): Promise<WarehouseStateRow> {
+  return stateRow(supabase, "clickhouse_cohort_snapshot_state", "snapshot_name", "fact_user_cohorts", tenantKey);
+}
+
+/** The fact_support_requests sync state. */
+export function getSupportSyncState(supabase: SupabaseLikeClient, tenantKey: string): Promise<WarehouseStateRow> {
+  return stateRow(supabase, "clickhouse_transaction_sync_state", "sync_name", "fact_support_requests_sync", tenantKey);
+}
+
+// ---- Member view ----------------------------------------------------------------
+// Everything the browser's version fingerprints read (analyticsCache.ts
+// warehouseVersionFromSummary / supportWarehouseVersionFromSummary), and nothing
+// else: lifecycle status, timestamps and opaque versions. The raw cursor id and
+// every count that feeds a fingerprint (transaction / support totals, support
+// attribution counts) are folded into ONE keyed token per state, placed where
+// the browser already reads the cursor id — so a sync still changes the version,
+// but no tenant total, cursor id, error text or data key reaches the caller.
+// No KPI aggregate runs for this view at all.
+
+export interface MemberWarehouseSummary {
+  redacted: true;
+  sync_state: Record<string, unknown> | null;
+  cohort_snapshot_state: Record<string, unknown> | null;
+  support_sync_state: Record<string, unknown> | null;
+}
+
+type Hasher = (value: string) => Promise<string>;
+
+function record(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+async function versionToken(hasher: Hasher, kind: string, parts: unknown[]): Promise<string | null> {
+  if (parts.every((part) => part === null || part === undefined || part === "")) return null;
+  return `v_${(await hasher(JSON.stringify([kind, ...parts.map((part) => part ?? null)]))).slice(0, 32)}`;
+}
+
+async function memberSyncState(row: WarehouseStateRow, hasher: Hasher, kind: string, extra: unknown[] = []): Promise<Record<string, unknown> | null> {
+  if (!row) return null;
+  return {
+    status: row.status ?? null,
+    cursor_updated_at: row.cursor_updated_at ?? null,
+    cursor_transaction_id: await versionToken(hasher, kind, [row.cursor_transaction_id, row.cursor_updated_at, row.clickhouse_total, ...extra]),
+  };
+}
+
+export async function memberWarehouseSummary(input: {
+  hasher: Hasher;
+  syncState: WarehouseStateRow;
+  cohortSnapshotState: WarehouseStateRow;
+  supportSyncState: WarehouseStateRow;
+}): Promise<MemberWarehouseSummary> {
+  const snapshot = input.cohortSnapshotState;
+  const attribution = record(record(input.supportSyncState?.diagnostics).attribution);
+  return {
+    redacted: true,
+    sync_state: await memberSyncState(input.syncState, input.hasher, "sync"),
+    // A rebuild always moves active_generated_at, so users_classified (a tenant
+    // user total) is not needed for the cohort part of the fingerprint.
+    cohort_snapshot_state: snapshot
+      ? {
+        status: snapshot.status ?? null,
+        active_warehouse_version: snapshot.active_warehouse_version ?? null,
+        active_classification_version: snapshot.active_classification_version ?? null,
+        active_generated_at: snapshot.active_generated_at ?? null,
+      }
+      : null,
+    support_sync_state: await memberSyncState(input.supportSyncState, input.hasher, "support", [
+      attribution.attribution_version,
+      attribution.funnel_matched,
+      attribution.unknown,
+    ]),
   };
 }

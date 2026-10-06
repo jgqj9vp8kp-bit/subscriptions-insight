@@ -12,7 +12,7 @@ import {
 } from "@/services/paymentAnalyticsDataSource";
 import { paymentAnalyticsBundleKey, normalizePaymentRequest } from "@/services/paymentAnalyticsCache";
 import { recordDuration } from "@/services/analyticsProgress";
-import { GC_MS, STALE_MS, transientRetry, useAnalyticsProgress } from "@/hooks/useAnalyticsCache";
+import { GC_MS, STALE_MS, transientRetry, useAnalyticsProgress, useCacheScope } from "@/hooks/useAnalyticsCache";
 import { traceEvent, traceHash, traceRequest } from "@/services/performanceTrace";
 
 const NS = "payment";
@@ -37,7 +37,9 @@ export function usePaymentAnalyticsBundle(params: {
   warehouseVersion: string;
   enabled: boolean;
 }): UsePaymentAnalyticsResult {
-  const { query, userScopeHash, warehouseVersion, enabled } = params;
+  const { query, warehouseVersion } = params;
+  const userScopeHash = useCacheScope(params.userScopeHash);
+  const enabled = params.enabled && userScopeHash !== "";
   const queryKey = useMemo(
     () => paymentAnalyticsBundleKey({ userScopeHash, warehouseVersion, request: query }),
     [userScopeHash, warehouseVersion, query],

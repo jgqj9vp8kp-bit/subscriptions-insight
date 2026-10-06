@@ -1,38 +1,46 @@
 /* global Deno */
 
+// funnelfox-subscription: proxy of FunnelFox GET /subscriptions/{id} (raw
+// upstream detail, customer email included) for the data owner's Import page.
+//
+// Access (policies/funnelfox-subscription.ts): rawOnly + admin.sync.run. The
+// gate authenticates before anything runs; CORS, OPTIONS and the GET / POST
+// method check come from it. Parameters are read exactly as before (query
+// string first, then body keys).
+
+import { serveWithAccess } from "../_shared/clickhouse/http.ts";
+import { FUNNELFOX_SUBSCRIPTION_POLICY } from "../_shared/access/policies/funnelfox-subscription.ts";
 import {
+  FunnelFoxEdgeError,
   fetchFunnelFox,
+  funnelFoxErrorResponse,
+  funnelFoxFailure,
+  funnelFoxRequestParams,
   getFunnelFoxSecret,
-  jsonResponse,
-  methodNotAllowed,
-  optionsResponse,
-  readRequestParams,
 } from "../_shared/funnelfox.ts";
 
-Deno.serve(async (req: Request) => {
-  if (req.method === "OPTIONS") return optionsResponse();
-  if (req.method !== "GET" && req.method !== "POST") return methodNotAllowed();
-
-  const params = await readRequestParams(req);
+serveWithAccess(FUNNELFOX_SUBSCRIPTION_POLICY, async ({ ctx, body, url }) => {
+  const params = funnelFoxRequestParams(url, body);
   const subscriptionId = params.get("id")?.trim();
 
   if (!subscriptionId) {
-    return jsonResponse({ error: "FunnelFox subscription id is required." }, 400);
+    return funnelFoxFailure(ctx, 400, { error: "FunnelFox subscription id is required." });
   }
 
   const secret = getFunnelFoxSecret();
   if (!secret) {
-    return jsonResponse({ error: "FunnelFox sync is not configured." }, 500);
+    return funnelFoxFailure(ctx, 500, { error: "FunnelFox sync is not configured." });
   }
 
   try {
     const upstream = await fetchFunnelFox(`/subscriptions/${encodeURIComponent(subscriptionId)}`, secret);
     if (!upstream.ok) {
-      return jsonResponse({ error: "FunnelFox subscription details request failed." }, upstream.status);
+      return funnelFoxFailure(ctx, upstream.status, { error: "FunnelFox subscription details request failed." });
     }
 
-    return jsonResponse(upstream.payload);
-  } catch {
-    return jsonResponse({ error: "FunnelFox subscription details request failed." }, 502);
+    return upstream.payload;
+  } catch (error) {
+    if (error instanceof FunnelFoxEdgeError) throw error;
+    return funnelFoxFailure(ctx, 502, { error: "FunnelFox subscription details request failed." });
   }
-});
+}, { onError: funnelFoxErrorResponse });

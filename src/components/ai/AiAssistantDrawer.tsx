@@ -7,20 +7,48 @@
 // from the page's published context pack. No context -> it says so instead of
 // guessing. Unavailable (no key) is a calm state; only transport failures are
 // loud (reportAi outcome discipline).
+//
+// Access (plan §23; UX only — ai-analytics requires ai.use itself): the drawer
+// renders and opens only with ai.use, and its exchanges belong to one page
+// surface of one access partition — when either changes they are cleared.
 import { useEffect, useRef, useState } from "react";
 import { AlertTriangle, Loader2, Send, Sparkles, X } from "lucide-react";
 import { AiFeedback } from "@/components/ai/AiFeedback";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { useAccess } from "@/hooks/useAccess";
 import { askAssistant, type AssistantOutcome } from "@/services/aiAssistantClient";
 import {
   MAX_PRIOR_ANSWER_CHARS,
   MAX_PRIOR_EXCHANGES,
   type AssistantPriorExchange,
 } from "@/services/aiAssistant";
+import { registerPurgeHandler } from "@/services/sessionPurge";
 import { useAiAssistantStore } from "@/store/aiAssistantStore";
 import { cn } from "@/lib/utils";
+
+// The published context pack and the open flag were built for whoever was
+// signed in: drop them on sign-out, account switch and access change (plan §20).
+registerPurgeHandler("ai-assistant", () => {
+  useAiAssistantStore.setState({ open: false, context: null });
+});
+
+/** Identity of the conversation: the access partition plus the page SURFACE.
+ * Not the display label: labels embed live row counts ("Cohorts · 41 cohorts"),
+ * so a background refresh or a filter tweak on the same page would wipe the
+ * conversation and drop an answer already paid for. A page unmounting
+ * (publishing null) keeps the conversation too; another surface or another
+ * principal / access starts over. A row's "Ask AI" re-publishes the same
+ * surface with a seed question, so it keeps the conversation. */
+interface ConversationIdentity {
+  partition: string;
+  surface: string | null;
+}
+
+function nextConversation(previous: ConversationIdentity, partition: string, surface: string | null): ConversationIdentity {
+  return { partition, surface: surface ?? previous.surface };
+}
 
 const SUGGESTED_QUESTIONS = [
   "What should I scale?",
@@ -59,11 +87,36 @@ function collectPriorExchanges(exchanges: Exchange[]): AssistantPriorExchange[] 
 }
 
 export function AiAssistantDrawer() {
+  const access = useAccess();
+  const canUseAi = access.can("ai.use");
   const { open, setOpen, context } = useAiAssistantStore();
   const [question, setQuestion] = useState("");
   const [exchanges, setExchanges] = useState<Exchange[]>([]);
   const [busy, setBusy] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const partition = access.partition;
+  const surface = context?.surface ?? null;
+  const conversationRef = useRef<ConversationIdentity>({ partition, surface });
+  /** Bumped on every conversation change; an answer that lands after it is dropped. */
+  const generationRef = useRef(0);
+
+  // Earlier answers describe another surface or principal: start over instead
+  // of replaying them as prior turns.
+  useEffect(() => {
+    const previous = conversationRef.current;
+    const next = nextConversation(previous, partition, surface);
+    if (previous.partition === next.partition && previous.surface === next.surface) return;
+    conversationRef.current = next;
+    generationRef.current += 1;
+    setExchanges([]);
+    setBusy(false);
+  }, [partition, surface]);
+
+  // AppLayout mounts the drawer only with ai.use; this also keeps a drawer that
+  // something else opened closed once the permission is gone.
+  useEffect(() => {
+    if (!canUseAi && open) setOpen(false);
+  }, [canUseAi, open, setOpen]);
 
   useEffect(() => {
     if (open && context?.seedQuestion) setQuestion(context.seedQuestion);
@@ -75,7 +128,8 @@ export function AiAssistantDrawer() {
 
   const ask = async (text: string) => {
     const trimmed = text.trim();
-    if (!trimmed || busy || !context) return;
+    if (!trimmed || busy || !context || !canUseAi) return;
+    const generation = generationRef.current;
     setQuestion("");
     setBusy(true);
     const priorExchanges = collectPriorExchanges(exchanges);
@@ -87,6 +141,9 @@ export function AiAssistantDrawer() {
       contextPack: context.contextPack,
       priorExchanges,
     });
+    // The context changed while this was in flight: the reset already cleared
+    // the exchanges and the busy flag, and the answer belongs to nothing on screen.
+    if (generation !== generationRef.current) return;
     setExchanges((current) =>
       current.map((exchange, index) =>
         index === current.length - 1 ? { ...exchange, outcome } : exchange,
@@ -94,6 +151,8 @@ export function AiAssistantDrawer() {
     );
     setBusy(false);
   };
+
+  if (!canUseAi) return null;
 
   return (
     <Sheet open={open} onOpenChange={setOpen}>

@@ -13,8 +13,14 @@
 //
 // Nothing here returns raw_payload / normalized_payload / raw emails / raw
 // transaction ids / credentials — only aggregates and non-reversible id hashes.
+//
+// Every best-effort `.catch(() => default)` keeps its default for ordinary
+// errors but rethrows a ScopeViolation (plan §13 R7): the access gate turns a
+// recorded violation into a 500 anyway, and rethrowing keeps a swallowed one
+// from silently producing a partial "ok" response first.
 
 import type { ClickHouseClientLike, SupabaseLikeClient } from "./types.ts";
+import { ScopeViolation } from "./scopedClient.ts";
 import {
   activeSubscriptionsByEmail,
   aggregateActiveSubscriptions,
@@ -634,7 +640,8 @@ export async function subscriptionDataStatus(client: ClickHouseClientLike, authU
     });
     const rows = (await rs.json()) as Array<{ c?: number | string }>;
     return n(rows[0]?.c) > 0 ? "ready" : "empty_source";
-  } catch {
+  } catch (error) {
+    if (error instanceof ScopeViolation) throw error;
     return "failed";
   }
 }
@@ -676,17 +683,14 @@ export async function supportDataStatus(client: ClickHouseClientLike, authUserId
       return { support_data_status: "ready", support_requests: supportRequests, support_unique_emails: supportUniqueEmails };
     }
 
-    const total = await client.query({
-      query: `SELECT count() AS c FROM ${FACT_SUPPORT_REQUESTS_TABLE} FINAL`,
-      format: "JSONEachRow",
-    });
-    const totalRows = (await total.json()) as Array<{ c?: number | string }>;
-    return {
-      support_data_status: n(totalRows[0]?.c) > 0 ? "sync_pending" : "empty_source",
-      support_requests: 0,
-      support_unique_emails: 0,
-    };
-  } catch {
+    // Phase 0 isolation fix (plan §3, §19): this used to count
+    // fact_support_requests across EVERY tenant to tell "sync_pending" (rows
+    // exist, just not yours) from "empty_source" — a cross-tenant side channel.
+    // Scoped to this tenant that count is the one above, so a tenant without
+    // support rows is simply empty_source.
+    return { support_data_status: "empty_source", support_requests: 0, support_unique_emails: 0 };
+  } catch (error) {
+    if (error instanceof ScopeViolation) throw error;
     return { support_data_status: "unavailable", support_requests: 0, support_unique_emails: 0 };
   }
 }
@@ -796,13 +800,20 @@ export async function runCohortList(input: {
   const [rs, subStatus, scan, optionsResult, fx] = await Promise.all([
     input.clickhouse.query({ query: sql, query_params: params, format: "JSONEachRow" }),
     subscriptionDataStatus(input.clickhouse, input.authUserId),
-    scanDiagnostics(input.clickhouse, input.authUserId).catch(() => ({ transactions_scanned: 0, users_scanned: 0, missing_fx: 0 })),
+    scanDiagnostics(input.clickhouse, input.authUserId).catch((error) => {
+      if (error instanceof ScopeViolation) throw error;
+      return { transactions_scanned: 0, users_scanned: 0, missing_fx: 0 };
+    }),
     // Options are scoped to the same active filters as the list (each dimension
     // minus its own predicate) — never a global list once filters are active.
-    buildFilterOptions(input.clickhouse, input.authUserId, nreq).catch(
-      () => ({ options: emptyFilterOptions(), scope_user_count: 0, dimensions: [] } as FilterOptionsResult),
-    ),
-    fxDiagnostics(input.clickhouse, input.authUserId, nreq.filters.media_buyer).catch(() => undefined),
+    buildFilterOptions(input.clickhouse, input.authUserId, nreq).catch((error) => {
+      if (error instanceof ScopeViolation) throw error;
+      return { options: emptyFilterOptions(), scope_user_count: 0, dimensions: [] } as FilterOptionsResult;
+    }),
+    fxDiagnostics(input.clickhouse, input.authUserId, nreq.filters.media_buyer).catch((error) => {
+      if (error instanceof ScopeViolation) throw error;
+      return undefined;
+    }),
   ]);
   const optionsDurationMs = Date.now() - optionsStarted;
   const rawRows = (await rs.json()) as RawCohortRow[];
@@ -813,7 +824,7 @@ export async function runCohortList(input: {
   // effort — any failure leaves the rows at 0, exactly as before.
   if (input.supabase) {
     try {
-      const activeByEmail = await activeSubscriptionsByEmail(input.supabase);
+      const activeByEmail = await activeSubscriptionsByEmail(input.supabase, input.authUserId);
       if (activeByEmail.size > 0) {
         const emailParams: Record<string, unknown> = { auth_user_id: input.authUserId };
         const emailRs = await input.clickhouse.query({
@@ -825,6 +836,7 @@ export async function runCohortList(input: {
         mergeActiveSubscriptions(rows, aggregateActiveSubscriptions(activeByEmail, emailRows));
       }
     } catch (error) {
+      if (error instanceof ScopeViolation) throw error;
       console.error("[cohorts] dynamic active-subscription overlay failed:", error instanceof Error ? error.message : error);
     }
   }
@@ -1008,10 +1020,17 @@ function funnelKeyWhere(
   return conds.join(" AND ");
 }
 
+/** `error` of a failed plan breakdown for callers without detailed errors. */
+export const PRICE_BREAKDOWN_FAILED = "price_breakdown_failed";
+
 export async function runCohortDetails(input: {
   authUserId: string;
   clickhouse: ClickHouseClientLike;
   request: CohortRequest;
+  /** Echo the warehouse error text of a failed plan breakdown — the data owner
+   * only (plan §12.7 / T19: employees never see warehouse or SQL text). Off by
+   * default; the response then carries PRICE_BREAKDOWN_FAILED instead. */
+  detailedErrors?: boolean;
 }): Promise<CohortDetailsResponse> {
   const started = Date.now();
   const nreq = normalizeCohortRequest(input.request);
@@ -1032,7 +1051,10 @@ export async function runCohortDetails(input: {
   // reuses the list's full measure set, which includes support_users.
   const supportStatus: CohortSupportDataStatus = await supportDataStatus(input.clickhouse, input.authUserId)
     .then((probe) => probe.support_data_status)
-    .catch(() => "unavailable" as const);
+    .catch((error) => {
+      if (error instanceof ScopeViolation) throw error;
+      return "unavailable" as const;
+    });
   const base = (extra: string, params: Record<string, unknown>) => {
     const memberConds = memberFilterConds(nreq.filters, params);
     const scopeWhere = key ? cohortKeyWhere(key, params) : funnelKeyWhere(funnelKey!, nreq, params);
@@ -1101,15 +1123,25 @@ FORMAT JSONEachRow`;
     ORDER BY plan_name = 'Unknown', price`, p4);
 
   const [sumRes, curRes, tokRes] = await Promise.all([
-    input.clickhouse.query({ query: summarySql, query_params: p1, format: "JSONEachRow" }).then((r) => r.json()).catch(() => []),
-    input.clickhouse.query({ query: currencySql, query_params: p2, format: "JSONEachRow" }).then((r) => r.json()).catch(() => []),
-    input.clickhouse.query({ query: tokenSql, query_params: p3, format: "JSONEachRow" }).then((r) => r.json()).catch(() => []),
+    input.clickhouse.query({ query: summarySql, query_params: p1, format: "JSONEachRow" }).then((r) => r.json()).catch((error) => {
+      if (error instanceof ScopeViolation) throw error;
+      return [];
+    }),
+    input.clickhouse.query({ query: currencySql, query_params: p2, format: "JSONEachRow" }).then((r) => r.json()).catch((error) => {
+      if (error instanceof ScopeViolation) throw error;
+      return [];
+    }),
+    input.clickhouse.query({ query: tokenSql, query_params: p3, format: "JSONEachRow" }).then((r) => r.json()).catch((error) => {
+      if (error instanceof ScopeViolation) throw error;
+      return [];
+    }),
   ]);
   // Plan breakdown stays best-effort (the rest of the panel must not die with
   // it), but a failure is no longer silent: the message travels in `error` so
   // the UI can say "unavailable" instead of the misleading "no breakdown".
   let planError: string | undefined;
   const planRes = await input.clickhouse.query({ query: planSql, query_params: p4, format: "JSONEachRow" }).then((r) => r.json()).catch((error) => {
+    if (error instanceof ScopeViolation) throw error;
     planError = error instanceof Error ? error.message : String(error);
     return [];
   });
@@ -1174,7 +1206,9 @@ FORMAT JSONEachRow`;
       available_days: Math.max(0, Math.min(30, ageDays)),
     },
     fx: { missing_transactions: 0, missing_amount: 0 },
-    ...(planError ? { error: `price_breakdown: ${planError}` } : {}),
+    ...(planError
+      ? { error: input.detailedErrors === true ? `price_breakdown: ${planError}` : PRICE_BREAKDOWN_FAILED }
+      : {}),
   };
 }
 

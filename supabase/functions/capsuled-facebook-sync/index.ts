@@ -1,7 +1,26 @@
 /* global Deno */
 
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+// capsuled-facebook-sync: pulls a Capsuled fb-stats window, stores it in
+// capsuled_facebook_syncs / capsuled_facebook_stats and rebuilds the
+// facebook_traffic snapshot — always for the workspace tenant (ctx.tenantKey),
+// never for the caller.
+//
+// Access (policies/capsuled-facebook-sync.ts): the one action is a sync trigger
+// → admin.sync.run. Upstream payloads in the response (rows[].raw_payload,
+// lastApiResponse) are stripped for everyone but the data owner. CORS comes from
+// the shared builder through the gate (GET, POST, OPTIONS — as before).
 
+import type { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+import { serveWithAccess } from "../_shared/clickhouse/http.ts";
+import type { SupabaseLikeClient } from "../_shared/clickhouse/types.ts";
+import {
+  CAPSULED_FACEBOOK_SYNC_POLICY,
+  CapsuledSyncError,
+  capsuledFacebookSyncErrorResponse,
+  capsuledRawPayloadsVisible,
+  stripCapsuledSyncRawPayloads,
+} from "../_shared/access/policies/capsuled-facebook-sync.ts";
 import {
   capsuledTrafficMetric,
   enumerateDays,
@@ -18,11 +37,8 @@ const LEVELS = new Set(["account", "campaign", "adset", "ad", "day"]);
 const DEFAULT_TIMEOUT_MS = 30000;
 const MAX_ATTEMPTS = 3;
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-};
+/** The gate's service-role client (a supabase-js client; typed narrowly there). */
+type ServiceClient = ReturnType<typeof createClient>;
 
 type Level = "account" | "campaign" | "adset" | "ad" | "day";
 
@@ -68,13 +84,6 @@ class CapsuledApiError extends Error {
     this.contentType = params.contentType;
     this.bodyPreview = params.bodyPreview;
   }
-}
-
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { ...corsHeaders, "Content-Type": "application/json" },
-  });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -205,8 +214,7 @@ function aggregateRows(rows: NormalizedRow[]): NormalizedRow[] {
   return Array.from(byKey.values());
 }
 
-function parseRequestFromUrl(req: Request): RequestParams {
-  const url = new URL(req.url);
+function parseRequestFromUrl(url: URL): RequestParams {
   const dateFrom = url.searchParams.get("dateFrom") ?? url.searchParams.get("date_from") ?? "";
   const dateTo = url.searchParams.get("dateTo") ?? url.searchParams.get("date_to") ?? "";
   const level = url.searchParams.get("level") ?? "campaign";
@@ -215,9 +223,10 @@ function parseRequestFromUrl(req: Request): RequestParams {
   return { dateFrom: dateKey(dateFrom)!, dateTo: dateKey(dateTo)!, level: level as Level, force: url.searchParams.get("force") === "true" };
 }
 
-async function parseRequest(req: Request): Promise<RequestParams> {
-  if (req.method === "GET") return parseRequestFromUrl(req);
-  const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+/** The gate has already read the JSON body (after authenticating); GET keeps
+ * its parameters in the query string. */
+function parseRequest(method: string, body: Record<string, unknown>, url: URL): RequestParams {
+  if (method === "GET") return parseRequestFromUrl(url);
   const dateFrom = dateKey(body.dateFrom ?? body.date_from);
   const dateTo = dateKey(body.dateTo ?? body.date_to);
   const level = String(body.level ?? "campaign");
@@ -312,13 +321,14 @@ function importKey(row: NormalizedRow): string {
  * Layer A alias map. Any failure degrades to an empty map: the snapshot still
  * builds with the historical name fallback instead of blocking the sync. */
 async function loadCampaignPathMap(
-  client: ReturnType<typeof createClient>,
-  userId: string,
+  pg: SupabaseLikeClient,
+  tenantKey: string,
 ): Promise<{ pathByCampaign: Map<string, string>; error: string | null }> {
   try {
+    if (!pg.rpc) throw new Error("rpc is not supported by this client");
     const [{ data: evidence, error: evidenceError }, aliases] = await Promise.all([
-      client.rpc("capsuled_campaign_path_evidence", { p_auth_user_id: userId }),
-      loadActiveCampaignAliasMap(client, userId).catch(() => ({ ...CONFIRMED_FB_CAMPAIGN_ALIASES })),
+      pg.rpc("capsuled_campaign_path_evidence", { p_auth_user_id: tenantKey }),
+      loadActiveCampaignAliasMap(pg, tenantKey).catch(() => ({ ...CONFIRMED_FB_CAMPAIGN_ALIASES })),
     ]);
     if (evidenceError) throw new Error(evidenceError.message);
     return { pathByCampaign: resolveCampaignPaths((evidence ?? []) as CampaignPathEvidenceRow[], aliases), error: null };
@@ -327,26 +337,16 @@ async function loadCampaignPathMap(
   }
 }
 
-Deno.serve(async (req: Request) => {
-  if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders });
-  if (req.method !== "GET" && req.method !== "POST") return jsonResponse({ error: "Method not allowed." }, 405);
-
-  const supabaseUrl = Deno.env.get("SUPABASE_URL");
-  const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-  if (!supabaseUrl || !serviceRoleKey) return jsonResponse({ error: "Capsuled sync is not configured." }, 500);
-
-  const authHeader = req.headers.get("authorization") ?? "";
-  const client = createClient(supabaseUrl, serviceRoleKey, { auth: { persistSession: false } });
-  const { data: userData, error: userError } = await client.auth.getUser(authHeader.replace(/^Bearer\s+/i, ""));
-  if (userError || !userData.user?.id) return jsonResponse({ error: "Sign in before syncing Capsuled Facebook data." }, 401);
-
-  const userId = userData.user.id;
+serveWithAccess(CAPSULED_FACEBOOK_SYNC_POLICY, async ({ ctx, body, url, req, pg }) => {
+  // Every row below is written for the workspace data key — never the caller.
+  const tenantKey = ctx.tenantKey;
+  const client = pg as unknown as ServiceClient;
   const startedAt = Date.now();
   let params: RequestParams;
   try {
-    params = await parseRequest(req);
+    params = parseRequest(req.method.toUpperCase(), body, url);
   } catch (error) {
-    return jsonResponse({ error: error instanceof Error ? error.message : "Invalid request." }, 400);
+    throw new CapsuledSyncError(400, { error: error instanceof Error ? error.message : "Invalid request." });
   }
 
   const failedRequests: string[] = [];
@@ -360,10 +360,9 @@ Deno.serve(async (req: Request) => {
       ? enumerateDays(params.dateFrom, params.dateTo)
       : [];
     if (splitDays.length > MAX_DAILY_SPLIT_DAYS) {
-      return jsonResponse(
-        { error: `Campaign-level sync fetches per-day rows; the window is limited to ${MAX_DAILY_SPLIT_DAYS} days. Split the range into smaller windows.` },
-        400,
-      );
+      throw new CapsuledSyncError(400, {
+        error: `Campaign-level sync fetches per-day rows; the window is limited to ${MAX_DAILY_SPLIT_DAYS} days. Split the range into smaller windows.`,
+      });
     }
 
     const importedAt = new Date().toISOString();
@@ -399,7 +398,7 @@ Deno.serve(async (req: Request) => {
     const { data: syncRow, error: syncError } = await client
       .from("capsuled_facebook_syncs")
       .insert({
-        user_id: userId,
+        user_id: tenantKey,
         date_from: params.dateFrom,
         date_to: params.dateTo,
         level: params.level,
@@ -421,7 +420,7 @@ Deno.serve(async (req: Request) => {
     if (rows.length) {
       const { error: upsertError } = await client.from("capsuled_facebook_stats").upsert(
         rows.map((row) => ({
-          user_id: userId,
+          user_id: tenantKey,
           sync_id: syncId,
           import_key: importKey(row),
           ...row,
@@ -441,7 +440,7 @@ Deno.serve(async (req: Request) => {
       const { data: windowRows, error: windowError } = await client
         .from("capsuled_facebook_stats")
         .select("id,date_from,date_to")
-        .eq("user_id", userId)
+        .eq("user_id", tenantKey)
         .eq("level", "campaign")
         .gte("date_from", params.dateFrom)
         .lte("date_to", params.dateTo);
@@ -455,7 +454,7 @@ Deno.serve(async (req: Request) => {
           const { error: deleteError } = await client
             .from("capsuled_facebook_stats")
             .delete()
-            .eq("user_id", userId)
+            .eq("user_id", tenantKey)
             .in("id", staleIds.slice(i, i + 200));
           if (deleteError) {
             failedRequests.push(`Superseded-row cleanup failed: ${deleteError.message}`);
@@ -474,7 +473,7 @@ Deno.serve(async (req: Request) => {
       const { data: page, error: pageError } = await client
         .from("capsuled_facebook_stats")
         .select("date_from,date_to,level,campaign_id,campaign_name,ad_account_id,ad_account_name,spend,fb_purchases,cpp,impressions,clicks,ctr,cpc,cpm,outbound_clicks,outbound_ctr,currency,last_import_at,raw_payload")
-        .eq("user_id", userId)
+        .eq("user_id", tenantKey)
         .eq("level", "campaign")
         .order("date_from", { ascending: false })
         .order("import_key", { ascending: true })
@@ -484,11 +483,11 @@ Deno.serve(async (req: Request) => {
       statsRows.push(...rowsPage);
       if (rowsPage.length < SNAPSHOT_PAGE) break;
     }
-    const { pathByCampaign, error: pathMapError } = await loadCampaignPathMap(client, userId);
+    const { pathByCampaign, error: pathMapError } = await loadCampaignPathMap(pg, tenantKey);
     const trafficMetrics = statsRows.map((row) => capsuledTrafficMetric(row, pathByCampaign));
     await client.from("data_snapshots").upsert(
       {
-        user_id: userId,
+        user_id: tenantKey,
         dataset_type: "facebook_traffic",
         name: "Capsuled Facebook traffic",
         payload: { trafficMetrics },
@@ -507,7 +506,7 @@ Deno.serve(async (req: Request) => {
     const spend = rows.reduce((total, row) => total + row.spend, 0);
     const fbPurchases = rows.reduce((total, row) => total + row.fb_purchases, 0);
     const campaignIds = Array.from(new Set(rows.map((row) => row.campaign_id).filter(Boolean)));
-    return jsonResponse({
+    const result = {
       rows,
       metadata: {
         syncId,
@@ -545,12 +544,17 @@ Deno.serve(async (req: Request) => {
         importDurationMs: durationMs,
         failedRequests,
       },
-    });
+    };
+    // Upstream payloads stay with the data owner; everyone else gets the same
+    // shape with raw_payload / lastApiResponse nulled.
+    return capsuledRawPayloadsVisible(ctx) ? result : stripCapsuledSyncRawPayloads(result);
   } catch (error) {
+    // A rejected request (window too long) never started a sync: no failed row.
+    if (error instanceof CapsuledSyncError) throw error;
     const message = error instanceof Error ? error.message : "Capsuled sync failed.";
     const durationMs = Date.now() - startedAt;
     await client.from("capsuled_facebook_syncs").insert({
-      user_id: userId,
+      user_id: tenantKey,
       date_from: params.dateFrom,
       date_to: params.dateTo,
       level: params.level,
@@ -562,19 +566,18 @@ Deno.serve(async (req: Request) => {
       error_message: message,
       finished_at: new Date().toISOString(),
     });
+    // Same status / body as before access control; the gate replaces the body
+    // (upstream previews included) with a generic one for non-owners.
     if (error instanceof CapsuledApiError) {
-      return jsonResponse(
-        {
-          error: message,
-          status: error.status,
-          content_type: error.contentType,
-          body_preview: error.bodyPreview,
-          failedRequests,
-          durationMs,
-        },
-        error.status === 401 || error.status === 403 ? 401 : 502,
-      );
+      throw new CapsuledSyncError(error.status === 401 || error.status === 403 ? 401 : 502, {
+        error: message,
+        status: error.status,
+        content_type: error.contentType,
+        body_preview: error.bodyPreview,
+        failedRequests,
+        durationMs,
+      });
     }
-    return jsonResponse({ error: message, failedRequests, durationMs }, error instanceof Error ? errorStatus(error) : 502);
+    throw new CapsuledSyncError(error instanceof Error ? errorStatus(error) : 502, { error: message, failedRequests, durationMs });
   }
-});
+}, { onError: capsuledFacebookSyncErrorResponse });

@@ -6,6 +6,7 @@ import { AppSidebar } from "@/components/AppSidebar";
 import { AiAssistantDrawer } from "@/components/ai/AiAssistantDrawer";
 import { Button } from "@/components/ui/button";
 import { useAuth } from "@/hooks/useAuth";
+import { useAccess } from "@/hooks/useAccess";
 import { useAiAssistantStore } from "@/store/aiAssistantStore";
 import { useDataStore } from "@/store/dataStore";
 import { shouldShowSampleDataBanner } from "@/services/transactionAutoLoadPolicy";
@@ -19,13 +20,19 @@ interface AppLayoutProps {
 
 export function AppLayout({ title, description, actions, children }: AppLayoutProps) {
   const { signOut, user } = useAuth();
+  const access = useAccess();
   const location = useLocation();
   const [signingOut, setSigningOut] = useState(false);
   const dataStoreSource = useDataStore((state) => state.meta.source);
   // Routes that defer transaction hydration render real ClickHouse aggregates
   // while the store legitimately stays on "mock" — the banner would call real
-  // numbers demo data there. See shouldShowSampleDataBanner.
-  const isSampleData = shouldShowSampleDataBanner(dataStoreSource, location.pathname);
+  // numbers demo data there. See shouldShowSampleDataBanner. Only the data
+  // owner hydrates the browser store at all (ProtectedRoute mounts the
+  // auto-loader for rawAccess only) and only they can import, so for anyone
+  // else "mock" says nothing about the numbers on screen.
+  const isSampleData = access.rawAccess && shouldShowSampleDataBanner(dataStoreSource, location.pathname);
+  // UX gate; ai-analytics itself requires ai.use. Legacy ⇒ true (today).
+  const canUseAi = access.can("ai.use");
 
   useEffect(() => {
     document.title = title ? `${title} • Subengine` : "Subengine";
@@ -57,16 +64,18 @@ export function AppLayout({ title, description, actions, children }: AppLayoutPr
             </div>
             <div className="flex items-center gap-2">
               {actions}
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => useAiAssistantStore.getState().setOpen(true)}
-                title="AI Assistant: ask about the analytics on this page"
-              >
-                <Sparkles className="h-4 w-4 text-primary" />
-                <span className="hidden sm:inline">AI</span>
-              </Button>
+              {canUseAi && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => useAiAssistantStore.getState().setOpen(true)}
+                  title="AI Assistant: ask about the analytics on this page"
+                >
+                  <Sparkles className="h-4 w-4 text-primary" />
+                  <span className="hidden sm:inline">AI</span>
+                </Button>
+              )}
               {user?.email && (
                 <div className="hidden max-w-[240px] truncate text-xs text-muted-foreground md:block">
                   {user.email}
@@ -97,7 +106,7 @@ export function AppLayout({ title, description, actions, children }: AppLayoutPr
             {children}
           </main>
         </div>
-        <AiAssistantDrawer />
+        {canUseAi && <AiAssistantDrawer />}
       </div>
     </SidebarProvider>
   );

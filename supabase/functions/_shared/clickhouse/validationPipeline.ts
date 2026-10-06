@@ -1,4 +1,5 @@
 import type { ClickHouseClientLike, SupabaseLikeClient } from "./types.ts";
+import { ScopeViolation } from "./scopedClient.ts";
 import {
   ANALYTICS_TRANSACTIONS_TABLE,
   ANALYTICS_VALIDATION_SOURCE_IDS_TABLE,
@@ -758,6 +759,8 @@ export async function runValidation(input: RunValidationInput): Promise<Validati
 
     return toResponse(input.action, state, now() - startedAt, diagnostics);
   } catch (error) {
+    // A ScopeViolation is never folded into a resumable 200 "paused" answer.
+    if (error instanceof ScopeViolation) throw error;
     const message = error instanceof Error ? error.message : "ClickHouse validation chunk failed.";
     const isClickHouse = message.toLowerCase().includes("clickhouse");
     // Preserve progress: mark stopped_reason, keep cursor/aggregates for resume.

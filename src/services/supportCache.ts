@@ -36,6 +36,18 @@ export function supportListKey(parts: { userScopeHash: string; warehouseVersion:
   return [SUPPORT_QUERY_ROOT, "list", parts.userScopeHash, parts.warehouseVersion, normalizeSupportRequest(parts.request, { includePage: true })] as const;
 }
 
+// `userScopeHash` is the access partition (useAccess().partition) for every key
+// below; the persistence layer stores only the aggregate "bundle" entries.
 export function supportDetailsKey(parts: { userScopeHash: string; warehouseVersion: string; requestId: string | null }) {
   return [SUPPORT_QUERY_ROOT, "details", parts.userScopeHash, parts.warehouseVersion, parts.requestId ?? "none"] as const;
+}
+
+/** Answered-reply drilldown of one request (message body — never persisted). */
+export function supportAnsweredReplyKey(parts: { userScopeHash: string; requestId: string | null }) {
+  return [SUPPORT_QUERY_ROOT, "answered-reply", parts.userScopeHash, parts.requestId ?? "none"] as const;
+}
+
+/** Import-batch list of the Support page (outside the warehouse-dependent roots). */
+export function supportImportBatchesKey(userScopeHash: string) {
+  return ["support-import-batches", userScopeHash] as const;
 }

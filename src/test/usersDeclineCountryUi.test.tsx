@@ -20,6 +20,14 @@ vi.mock("@/services/sheets", () => ({
 
 vi.mock("@/hooks/useAuth", () => ({ useAuth: () => ({ user: { id: "test-user" } }) }));
 
+// The page reads useAccess(); these tests cover the data owner's view (legacy
+// access: every permission, raw access on — exactly today's behaviour).
+vi.mock("@/hooks/useAccess", async () => {
+  const { buildAccessValue } = await import("@/contexts/accessContext");
+  const owner = buildAccessValue({ status: "legacy", access: null, userId: "test-user" });
+  return { useAccess: () => owner, useOptionalAccess: () => owner, useCan: (key: string) => owner.can(key) };
+});
+
 // The warehouse version gate normally requires a live clickhouse-summary call.
 vi.mock("@/hooks/useAnalyticsCache", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/hooks/useAnalyticsCache")>();

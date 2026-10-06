@@ -50,6 +50,7 @@ function cachePayload(records: WarehouseRecord[], overrides: Partial<WarehouseCa
   return {
     schema_version: WAREHOUSE_CACHE_SCHEMA_VERSION,
     auth_user_id: "user-1",
+    partition: "p-owner",
     saved_at: "2026-07-28T00:00:00+00:00",
     max_updated_at: maxUpdatedAt(records) ?? "",
     row_count: records.length,
@@ -78,6 +79,8 @@ function memStore(initial: unknown = null) {
 function makeDeps(overrides: Partial<WarehouseCacheDeps> & { store: WarehouseCacheStore }): WarehouseCacheDeps {
   return {
     currentUserId: async () => "user-1",
+    // The data owner's resolved access (rawCacheStamp() in the app).
+    cacheStamp: () => "p-owner",
     loadRecords: vi.fn(async () => []),
     countDeltaRows: async () => 0,
     fetchDeltaRows: async () => [],
@@ -111,6 +114,11 @@ describe("isWarehouseCachePayloadUsable", () => {
     expect(isWarehouseCachePayloadUsable(cachePayload([]), "user-1")).toBe(false);
     expect(isWarehouseCachePayloadUsable(null, "user-1")).toBe(false);
     expect(isWarehouseCachePayloadUsable("junk", "user-1")).toBe(false);
+  });
+  it("requires the access partition stamp when one is given", () => {
+    expect(isWarehouseCachePayloadUsable(cachePayload(records), "user-1", "p-owner")).toBe(true);
+    expect(isWarehouseCachePayloadUsable(cachePayload(records), "user-1", "p-other")).toBe(false);
+    expect(isWarehouseCachePayloadUsable(cachePayload(records, { partition: undefined }), "user-1", "p-owner")).toBe(false);
   });
 });
 
@@ -310,6 +318,44 @@ describe("loadWarehouseTransactionsCached", () => {
 
     expect(loadRecords).toHaveBeenCalledTimes(1);
     expect(txs).toHaveLength(2);
+    expect(state.writes).toBe(0);
+  });
+
+  it("without raw access (no partition stamp) the cache is neither read nor written", async () => {
+    const { store, state } = memStore(cachePayload(coldRecords));
+    const read = vi.spyOn(store, "read");
+    const loadRecords = vi.fn(async () => coldRecords);
+    const deps = makeDeps({ store, loadRecords, cacheStamp: () => null });
+
+    const txs = await loadWarehouseTransactionsCached({}, deps);
+    await flushBackgroundWrites();
+
+    expect(read).not.toHaveBeenCalled();
+    expect(loadRecords).toHaveBeenCalledTimes(1);
+    expect(txs).toHaveLength(2);
+    expect(state.writes).toBe(0);
+  });
+
+  it("an entry stamped with another partition is ignored and reseeded under the active one", async () => {
+    const { store, state } = memStore(cachePayload(coldRecords, { partition: "p-previous" }));
+    const loadRecords = vi.fn(async () => coldRecords);
+    await loadWarehouseTransactionsCached({}, makeDeps({ store, loadRecords }));
+    await flushBackgroundWrites();
+
+    expect(loadRecords).toHaveBeenCalledTimes(1);
+    expect((state.value as WarehouseCachePayload).partition).toBe("p-owner");
+  });
+
+  it("a load that outlives its partition (purge mid-load) is not persisted", async () => {
+    const { store, state } = memStore();
+    let stamp: string | null = "p-owner";
+    const loadRecords = vi.fn(async () => {
+      stamp = null; // access changed while the network load ran
+      return coldRecords;
+    });
+    await loadWarehouseTransactionsCached({}, makeDeps({ store, loadRecords, cacheStamp: () => stamp }));
+    await flushBackgroundWrites();
+
     expect(state.writes).toBe(0);
   });
 });

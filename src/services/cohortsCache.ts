@@ -1,6 +1,7 @@
 // Cohorts-specific query keys + filter normalization. Shared analytics primitives
-// (user-scope hash, warehouse version, roots, array normalization) live in
-// analyticsCache.ts and are re-exported here for existing importers.
+// (warehouse version, roots, array normalization) live in analyticsCache.ts and
+// are re-exported here for existing importers. The `userScopeHash` key slot
+// carries the access partition (see analyticsCache.ts).
 
 import type { CohortRequest, CohortRefundStatus, CohortSort } from "../../supabase/functions/_shared/clickhouse/cohortContract";
 import { normalizeFbAllocationDiagnosticsRequest, type NormalizedFbAllocationDiagnosticsRequest } from "../../supabase/functions/_shared/clickhouse/fbAllocationDiagnostics";

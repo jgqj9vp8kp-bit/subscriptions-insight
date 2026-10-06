@@ -234,8 +234,10 @@ describe("ClickHouse Phase 2 controls and validation helpers", () => {
   it("defines Supabase Edge Function entrypoints for every ClickHouse action", () => {
     for (const functionName of ["clickhouse-health", "clickhouse-init", "clickhouse-backfill", "clickhouse-validate", "clickhouse-summary"]) {
       const source = readFileSync(resolve(process.cwd(), `supabase/functions/${functionName}/index.ts`), "utf8");
-      expect(source).toContain("requireSupabaseUser");
-      expect(source).toContain("Deno.serve");
+      // Every entrypoint goes through the access gate (plan §10); the legacy
+      // "any signed-in user" helper must not come back.
+      expect(source).toContain("serveWithAccess(");
+      expect(source).not.toContain("requireSupabaseUser");
     }
   });
 });

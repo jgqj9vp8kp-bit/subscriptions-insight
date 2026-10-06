@@ -2,7 +2,13 @@
 // serializable {id, label, frozen} entries. Plan pushes snapshots; Compare re-runs
 // them through the engine (deterministic) and diffs against a chosen baseline.
 // Saved-scenario persistence (Postgres) is separate — this is the working set.
+//
+// The entries are frozen snapshots of the signed-in user's economics, kept in
+// browser storage: they are dropped on every session purge (plan §20) — sign
+// out, another principal, or an access change that may have narrowed what the
+// numbers in them were allowed to show.
 import type { FrozenForecastInputs } from "@/services/funnelEconomics";
+import { registerPurgeHandler } from "@/services/sessionPurge";
 
 const STORAGE_KEY = "forecasting_compare_entries_v1";
 export const COMPARE_ENTRIES_LIMIT = 6;
@@ -49,3 +55,11 @@ export function removeCompareEntry(id: string): CompareStoreEntry[] {
 export function clearCompareEntries(): void {
   saveCompareEntries([]);
 }
+
+registerPurgeHandler("forecasting-compare-entries", () => {
+  try {
+    localStorage.removeItem(STORAGE_KEY);
+  } catch {
+    /* storage unavailable: nothing persisted to drop */
+  }
+});

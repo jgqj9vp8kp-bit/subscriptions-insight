@@ -1,4 +1,8 @@
+// Best-effort `.catch(() => default)` sites below keep their defaults for
+// ordinary errors but rethrow a ScopeViolation (plan §13 R7), so a guard trip
+// can never be swallowed into a partial "ok" response.
 import type { ClickHouseClientLike, SupabaseLikeClient } from "./types.ts";
+import { ScopeViolation } from "./scopedClient.ts";
 import {
   ANALYTICS_TRANSACTIONS_TABLE,
   CREATE_FACT_USER_COHORTS_SQL,
@@ -399,7 +403,10 @@ export async function rebuildCohortMembership(input: {
 }): Promise<CohortMembershipRebuildResult> {
   const started = Date.now();
   await ensureCohortMembershipSchema(input.clickhouse);
-  const previousState = await getCohortSnapshotState(input.supabase, input.authUserId).catch(() => null);
+  const previousState = await getCohortSnapshotState(input.supabase, input.authUserId).catch((error) => {
+    if (error instanceof ScopeViolation) throw error;
+    return null;
+  });
   const fingerprint = await getWarehouseFingerprint(input.clickhouse, input.authUserId);
   const classificationVersion = COHORT_CLASSIFICATION_VERSION;
   const generatedAt = new Date().toISOString();
@@ -512,7 +519,10 @@ export async function rebuildCohortMembership(input: {
     if (!completed) {
       throw new Error("Cohort snapshot rebuild was superseded; its result was not activated.");
     }
-    const nextState = await getCohortSnapshotState(input.supabase, input.authUserId).catch(() => null);
+    const nextState = await getCohortSnapshotState(input.supabase, input.authUserId).catch((error) => {
+      if (error instanceof ScopeViolation) throw error;
+      return null;
+    });
     return {
       status: "completed",
       warehouse_version: fingerprint.warehouse_version,
@@ -528,6 +538,8 @@ export async function rebuildCohortMembership(input: {
       ...versionDiff,
     };
   } catch (error) {
+    // Every failure — a ScopeViolation included — releases the claimed lease
+    // first and then propagates unchanged.
     const message = error instanceof Error ? error.message : "Unknown cohort membership rebuild error.";
     await snapshotBuildCas(input.supabase, "fail_clickhouse_cohort_snapshot_build", {
       p_auth_user_id: input.authUserId,
@@ -536,7 +548,10 @@ export async function rebuildCohortMembership(input: {
       p_duration_ms: Date.now() - started,
       p_error: message,
       p_diagnostics: failedDiagnostics ? { ...failedDiagnostics, error: message } : { warehouse: fingerprint, error: message },
-    }).catch(() => false);
+    }).catch((casError) => {
+      if (casError instanceof ScopeViolation) throw casError;
+      return false;
+    });
     throw error;
   }
 }
@@ -859,7 +874,10 @@ export async function runMaterializedCohortList(input: {
   request: CohortRequest;
   allocationDiagnosticsEnabled?: boolean;
 }): Promise<CohortResponse | null> {
-  const state = await getCohortSnapshotState(input.supabase, input.authUserId).catch(() => null);
+  const state = await getCohortSnapshotState(input.supabase, input.authUserId).catch((error) => {
+    if (error instanceof ScopeViolation) throw error;
+    return null;
+  });
   const active = activeCohortSnapshotVersion(state);
   if (!state || !active) return null;
 
@@ -878,12 +896,21 @@ export async function runMaterializedCohortList(input: {
       input.clickhouse,
       buildMaterializedFilterOptionsQuery(nreq, active, optionsParams),
       optionsParams,
-    ).catch(() => []),
-    fxDiagnostics(input.clickhouse, input.authUserId, nreq.filters.media_buyer).catch(() => undefined),
+    ).catch((error) => {
+      if (error instanceof ScopeViolation) throw error;
+      return [];
+    }),
+    fxDiagnostics(input.clickhouse, input.authUserId, nreq.filters.media_buyer).catch((error) => {
+      if (error instanceof ScopeViolation) throw error;
+      return undefined;
+    }),
     // Live warehouse fingerprint from the SAME request, so snapshot freshness in
     // this response is a real comparison, never build-time metadata passed off
     // as current state.
-    getWarehouseFingerprint(input.clickhouse, input.authUserId).catch(() => null),
+    getWarehouseFingerprint(input.clickhouse, input.authUserId).catch((error) => {
+      if (error instanceof ScopeViolation) throw error;
+      return null;
+    }),
   ]);
   const optionsDurationMs = Date.now() - optionsStarted;
   const rows = rawRows.map((row) => toAggregateRow(row));
@@ -897,7 +924,10 @@ export async function runMaterializedCohortList(input: {
     authUserId: input.authUserId,
     warehouseVersion: active.warehouse_version,
     classificationVersion: active.classification_version,
-  }).catch(() => new Map());
+  }).catch((error) => {
+    if (error instanceof ScopeViolation) throw error;
+    return new Map();
+  });
   mergeActiveSubscriptions(rows, activeSubs);
   const totals = computeTotals(rows);
   const options = filterOptionsFromRows(optionRows, optionFiltersApplied(nreq.filters, nreq.dateFrom, nreq.dateTo));
@@ -924,6 +954,7 @@ export async function runMaterializedCohortList(input: {
     allocationDiagnosticsEnabled: Boolean(input.allocationDiagnosticsEnabled),
     allocationDiagnosticsRequest: input.request.fb_allocation_diagnostics,
   }).catch((error) => {
+    if (error instanceof ScopeViolation) throw error;
     // The client only ever sees a sanitized message, which made a total FB
     // outage look like a transient warehouse hiccup — a ClickHouse
     // ILLEGAL_AGGREGATION went unnoticed until every Spend (FB) cell was
@@ -963,7 +994,10 @@ export async function runMaterializedCohortOptions(input: {
   clickhouse: ClickHouseClientLike;
   request: CohortRequest;
 }): Promise<CohortResponse | null> {
-  const state = await getCohortSnapshotState(input.supabase, input.authUserId).catch(() => null);
+  const state = await getCohortSnapshotState(input.supabase, input.authUserId).catch((error) => {
+    if (error instanceof ScopeViolation) throw error;
+    return null;
+  });
   const active = activeCohortSnapshotVersion(state);
   if (!state || !active) return null;
 
@@ -978,7 +1012,10 @@ export async function runMaterializedCohortOptions(input: {
     ),
     subscriptionDataStatus(input.clickhouse, input.authUserId),
     supportDataStatus(input.clickhouse, input.authUserId),
-    getWarehouseFingerprint(input.clickhouse, input.authUserId).catch(() => null),
+    getWarehouseFingerprint(input.clickhouse, input.authUserId).catch((error) => {
+      if (error instanceof ScopeViolation) throw error;
+      return null;
+    }),
   ]);
   const options = filterOptionsFromRows(optionRows, optionFiltersApplied(nreq.filters, nreq.dateFrom, nreq.dateTo));
   return {

@@ -1,48 +1,62 @@
 /* global Deno */
 
-import { clickHouseEnv, createClickHouseClient, isClickHouseConfigured } from "../_shared/clickhouse/client.ts";
-import { jsonResponse, methodNotAllowed, optionsResponse, requireSupabaseUser } from "../_shared/clickhouse/http.ts";
+// clickhouse-health: the `SELECT 1` warehouse connectivity probe (Integrations
+// → ClickHouse → Test connection). Answers 200 with `connected: false` on any
+// warehouse failure, as before.
+//
+// Access (policies/clickhouse-health.ts): admin.integrations.view or
+// admin.diagnostics.view. The data owner gets today's body; everyone else the
+// connectivity flags only (no database name, no ClickHouse error text).
 
-Deno.serve(async (req: Request) => {
-  if (req.method === "OPTIONS") return optionsResponse();
-  if (req.method !== "GET" && req.method !== "POST") return methodNotAllowed("GET, POST");
+import { clickHouseEnv, isClickHouseConfigured } from "../_shared/clickhouse/client.ts";
+import { serveWithAccess } from "../_shared/clickhouse/http.ts";
+import { ScopeViolation } from "../_shared/clickhouse/scopedClient.ts";
+import type { ClickHouseClientLike } from "../_shared/clickhouse/types.ts";
+import {
+  CLICKHOUSE_HEALTH_POLICY,
+  CLICKHOUSE_NOT_CONFIGURED_MESSAGE,
+  healthDetailVisible,
+  projectHealthForViewer,
+} from "../_shared/access/policies/clickhouse-health.ts";
 
-  const auth = await requireSupabaseUser(req);
-  if ("status" in auth) return jsonResponse(auth.body, auth.status);
-
+async function probeClickHouse(clickhouse: () => ClickHouseClientLike): Promise<Record<string, unknown>> {
+  // Config probe only: host / username / password never leave this function.
   const env = clickHouseEnv();
   if (!isClickHouseConfigured()) {
-    return jsonResponse({
+    return {
       connected: false,
       configured: false,
       host_configured: Boolean(env.host),
       password_configured: env.hasPassword,
-      error: "ClickHouse is not configured in Supabase Secrets. Set CLICKHOUSE_HOST and CLICKHOUSE_PASSWORD.",
-    });
+      error: CLICKHOUSE_NOT_CONFIGURED_MESSAGE,
+    };
   }
 
   const startedAt = Date.now();
-  const client = createClickHouseClient();
   try {
-    const resultSet = await client.query({ query: "SELECT 1 AS ok", format: "JSONEachRow" });
+    const resultSet = await clickhouse().query({ query: "SELECT 1 AS ok", format: "JSONEachRow" });
     const rows = (await resultSet.json()) as Array<{ ok?: number }>;
     const ok = Number(rows[0]?.ok) === 1;
-    return jsonResponse({
+    return {
       connected: ok,
       configured: true,
       database: env.database,
       result: ok ? 1 : null,
       latency_ms: Date.now() - startedAt,
-    });
+    };
   } catch (error) {
-    return jsonResponse({
+    if (error instanceof ScopeViolation) throw error;
+    return {
       connected: false,
       configured: true,
       database: env.database,
       latency_ms: Date.now() - startedAt,
       error: error instanceof Error ? error.message : "ClickHouse connection failed.",
-    });
-  } finally {
-    await client.close?.().catch(() => undefined);
+    };
   }
+}
+
+serveWithAccess(CLICKHOUSE_HEALTH_POLICY, async ({ ctx, clickhouse }) => {
+  const health = await probeClickHouse(clickhouse);
+  return healthDetailVisible(ctx) ? health : projectHealthForViewer(health);
 });

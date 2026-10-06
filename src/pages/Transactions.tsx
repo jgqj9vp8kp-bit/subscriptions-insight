@@ -23,15 +23,42 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { FunnelBadge, StatusBadge, TypeBadge } from "@/components/StatusBadges";
 import { PaymentPassAnalytics } from "@/components/PaymentPassAnalytics";
 import { BankAnalytics } from "@/components/BankAnalytics";
+import { NoAccess } from "@/components/NoAccess";
 import { useTransactions } from "@/services/sheets";
 import { formatCurrency } from "@/services/analytics";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
+import { useAccess } from "@/hooks/useAccess";
 import type { TransactionStatus, TransactionType } from "@/services/types";
 import { autoLoadWarehouseIntoStore } from "@/services/analyticsAdapters";
 import { traceEvent, traceMark } from "@/services/performanceTrace";
 
 type SortKey = "event_time" | "amount_usd";
 type SortDir = "asc" | "desc";
+type TransactionsMode = "list" | "pass" | "banks";
+
+/** Tab order (also the coercion preference for a persisted tab the member may not open). */
+const TRANSACTIONS_MODES: readonly TransactionsMode[] = ["list", "pass", "banks"];
+
+/** Which tabs the current access may open (plan §14; UX only — the Edge gate
+ * re-checks every Payment Pass / Banks request):
+ *   list  — transactions.view AND raw access: the list is the browser-side
+ *           transaction warehouse, which only the data owner downloads (D8);
+ *   pass  — payment_pass.view;
+ *   banks — payment_pass.banks.view.
+ * Legacy access passes every check, so the owner keeps all three tabs. */
+function allowedTransactionsModes(access: { rawAccess: boolean; can: (key: string) => boolean }): TransactionsMode[] {
+  return TRANSACTIONS_MODES.filter((mode) => {
+    if (mode === "list") return access.rawAccess && access.can("transactions.view");
+    if (mode === "pass") return access.can("payment_pass.view");
+    return access.can("payment_pass.banks.view");
+  });
+}
+
+/** The persisted tab when it is still allowed, else the first allowed one
+ * (null when none is). */
+function coerceTransactionsMode(mode: unknown, allowed: readonly TransactionsMode[]): TransactionsMode | null {
+  return allowed.includes(mode as TransactionsMode) ? (mode as TransactionsMode) : allowed[0] ?? null;
+}
 
 const TYPES: TransactionType[] = ["trial", "upsell", "first_subscription", "renewal_2", "renewal_3", "renewal", "token_purchase", "failed_payment", "refund", "chargeback", "unknown"];
 const STATUSES: TransactionStatus[] = ["success", "failed", "refunded", "chargeback"];
@@ -39,8 +66,10 @@ const FUNNELS = ["past_life", "soulmate", "starseed", "unknown"] as const;
 
 const PAGE_SIZE = 25;
 
+const NO_TRANSACTIONS: ReturnType<typeof useTransactions> = [];
+
 const DEFAULT_TRANSACTIONS_UI_STATE = {
-  mode: "list" as "list" | "pass" | "banks",
+  mode: "list" as TransactionsMode,
   search: "",
   typeFilter: "all",
   funnelFilter: "all",
@@ -55,10 +84,20 @@ const DEFAULT_TRANSACTIONS_UI_STATE = {
 
 export default function TransactionsPage() {
   const txs = useTransactions();
+  const access = useAccess();
   const mountedRef = useRef(false);
   const [uiState, setUiState, resetUiState] = usePersistedPageState("ui_state_transactions", DEFAULT_TRANSACTIONS_UI_STATE);
   const { mode, search, typeFilter, funnelFilter, campaignPathFilter, statusFilter, dateFrom, dateTo, sortKey, sortDir, page } = uiState;
   const updateUiState = (patch: Partial<typeof DEFAULT_TRANSACTIONS_UI_STATE>) => setUiState((current) => ({ ...current, ...patch }));
+  // A persisted tab the member may not open (another role on this browser, or
+  // access narrowed since) falls back to the first allowed tab; the stored value
+  // is only replaced when the member picks a tab.
+  const allowedModes = allowedTransactionsModes(access);
+  const activeMode = coerceTransactionsMode(mode, allowedModes);
+  const canList = allowedModes.includes("list");
+  // Without the list tab the store holds nothing that belongs to this member
+  // (only the data owner hydrates it), so the list memos run on nothing.
+  const listTxs = canList ? txs : NO_TRANSACTIONS;
 
   if (!mountedRef.current) {
     mountedRef.current = true;
@@ -66,21 +105,22 @@ export default function TransactionsPage() {
   }
 
   useEffect(() => {
-    if (mode !== "list") {
+    if (activeMode === null) return;
+    if (activeMode !== "list") {
       // Both analytics tabs are fully server-side; neither reads the client
       // transaction store, so the 45k-row warehouse hydration is skipped.
-      traceEvent("warehouse.transactions_lazy_load_skipped", { reason: mode === "banks" ? "banks_tab" : "payment_pass_tab" });
+      traceEvent("warehouse.transactions_lazy_load_skipped", { reason: activeMode === "banks" ? "banks_tab" : "payment_pass_tab" });
       return;
     }
     traceEvent("warehouse.transactions_lazy_load_requested", { reason: "transaction_list_tab" });
     void autoLoadWarehouseIntoStore();
-  }, [mode]);
+  }, [activeMode]);
 
-  const campaignPathOptions = useMemo(() => Array.from(new Set(txs.map((t) => t.campaign_path || "unknown"))).sort(), [txs]);
+  const campaignPathOptions = useMemo(() => Array.from(new Set(listTxs.map((t) => t.campaign_path || "unknown"))).sort(), [listTxs]);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
-    const list = txs.filter((t) => {
+    const list = listTxs.filter((t) => {
       if (q && !t.email.toLowerCase().includes(q)) return false;
       if (typeFilter !== "all" && t.transaction_type !== typeFilter) return false;
       if (funnelFilter !== "all" && t.funnel !== funnelFilter) return false;
@@ -98,7 +138,7 @@ export default function TransactionsPage() {
       return sortDir === "asc" ? cmp : -cmp;
     });
     return list;
-  }, [txs, search, typeFilter, funnelFilter, campaignPathFilter, statusFilter, dateFrom, dateTo, sortKey, sortDir]);
+  }, [listTxs, search, typeFilter, funnelFilter, campaignPathFilter, statusFilter, dateFrom, dateTo, sortKey, sortDir]);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
@@ -120,14 +160,25 @@ export default function TransactionsPage() {
 
   const hasFilters = search || typeFilter !== "all" || funnelFilter !== "all" || campaignPathFilter !== "all" || statusFilter !== "all" || dateFrom || dateTo;
 
+  // The route opens for transactions.view too, but without raw access that
+  // grants no tab here (the list is data-owner only in v1).
+  if (activeMode === null) {
+    return (
+      <AppLayout title="Transactions">
+        <NoAccess description="None of the Transactions tabs is available to your role. The transaction list is limited to the data owner; Payment Pass and Banks each need their own permission." />
+      </AppLayout>
+    );
+  }
+
   return (
-    <AppLayout title="Transactions" description={`${filtered.length} of ${txs.length} transactions`}>
-      <Tabs value={mode} onValueChange={(v) => updateUiState({ mode: v as "list" | "pass" | "banks" })} className="space-y-4">
+    <AppLayout title="Transactions" description={canList ? `${filtered.length} of ${listTxs.length} transactions` : undefined}>
+      <Tabs value={activeMode} onValueChange={(v) => updateUiState({ mode: v as TransactionsMode })} className="space-y-4">
         <TabsList>
-          <TabsTrigger value="list">Transaction List</TabsTrigger>
-          <TabsTrigger value="pass">Payment Pass Analytics</TabsTrigger>
-          <TabsTrigger value="banks">Banks</TabsTrigger>
+          {allowedModes.includes("list") && <TabsTrigger value="list">Transaction List</TabsTrigger>}
+          {allowedModes.includes("pass") && <TabsTrigger value="pass">Payment Pass Analytics</TabsTrigger>}
+          {allowedModes.includes("banks") && <TabsTrigger value="banks">Banks</TabsTrigger>}
         </TabsList>
+        {canList && (
         <TabsContent value="list">
       <Card className="p-4 shadow-card">
         <div className="flex flex-wrap items-center gap-2">
@@ -265,12 +316,17 @@ export default function TransactionsPage() {
         </div>
       </Card>
         </TabsContent>
-        <TabsContent value="pass">
-          <PaymentPassAnalytics txs={txs} />
-        </TabsContent>
-        <TabsContent value="banks">
-          <BankAnalytics />
-        </TabsContent>
+        )}
+        {allowedModes.includes("pass") && (
+          <TabsContent value="pass">
+            <PaymentPassAnalytics txs={txs} />
+          </TabsContent>
+        )}
+        {allowedModes.includes("banks") && (
+          <TabsContent value="banks">
+            <BankAnalytics />
+          </TabsContent>
+        )}
       </Tabs>
     </AppLayout>
   );

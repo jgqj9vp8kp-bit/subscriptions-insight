@@ -14,18 +14,29 @@
 // Each stage persists its cursor + completion flag to public.funnelfox_leads_sync_state, so the next
 // call resumes from where the last one stopped. No stage param → run the next incomplete stage.
 //
-// Pure logic mirrors src/services/funnelfoxLeadsTransform.ts (kept in lockstep). Deploy WITH JWT
-// verification. FUNNELFOX_SECRET stays server-side; emails are masked in any log line.
+// Pure logic mirrors src/services/funnelfoxLeadsTransform.ts (kept in lockstep). FUNNELFOX_SECRET
+// stays server-side; emails are masked in any log line.
+//
+// Access (policies/funnelfox-leads-sync.ts): rawOnly + admin.sync.run on every action (sync /
+// sync_full_reset / dry_run, derived from the flags) — the reconcile stage uses the conversion
+// context the data owner's browser computes from its in-memory warehouse. Rows are written for the
+// workspace data key (ctx.tenantKey). The gate authenticates before the body is read; CORS, OPTIONS
+// and the GET / POST method check come from it.
 
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import type { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { serveWithAccess } from "../_shared/clickhouse/http.ts";
+import { FUNNELFOX_LEADS_SYNC_POLICY } from "../_shared/access/policies/funnelfox-leads-sync.ts";
 import {
-  corsHeaders,
   detectProfileEmail,
   fetchFunnelFox,
+  funnelFoxErrorResponse,
+  funnelFoxFailure,
   getFunnelFoxSecret,
 } from "../_shared/funnelfox.ts";
 
 type JsonRecord = Record<string, unknown>;
+/** The gate's service-role client (a supabase-js client; typed narrowly there). */
+type ServiceClient = ReturnType<typeof createClient>;
 
 const PROFILE_DETAIL_CONCURRENCY = 5;
 const DEFAULT_LIMIT = 100;
@@ -435,47 +446,30 @@ async function probeEmailExtraction(rows: JsonRecord[], secret: string) {
 
 // ---- HTTP entry ------------------------------------------------------------------------------
 
-Deno.serve(async (req: Request) => {
-  if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
-  if (req.method !== "POST" && req.method !== "GET") {
-    return jsonResponse({ error: "Method not allowed." }, 405);
-  }
-
+serveWithAccess(FUNNELFOX_LEADS_SYNC_POLICY, async ({ ctx, action, body, url, pg }) => {
   const startedAt = Date.now();
   const deadline = startedAt + SOFT_TIME_BUDGET_MS;
   const isExpired = () => Date.now() > deadline;
 
   const secret = getFunnelFoxSecret();
-  if (!secret) return jsonResponse({ error: "FunnelFox is not configured." }, 500);
+  if (!secret) return funnelFoxFailure(ctx, 500, { error: "FunnelFox is not configured." });
 
-  const supabaseUrl = Deno.env.get("SUPABASE_URL");
-  const anonKey = Deno.env.get("SUPABASE_ANON_KEY");
-  const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-  if (!supabaseUrl || !anonKey || !serviceKey) return jsonResponse({ error: "Server is not configured." }, 500);
+  // The gate admitted only the data owner with admin.sync.run. Rows are written for the workspace
+  // data key, never for "the caller" as such.
+  const tenantKey = ctx.tenantKey;
+  const db = pg as unknown as ServiceClient;
 
-  const token = (req.headers.get("Authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
-  if (!token) return jsonResponse({ error: "Authentication required." }, 401);
-  const authClient = createClient(supabaseUrl, anonKey, { auth: { persistSession: false } });
-  const { data: userData, error: userError } = await authClient.auth.getUser(token);
-  const userId = userData?.user?.id;
-  if (userError || !userId) return jsonResponse({ error: "Invalid or expired session." }, 401);
-
-  // Params from query and/or JSON body.
-  const url = new URL(req.url);
-  let body: JsonRecord = {};
-  if (req.method === "POST") {
-    try { body = readRecord(await req.json()); } catch { body = {}; }
-  }
+  // Params from query and/or JSON body (the gate parsed the body after authenticating).
   const intParam = (value: unknown, fallback: number, min: number, max: number) => {
     const n = Number(value);
     return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.floor(n))) : fallback;
   };
-  const boolParam = (a: unknown, b: unknown) =>
-    a === true || String(b ?? "").toLowerCase() === "true";
 
   const limit = intParam(body.limit ?? url.searchParams.get("limit"), DEFAULT_LIMIT, 1, MAX_LIMIT);
-  const dryRun = boolParam(body.dry_run, url.searchParams.get("dry_run"));
-  const fullReset = boolParam(body.full_reset, url.searchParams.get("full_reset"));
+  // The dry_run / full_reset flags were parsed into the authorized action by the policy
+  // (funnelFoxSyncFlags — the same rules as before; dry_run wins).
+  const dryRun = action === "dry_run";
+  const fullReset = action === "sync_full_reset";
   const maxPages = intParam(
     body.max_pages ?? url.searchParams.get("max_pages"),
     dryRun ? DRY_RUN_MAX_PAGES : DEFAULT_MAX_PAGES,
@@ -489,8 +483,6 @@ Deno.serve(async (req: Request) => {
       : null;
   const conversion = parseConversionContext(body.conversion);
 
-  const db = createClient(supabaseUrl, serviceKey, { auth: { persistSession: false } });
-
   // ---- Phase 6: dry run — diagnostics only, no writes ----------------------------------------
   if (dryRun) {
     try {
@@ -498,7 +490,7 @@ Deno.serve(async (req: Request) => {
       const profileProbe = await crawlList("/profiles", undefined, limit, probePages, isExpired, secret);
       const sessionProbe = await crawlList("/sessions", undefined, limit, 1, isExpired, secret);
       const listEmails = profileProbe.rows.filter((r) => emailFromListRow(r)).length;
-      return jsonResponse({
+      return {
         status: "ok",
         dry_run: true,
         stage: "profiles",
@@ -514,10 +506,10 @@ Deno.serve(async (req: Request) => {
           email_extraction: await probeEmailExtraction(profileProbe.rows, secret),
           note: "Dry run: no rows written, no raw payloads or emails returned.",
         },
-      });
+      };
     } catch (error) {
       const message = error instanceof Error ? error.message : "dry run failed";
-      return jsonResponse({ error: "FunnelFox leads dry run failed.", detail: message }, 502);
+      return funnelFoxFailure(ctx, 502, { error: "FunnelFox leads dry run failed.", detail: message });
     }
   }
 
@@ -526,7 +518,7 @@ Deno.serve(async (req: Request) => {
     const { data: stateRow } = await db
       .from("funnelfox_leads_sync_state")
       .select("*")
-      .eq("auth_user_id", userId)
+      .eq("auth_user_id", tenantKey)
       .maybeSingle();
 
     if (fullReset) {
@@ -537,7 +529,7 @@ Deno.serve(async (req: Request) => {
       await db
         .from("funnelfox_leads")
         .update({ detail_checked: false })
-        .eq("auth_user_id", userId)
+        .eq("auth_user_id", tenantKey)
         .is("normalized_email", null);
     }
 
@@ -583,7 +575,7 @@ Deno.serve(async (req: Request) => {
       const skippedNoProfileId = parsed.length - kept.length;
 
       const rows = kept.map((p) => ({
-        auth_user_id: userId,
+        auth_user_id: tenantKey,
         profile_id: p.profile_id,
         created_at: p.created_at,
         updated_at: p.updated_at,
@@ -622,7 +614,7 @@ Deno.serve(async (req: Request) => {
       const { data: candidateRows } = await db
         .from("funnelfox_leads")
         .select("profile_id, raw_profile_list")
-        .eq("auth_user_id", userId)
+        .eq("auth_user_id", tenantKey)
         .is("normalized_email", null)
         .eq("detail_checked", false)
         .limit(DETAIL_CANDIDATE_BATCH);
@@ -645,7 +637,7 @@ Deno.serve(async (req: Request) => {
           if (listEmail) {
             fetched += 1;
             updates.push({
-              auth_user_id: userId,
+              auth_user_id: tenantKey,
               profile_id: current.profile_id,
               email: listEmail,
               normalized_email: listEmail,
@@ -661,7 +653,7 @@ Deno.serve(async (req: Request) => {
               fetched += 1;
               const email = detectProfileEmail(payload);
               updates.push({
-                auth_user_id: userId,
+                auth_user_id: tenantKey,
                 profile_id: current.profile_id,
                 email,
                 normalized_email: normalizeEmail(email),
@@ -673,7 +665,7 @@ Deno.serve(async (req: Request) => {
               // 404/410 — profile gone, won't change on retry. Mark checked, no email.
               gone += 1;
               updates.push({
-                auth_user_id: userId,
+                auth_user_id: tenantKey,
                 profile_id: current.profile_id,
                 detail_checked: true,
                 synced_at: new Date().toISOString(),
@@ -705,7 +697,7 @@ Deno.serve(async (req: Request) => {
       const { count: remainingUnchecked } = await db
         .from("funnelfox_leads")
         .select("*", { count: "exact", head: true })
-        .eq("auth_user_id", userId)
+        .eq("auth_user_id", tenantKey)
         .is("normalized_email", null)
         .eq("detail_checked", false);
       const remaining = remainingUnchecked ?? 0;
@@ -751,7 +743,7 @@ Deno.serve(async (req: Request) => {
           const { data } = await db
             .from("funnelfox_leads")
             .select("profile_id, session_created_at")
-            .eq("auth_user_id", userId)
+            .eq("auth_user_id", tenantKey)
             .in("profile_id", slice);
           for (const r of (data ?? []) as Array<{ profile_id: string; session_created_at: string | null }>) {
             existingByProfile.set(r.profile_id, r.session_created_at);
@@ -766,7 +758,7 @@ Deno.serve(async (req: Request) => {
           const attribution = parseOriginUrl(s.origin);
           joined += 1;
           updates.push({
-            auth_user_id: userId,
+            auth_user_id: tenantKey,
             profile_id: profileId,
             session_id: s.session_id || null,
             session_created_at: s.created_at,
@@ -814,7 +806,7 @@ Deno.serve(async (req: Request) => {
         const { data, error } = await db
           .from("funnelfox_leads")
           .select("profile_id, normalized_email")
-          .eq("auth_user_id", userId)
+          .eq("auth_user_id", tenantKey)
           .range(from, from + PAGE - 1);
         if (error) throw new Error(`reconcile read failed: ${error.message}`);
         const chunk = (data ?? []) as Array<{ profile_id: string; normalized_email: string | null }>;
@@ -834,7 +826,7 @@ Deno.serve(async (req: Request) => {
         if (active) activeSubExcluded += 1;
         if (isLead) leadsFound += 1;
         return {
-          auth_user_id: userId,
+          auth_user_id: tenantKey,
           profile_id: row.profile_id,
           has_successful_payment: paid,
           has_active_subscription: active,
@@ -864,16 +856,16 @@ Deno.serve(async (req: Request) => {
     const { count: savedTotal } = await db
       .from("funnelfox_leads")
       .select("*", { count: "exact", head: true })
-      .eq("auth_user_id", userId);
+      .eq("auth_user_id", tenantKey);
     const { count: withEmailTotal } = await db
       .from("funnelfox_leads")
       .select("*", { count: "exact", head: true })
-      .eq("auth_user_id", userId)
+      .eq("auth_user_id", tenantKey)
       .not("normalized_email", "is", null);
     const { count: pendingDetails } = await db
       .from("funnelfox_leads")
       .select("*", { count: "exact", head: true })
-      .eq("auth_user_id", userId)
+      .eq("auth_user_id", tenantKey)
       .is("normalized_email", null)
       .eq("detail_checked", false);
 
@@ -927,7 +919,7 @@ Deno.serve(async (req: Request) => {
     const nowIso = new Date().toISOString();
     await db.from("funnelfox_leads_sync_state").upsert(
       {
-        auth_user_id: userId,
+        auth_user_id: tenantKey,
         ...cursorUpdate,
         ...completionUpdate,
         profiles_scanned_total: scannedTotal,
@@ -945,7 +937,7 @@ Deno.serve(async (req: Request) => {
     );
 
     console.info("funnelfox-leads-sync", {
-      userId_present: true,
+      actor: ctx.actor.kind,
       stage,
       status: overallStatus,
       stopped_reason: stoppedReason,
@@ -954,7 +946,7 @@ Deno.serve(async (req: Request) => {
       profiles_with_email: profilesWithEmail,
     });
 
-    return jsonResponse({
+    return {
       status: overallStatus,
       dry_run: false,
       stage,
@@ -965,20 +957,13 @@ Deno.serve(async (req: Request) => {
       coverage_warning: warning.coverage_warning,
       coverage_warning_message: warning.coverage_warning_message,
       summary: stats,
-    });
+    };
   } catch (error) {
     const message = error instanceof Error ? error.message : "sync failed";
     await db.from("funnelfox_leads_sync_state").upsert(
-      { auth_user_id: userId, last_status: "error", last_error: message },
+      { auth_user_id: tenantKey, last_status: "error", last_error: message },
       { onConflict: "auth_user_id" },
     );
-    return jsonResponse({ error: "FunnelFox leads sync failed.", detail: message }, 502);
+    return funnelFoxFailure(ctx, 502, { error: "FunnelFox leads sync failed.", detail: message });
   }
-});
-
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { ...corsHeaders, "Content-Type": "application/json", "Cache-Control": "no-store" },
-  });
-}
+}, { onError: funnelFoxErrorResponse });

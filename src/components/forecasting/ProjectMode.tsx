@@ -31,6 +31,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { sanitizeColumnVisibility } from "@/services/cohortsUiSettings";
 import { exportProjectTable } from "@/services/projectExport";
+import { useAccess } from "@/hooks/useAccess";
 import { fmtInt, fmtMoney, fmtPctValue, fmtRatio } from "@/components/forecasting/forecastFormat";
 import { loadProjectSeedData, type ProjectSeedData } from "@/services/projectForecastSeeding";
 import {
@@ -145,6 +146,13 @@ function editsFromEntries(entries: ProjectFunnelEntry[]): { edits: Record<string
 }
 
 export function ProjectMode() {
+  // Saved projects are project_forecasts rows: Save / Duplicate create one
+  // (forecasting.create), Delete removes one (forecasting.delete). Loading,
+  // replaying and the live what-if editors only read. UX only — RLS is
+  // authoritative.
+  const access = useAccess();
+  const canCreate = access.can("forecasting.create");
+  const canDelete = access.can("forecasting.delete");
   const defaultWindow = useMemo(previousMonthWindow, []);
   const [fromInput, setFromInput] = useState(defaultWindow.from);
   const [toInput, setToInput] = useState(defaultWindow.to);
@@ -519,9 +527,13 @@ export function ProjectMode() {
             </Select>
           </div>
           <Button variant="outline" size="sm" className="h-8" disabled={!selectedSavedId || persistBusy} onClick={() => onLoadSaved(selectedSavedId)}>Load</Button>
-          <Button variant="outline" size="sm" className="h-8" disabled={!selectedSavedId || persistBusy} onClick={() => onDuplicateSaved(selectedSavedId)}>Duplicate</Button>
-          <Button variant="outline" size="sm" className="h-8 text-destructive" disabled={!selectedSavedId || persistBusy} onClick={() => onDeleteSaved(selectedSavedId)}>Delete</Button>
-          {viewMode.kind === "live" && project && (
+          {canCreate && (
+            <Button variant="outline" size="sm" className="h-8" disabled={!selectedSavedId || persistBusy} onClick={() => onDuplicateSaved(selectedSavedId)}>Duplicate</Button>
+          )}
+          {canDelete && (
+            <Button variant="outline" size="sm" className="h-8 text-destructive" disabled={!selectedSavedId || persistBusy} onClick={() => onDeleteSaved(selectedSavedId)}>Delete</Button>
+          )}
+          {canCreate && viewMode.kind === "live" && project && (
             <>
               <div className="ml-4 space-y-1">
                 <Label className="text-xs text-muted-foreground">Save current as</Label>

@@ -31,7 +31,7 @@ import {
   type SpendGroup,
   type WindowSpendLedger,
 } from "./funnelEconomicsProject.ts";
-import type { ClickHouseClientLike } from "./types.ts";
+import type { ClickHouseClientLike, SupabaseLikeClient } from "./types.ts";
 
 export const ANALYTICS_TRANSACTIONS_TABLE = "analytics_transactions";
 export const FACT_FACEBOOK_STATS_TABLE = "fact_facebook_stats";
@@ -304,18 +304,10 @@ export function assembleProjectSpendLedger(input: {
 
 // ---- Edge orchestration ----------------------------------------------------------
 
-interface SupabaseLikeClient {
-  from(table: string): {
-    select(columns: string): {
-      lte(column: string, value: string): {
-        gte(column: string, value: string): PromiseLike<{ data: unknown[] | null; error: { message: string } | null }>;
-      };
-    };
-  };
-}
-
 /** One call = the whole ledger: three ClickHouse reads + the known-gap overlap.
- * Wired as clickhouse-facebook action "spend_ledger". */
+ * Wired as clickhouse-facebook action "spend_ledger". The edge reads with the
+ * service role (RLS bypassed), so the known-gap read is owner-filtered here, the
+ * same way the recon snapshot reads them. */
 export async function runProjectSpendLedger(input: {
   clickhouse: ClickHouseClientLike;
   supabase: SupabaseLikeClient;
@@ -341,8 +333,10 @@ export async function runProjectSpendLedger(input: {
     input.supabase
       .from("facebook_known_gaps")
       .select("gap_id,gap_from,gap_to,reason")
+      .eq("auth_user_id", input.authUserId)
       .lte("gap_from", window.to)
-      .gte("gap_to", window.from),
+      // gte is optional on the shared fake-friendly type; supabase-js always has it.
+      .gte!("gap_to", window.from),
   ]);
   if (gapsResult.error) throw new Error(`Could not read known gaps: ${gapsResult.error.message}`);
 

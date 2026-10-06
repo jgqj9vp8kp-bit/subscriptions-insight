@@ -12,6 +12,7 @@ import {
   type WarehouseManagementClient,
 } from "@/services/transactionWarehouse";
 import { loadWarehouseTransactionsCached } from "@/services/transactionWarehouseCache";
+import { getActiveCacheAccess } from "@/services/analyticsCache";
 import type { Transaction } from "@/services/types";
 import { traceAsync, traceEvent, traceRequest } from "@/services/performanceTrace";
 
@@ -276,12 +277,25 @@ async function autoLoadWarehouseIntoStoreInner(options: WarehouseAutoLoadOptions
       return { status: "empty", count: 0, message: "No warehouse data found", progress };
     }
 
+    // The access partition this load runs under (plan §20). A purge (sign-out,
+    // account switch, access change) while the download runs resets the store;
+    // a late result must not refill it for whoever is signed in now.
+    const loadPartition = getActiveCacheAccess().partition;
     const transactions = await traceRequest(
       "warehouse.global_transactions_query",
       "supabase:transactions:full_load",
       () => loadWarehouseTransactionsCached({ totalRowsExpected: count, onProgress: publishPageProgress }),
       { table: "transactions", blocks_render: false, source: "supabase" },
     );
+    if (getActiveCacheAccess().partition !== loadPartition) {
+      const progress = setLegacyWarehouseLoadProgress({
+        ...initialLegacyWarehouseLoadProgress,
+        status: "skipped",
+        duration_ms: Date.now() - startedAt,
+        stopped_reason: "access_changed_during_fetch",
+      });
+      return { status: "skipped", count: 0, message: "Access changed while loading.", progress };
+    }
 
     // Re-check after the (async) load so we never clobber a dataset that arrived in the meantime.
     const stateAfterFetch = useDataStore.getState();

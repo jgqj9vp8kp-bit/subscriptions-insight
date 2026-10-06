@@ -1,14 +1,33 @@
 import { defineConfig, loadEnv } from "vite";
-import type { ViteDevServer } from "vite";
+import type { Plugin, ViteDevServer } from "vite";
 import react from "@vitejs/plugin-react-swc";
 import path from "path";
 import { componentTagger } from "lovable-tagger";
-import { handleFunnelFoxProfile, handleFunnelFoxProfileDebug, handleFunnelFoxSubscriptionDetails, handleFunnelFoxSubscriptions } from "./api/funnelfox/subscriptionsCore";
+import {
+  FUNNELFOX_LOCAL_PROXY_FLAG,
+  handleFunnelFoxProfile,
+  handleFunnelFoxProfileDebug,
+  handleFunnelFoxSubscriptionDetails,
+  handleFunnelFoxSubscriptions,
+} from "./api/funnelfox/subscriptionsCore";
 
-function funnelFoxDevProxy() {
+// Dev server hosts that only this machine can reach.
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
+
+// Dev-only FunnelFox proxy. The handlers return raw upstream payloads (customer
+// emails) to any valid session, so they refuse to run unless
+// FUNNELFOX_LOCAL_PROXY_ENABLED=true. That flag is switched on here, inside
+// configureServer — which only `vite` (the dev server) calls; `vite build` and
+// `vite preview` never do — and only when the dev server listens on loopback.
+// The default bind is "::" (the Lovable editor preview needs it), so on a
+// network-reachable dev server the proxy stays off unless the developer sets
+// the flag explicitly; an explicit value always wins.
+function funnelFoxDevProxy(): Plugin {
   return {
     name: "funnelfox-dev-proxy",
+    apply: "serve",
     configureServer(server: ViteDevServer) {
+      if (process.env[FUNNELFOX_LOCAL_PROXY_FLAG] === undefined && LOOPBACK_HOSTS.has(String(server.config.server.host))) process.env[FUNNELFOX_LOCAL_PROXY_FLAG] = "true";
       server.middlewares.use(async (req, res, next) => {
         const requestUrl = new URL(req.url ?? "/", "http://localhost");
         const isSubscriptionsRoute = requestUrl.pathname === "/api/funnelfox/subscriptions";
@@ -65,6 +84,10 @@ export default defineConfig(({ mode }) => {
 
   return {
     server: {
+      // "::" is the Lovable template default (its editor preview reaches the dev
+      // server over the network). The FunnelFox dev proxy is NOT enabled on this
+      // bind — see funnelFoxDevProxy; run `npm run dev -- --host localhost` to
+      // use it locally.
       host: "::",
       port: 8080,
       hmr: {

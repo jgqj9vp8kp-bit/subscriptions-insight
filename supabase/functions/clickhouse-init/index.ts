@@ -1,26 +1,20 @@
 /* global Deno */
 
-import { clickHouseEnv, createClickHouseClient } from "../_shared/clickhouse/client.ts";
-import { jsonResponse, methodNotAllowed, optionsResponse, requireSupabaseUser } from "../_shared/clickhouse/http.ts";
+// clickhouse-init: idempotent warehouse DDL (CREATE / ALTER of every table and
+// the one-time whole-table rebuilds), then the analytics_transactions metadata
+// and the workspace tenant's row counts (ctx.tenantKey, never the caller).
+//
+// Access (policies/clickhouse-init.ts): the workspace Owner who is also the
+// data owner (ownerOnly + rawOnly) — platform DDL rewrites every tenant's rows.
+
+import { serveWithAccess } from "../_shared/clickhouse/http.ts";
 import { initializeClickHouseSchema } from "../_shared/clickhouse/schema.ts";
+import { CLICKHOUSE_INIT_POLICY, clickHouseInitErrorResponse } from "../_shared/access/policies/clickhouse-init.ts";
 
-Deno.serve(async (req: Request) => {
-  if (req.method === "OPTIONS") return optionsResponse();
-  if (req.method !== "POST") return methodNotAllowed("POST");
-
-  const auth = await requireSupabaseUser(req);
-  if ("status" in auth) return jsonResponse(auth.body, auth.status);
-
-  let client: ReturnType<typeof createClickHouseClient> | null = null;
-  try {
-    client = createClickHouseClient();
-    const result = await initializeClickHouseSchema({ client, env: clickHouseEnv() });
-    return jsonResponse(result);
-  } catch (error) {
-    return jsonResponse({
-      error: error instanceof Error ? error.message : "Could not initialize ClickHouse schema.",
-    }, 502);
-  } finally {
-    await client?.close?.().catch(() => undefined);
-  }
-});
+serveWithAccess(
+  CLICKHOUSE_INIT_POLICY,
+  // The database name is read from the warehouse (currentDatabase()), so no
+  // ClickHouse config is read here.
+  async ({ ctx, clickhouse }) => await initializeClickHouseSchema({ client: clickhouse(), authUserId: ctx.tenantKey }),
+  { onError: clickHouseInitErrorResponse },
+);

@@ -17,8 +17,10 @@ import {
   type FbReportResponse,
   type FbStatusResponse,
 } from "@/services/fbWarehouse";
+import { partitionedVersionKey } from "@/services/analyticsCache";
 import { recordDuration } from "@/services/analyticsProgress";
-import { GC_MS, STALE_MS, transientRetry, useAnalyticsProgress } from "@/hooks/useAnalyticsCache";
+import { GC_MS, STALE_MS, transientRetry, useAnalyticsProgress, useCacheScope } from "@/hooks/useAnalyticsCache";
+import { useOptionalAccess } from "@/hooks/useAccess";
 import { traceHash, traceRequest } from "@/services/performanceTrace";
 
 const NS = "fb-analytics";
@@ -29,13 +31,17 @@ export function useFbWarehouseStatus(enabled: boolean): {
   ready: boolean;
   refetch: () => void;
 } {
+  // The status payload differs per access (tenant spend totals are owner /
+  // admin only), so its entry is partitioned like every report.
+  const access = useOptionalAccess();
+  const active = enabled && (!access || access.partition !== "");
   const query = useQuery({
-    queryKey: [...FB_WAREHOUSE_VERSION_KEY],
+    queryKey: partitionedVersionKey(FB_WAREHOUSE_VERSION_KEY, access?.partition),
     queryFn: async () =>
       traceRequest("fb_warehouse.status", "clickhouse-facebook:status", () => loadFbStatus(), {
         edge_function: "clickhouse-facebook",
       }),
-    enabled,
+    enabled: active,
     staleTime: STALE_MS,
     gcTime: GC_MS,
     retry: transientRetry,
@@ -46,7 +52,7 @@ export function useFbWarehouseStatus(enabled: boolean): {
   return {
     status,
     version: fbWarehouseVersionFromStatus(status),
-    ready: !enabled || query.isSuccess || query.isError,
+    ready: !active || query.isSuccess || query.isError,
     refetch: () => void query.refetch(),
   };
 }
@@ -67,7 +73,9 @@ export function useFbReportQuery(params: {
   warehouseVersion: string;
   enabled: boolean;
 }): UseFbReportResult {
-  const { query, userScopeHash, warehouseVersion, enabled } = params;
+  const { query, warehouseVersion } = params;
+  const userScopeHash = useCacheScope(params.userScopeHash);
+  const enabled = params.enabled && userScopeHash !== "";
   const queryKey = useMemo(
     () => fbReportKey({ userScopeHash, warehouseVersion, query }),
     [userScopeHash, warehouseVersion, query],

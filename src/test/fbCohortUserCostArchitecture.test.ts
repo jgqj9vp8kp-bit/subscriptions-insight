@@ -13,7 +13,7 @@ import {
   type FbCampaignMetricRow,
   type FbMetaTimezoneConfig,
 } from "../../supabase/functions/_shared/clickhouse/fbCohortStats.ts";
-import { FetchClickHouseClient } from "../../supabase/functions/_shared/clickhouse/client.ts";
+import { internalCreateClickHouseClient } from "../../supabase/functions/_shared/clickhouse/client.ts";
 import type { CohortFilters } from "../../supabase/functions/_shared/clickhouse/cohortContract.ts";
 
 const DATE = "2026-07-14";
@@ -420,7 +420,7 @@ describe("production blocker regressions: bounded transport and precision", () =
       return new Response("", { status: 200 });
     });
     try {
-      const client = new FetchClickHouseClient({ host: "https://clickhouse.example", username: "u", password: "p", database: "analytics" });
+      const client = internalCreateClickHouseClient({ host: "https://clickhouse.example", username: "u", password: "p", database: "analytics" });
       await client.query({ query: sql, query_params: params, format: "JSONEachRow" });
     } finally {
       vi.unstubAllGlobals();

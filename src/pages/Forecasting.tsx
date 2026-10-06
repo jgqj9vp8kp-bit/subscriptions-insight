@@ -19,6 +19,7 @@ import { cn } from "@/lib/utils";
 import { useTransactions } from "@/services/sheets";
 import { useDataStore } from "@/store/dataStore";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
+import { useAccess } from "@/hooks/useAccess";
 import { computeCohorts, formatCurrency, DEFAULT_MAX_RENEWAL_DEPTH } from "@/services/analytics";
 import { aggregateTrafficMetrics } from "@/services/cohortReporting";
 import { filterCohortsWithDiagnostics, filterTransactionsByTrialAttribution, campaignIdForTransaction } from "@/services/cohortFiltering";
@@ -170,10 +171,23 @@ function CostInput({
   );
 }
 
+// Stable empty inputs for principals without raw access (see ForecastingPage).
+const NO_TRANSACTIONS: ReturnType<typeof useTransactions> = [];
+const NO_SUBSCRIPTIONS: ReturnType<typeof useDataStore.getState>["subscriptions"] = [];
+const NO_TRAFFIC_METRICS: ReturnType<typeof useDataStore.getState>["trafficMetrics"] = [];
+
 export default function ForecastingPage() {
-  const txs = useTransactions();
-  const subscriptions = useDataStore((state) => state.subscriptions);
-  const trafficMetrics = useDataStore((state) => state.trafficMetrics);
+  // The Actuals tab is a client compute over the downloaded transaction
+  // warehouse (D8): data owner only (rawAccess; legacy ⇒ true). Everyone else
+  // gets Plan / Compare / Project, which read the server, and the Actuals
+  // memos below run on empty inputs. UX only — the Edge gate is authoritative.
+  const { rawAccess } = useAccess();
+  const storeTxs = useTransactions();
+  const storeSubscriptions = useDataStore((state) => state.subscriptions);
+  const storeTrafficMetrics = useDataStore((state) => state.trafficMetrics);
+  const txs = rawAccess ? storeTxs : NO_TRANSACTIONS;
+  const subscriptions = rawAccess ? storeSubscriptions : NO_SUBSCRIPTIONS;
+  const trafficMetrics = rawAccess ? storeTrafficMetrics : NO_TRAFFIC_METRICS;
   const [ui, setUi, resetUi] = usePersistedPageState<UiState>("ui_state_forecasting_v2", DEFAULT_FORECAST_UI_STATE);
   const update = (patch: Partial<UiState>) => setUi((current) => ({ ...current, ...patch }));
 
@@ -384,14 +398,17 @@ export default function ForecastingPage() {
   return (
     <AppLayout
       title="Forecasting"
-      description="Plan future funnel economics (Plan) or analyze realized payback of past cohorts (Actuals)."
+      description={rawAccess
+        ? "Plan future funnel economics (Plan) or analyze realized payback of past cohorts (Actuals)."
+        : "Plan future funnel economics (Plan), compare scenarios (Compare) and review project payback (Project)."}
     >
-      <Tabs defaultValue="plan" className="space-y-4">
+      {/* Re-keyed on raw access so a session that loses it can never stay on Actuals. */}
+      <Tabs key={rawAccess ? "raw" : "server"} defaultValue="plan" className="space-y-4">
         <TabsList>
           <TabsTrigger value="plan">Plan</TabsTrigger>
           <TabsTrigger value="compare">Compare</TabsTrigger>
           <TabsTrigger value="project">Project</TabsTrigger>
-          <TabsTrigger value="actuals">Actuals</TabsTrigger>
+          {rawAccess && <TabsTrigger value="actuals">Actuals</TabsTrigger>}
         </TabsList>
         <TabsContent value="plan" className="mt-0">
           <PlanMode />
@@ -402,6 +419,7 @@ export default function ForecastingPage() {
         <TabsContent value="project" className="mt-0">
           <ProjectMode />
         </TabsContent>
+        {rawAccess && (
         <TabsContent value="actuals" className="mt-0">
       <TooltipProvider delayDuration={100}>
         <div className={cn("space-y-4", isStale && "opacity-70 transition-opacity")}>
@@ -626,6 +644,7 @@ export default function ForecastingPage() {
         </div>
       </TooltipProvider>
         </TabsContent>
+        )}
       </Tabs>
     </AppLayout>
   );

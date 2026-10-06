@@ -20,6 +20,7 @@
 import type { ClickHouseClientLike, SupabaseLikeClient } from "./types.ts";
 import { ensureFbWarehouseV2Schema, FB_BATCH_REGISTRY_TABLE, FB_DQ_RESULTS_TABLE, FACT_FB_ACCOUNT_DAILY_TABLE, FACT_FB_AD_DAILY_TABLE, FACT_FB_ADSET_DAILY_TABLE, FACT_FB_CAMPAIGN_DAILY_TABLE, RAW_FACEBOOK_API_RESPONSES_TABLE } from "./fbWarehouseV2Schema.ts";
 import { deriveDimCandidatesFromRows, syncFbV2Dims, type FbDimSourceRow } from "./fbWarehouseV2Dims.ts";
+import { ScopeViolation } from "./scopedClient.ts";
 
 export const FB_SYNC_RUN_REQUESTS_TABLE = "facebook_sync_run_requests";
 
@@ -132,6 +133,9 @@ export class FbWarehouseV2Writer {
     try {
       await work();
     } catch (error) {
+      // Fail-safe for warehouse faults only: a write under the wrong tenant is
+      // a ScopeViolation and must fail the sync (rule R7).
+      if (error instanceof ScopeViolation) throw error;
       this.errors.push(`${step}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }

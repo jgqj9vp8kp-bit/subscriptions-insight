@@ -8,6 +8,7 @@
 
 import { rebuildClickHouseCohortMembership } from "@/services/clickhouse";
 import { traceEvent } from "@/services/performanceTrace";
+import { registerPurgeHandler } from "@/services/sessionPurge";
 import type { CohortResponse } from "../../supabase/functions/_shared/clickhouse/cohortContract";
 
 /** Structural subset of CohortFxDiagnostics / FxNormalizationDiagnostics this module needs. */
@@ -144,11 +145,18 @@ export function staleSnapshotRebuildKey(health: CohortSnapshotHealth): string | 
   ].join("→");
 }
 
-/** Test-only: reset the single-flight bookkeeping. */
-export function resetCohortSnapshotAutoRebuildForTests(): void {
+/** Forget which staleness observations were already acted on. The keys were
+ * observed by the previous principal / access partition, so the session purge
+ * resets them (plan §20); tests reset between cases. */
+export function resetCohortSnapshotAutoRebuild(): void {
   attemptedRebuildKeys.clear();
   rebuildInFlight = null;
 }
+
+/** Test-only alias kept for existing suites. */
+export const resetCohortSnapshotAutoRebuildForTests = resetCohortSnapshotAutoRebuild;
+
+registerPurgeHandler("cohort-snapshot-auto-rebuild", resetCohortSnapshotAutoRebuild);
 
 /**
  * Trigger a background snapshot rebuild for a stale observation, at most once

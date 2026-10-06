@@ -8,6 +8,7 @@ import { useQuery } from "@tanstack/react-query";
 import { cn } from "@/lib/utils";
 import { AiActionChip } from "@/components/ai/AiActionChip";
 import { AiFeedback } from "@/components/ai/AiFeedback";
+import { useAccess } from "@/hooks/useAccess";
 import { loadAiActionHistory, type AiActionHistoryPoint } from "@/services/aiRecommendationLog";
 import { aiActionLabel, aiScopeKey, aiScopeLabel, type AiAction, type AiBudgetDeltaPct, type AiEvidence, type AiMetricVerdict, type AiRecommendation } from "@/services/aiSignals";
 import { useAiAssistantStore } from "@/store/aiAssistantStore";
@@ -70,10 +71,12 @@ function EvidenceRow({ ev }: { ev: AiEvidence }) {
 }
 
 /** "Ask AI" opens the assistant with the page's published context and a
- * pre-filled question about this row — follow-ups can then compare to peers. */
+ * pre-filled question about this row — follow-ups can then compare to peers.
+ * Only with ai.use (the assistant itself requires it). */
 function AskAiButton({ rec }: { rec: AiRecommendation }) {
+  const canUseAi = useAccess().can("ai.use");
   const context = useAiAssistantStore((state) => state.context);
-  if (!context) return null;
+  if (!context || !canUseAi) return null;
   return (
     <button
       type="button"
@@ -125,11 +128,14 @@ export interface AiHistoryKey {
 }
 
 export function AiAnalysisPanel({ rec, history, footer }: { rec: AiRecommendation; history?: AiHistoryKey; footer?: React.ReactNode }) {
+  const access = useAccess();
   const scopeKey = aiScopeKey(rec.scope);
+  // Past verdicts are the actor's saved AI history (ai_recommendations):
+  // ai.history.view, keyed by the access partition like every other cache.
   const historyQuery = useQuery({
-    queryKey: ["ai-action-history", history?.surface, history?.contextHash, scopeKey],
+    queryKey: ["ai-action-history", access.partition, history?.surface, history?.contextHash, scopeKey],
     queryFn: () => loadAiActionHistory({ surface: history!.surface, contextHash: history!.contextHash!, scopeKey }),
-    enabled: Boolean(history?.contextHash),
+    enabled: Boolean(history?.contextHash) && access.can("ai.history.view"),
     staleTime: 5 * 60 * 1000,
   });
 

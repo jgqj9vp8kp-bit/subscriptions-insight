@@ -6,8 +6,15 @@
 
 import { useEffect, useReducer, useRef } from "react";
 import { useQuery, type QueryClient } from "@tanstack/react-query";
-import { getClickHouseSummary, invalidateClickHouseSummaryCache } from "@/services/clickhouse";
+import { useOptionalAccess } from "@/hooks/useAccess";
 import {
+  ClickHouseRequestError,
+  getClickHouseSummary,
+  invalidateClickHouseSummaryCache,
+  isAccessErrorCode,
+} from "@/services/clickhouse";
+import {
+  partitionedVersionKey,
   warehouseVersionFromSummary,
   supportWarehouseVersionFromSummary,
   SUPPORT_WAREHOUSE_VERSION_KEY,
@@ -25,8 +32,27 @@ import { traceEvent, traceRequest } from "@/services/performanceTrace";
 export const STALE_MS = 5 * 60 * 1000;
 export const GC_MS = 60 * 60 * 1000;
 
+/** The cache partition a query key must carry (plan §20). Inside the
+ * AccessProvider it is always the server-issued access partition — whatever the
+ * caller passed — so an entry fetched under one principal, role or funnel scope
+ * is never served under another. Outside a provider (unit tests, isolated
+ * widgets) the caller's scope is used as before. "" ⇒ no data may be loaded:
+ * callers must keep their queries disabled. */
+export function useCacheScope(userScopeHash: string): string {
+  const access = useOptionalAccess();
+  return access ? access.partition : userScopeHash;
+}
+
 // Retry only transient failures: not validation (400) or auth ("Sign in").
 export function transientRetry(failureCount: number, error: unknown): boolean {
+  // Typed Edge errors: any 4xx is the request or the caller's access
+  // (401/403/404/409 — asking again cannot change the answer, R12), and an
+  // access-layer code (auth/access service 503, workspace not bootstrapped) is
+  // retried by the access refresh, not per query.
+  if (error instanceof ClickHouseRequestError) {
+    if (error.status >= 400 && error.status < 500) return false;
+    if (isAccessErrorCode(error.errorCode)) return false;
+  }
   const msg = error instanceof Error ? error.message : String(error ?? "");
   // "unavailable" = the ClickHouse circuit breaker's instant failure (the edge
   // function already retried the warehouse with backoff); re-asking cannot
@@ -41,8 +67,10 @@ export function transientRetry(failureCount: number, error: unknown): boolean {
 // can gate the heavier list/bundle fetch on it and avoid a wasted double fetch on
 // the first-ever visit (re-key once the version resolves).
 export function useWarehouseVersion(enabled: boolean): { version: string; ready: boolean } {
+  const access = useOptionalAccess();
+  const active = enabled && (!access || access.partition !== "");
   const query = useQuery({
-    queryKey: WAREHOUSE_VERSION_KEY,
+    queryKey: partitionedVersionKey(WAREHOUSE_VERSION_KEY, access?.partition),
     queryFn: async () => {
       const summary = await traceRequest(
         "warehouse_version.query",
@@ -52,7 +80,7 @@ export function useWarehouseVersion(enabled: boolean): { version: string; ready:
       );
       return warehouseVersionFromSummary(summary);
     },
-    enabled,
+    enabled: active,
     staleTime: STALE_MS,
     gcTime: GC_MS,
     retry: transientRetry,
@@ -60,25 +88,27 @@ export function useWarehouseVersion(enabled: boolean): { version: string; ready:
     refetchOnReconnect: true,
   });
   useEffect(() => {
-    if (!enabled) return;
+    if (!active) return;
     traceEvent("warehouse_version.state", {
       status: query.status,
       fetch_status: query.fetchStatus,
       has_data: query.data != null,
       is_stale: query.isStale,
     });
-  }, [enabled, query.status, query.fetchStatus, query.data, query.isStale]);
+  }, [active, query.status, query.fetchStatus, query.data, query.isStale]);
   return {
     version: (query.data as string | undefined) ?? "whv_unknown",
-    ready: !enabled || query.isSuccess || query.isError || query.data != null,
+    ready: !active || query.isSuccess || query.isError || query.data != null,
   };
 }
 
 export function useSupportWarehouseVersion(enabled: boolean): { version: string; ready: boolean } {
+  const access = useOptionalAccess();
+  const active = enabled && (!access || access.partition !== "");
   const query = useQuery({
-    queryKey: SUPPORT_WAREHOUSE_VERSION_KEY,
+    queryKey: partitionedVersionKey(SUPPORT_WAREHOUSE_VERSION_KEY, access?.partition),
     queryFn: async () => supportWarehouseVersionFromSummary(await getClickHouseSummary()),
-    enabled,
+    enabled: active,
     staleTime: STALE_MS,
     gcTime: GC_MS,
     retry: transientRetry,
@@ -87,7 +117,7 @@ export function useSupportWarehouseVersion(enabled: boolean): { version: string;
   });
   return {
     version: (query.data as string | undefined) ?? "swhv_unknown",
-    ready: !enabled || query.isSuccess || query.isError || query.data != null,
+    ready: !active || query.isSuccess || query.isError || query.data != null,
   };
 }
 

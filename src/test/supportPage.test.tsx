@@ -44,6 +44,13 @@ vi.mock("recharts", () => ({
 
 vi.mock("@/hooks/use-toast", () => ({ useToast: () => ({ toast: vi.fn() }) }));
 vi.mock("@/hooks/useAuth", () => ({ useAuth: () => ({ user: { id: "user_1" } }) }));
+// The page reads useAccess(); these tests cover the data owner's view (legacy
+// access: every permission, raw access on — exactly today's behaviour).
+vi.mock("@/hooks/useAccess", async () => {
+  const { buildAccessValue } = await import("@/contexts/accessContext");
+  const owner = buildAccessValue({ status: "legacy", access: null, userId: "user_1" });
+  return { useAccess: () => owner, useOptionalAccess: () => owner, useCan: (key: string) => owner.can(key) };
+});
 vi.mock("@/hooks/useAnalyticsCache", () => ({
   useSupportWarehouseVersion: () => ({ version: "whv_support", ready: true }),
   invalidateSupportAnalyticsCache: vi.fn(() => Promise.resolve()),

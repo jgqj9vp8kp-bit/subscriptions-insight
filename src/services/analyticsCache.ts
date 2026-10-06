@@ -1,9 +1,14 @@
 // Shared analytics query-cache primitives, reused by Cohorts, Users, and Payment
-// Pass Analytics: the non-reversible user-scope hash, the hashed warehouse-version
-// fingerprint, the warehouse-dependent query roots, and array normalization.
+// Pass Analytics: the cache partition, the hashed warehouse-version fingerprint,
+// the warehouse-dependent query roots, and array normalization.
 //
-// No raw user identifiers or cursor ids ever appear in a key or persisted storage —
-// only non-reversible hashes.
+// Cache isolation (plan §20): the "userScopeHash" slot of every query key now
+// carries the server-issued ACCESS PARTITION (useAccess().partition, an HMAC of
+// workspace | principal | access version | scope; legacy ⇒ "legacy:" + user id),
+// so an entry fetched under one principal, role or funnel scope can never be
+// served under another. The hooks resolve it themselves (useCacheScope).
+//
+// No cursor ids ever appear in a key or persisted storage — only hashes.
 
 import type { ClickHouseSummary } from "@/services/clickhouse";
 
@@ -43,11 +48,26 @@ import type { ClickHouseSummary } from "@/services/clickhouse";
 // to correct them. Discard v13 bundles so both lists populate on first load.
 // v15 (2026-09): the Dashboard Revenue Intelligence root ("revenue") joins the
 // warehouse-dependent set; older persisted caches know nothing about it.
-export const ANALYTICS_CACHE_SCHEMA_VERSION = 15;
+// v16 (2026-10, access control): keys carry the access partition instead of the
+// FNV user hash, the persisted envelope is stored per partition and no longer
+// holds Users rows / Support messages. Discard every v15 envelope.
+export const ANALYTICS_CACHE_SCHEMA_VERSION = 16;
 
+// Prefixes: the hooks append the access partition (warehouseVersionKey), and
+// invalidation / persistence match on these two leading segments.
 export const WAREHOUSE_VERSION_KEY = ["clickhouse", "warehouse-version"] as const;
 export const SUPPORT_WAREHOUSE_VERSION_KEY = ["clickhouse", "support-warehouse-version"] as const;
 export const WAREHOUSE_ANALYTICS_INVALIDATED_EVENT = "warehouse-analytics-invalidated";
+
+/** A version-key prefix scoped to one access partition. Without a partition
+ * (no AccessProvider, e.g. unit tests) the bare prefix is the key, as before. */
+export function partitionedVersionKey(prefix: readonly string[], partition?: string | null): string[] {
+  return partition ? [...prefix, partition] : [...prefix];
+}
+
+export function warehouseVersionKey(partition?: string | null): string[] {
+  return partitionedVersionKey(WAREHOUSE_VERSION_KEY, partition);
+}
 
 // Analytics query roots that depend on warehouse transaction data. Invalidated
 // together after a successful CSV import + ClickHouse auto-sync, and persisted by
@@ -65,10 +85,74 @@ export function fnv(input: string): string {
   return (h >>> 0).toString(36);
 }
 
-// Non-reversible per-user scope for cache isolation — never exposes the raw id/email.
+/** @deprecated A 32-bit hash of the user id is not a cache partition: it ignores
+ * role and funnel scope. Inside the app the hooks key on useAccess().partition;
+ * this stays only for callers not yet migrated (and their tests). */
 export function hashUserScope(userId: string | null | undefined): string {
   const input = (userId ?? "anonymous").trim() || "anonymous";
   return `u_${fnv(input)}`;
+}
+
+// ---- Browser cache access (IndexedDB raw datasets) -------------------------
+// The raw-dataset caches (Palmer, FunnelFox subscriptions, FB traffic, the
+// transaction warehouse) are data-owner only (plan D8) and are read and written
+// through plain service functions that many callers use without any React
+// context. AnalyticsCacheGate publishes the resolved access here (during render,
+// before any route child renders); until then — and for anyone without raw
+// access — the caches neither read nor write.
+
+export interface CacheAccess {
+  /** Server-issued access partition; "" while access is unresolved or grants nothing. */
+  partition: string;
+  rawAccess: boolean;
+}
+
+const NO_CACHE_ACCESS: CacheAccess = Object.freeze({ partition: "", rawAccess: false });
+let activeCacheAccess: CacheAccess = NO_CACHE_ACCESS;
+
+export function setActiveCacheAccess(next: CacheAccess | null): void {
+  const partition = next?.partition ?? "";
+  const rawAccess = Boolean(partition) && next?.rawAccess === true;
+  if (activeCacheAccess.partition === partition && activeCacheAccess.rawAccess === rawAccess) return;
+  activeCacheAccess = partition ? { partition, rawAccess } : NO_CACHE_ACCESS;
+}
+
+export function getActiveCacheAccess(): CacheAccess {
+  return activeCacheAccess;
+}
+
+export interface CacheScopeOptions {
+  /** The partition the caller loaded its data under. A mismatch with the active
+   * partition (the access changed meanwhile) turns the call into a no-op. */
+  partition?: string;
+}
+
+/** The stamp a raw-dataset cache entry must carry right now, or null when the
+ * cache must not be touched at all (no raw access, unresolved access, or the
+ * caller's partition is no longer the active one). */
+export function rawCacheStamp(options: CacheScopeOptions = {}): string | null {
+  const { partition, rawAccess } = activeCacheAccess;
+  if (!rawAccess || !partition) return null;
+  if (options.partition !== undefined && options.partition !== partition) return null;
+  return partition;
+}
+
+/** Deletes a whole IndexedDB database (session purge). Resolves once deleted;
+ * a "blocked" delete completes when the last connection closes, and the purge
+ * registry bounds the wait. No-op where IndexedDB does not exist. */
+export function deleteIndexedDbDatabase(name: string): Promise<void> {
+  if (typeof indexedDB === "undefined") return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    let request: IDBOpenDBRequest;
+    try {
+      request = indexedDB.deleteDatabase(name);
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error ?? new Error(`Could not delete IndexedDB database ${name}.`));
+  });
 }
 
 // Deterministic array normalization: dedupe + trim + sort, so two logically

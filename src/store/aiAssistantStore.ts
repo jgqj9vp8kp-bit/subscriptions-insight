@@ -4,6 +4,7 @@
 // pre-rendered context pack — the assistant never sees raw rows.
 import { create } from "zustand";
 import type { AiContextPack } from "@/services/aiSignals";
+import { registerPurgeHandler } from "@/services/sessionPurge";
 
 export interface AiAssistantContext {
   surface: string;
@@ -31,3 +32,10 @@ export const useAiAssistantStore = create<AiAssistantState>((set) => ({
   publishContext: (context) => set({ context }),
   openWith: (context) => set({ context, open: true }),
 }));
+
+// The published context pack was built from the previous principal's data.
+// AiAssistantDrawer registers the same reset; registering it with the store too
+// covers sessions in which the drawer module never loaded.
+registerPurgeHandler("ai-assistant-store", () => {
+  useAiAssistantStore.setState({ open: false, context: null });
+});

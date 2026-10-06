@@ -38,7 +38,8 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/hooks/useAuth";
-import { hashUserScope } from "@/services/analyticsCache";
+import { useAccess } from "@/hooks/useAccess";
+import { canAccessRoute } from "@/services/accessRoutes";
 import { useWarehouseVersion } from "@/hooks/useAnalyticsCache";
 import { useRevenueBundle, useRevenueDayBreakdown } from "@/hooks/useRevenueIntelligence";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
@@ -209,7 +210,12 @@ const TABLE_COLUMNS: Array<{ key: SortKey; label: string }> = [
 
 export function RevenueIntelligenceSection(): JSX.Element {
   const { user } = useAuth();
-  const userScopeHash = useMemo(() => hashUserScope(user?.id), [user?.id]);
+  const access = useAccess();
+  // Cache partition (plan §20): the server-issued access partition, so a role
+  // or scope change re-keys every cached bundle (legacy ⇒ per-user key).
+  const userScopeHash = access.partition;
+  // The drilldown links lead to /cohorts; offer them only where it opens.
+  const canOpenCohorts = canAccessRoute("/cohorts", access);
   const { version: warehouseVersion, ready } = useWarehouseVersion(Boolean(user));
   const [ui, setUi] = usePersistedPageState("ui_state_revenue_intel", DEFAULT_UI);
 
@@ -373,10 +379,16 @@ export function RevenueIntelligenceSection(): JSX.Element {
       {error === "cohort_snapshot_not_ready" && (
         <Card className="p-4 text-sm text-muted-foreground shadow-card">
           Revenue Intelligence needs the cohort snapshot.{" "}
-          <Link to="/cohorts" className="font-medium text-primary underline-offset-2 hover:underline">
-            Open the Cohorts page
-          </Link>{" "}
-          once (or rebuild the snapshot from Integrations) and come back.
+          {canOpenCohorts ? (
+            <>
+              <Link to="/cohorts" className="font-medium text-primary underline-offset-2 hover:underline">
+                Open the Cohorts page
+              </Link>{" "}
+              once (or rebuild the snapshot from Integrations) and come back.
+            </>
+          ) : (
+            "Ask a workspace admin to rebuild it, then come back."
+          )}
         </Card>
       )}
       {error && error !== "cohort_snapshot_not_ready" && (
@@ -556,15 +568,17 @@ export function RevenueIntelligenceSection(): JSX.Element {
                               {dayBreakdown.error && <div className="text-xs text-destructive">{dayBreakdown.error}</div>}
                               {dayBreakdown.breakdown?.ok && (
                                 <>
-                                  <div className="mb-2 flex items-center justify-end">
-                                    <Link
-                                      to={`/cohorts?cohort_date=${row.date}`}
-                                      onClick={(event) => event.stopPropagation()}
-                                      className="inline-flex items-center gap-1 text-xs font-medium text-primary underline-offset-2 hover:underline"
-                                    >
-                                      Open in Cohorts <ExternalLink className="h-3 w-3" />
-                                    </Link>
-                                  </div>
+                                  {canOpenCohorts && (
+                                    <div className="mb-2 flex items-center justify-end">
+                                      <Link
+                                        to={`/cohorts?cohort_date=${row.date}`}
+                                        onClick={(event) => event.stopPropagation()}
+                                        className="inline-flex items-center gap-1 text-xs font-medium text-primary underline-offset-2 hover:underline"
+                                      >
+                                        Open in Cohorts <ExternalLink className="h-3 w-3" />
+                                      </Link>
+                                    </div>
+                                  )}
                                   <div className="grid gap-4 lg:grid-cols-2">
                                     <div>
                                       <div className="mb-1 text-xs font-semibold text-muted-foreground">Revenue sources · by cohort</div>

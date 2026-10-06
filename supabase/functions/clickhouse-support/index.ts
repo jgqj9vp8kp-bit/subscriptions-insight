@@ -3,11 +3,24 @@
 // clickhouse-support: server-side Support Analytics read path and Supabase-to-
 // ClickHouse synchronization. The browser never runs analytics SQL,
 // classification, grouping, or statistics; it only receives aggregate bundles,
-// paged rows, and one opened request detail.
+// paged rows, and one opened request detail — always of the workspace data
+// (ctx.tenantKey), never of the caller.
+//
+// Access is decided by CLICKHOUSE_SUPPORT_POLICY before the handler runs
+// (support.view for aggregates, support.messages.view for rows / bodies / any
+// search, support.export for the export, admin.sync.run for the sync; funnel-
+// restricted members are refused). The status diagnostics are stripped for
+// readers without raw access or admin.sync.run.
 
-import { createClickHouseClient } from "../_shared/clickhouse/client.ts";
-import { jsonResponse, methodNotAllowed, optionsResponse, parseJsonBody, requireSupabaseUser } from "../_shared/clickhouse/http.ts";
+import { serveWithAccess } from "../_shared/clickhouse/http.ts";
 import {
+  CLICKHOUSE_SUPPORT_POLICY,
+  projectSupportStatusForViewer,
+  supportReadOf,
+  supportStatusDetailVisible,
+} from "../_shared/access/policies/clickhouse-support.ts";
+import {
+  clickHouseSupportErrorResponse,
   normalizeSupportRequest,
   runSupportBundle,
   runSupportDetails,
@@ -17,7 +30,6 @@ import {
   runSupportStatus,
   runSupportSync,
   runSupportUnansweredContacts,
-  SupportRequestError,
 } from "../_shared/clickhouse/support.ts";
 import type { SupportRequest } from "../_shared/clickhouse/supportContract.ts";
 
@@ -30,50 +42,31 @@ function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
   ]);
 }
 
-Deno.serve(async (req: Request) => {
-  if (req.method === "OPTIONS") return optionsResponse();
-  if (req.method !== "POST") return methodNotAllowed("POST");
-
-  const auth = await requireSupabaseUser(req);
-  if ("status" in auth) return jsonResponse(auth.body, auth.status);
-
-  let request: SupportRequest;
-  try {
-    request = (await parseJsonBody<Record<string, unknown>>(req)) as SupportRequest;
-  } catch {
-    return jsonResponse({ ok: false, error: "Invalid JSON request body." }, 400);
-  }
-
-  let action: ReturnType<typeof normalizeSupportRequest>["action"];
-  try {
-    action = normalizeSupportRequest(request).action;
-  } catch (error) {
-    return jsonResponse({ ok: false, error: error instanceof Error ? error.message : "Unsupported support action." }, 400);
-  }
-
-  let client: ReturnType<typeof createClickHouseClient> | null = null;
-  try {
-    client = createClickHouseClient();
-    const common = { authUserId: auth.id, clickhouse: client };
-    if (action === "sync") return jsonResponse(await withTimeout(runSupportSync({ ...common, supabase: auth.supabase, request }), QUERY_TIMEOUT_MS));
-    if (action === "status") return jsonResponse(await withTimeout(runSupportStatus({ ...common, supabase: auth.supabase }), QUERY_TIMEOUT_MS));
-    if (action === "options") return jsonResponse(await withTimeout(runSupportOptions(common), QUERY_TIMEOUT_MS));
-    if (action === "list") return jsonResponse(await withTimeout(runSupportList({ ...common, request }), QUERY_TIMEOUT_MS));
-    if (action === "details") return jsonResponse(await withTimeout(runSupportDetails({ ...common, request }), QUERY_TIMEOUT_MS));
-    // Must stay ABOVE the bundle line below: that one is an unconditional
-    // fallthrough, so a missing branch here would answer an analytics bundle —
-    // ok: true and no rows — and the export would quietly write an empty file.
-    if (action === "export") return jsonResponse(await withTimeout(runSupportExport({ ...common, request }), QUERY_TIMEOUT_MS));
-    if (action === "unanswered_contacts") return jsonResponse(await withTimeout(runSupportUnansweredContacts({ ...common, request }), QUERY_TIMEOUT_MS));
-    return jsonResponse(await withTimeout(runSupportBundle({ ...common, supabase: auth.supabase, request }), QUERY_TIMEOUT_MS));
-  } catch (error) {
-    const status = error instanceof SupportRequestError ? 400 : 502;
-    return jsonResponse({
-      ok: false,
-      source: "clickhouse",
-      error: error instanceof Error ? error.message : "ClickHouse support request failed.",
-    }, status);
-  } finally {
-    await client?.close?.().catch(() => undefined);
-  }
-});
+serveWithAccess(
+  CLICKHOUSE_SUPPORT_POLICY,
+  async ({ ctx, action, body, pg, clickhouse }) => {
+    const request = body as SupportRequest;
+    // Same request validation as before access control (dates, sort, filters):
+    // a malformed request is a 400 (SupportRequestError) for every action.
+    normalizeSupportRequest(request);
+    const common = { authUserId: ctx.tenantKey, clickhouse: clickhouse() };
+    // Dispatch on the AUTHORIZED action (search variants run their base read);
+    // every branch is explicit — there is no fallthrough to the bundle.
+    const read = supportReadOf(action);
+    if (read === "sync") return await withTimeout(runSupportSync({ ...common, supabase: pg, request }), QUERY_TIMEOUT_MS);
+    if (read === "status") {
+      const status = await withTimeout(runSupportStatus({ ...common, supabase: pg }), QUERY_TIMEOUT_MS);
+      return supportStatusDetailVisible(ctx) ? status : projectSupportStatusForViewer(status);
+    }
+    if (read === "options") return await withTimeout(runSupportOptions(common), QUERY_TIMEOUT_MS);
+    if (read === "list") return await withTimeout(runSupportList({ ...common, request }), QUERY_TIMEOUT_MS);
+    if (read === "details") return await withTimeout(runSupportDetails({ ...common, request }), QUERY_TIMEOUT_MS);
+    if (read === "export") return await withTimeout(runSupportExport({ ...common, request }), QUERY_TIMEOUT_MS);
+    if (read === "unanswered_contacts") return await withTimeout(runSupportUnansweredContacts({ ...common, request }), QUERY_TIMEOUT_MS);
+    if (read === "bundle") return await withTimeout(runSupportBundle({ ...common, supabase: pg, request }), QUERY_TIMEOUT_MS);
+    throw new Error(`Unhandled support action: ${action}`);
+  },
+  // Same status / body as before access control; the gate sanitizes the body
+  // for everyone but the data owner.
+  { onError: (error) => clickHouseSupportErrorResponse(error) },
+);

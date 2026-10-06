@@ -7,12 +7,12 @@
 // users/health). Reads retry; writes must not (a reset can arrive after the server
 // accepted the body, so a re-sent INSERT could duplicate rows).
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { FetchClickHouseClient } from "../../supabase/functions/_shared/clickhouse/client.ts";
+import { internalCreateClickHouseClient } from "../../supabase/functions/_shared/clickhouse/client.ts";
 
 const ENV = { host: "https://warehouse.example:8443", username: "default", password: "secret", database: "default" };
 
 function client() {
-  return new FetchClickHouseClient(ENV);
+  return internalCreateClickHouseClient(ENV);
 }
 
 function okResponse(body: string) {

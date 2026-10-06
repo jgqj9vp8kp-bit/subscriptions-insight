@@ -24,6 +24,9 @@ export interface NormalizedPaymentRequest {
   groupBy: string;
   firstTxDimension: string;
   renewalDimension: string;
+  /** Present only on the AI pass-rate call: a reduced bundle must never fill
+   * the Payment Pass tab's cache entry for the same filters. */
+  purpose?: string;
 }
 
 export function normalizePaymentRequest(q: PaymentAnalyticsQuery): NormalizedPaymentRequest {
@@ -44,6 +47,7 @@ export function normalizePaymentRequest(q: PaymentAnalyticsQuery): NormalizedPay
     groupBy: q.groupBy,
     firstTxDimension: q.firstTxDimension,
     renewalDimension: q.renewalDimension,
+    ...(q.purpose ? { purpose: q.purpose } : {}),
   };
 }
 

@@ -14,6 +14,7 @@
 //    precedent — a cascading default would fight the append-only guard).
 import { supabase } from "@/services/supabaseClient";
 import { fnv } from "@/services/analyticsCache";
+import { registerPurgeHandler } from "@/services/sessionPurge";
 import { aiScopeKey, type AiEngineOutput, type AiScope } from "@/services/aiSignals";
 
 /** JSON with recursively sorted object keys — stable across the Postgres jsonb
@@ -35,12 +36,44 @@ export interface AiContextHashParts {
   /** Page-owned stable serialization of the applied filters (view mode and
    * other presentation state excluded — they don't change the engine input). */
   contextKey: string;
+  /** The funnel data scope the engine input was served under (plan §23/§25
+   * "scopeHash in context_hash"): AI_SCOPE_ALL, or aiAccessScopeKey() of a
+   * restricted scope. Omitted ⇒ AI_SCOPE_ALL. Deliberately NOT the cache
+   * partition: that also hashes the principal and access_version, so every role
+   * edit (or the legacy → bootstrapped switch) would orphan the history. The
+   * table is actor-owned (own-row RLS), so principals never share rows anyway. */
+  accessScope?: string;
+}
+
+/** Funnel scope "all" — what every context hash meant before access control. */
+export const AI_SCOPE_ALL = "all";
+
+/** Stable scope component of the context hash: AI_SCOPE_ALL for scope all (and
+ * legacy mode / no AccessProvider), else the mode plus the sorted funnel ids.
+ * Independent of principal and access_version. */
+export function aiAccessScopeKey(
+  access: { legacy?: boolean; access?: { funnel_scope?: { mode?: string; funnel_ids?: readonly string[] } | null } | null } | null | undefined,
+): string {
+  if (!access || access.legacy) return AI_SCOPE_ALL;
+  const scope = access.access?.funnel_scope;
+  if (scope?.mode === "all") return AI_SCOPE_ALL;
+  if (scope?.mode === "selected") {
+    const ids = [...(scope.funnel_ids ?? [])].map((id) => id.toLowerCase()).sort();
+    return `selected:${fnv(ids.join(","))}`;
+  }
+  return "none";
 }
 
 /** warehouseVersion deliberately NOT hashed: it rides its own column, and the
- * content dedup already ignores a version bump that changed nothing. */
+ * content dedup already ignores a version bump that changed nothing. For funnel
+ * scope all the hash is exactly the pre-access-control one, so the data owner's
+ * recommendation history (§18 verdict timeline) stays reachable; a restricted
+ * scope adds its scope key, so recommendations never cross scopes. */
 export function computeAiContextHash(parts: AiContextHashParts): string {
-  return `c_${fnv(stableJson([parts.surface, parts.dateFrom ?? "", parts.dateTo ?? "", parts.contextKey]))}`;
+  const scope = parts.accessScope ?? AI_SCOPE_ALL;
+  const key: unknown[] = [parts.surface, parts.dateFrom ?? "", parts.dateTo ?? "", parts.contextKey];
+  if (scope !== AI_SCOPE_ALL) key.push(scope);
+  return `c_${fnv(stableJson(key))}`;
 }
 
 export function aiRecommendationsUnchanged(stored: unknown, current: AiEngineOutput["recommendations"]): boolean {
@@ -60,16 +93,26 @@ const DEDUP_LOOKBACK = 3;
  * read an empty history and both insert (observed live). The table is
  * append-only, so a raced duplicate cannot even be cleaned up afterwards. */
 let writeChain: Promise<unknown> = Promise.resolve();
+/** Bumped by the session purge: a snapshot queued for the previous principal
+ * must not be inserted under whoever signs in next (the insert reads the
+ * session user at write time). */
+let writeGeneration = 0;
 
 export function maybeWriteAiRecommendations(params: {
   contextHash: string;
   warehouseVersion: string | null;
   output: AiEngineOutput;
 }): Promise<AiRecommendationWriteResult> {
-  const run = writeChain.then(() => writeSnapshotOnce(params));
+  const generation = writeGeneration;
+  const run = writeChain.then(() => (generation === writeGeneration ? writeSnapshotOnce(params) : ("skipped" as const)));
   writeChain = run.catch(() => undefined);
   return run;
 }
+
+registerPurgeHandler("ai-recommendation-log", () => {
+  writeGeneration += 1;
+  writeChain = Promise.resolve();
+});
 
 async function writeSnapshotOnce(params: {
   contextHash: string;

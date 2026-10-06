@@ -6,6 +6,11 @@
 // user's email from the ClickHouse snapshot, and count per cohort in JS. The
 // "active now" definition lives in the RPC and matches isSubscriptionActiveNow
 // (the definition the legacy client cohort compute uses), so the two agree.
+//
+// Tenant scope (Phase 0): the Edge caller is the SERVICE-ROLE client, which
+// bypasses RLS, so the RPC must be told whose subscriptions to read — the
+// p_data_key overload (202610050001_phase0_isolation_fixes.sql). The legacy
+// no-arg form returned every account's subscriptions merged into one map.
 import type { ClickHouseClientLike, SupabaseLikeClient } from "./types.ts";
 import { FACT_USER_COHORTS_TABLE } from "./schema.ts";
 
@@ -24,14 +29,15 @@ const cohortKey = (cohortDate: string, funnel: string, campaignPath: string): st
   `${cohortDate}|${funnel}|${campaignPath}`;
 
 /**
- * Active subscription ids grouped by normalized email (RLS-scoped to the caller).
- * The RPC already excludes FunnelFox sandbox/test subscriptions, so the returned
- * ids are live subscriptions only.
+ * Active subscription ids grouped by normalized email, for ONE tenant: dataKey
+ * is the workspace data key (ctx.tenantKey — the same value bound to
+ * {auth_user_id:String}). The RPC already excludes FunnelFox sandbox/test
+ * subscriptions, so the returned ids are live subscriptions only.
  */
-export async function activeSubscriptionsByEmail(supabase: SupabaseLikeClient): Promise<Map<string, string[]>> {
+export async function activeSubscriptionsByEmail(supabase: SupabaseLikeClient, dataKey: string): Promise<Map<string, string[]>> {
   const map = new Map<string, string[]>();
   if (!supabase.rpc) return map;
-  const { data, error } = await supabase.rpc("active_funnelfox_subscription_emails");
+  const { data, error } = await supabase.rpc("active_funnelfox_subscription_emails", { p_data_key: dataKey });
   if (error) throw new Error(`Could not load active subscriptions: ${error.message}`);
   const obj = (data ?? {}) as Record<string, unknown>;
   for (const [email, ids] of Object.entries(obj)) {
@@ -96,7 +102,7 @@ export async function activeSubscriptionMetricsByCohort(input: {
   warehouseVersion: string;
   classificationVersion: string;
 }): Promise<Map<string, CohortActiveSubs>> {
-  const activeByEmail = await activeSubscriptionsByEmail(input.supabase);
+  const activeByEmail = await activeSubscriptionsByEmail(input.supabase, input.authUserId);
   if (activeByEmail.size === 0) return new Map();
 
   const rs = await input.clickhouse.query({
@@ -141,5 +147,47 @@ export function mergeActiveSubscriptions(
       row.active_subscription_ids = metric.active_subscription_ids;
       row.active_user_ids = metric.active_user_ids;
     }
+  }
+}
+
+// ---- Identity pseudonymization (responses for anyone but the data owner) ---
+// active_user_ids are normalized customer EMAILS and active_subscription_ids are
+// upstream FunnelFox ids. The browser only unions them (distinct counts for the
+// total and funnel roll-up rows), so a caller without raw access gets keyed
+// tokens instead: one identity always maps to the same token (unions and counts
+// are unchanged), but a token can neither be reversed nor confirmed for a
+// guessed email without the server key. The data owner keeps the raw values.
+
+export type KeyedHasher = (value: string) => Promise<string>;
+
+/** HMAC-SHA256(secret, `${label}|${value}`) as hex, memoized per hasher. The
+ * label separates uses, so one secret never yields equal tokens across them. */
+export async function createKeyedHasher(secret: string, label: string): Promise<KeyedHasher> {
+  if (!secret) throw new Error("A keyed hasher needs a non-empty secret.");
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const memo = new Map<string, Promise<string>>();
+  return (value: string) => {
+    let digest = memo.get(value);
+    if (!digest) {
+      digest = crypto.subtle.sign("HMAC", key, encoder.encode(`${label}|${value}`))
+        .then((bytes) => [...new Uint8Array(bytes)].map((byte) => byte.toString(16).padStart(2, "0")).join(""));
+      memo.set(value, digest);
+    }
+    return digest;
+  };
+}
+
+/** Replaces active_user_ids / active_subscription_ids in place with keyed
+ * tokens (`u_…` / `s_…`, 128-bit). Counts and every other field are untouched. */
+export async function pseudonymizeActiveIdentities(
+  rows: Array<{ active_user_ids?: string[]; active_subscription_ids?: string[] }>,
+  hasher: KeyedHasher,
+): Promise<void> {
+  const tokens = (kind: "u" | "s", ids: string[]) =>
+    Promise.all(ids.map(async (id) => `${kind}_${(await hasher(`${kind}|${id}`)).slice(0, 32)}`));
+  for (const row of rows) {
+    if (Array.isArray(row.active_user_ids)) row.active_user_ids = await tokens("u", row.active_user_ids);
+    if (Array.isArray(row.active_subscription_ids)) row.active_subscription_ids = await tokens("s", row.active_subscription_ids);
   }
 }

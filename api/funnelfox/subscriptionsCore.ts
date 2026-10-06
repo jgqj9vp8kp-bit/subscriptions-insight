@@ -1,7 +1,29 @@
 /* global process */
 
+// Local FunnelFox proxy core: mounted by the Vite dev server (vite.config.ts) and
+// by the Vercel-style twins in api/funnelfox/*.ts. It returns RAW upstream
+// payloads (customer emails included) to any valid Supabase session, with no
+// workspace / permission check — so it is a DEVELOPMENT tool only (plan §6
+// "External", Phase 0). Every handler refuses to run unless
+// FUNNELFOX_LOCAL_PROXY_ENABLED=true, which only the local dev server sets
+// (vite.config.ts configureServer). Production traffic goes through the gated
+// funnelfox-* Edge functions (data owner + admin.sync.run).
+
 const FUNNELFOX_SUBSCRIPTIONS_URL = "https://api.funnelfox.io/public/v1/subscriptions";
 const FUNNELFOX_PROFILES_URL = "https://api.funnelfox.io/public/v1/profiles";
+
+/** The explicit opt-in. Never set it on a deployed runtime. */
+export const FUNNELFOX_LOCAL_PROXY_FLAG = "FUNNELFOX_LOCAL_PROXY_ENABLED";
+
+export function isFunnelFoxLocalProxyEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  return String(env[FUNNELFOX_LOCAL_PROXY_FLAG] ?? "").trim().toLowerCase() === "true";
+}
+
+/** The answer of a disabled proxy: no auth call, no upstream call, nothing that
+ * reveals the route exists. */
+function localProxyDisabled(): ProxyResult {
+  return { status: 404, body: { error: "Not found." } };
+}
 
 type ProxyOptions = {
   cursor?: string;
@@ -266,6 +288,7 @@ function profileDebugBody(profileId: string, payload: unknown) {
 }
 
 export async function handleFunnelFoxSubscriptions(options: ProxyOptions): Promise<ProxyResult> {
+  if (!isFunnelFoxLocalProxyEnabled()) return localProxyDisabled();
   const debug = Boolean(options.debug);
   const authError = await verifyAuth(options.authHeader);
   if (authError) return authError;
@@ -324,6 +347,7 @@ export async function handleFunnelFoxSubscriptions(options: ProxyOptions): Promi
 }
 
 export async function handleFunnelFoxSubscriptionDetails(options: SubscriptionDetailsProxyOptions): Promise<ProxyResult> {
+  if (!isFunnelFoxLocalProxyEnabled()) return localProxyDisabled();
   const authError = await verifyAuth(options.authHeader);
   if (authError) return authError;
   const secret = process.env.FUNNELFOX_SECRET;
@@ -377,6 +401,7 @@ export async function handleFunnelFoxSubscriptionDetails(options: SubscriptionDe
 }
 
 export async function handleFunnelFoxProfile(options: ProfileProxyOptions): Promise<ProxyResult> {
+  if (!isFunnelFoxLocalProxyEnabled()) return localProxyDisabled();
   const authError = await verifyAuth(options.authHeader);
   if (authError) return authError;
   const secret = process.env.FUNNELFOX_SECRET;
@@ -430,6 +455,7 @@ export async function handleFunnelFoxProfile(options: ProfileProxyOptions): Prom
 }
 
 export async function handleFunnelFoxProfileDebug(options: ProfileProxyOptions): Promise<ProxyResult> {
+  if (!isFunnelFoxLocalProxyEnabled()) return localProxyDisabled();
   const result = await handleFunnelFoxProfile(options);
   if (result.status !== 200) return result;
 

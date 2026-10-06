@@ -77,7 +77,9 @@ describe("cohorts cache persistence (sessionStorage)", () => {
 
   it("persists successful analytics (cohorts/users/payment) + warehouse-version queries; skips others/PII", () => {
     expect(shouldPersistCohortsQuery({ queryKey: keyFor("u_A"), state: { status: "success", data: sample } } as never)).toBe(true);
-    expect(shouldPersistCohortsQuery({ queryKey: ["users", "list"], state: { status: "success", data: {} } } as never)).toBe(true);
+    // Users rows carry customer emails / ids: only the aggregate siblings persist.
+    expect(shouldPersistCohortsQuery({ queryKey: ["users", "list"], state: { status: "success", data: {} } } as never)).toBe(false);
+    expect(shouldPersistCohortsQuery({ queryKey: ["users", "summary"], state: { status: "success", data: {} } } as never)).toBe(true);
     expect(shouldPersistCohortsQuery({ queryKey: ["payment-analytics", "bundle"], state: { status: "success", data: {} } } as never)).toBe(true);
     expect(shouldPersistCohortsQuery({ queryKey: [...WAREHOUSE_VERSION_KEY], state: { status: "success", data: "whv_x" } } as never)).toBe(true);
     // pending query — not persisted
