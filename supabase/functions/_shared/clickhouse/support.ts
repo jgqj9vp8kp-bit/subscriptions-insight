@@ -501,7 +501,10 @@ const ROW_SELECT = `
   if(answered_at IS NULL, '', formatDateTime(answered_at, '%Y-%m-%dT%H:%i:%S.000Z')) AS answered_at,
   answer_source,
   reply_count,
-  if(answered_at IS NULL, NULL, dateDiff('minute', received_at, answered_at)) AS first_response_minutes,
+  -- fsr.* = the stored DateTime columns: the bare names are shadowed above by the
+  -- formatted-string aliases received_at / answered_at, and ClickHouse resolves
+  -- aliases first (dateDiff on a String fails with DB::Exception code 43).
+  if(fsr.answered_at IS NULL, NULL, dateDiff('minute', fsr.received_at, fsr.answered_at)) AS first_response_minutes,
   formatDateTime(imported_at, '%Y-%m-%dT%H:%i:%S.000Z') AS imported_at
 `;
 
@@ -524,7 +527,7 @@ export async function runSupportList(input: { authUserId: string; clickhouse: Cl
   const rows = await jsonRows<Record<string, unknown>>(
     input.clickhouse,
     `SELECT ${ROW_SELECT}
-     FROM ${FACT_SUPPORT_REQUESTS_TABLE} FINAL
+     FROM ${FACT_SUPPORT_REQUESTS_TABLE} AS fsr FINAL
      WHERE ${where}
      ORDER BY ${order}, request_id ASC
      LIMIT {limit:UInt32} OFFSET {offset:UInt32}`,
@@ -580,7 +583,7 @@ export async function runSupportExport(input: { authUserId: string; clickhouse: 
   const rows = await jsonRows<Record<string, unknown>>(
     input.clickhouse,
     `SELECT ${ROW_SELECT}, message_body
-     FROM ${FACT_SUPPORT_REQUESTS_TABLE} FINAL
+     FROM ${FACT_SUPPORT_REQUESTS_TABLE} AS fsr FINAL
      WHERE ${where}
      ORDER BY ${order}, request_id ASC
      LIMIT {limit:UInt32} OFFSET {offset:UInt32}`,
@@ -676,7 +679,7 @@ export async function runSupportDetails(input: { authUserId: string; clickhouse:
   const rows = await jsonRows<Record<string, unknown>>(
     input.clickhouse,
     `SELECT ${ROW_SELECT}, message_body
-     FROM ${FACT_SUPPORT_REQUESTS_TABLE} FINAL
+     FROM ${FACT_SUPPORT_REQUESTS_TABLE} AS fsr FINAL
      WHERE auth_user_id = {auth_user_id:String} AND request_id = {request_id:String}
      LIMIT 1`,
     { auth_user_id: input.authUserId, request_id: req.requestId },
