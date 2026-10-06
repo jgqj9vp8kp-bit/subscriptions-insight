@@ -47,3 +47,20 @@ describe("sample-data banner policy", () => {
     expect(shouldShowSampleDataBanner("palmer_import", "/fb-analytics", storageWith(null))).toBe(false);
   });
 });
+
+describe("on-demand transaction hydration (Users → Leads tab)", () => {
+  it("counts mounted requests and releases each one exactly once", async () => {
+    const { useTransactionDemand } = await import("@/services/transactionAutoLoadPolicy");
+    const { acquire } = useTransactionDemand.getState();
+    const releaseA = acquire();
+    const releaseB = acquire();
+    expect(useTransactionDemand.getState().demand).toBe(2);
+    releaseA();
+    releaseA(); // idempotent
+    expect(useTransactionDemand.getState().demand).toBe(1);
+    releaseB();
+    expect(useTransactionDemand.getState().demand).toBe(0);
+    // /users still defers by path; the demand is what turns hydration on there.
+    expect(shouldAutoLoadTransactionsForPath("/users", null)).toBe(false);
+  });
+});

@@ -1,4 +1,5 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { ArrowDown, ArrowUp, ArrowUpDown, Check, ChevronDown, Search, X } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { Button } from "@/components/ui/button";
@@ -83,7 +84,10 @@ interface CohortExplorerRow {
   trial_users: number;
   net_revenue: number;
 }
-type UsersPageMode = "users_table" | "decline_analytics";
+type UsersPageMode = "users_table" | "decline_analytics" | "leads";
+
+// The Leads tab pulls in the leads computation and FunnelFox sync code only when opened.
+const LeadsPanel = lazy(() => import("@/pages/Leads").then((module) => ({ default: module.LeadsPanel })));
 type DeclineSortKey = "reason" | "failed_users" | "failed_transactions" | "share" | "avg_attempts" | "latest_failed_date";
 // Sort fields of the server-computed Decline Analytics country breakdown
 // (mirrors the Edge Function allowlist; sorting runs over the FULL country set).
@@ -424,7 +428,7 @@ export default function UsersPage() {
     cohortDateTo,
     cohortSortKey,
     cohortSortDir,
-    mode,
+    mode: persistedMode,
     declineAnalyticsReasons: rawDeclineAnalyticsReasons,
     declineAnalyticsStages: rawDeclineAnalyticsStages,
     declineSortKey,
@@ -501,7 +505,22 @@ export default function UsersPage() {
   // only the data owner hydrates (D8). Everyone else always reads the Edge
   // function (the legacy flag is ignored) and an Edge error is shown as an
   // error, never recomputed in the browser.
-  const { rawAccess, partition } = useAccess();
+  const { rawAccess, partition, can } = useAccess();
+  // The Leads tab (formerly the /leads page) is computed in the browser from the
+  // raw warehouse, so it stays data-owner only; a persisted "leads" tab falls
+  // back to the users table for anyone else.
+  const canSeeLeads = rawAccess && can("leads.view");
+  const mode: UsersPageMode = persistedMode === "leads" && !canSeeLeads ? "users_table" : persistedMode;
+  const [searchParams, setSearchParams] = useSearchParams();
+  useEffect(() => {
+    // /leads redirects here as /users?tab=leads: open that tab once, then drop the param.
+    if (searchParams.get("tab") !== "leads") return;
+    if (canSeeLeads) updateUiState({ mode: "leads" });
+    const next = new URLSearchParams(searchParams);
+    next.delete("tab");
+    setSearchParams(next, { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams, canSeeLeads]);
   const legacyFallbackAllowed = rawAccess;
   const usersSource = useMemo(() => (legacyFallbackAllowed ? usersDataSourceMode() : "clickhouse"), [legacyFallbackAllowed]);
   // The access partition (plan §20): the cache key is per principal, role and scope.
@@ -547,7 +566,8 @@ export default function UsersPage() {
   // from the transaction store, which this route deliberately never hydrates, so
   // both the cohort list and any cohort-scoped user count came out empty. The
   // selection is now a server filter (filters.cohort_ids) like every other one.
-  const usersServerEligible = usersSource === "clickhouse" && mode !== "decline_analytics";
+  // Only the users table needs the list query (not decline analytics, not leads).
+  const usersServerEligible = usersSource === "clickhouse" && mode === "users_table";
   // Decline Analytics ClickHouse path: the bundle (totals + reason/stage rows +
   // country breakdown) is computed server-side over the SAME filtered user set.
   // Cohort selections are still a legacy boundary (not reproduced server-side).
@@ -1221,7 +1241,9 @@ export default function UsersPage() {
 
   return (
     <AppLayout title="Users" description={`${displayTotal} users`}>
-      <div className="grid gap-4 lg:grid-cols-[320px_minmax(0,1fr)]">
+      <div className={mode === "leads" ? "grid gap-4" : "grid gap-4 lg:grid-cols-[320px_minmax(0,1fr)]"}>
+        {/* Leads have no cohort (it starts with the first payment), so the cohort explorer is hidden on that tab. */}
+        {mode !== "leads" && (
         <Card className="p-4 shadow-card lg:sticky lg:top-4 lg:self-start">
           <div className="space-y-3">
             <div className="flex items-center justify-between gap-2">
@@ -1330,6 +1352,7 @@ export default function UsersPage() {
             </div>
           </div>
         </Card>
+        )}
 
         <Card className="min-w-0 p-4 shadow-card">
         <Tabs value={mode} onValueChange={(value) => updateUiState({ mode: value as UsersPageMode })}>
@@ -1337,10 +1360,13 @@ export default function UsersPage() {
             <TabsList>
               <TabsTrigger value="users_table">Users Table</TabsTrigger>
               <TabsTrigger value="decline_analytics">Decline Analytics</TabsTrigger>
+              {canSeeLeads && <TabsTrigger value="leads">Leads</TabsTrigger>}
             </TabsList>
-            <div className="text-xs text-muted-foreground">
-              {selectedCohortIds.length ? `${selectedCohortIds.length} cohort${selectedCohortIds.length === 1 ? "" : "s"} selected` : "All visible users"}
-            </div>
+            {mode !== "leads" && (
+              <div className="text-xs text-muted-foreground">
+                {selectedCohortIds.length ? `${selectedCohortIds.length} cohort${selectedCohortIds.length === 1 ? "" : "s"} selected` : "All visible users"}
+              </div>
+            )}
           </div>
 
           <TabsContent value="users_table" className="mt-0">
@@ -2269,6 +2295,14 @@ export default function UsersPage() {
               </div>
             )}
           </TabsContent>
+
+          {canSeeLeads && (
+            <TabsContent value="leads" className="mt-0">
+              <Suspense fallback={<div className="py-12 text-center text-sm text-muted-foreground">Loading leads…</div>}>
+                <LeadsPanel embedded />
+              </Suspense>
+            </TabsContent>
+          )}
         </Tabs>
         </Card>
       </div>

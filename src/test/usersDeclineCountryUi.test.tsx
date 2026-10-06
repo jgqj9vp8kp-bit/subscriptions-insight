@@ -4,6 +4,7 @@
 // with the sort in the contract), and diagnostics are surfaced.
 
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -118,10 +119,13 @@ function bundle(): UsersDeclineResponse {
 
 function renderPage() {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  // The page reads ?tab= (the /leads redirect), so it renders under a router.
   return render(
-    <QueryClientProvider client={queryClient}>
-      <UsersPage />
-    </QueryClientProvider>,
+    <MemoryRouter>
+      <QueryClientProvider client={queryClient}>
+        <UsersPage />
+      </QueryClientProvider>
+    </MemoryRouter>,
   );
 }
 

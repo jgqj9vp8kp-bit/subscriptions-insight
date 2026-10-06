@@ -6,6 +6,7 @@
 // is exactly today's.
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactElement, ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -213,10 +214,13 @@ const LEGACY_OWNER = () => buildAccessValue({ status: "legacy", access: null, us
 
 function renderWith(access: AccessContextValue, ui: ReactElement) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+  // Pages may read the URL (Users reads ?tab=), so render under a router.
   return render(
-    <QueryClientProvider client={client}>
-      <AccessContext.Provider value={access}>{ui}</AccessContext.Provider>
-    </QueryClientProvider>,
+    <MemoryRouter>
+      <QueryClientProvider client={client}>
+        <AccessContext.Provider value={access}>{ui}</AccessContext.Provider>
+      </QueryClientProvider>
+    </MemoryRouter>,
   );
 }
 
@@ -384,6 +388,16 @@ describe("Users legacy fallback", () => {
     renderWith(LEGACY_OWNER(), <UsersPage />);
     expect(mocks.usersData.mock.calls.at(-1)?.[0]).toMatchObject({ enabled: false });
     expect(screen.getByText("buyer@example.com")).toBeInTheDocument();
+  });
+
+  it("the Leads tab (browser-computed from the raw warehouse) is data-owner only", () => {
+    renderWith(LEGACY_OWNER(), <UsersPage />);
+    expect(screen.getByRole("tab", { name: "Leads" })).toBeInTheDocument();
+    cleanup();
+    // An employee, even with leads.view, never gets the tab (no raw access).
+    renderWith(member([...USERS_PERMS, "leads.view"]), <UsersPage />);
+    expect(screen.getByRole("tab", { name: "Users Table" })).toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "Leads" })).toBeNull();
   });
 
   it("member: the legacy flag is ignored and the server path is enabled", () => {

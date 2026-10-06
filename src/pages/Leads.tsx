@@ -22,6 +22,7 @@ import {
 } from "@/components/ui/table";
 import { useTransactions } from "@/services/sheets";
 import { useDataStore } from "@/store/dataStore";
+import { useRequireRawTransactions } from "@/services/transactionAutoLoadPolicy";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { useAccess } from "@/hooks/useAccess";
@@ -64,6 +65,9 @@ interface LeadView {
   media_buyer: MediaBuyer;
   country: string | null;
   session_date: string | null;
+  /** When the lead came in: the FunnelFox profile's creation, or the warehouse
+   * first touch (earliest transaction event) for the fallback source. */
+  lead_date: string | null;
   days_since_visit: number | null;
   customer_id: string;
   user_agent: string | null;
@@ -72,6 +76,15 @@ interface LeadView {
 
 function dayKey(value: string | null): string {
   return value ? value.slice(0, 10) : "";
+}
+
+/** "YYYY-MM-DD HH:mm" in the viewer's local time, or "" for a missing/invalid value. */
+export function formatLeadDateTime(value: string | null): string {
+  if (!value) return "";
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "";
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
 function daysSince(value: string | null, now: number): number | null {
@@ -91,6 +104,7 @@ function funnelfoxToView(row: FunnelFoxLeadRow, now: number): LeadView {
     media_buyer: (row.media_buyer as MediaBuyer) || "Unknown",
     country: row.country_code,
     session_date: session,
+    lead_date: row.created_at ?? session,
     days_since_visit: daysSince(session, now),
     customer_id: row.profile_id,
     user_agent: row.user_agent,
@@ -108,6 +122,7 @@ function warehouseToView(lead: LeadRecord): LeadView {
     media_buyer: lead.media_buyer,
     country: lead.country,
     session_date: lead.session_date,
+    lead_date: lead.lead_created || lead.session_date || null,
     days_since_visit: lead.days_since_visit,
     customer_id: lead.customer_id,
     user_agent: lead.user_agent,
@@ -115,7 +130,12 @@ function warehouseToView(lead: LeadRecord): LeadView {
   };
 }
 
-export default function LeadsPage() {
+/** The Leads content (sync block, KPI cards, filterable table). Rendered as the
+ * "Leads" tab of the Users page; `embedded` drops the card shadows so it sits
+ * flush inside that page's card. The standalone page below wraps it in AppLayout
+ * (the /leads route itself now redirects to /users?tab=leads). */
+export function LeadsPanel({ embedded = false }: { embedded?: boolean }) {
+  const cardShadow = embedded ? "shadow-none" : "shadow-card";
   const txs = useTransactions();
   const subscriptions = useDataStore((s) => s.subscriptions);
   const rawPalmerRows = useDataStore((s) => s.rawPalmerRows);
@@ -125,6 +145,9 @@ export default function LeadsPage() {
   // (funnelfox-leads-sync policy). Owner / legacy: both true.
   const access = useAccess();
   const canSync = access.rawAccess && access.can("admin.sync.run");
+  // Leads are computed from the raw warehouse. /users defers that hydration
+  // (the Users table reads ClickHouse), so the tab asks for it while open.
+  useRequireRawTransactions(access.rawAccess);
 
   const [uiState, setUiState, resetUiState] = usePersistedPageState("ui_state_leads", DEFAULT_LEADS_UI_STATE);
 
@@ -293,9 +316,9 @@ export default function LeadsPage() {
   const detailChecked = Math.max(0, (stats?.profiles_total_saved ?? 0) - remainingUnchecked);
 
   return (
-    <AppLayout title="Leads" description="Emails captured with no successful payment and no active subscription">
+    <>
       {/* Sync block */}
-      <Card className="mb-4 p-4 shadow-card">
+      <Card className={`mb-4 p-4 ${cardShadow}`}>
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="text-sm">
             <div className="font-medium">FunnelFox Leads sync</div>
@@ -370,7 +393,7 @@ export default function LeadsPage() {
         <KpiCard label="Leads Last 7 Days" value={summaryCards.leads_last_7_days.toLocaleString()} />
       </div>
 
-      <Card className="p-4 shadow-card">
+      <Card className={`p-4 ${cardShadow}`}>
         <div className="flex flex-wrap items-center gap-2">
           {(isFiltering || loading) && (
             <span className="order-last ml-auto flex items-center gap-1 text-xs text-primary">
@@ -445,6 +468,7 @@ export default function LeadsPage() {
             <TableHeader>
               <TableRow>
                 <TableHead>Email</TableHead>
+                <TableHead className="whitespace-nowrap">Lead Date</TableHead>
                 <TableHead>Funnel</TableHead>
                 <TableHead>Campaign Path</TableHead>
                 <TableHead>Campaign ID</TableHead>
@@ -461,6 +485,7 @@ export default function LeadsPage() {
               {paged.map((v) => (
                 <TableRow key={v.key}>
                   <TableCell className="text-sm">{v.email || "—"}</TableCell>
+                  <TableCell className="whitespace-nowrap text-xs tabular-nums">{formatLeadDateTime(v.lead_date) || "—"}</TableCell>
                   <TableCell className="text-xs">{v.funnel}</TableCell>
                   <TableCell className="text-xs text-muted-foreground">{v.campaign_path}</TableCell>
                   <TableCell className="text-xs text-muted-foreground">{v.campaign_id}</TableCell>
@@ -498,6 +523,14 @@ export default function LeadsPage() {
           </div>
         )}
       </Card>
+    </>
+  );
+}
+
+export default function LeadsPage() {
+  return (
+    <AppLayout title="Leads" description="Emails captured with no successful payment and no active subscription">
+      <LeadsPanel />
     </AppLayout>
   );
 }

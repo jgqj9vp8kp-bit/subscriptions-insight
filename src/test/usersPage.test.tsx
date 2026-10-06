@@ -2,6 +2,7 @@ import { fireEvent, render, screen, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter } from "react-router-dom";
 import UsersPage from "@/pages/Users";
 import { useDataStore } from "@/store/dataStore";
 import type { Transaction } from "@/services/types";
@@ -35,13 +36,23 @@ vi.mock("@/hooks/useAccess", async () => {
   return { useAccess: () => owner, useOptionalAccess: () => owner, useCan: (key: string) => owner.can(key) };
 });
 
+// The Leads tab's FunnelFox sync source stays empty here (warehouse fallback).
+vi.mock("@/services/funnelfoxLeads", () => ({
+  loadFunnelFoxLeads: vi.fn(async () => []),
+  getFunnelFoxLeadsStats: vi.fn(async () => null),
+  runFunnelFoxLeadsSync: vi.fn(async () => undefined),
+}));
+
 import { useTransactions } from "@/services/sheets";
 
-function renderPage() {
+function renderPage(initialEntry = "/users") {
+  // The page reads ?tab= (the /leads redirect), so it renders under a router.
   return render(
-    <QueryClientProvider client={new QueryClient()}>
-      <UsersPage />
-    </QueryClientProvider>,
+    <MemoryRouter initialEntries={[initialEntry]}>
+      <QueryClientProvider client={new QueryClient()}>
+        <UsersPage />
+      </QueryClientProvider>
+    </MemoryRouter>,
   );
 }
 
@@ -687,6 +698,23 @@ describe("Users page", () => {
     expect(rows[1]).toHaveTextContent("high@example.com");
     expect(rows[2]).toHaveTextContent("low@example.com");
     expect(screen.queryByText("other@example.com")).not.toBeInTheDocument();
+  });
+
+  it("opens the Leads tab from /users?tab=leads (the old /leads link) and hides the cohort explorer there", async () => {
+    vi.mocked(useTransactions).mockReturnValue([
+      cohortTx({ user_id: "a", email: "a@example.com", campaign_path: "campaign-a" }),
+      failedTx({ transaction_id: "tx_lead", user_id: "lead", email: "lead@example.com", campaign_path: "campaign-b" }),
+    ]);
+
+    renderPage("/users?tab=leads");
+
+    expect(await screen.findByText("Total Leads")).toBeInTheDocument();
+    expect(await screen.findByText("lead@example.com")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Leads" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByPlaceholderText("Search campaign…")).toBeNull();
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Users Table" }));
+    expect(await screen.findByPlaceholderText("Search campaign…")).toBeInTheDocument();
   });
 
   it("switches from the users table to decline analytics", () => {

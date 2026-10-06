@@ -1,7 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import LeadsPage from "@/pages/Leads";
+import LeadsPage, { formatLeadDateTime } from "@/pages/Leads";
 import { useDataStore } from "@/store/dataStore";
 import type { Transaction } from "@/services/types";
 
@@ -93,5 +93,25 @@ describe("Leads page", () => {
 
     expect(screen.queryByText("active@example.com")).not.toBeInTheDocument();
     expect(screen.getByText(/No leads found/)).toBeInTheDocument();
+  });
+});
+
+describe("Leads — lead date column", () => {
+  it("shows when each lead came in (first touch, local date and time) right after the email", () => {
+    vi.mocked(useTransactions).mockReturnValue([
+      tx({ transaction_id: "first", user_id: "lead_user", email: "lead@example.com", status: "failed", event_time: "2026-06-10T10:00:00.000Z" }),
+      tx({ transaction_id: "later", user_id: "lead_user", email: "lead@example.com", status: "failed", event_time: "2026-06-12T08:30:00.000Z" }),
+    ]);
+    render(<LeadsPage />);
+    const headers = screen.getAllByRole("columnheader").map((cell) => cell.textContent);
+    expect(headers.slice(0, 2)).toEqual(["Email", "Lead Date"]);
+    expect(screen.getByText(formatLeadDateTime("2026-06-10T10:00:00.000Z"))).toBeInTheDocument();
+  });
+
+  it("formats as YYYY-MM-DD HH:mm in local time and tolerates missing values", () => {
+    const local = new Date(2026, 9, 5, 7, 4);
+    expect(formatLeadDateTime(local.toISOString())).toBe("2026-10-05 07:04");
+    expect(formatLeadDateTime(null)).toBe("");
+    expect(formatLeadDateTime("not a date")).toBe("");
   });
 });

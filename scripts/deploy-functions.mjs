@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 // Deploy-all for the Supabase Edge functions (plan §26.6 / §31 "scripts/deploy-functions").
 //
 // Access control only holds when EVERY function runs the access-aware build: an

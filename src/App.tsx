@@ -1,6 +1,6 @@
 import { lazy, Suspense, useEffect } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, Route, Routes } from "react-router-dom";
+import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { Loader2 } from "lucide-react";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { Toaster } from "@/components/ui/toaster";
@@ -29,7 +29,6 @@ import NotFound from "./pages/NotFound.tsx";
 const Dashboard = lazy(() => import("./pages/Dashboard.tsx"));
 const Transactions = lazy(() => import("./pages/Transactions.tsx"));
 const UsersPage = lazy(() => import("./pages/Users.tsx"));
-const LeadsPage = lazy(() => import("./pages/Leads.tsx"));
 const Cohorts = lazy(() => import("./pages/Cohorts.tsx"));
 const FunnelsPage = lazy(() => import("./pages/Funnels.tsx"));
 const Reports = lazy(() => import("./pages/Reports.tsx"));
@@ -107,7 +106,8 @@ const App = () => (
                     <Route path="/" element={<RequirePermission route="/"><Dashboard /></RequirePermission>} />
                     <Route path="/transactions" element={<RequirePermission route="/transactions"><Transactions /></RequirePermission>} />
                     <Route path="/users" element={<RequirePermission route="/users"><UsersPage /></RequirePermission>} />
-                    <Route path="/leads" element={<RequirePermission route="/leads"><LeadsPage /></RequirePermission>} />
+                    {/* Leads is now a tab of the Users page; keep old links working. */}
+                    <Route path="/leads" element={<Navigate to="/users?tab=leads" replace />} />
                     <Route path="/cohorts" element={<RequirePermission route="/cohorts"><Cohorts /></RequirePermission>} />
                     <Route path="/funnels" element={<RequirePermission route="/funnels"><FunnelsPage /></RequirePermission>} />
                     <Route path="/reports" element={<RequirePermission route="/reports"><Reports /></RequirePermission>} />

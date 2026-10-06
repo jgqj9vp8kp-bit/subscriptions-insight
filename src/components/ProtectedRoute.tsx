@@ -5,7 +5,7 @@ import { useAccess } from "@/hooks/useAccess";
 import { NoAccess } from "@/components/NoAccess";
 import { SavedDataAutoLoader } from "@/components/SavedDataAutoLoader";
 import { canAccessRoute, firstAllowedRoute, normalizeRoutePath } from "@/services/accessRoutes";
-import { shouldAutoLoadTransactionsForPath } from "@/services/transactionAutoLoadPolicy";
+import { shouldAutoLoadTransactionsForPath, useTransactionDemand } from "@/services/transactionAutoLoadPolicy";
 
 function FullPageLoader({ label }: { label: string }) {
   return (
@@ -24,7 +24,10 @@ export function ProtectedRoute() {
   const location = useLocation();
   const { configured, loading, user } = useAuth();
   const access = useAccess();
-  const loadTransactions = shouldAutoLoadTransactionsForPath(location.pathname);
+  // A mounted raw-warehouse view (the Users page's Leads tab) can request
+  // hydration on a route the path policy defers.
+  const transactionsDemanded = useTransactionDemand((state) => state.demand > 0);
+  const loadTransactions = shouldAutoLoadTransactionsForPath(location.pathname) || transactionsDemanded;
 
   if (loading) {
     return <FullPageLoader label="Loading session..." />;

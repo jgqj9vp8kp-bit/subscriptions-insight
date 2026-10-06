@@ -292,7 +292,7 @@ describe("AppSidebar", () => {
   }
 
   const linkNames = () => screen.queryAllByRole("link").map((link) => link.textContent);
-  const ALL_PAGES = ["Dashboard", "Transactions", "Users", "Leads", "Cohorts", "Funnels", "Reports", "FB-Analytics", "Integrations", "Support", "Forecasting", "Subscriptions", "Import data"];
+  const ALL_PAGES = ["Dashboard", "Transactions", "Users", "Cohorts", "Funnels", "Reports", "FB-Analytics", "Integrations", "Support", "Forecasting", "Subscriptions", "Import data"];
 
   it("owner sees every page plus the Administration group", () => {
     renderSidebar(OWNER());
@@ -533,8 +533,12 @@ describe("AccessErrorBridge", () => {
 describe("App.tsx routes (static)", () => {
   it("every protected route is wrapped in RequirePermission with its own path, admin routes included", () => {
     const source = readFileSync(resolve(process.cwd(), "src/App.tsx"), "utf8");
-    const routes = [...source.matchAll(/<Route\s+path="(\/[^"]*)"\s+element=\{(.*)\}\s*\/>/g)].filter((match) => match[1] !== "/login");
-    expect(routes.length).toBeGreaterThanOrEqual(16);
+    const allRoutes = [...source.matchAll(/<Route\s+path="(\/[^"]*)"\s+element=\{(.*)\}\s*\/>/g)].filter((match) => match[1] !== "/login");
+    // /leads is a pure redirect into the Users page tab (guarded there).
+    const redirects = allRoutes.filter(([, , element]) => element.startsWith("<Navigate "));
+    expect(redirects.map(([, path, element]) => [path, element])).toEqual([["/leads", '<Navigate to="/users?tab=leads" replace />']]);
+    const routes = allRoutes.filter(([, , element]) => !element.startsWith("<Navigate "));
+    expect(routes.length).toBeGreaterThanOrEqual(15);
     for (const [, path, element] of routes) {
       expect(element, path).toMatch(new RegExp(`^<RequirePermission route="${path.replace(/[/-]/g, "\\$&")}">`));
     }
@@ -599,8 +603,10 @@ describe.runIf(ADMIN_PAGES_PRESENT)("App", () => {
     expect(await screen.findByText(/admin members page/)).toBeInTheDocument();
     expect(screen.getByTestId("saved-data-auto-loader")).toBeInTheDocument();
     cleanup();
+    // /leads now lands on the Users page (its Leads tab).
     renderApp("/leads");
-    expect(await screen.findByText("leads page")).toBeInTheDocument();
+    expect(await screen.findByText("users page")).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/users");
   });
 
   it("redirects / to the first allowed page for a member without the Dashboard", async () => {

@@ -1,3 +1,6 @@
+import { useEffect } from "react";
+import { create } from "zustand";
+
 const TRANSACTIONS_UI_STATE_KEY = "ui_state_transactions";
 
 function readPersistedTransactionsMode(storage: Storage | null): "list" | "pass" {
@@ -18,6 +21,36 @@ function safeLocalStorage(): Storage | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * On-demand hydration for views that compute from the raw warehouse on a route
+ * the path policy defers (the Leads tab of /users). While at least one such view
+ * is mounted, ProtectedRoute asks SavedDataAutoLoader to load transactions even
+ * though the path alone would not. Releasing never unloads anything.
+ */
+interface TransactionDemandState {
+  demand: number;
+  acquire: () => () => void;
+}
+
+export const useTransactionDemand = create<TransactionDemandState>()((set) => ({
+  demand: 0,
+  acquire: () => {
+    set((state) => ({ demand: state.demand + 1 }));
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      set((state) => ({ demand: Math.max(0, state.demand - 1) }));
+    };
+  },
+}));
+
+/** Mount-scoped request for raw transactions (no-op when `enabled` is false). */
+export function useRequireRawTransactions(enabled: boolean): void {
+  const acquire = useTransactionDemand((state) => state.acquire);
+  useEffect(() => (enabled ? acquire() : undefined), [enabled, acquire]);
 }
 
 export function shouldAutoLoadTransactionsForPath(pathname: string, storage: Storage | null = safeLocalStorage()): boolean {

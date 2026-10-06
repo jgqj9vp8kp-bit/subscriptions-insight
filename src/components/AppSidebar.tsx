@@ -1,4 +1,4 @@
-import { BarChart3, FileText, Headphones, LayoutDashboard, Receipt, Users, UserPlus, Layers, Upload, Repeat, Calculator, Plug, Route, UserCog, ShieldCheck, ScrollText, type LucideIcon } from "lucide-react";
+import { BarChart3, FileText, Headphones, LayoutDashboard, Receipt, Users, Layers, Upload, Repeat, Calculator, Plug, Route, UserCog, ShieldCheck, ScrollText, type LucideIcon } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { NavLink } from "@/components/NavLink";
 import { useAccess } from "@/hooks/useAccess";
@@ -30,7 +30,6 @@ const items: NavItem[] = [
   { title: "Dashboard", url: "/", icon: LayoutDashboard, end: true },
   { title: "Transactions", url: "/transactions", icon: Receipt, end: false },
   { title: "Users", url: "/users", icon: Users, end: false },
-  { title: "Leads", url: "/leads", icon: UserPlus, end: false },
   { title: "Cohorts", url: "/cohorts", icon: Layers, end: false },
   { title: "Funnels", url: "/funnels", icon: Route, end: false },
   { title: "Reports", url: "/reports", icon: FileText, end: false },
