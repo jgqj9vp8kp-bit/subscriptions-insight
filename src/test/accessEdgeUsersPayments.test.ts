@@ -51,6 +51,7 @@ import {
   type PaymentAnalyticsRequest,
 } from "../../supabase/functions/_shared/clickhouse/paymentAnalytics.ts";
 import { runUsersList } from "../../supabase/functions/_shared/clickhouse/users.ts";
+import { readLeadsSyncState, resetLeadsMemo, runLeadsList } from "../../supabase/functions/_shared/clickhouse/leads.ts";
 import { FACT_SUBSCRIPTIONS_TABLE } from "../../supabase/functions/_shared/clickhouse/factSubscriptions.ts";
 import type { ClickHouseClientLike } from "../../supabase/functions/_shared/clickhouse/types.ts";
 
@@ -136,7 +137,15 @@ async function expectDenied<A extends string>(policy: FunctionPolicy<A>, body: u
 const MATRIX: Array<{ policy: FunctionPolicy<string>; bodies: Record<string, unknown> }> = [
   {
     policy: CLICKHOUSE_USERS_POLICY as FunctionPolicy<string>,
-    bodies: { list: { action: "list" }, summary: { action: "summary" }, options: { action: "options" }, decline: { action: "decline" }, details: { action: "details", user_id: "u1" } },
+    bodies: {
+      list: { action: "list" },
+      summary: { action: "summary" },
+      options: { action: "options" },
+      decline: { action: "decline" },
+      details: { action: "details", user_id: "u1" },
+      leads_list: { action: "leads_list", filters: { source: "warehouse" } },
+      leads_overview: { action: "leads_overview" },
+    },
   },
   {
     policy: CLICKHOUSE_PAYMENT_ANALYTICS_POLICY as FunctionPolicy<string>,
@@ -175,6 +184,9 @@ describe("policy tables", () => {
       options: { allOf: ["users.view", "users.pii.view"] },
       decline: { allOf: ["users.view", "users.pii.view"] },
       details: { allOf: ["users.view", "users.pii.view", "users.details.view"] },
+      // Leads tab: data owner only for the first release (owner decision 4).
+      leads_list: { allOf: ["users.view", "users.pii.view", "leads.view"], rawOnly: true },
+      leads_overview: { allOf: ["users.view", "users.pii.view", "leads.view"], rawOnly: true },
     });
     expect(CLICKHOUSE_PAYMENT_ANALYTICS_POLICY.actions).toEqual({
       bundle: { anyOf: ["payment_pass.view"] },
@@ -196,9 +208,9 @@ describe("policy tables", () => {
 });
 
 describe("canonical action normalizers (rule R3: no silent defaults)", () => {
-  it("clickhouse-users maps only the five named actions — a missing action is no longer 'list'", () => {
-    for (const action of ["list", "summary", "options", "decline", "details"]) expect(normalizeClickHouseUsersAction({ action })).toBe(action);
-    for (const body of [{}, { action: null }, { action: "delete_users" }, { action: ["list"] }]) {
+  it("clickhouse-users maps only the seven named actions — a missing action is no longer 'list'", () => {
+    for (const action of ["list", "summary", "options", "decline", "details", "leads_list", "leads_overview"]) expect(normalizeClickHouseUsersAction({ action })).toBe(action);
+    for (const body of [{}, { action: null }, { action: "delete_users" }, { action: ["list"] }, { action: "leads" }, { action: "LEADS_LIST" }]) {
       expect(() => normalizeClickHouseUsersAction(body)).toThrow(ActionNormalizeError);
     }
   });
@@ -255,6 +267,17 @@ describe("gate decisions per function", () => {
     await expectDenied(CLICKHOUSE_USERS_POLICY, { action: "details", user_id: "u1" }, memberRow(["users.view", "users.details.view"]), 403, ACCESS_ERROR.PERMISSION_DENIED);
     await expectAllowed(CLICKHOUSE_USERS_POLICY, { action: "details", user_id: "u1" }, memberRow([...page, "users.details.view"]), "details");
     await expectDenied(CLICKHOUSE_USERS_POLICY, {}, memberRow(page), 400, ACCESS_ERROR.UNKNOWN_ACTION);
+  });
+
+  it("clickhouse-users leads actions: the data owner only, whatever the member's role", async () => {
+    const leadsKeys = ["users.view", "users.pii.view", "leads.view"];
+    for (const action of ["leads_list", "leads_overview"] as const) {
+      await expectAllowed(CLICKHOUSE_USERS_POLICY, { action }, ownerRow(), action);
+      await expectDenied(CLICKHOUSE_USERS_POLICY, { action }, memberRow(leadsKeys), 403, ACCESS_ERROR.RAW_ACCESS_REQUIRED);
+      await expectDenied(CLICKHOUSE_USERS_POLICY, { action }, memberRow([...ENFORCED_PERMISSION_KEYS]), 403, ACCESS_ERROR.RAW_ACCESS_REQUIRED);
+    }
+    // The Users actions are unchanged for a leads-only member: leads.view grants nothing there.
+    await expectDenied(CLICKHOUSE_USERS_POLICY, { action: "list" }, memberRow(["leads.view"]), 403, ACCESS_ERROR.PERMISSION_DENIED);
   });
 
   it("clickhouse-payment-analytics: bundle / banks / AI pass rates each need their own permission", async () => {
@@ -476,6 +499,22 @@ describe("best-effort catches rethrow ScopeViolation", () => {
     };
     await expect(runPaymentAnalytics({ authUserId: DATA_KEY, clickhouse: sweeper(new Error("boom")), request: { action: "analytics" } })).resolves.toMatchObject({ ok: true });
     await expect(runPaymentAnalytics({ authUserId: DATA_KEY, clickhouse: sweeper(violation()), request: { action: "analytics" } })).rejects.toBeInstanceOf(ScopeViolation);
+  });
+
+  it("leads: the sync-state read stays best-effort, except for a ScopeViolation", async () => {
+    const pg = (failure: () => never) => ({ from: vi.fn(failure) }) as unknown as Parameters<typeof readLeadsSyncState>[0];
+    await expect(readLeadsSyncState(pg(() => { throw new Error("boom"); }), DATA_KEY, Date.now())).resolves.toMatchObject({ status: null, stats: {} });
+    await expect(readLeadsSyncState(pg(() => { throw violation(); }), DATA_KEY, Date.now())).rejects.toBeInstanceOf(ScopeViolation);
+  });
+
+  it("leads: a restricted context reaching the leads runner fails on the warehouse read", async () => {
+    resetLeadsMemo();
+    const ctx = contextFor(ownerRow("selected"));
+    const raw = usersClient(() => false, new Error("unused"));
+    const pg = { rpc: vi.fn(async () => ({ data: {}, error: null })), from: vi.fn() } as unknown as Parameters<typeof readLeadsSyncState>[0];
+    await expect(runLeadsList({ tenantKey: ctx.tenantKey, clickhouse: createScopedReader(ctx, raw), pg, request: { action: "leads_list" } })).rejects.toBeInstanceOf(ScopeViolation);
+    expect(ctx.violations).toEqual(["restricted_protected_table:analytics_transactions"]);
+    expect(raw.query).not.toHaveBeenCalled();
   });
 });
 

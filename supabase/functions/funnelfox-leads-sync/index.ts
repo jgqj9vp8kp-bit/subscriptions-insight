@@ -1,63 +1,94 @@
 /* global Deno */
 
-// FunnelFox → Leads sync — resumable, staged, diagnosable.
+// FunnelFox → Leads sync — resumable, staged, cron-driven, diagnosable.
 //
-// A single Edge invocation has ~60s of wall clock, which is not enough to crawl /profiles, enrich
-// every email via /profiles/{id}, crawl /sessions, and reconcile conversion in one shot for large
-// accounts. So the sync is split into four RESUMABLE stages, and one invocation runs ONE stage:
+// Where the emails are (live probe 2026-10-06, key names / counts only): a FunnelFox profile LIST row
+// is { id, created_at, funnel_id, preview, email? } — about a quarter of the rows carry `email` at the
+// root and nothing else in the row does. The /profiles/{id} detail payload carries NO email, so the
+// old per-profile detail stage is gone: this function never calls /profiles/{id}. Only profiles that
+// carry an email are stored (light columns + the `preview` flag, no raw payloads); the rest are only
+// counted in sync_state.stats.
 //
-//   profiles         → crawl /public/v1/profiles, upsert basic rows (no email yet)
-//   profile_details  → fetch /profiles/{id} for rows still missing an email (concurrency-limited)
-//   sessions         → crawl /public/v1/sessions, join earliest session attribution per profile
-//   reconcile        → recompute has_successful_payment / has_active_subscription / is_lead
+// A single Edge invocation has ~60s of wall clock, so the work is split into three RESUMABLE stages
+// and one invocation runs ONE stage:
+//
+//   profiles   → crawl /public/v1/profiles (FunnelFox order, newest first) and upsert the rows that
+//                carry an email. Rows + cursor are checkpointed every FLUSH_EVERY_PAGES pages, so a
+//                killed call loses at most that many pages.
+//   sessions   → crawl /public/v1/sessions and attach the earliest session's attribution to STORED
+//                profiles only (light columns; no raw_session).
+//   reconcile  → one SQL call, public.funnelfox_leads_reconcile(p_data_key): paid emails from
+//                public.transactions, active ones from the Cohorts RPC. Server-side only — a
+//                `conversion` key in the body (the old browser context) is ignored.
 //
 // Each stage persists its cursor + completion flag to public.funnelfox_leads_sync_state, so the next
-// call resumes from where the last one stopped. No stage param → run the next incomplete stage.
+// call resumes where the last one stopped. No stage param → the next incomplete stage; with every
+// stage complete a plain sync is an idle no-op with no writes, so the minute cron tick costs one read.
+// A lease (funnelfox_leads_acquire_lease returns a token; only that token releases it) keeps the cron
+// tick and the page's button from crawling the same cursor at once (the loser answers status "busy");
+// every FunnelFox page has a timeout, so no call outlives its lease. A FunnelFox 429 parks the pipeline
+// until stats.rate_limited_until (Retry-After, default 60s). Any other FunnelFox error backs the cron
+// off exponentially (stats.error_backoff_until, at most an hour); a cursor FunnelFox keeps refusing is
+// dropped after CURSOR_RESET_AFTER_ERRORS errors in a row (the pass restarts), and the daily refresh
+// restarts a pipeline left in an error. has_more without a recognised next cursor, or a 2xx without a
+// data array, is an error — never a silent "completed".
 //
 // Pure logic mirrors src/services/funnelfoxLeadsTransform.ts (kept in lockstep). FUNNELFOX_SECRET
-// stays server-side; emails are masked in any log line.
+// stays server-side; no email, raw payload or cursor value is logged, and the diagnose (dry_run)
+// returns key names and counts only.
 //
-// Access (policies/funnelfox-leads-sync.ts): rawOnly + admin.sync.run on every action (sync /
-// sync_full_reset / dry_run, derived from the flags) — the reconcile stage uses the conversion
-// context the data owner's browser computes from its in-memory warehouse. Rows are written for the
-// workspace data key (ctx.tenantKey). The gate authenticates before the body is read; CORS, OPTIONS
-// and the GET / POST method check come from it.
+// Access (policies/funnelfox-leads-sync.ts): a session needs raw access + admin.sync.run (sync /
+// sync_full_reset / dry_run, derived from the flags); the pg_cron ticks (migration 202610060011: the
+// minute advance tick and the daily refresh) authenticate with x-cron-secret through the gate's cron
+// branch and may run sync / sync_full_reset only. Either way rows are written for the workspace data
+// key (ctx.tenantKey). A cron full_reset that arrives while the pipeline is still unfinished runs as a
+// plain advance, so the daily refresh never restarts a healthy running backfill (one whose last run
+// ended in an error is restarted).
 
 import type { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { serveWithAccess } from "../_shared/clickhouse/http.ts";
 import { FUNNELFOX_LEADS_SYNC_POLICY } from "../_shared/access/policies/funnelfox-leads-sync.ts";
-import {
-  detectProfileEmail,
-  fetchFunnelFox,
-  funnelFoxErrorResponse,
-  funnelFoxFailure,
-  getFunnelFoxSecret,
-} from "../_shared/funnelfox.ts";
+import { fetchFunnelFox, funnelFoxErrorResponse, funnelFoxFailure, getFunnelFoxSecret } from "../_shared/funnelfox.ts";
 
 type JsonRecord = Record<string, unknown>;
 /** The gate's service-role client (a supabase-js client; typed narrowly there). */
 type ServiceClient = ReturnType<typeof createClient>;
 
-const PROFILE_DETAIL_CONCURRENCY = 5;
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 500;
-const DEFAULT_MAX_PAGES = 50;
+const DEFAULT_MAX_PAGES = 200;
+const MAX_PAGES_CAP = 1000;
 const DRY_RUN_MAX_PAGES = 2;
-const DETAIL_CANDIDATE_BATCH = 2000; // email-less rows pulled per profile_details run
 const SOFT_TIME_BUDGET_MS = 50_000; // stay under the ~60s Edge wall clock; resume next call if exceeded
 const UPSERT_BATCH = 500;
+const LOOKUP_BATCH = 200; // profile ids per `.in()` lookup (keeps the PostgREST URL short)
+const FLUSH_EVERY_PAGES = 10;
+const LEASE_SECONDS = 120; // > budget + one page timeout + final writes; an orphaned lease (killed call) expires on its own
+// One FunnelFox list page: a hung request is abandoned (an api_error of that page) long before the
+// lease runs out, so a call can never outlive its lease and overlap the next tick.
+const FUNNELFOX_PAGE_TIMEOUT_MS = 20_000;
+const DEFAULT_RETRY_AFTER_SECONDS = 60;
+const MAX_RETRY_AFTER_SECONDS = 3600;
+// After a FunnelFox error the cron backs off exponentially (60s, 120s, 240s, … at most an hour).
+const ERROR_BACKOFF_BASE_SECONDS = 60;
+const ERROR_BACKOFF_MAX_SECONDS = 3600;
+// This many consecutive errors on a cursor FunnelFox refuses (4xx, or one that does not advance)
+// drop that stage's cursor, so the next run restarts the pass instead of retrying it forever.
+const CURSOR_RESET_AFTER_ERRORS = 3;
+const CURSOR_REJECTED_STATUSES: ReadonlySet<number> = new Set([400, 404, 410, 422]);
+const EMAIL_SOURCE_LIST = "list";
 
 // ---- pure helpers (mirror funnelfoxLeadsTransform.ts) ----------------------------------------
 
 // Must match MEDIA_BUYER_BY_UTM_SOURCE in src/services/userMediaBuyer.ts.
 const MEDIA_BUYER_BY_UTM: Record<string, string> = { "4": "Ivan", "19": "Artem A", "22": "Artem D" };
 
-type SyncStage = "profiles" | "profile_details" | "sessions" | "reconcile";
-type SyncStoppedReason = "completed" | "soft_timeout" | "max_pages_reached" | "api_error" | "unknown";
+type SyncStage = "profiles" | "sessions" | "reconcile";
+type SyncStoppedReason = "completed" | "soft_timeout" | "max_pages_reached" | "rate_limited" | "api_error" | "unknown";
+type CursorKey = "cursor" | "next_cursor";
 
 interface StageCompletion {
   profiles_completed: boolean;
-  details_completed: boolean;
   sessions_completed: boolean;
   reconcile_completed: boolean;
 }
@@ -75,6 +106,13 @@ function normalizeEmail(value: unknown): string | null {
   if (typeof value !== "string") return null;
   return value.trim().toLowerCase() || null;
 }
+function looksLikeEmail(value: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim());
+}
+function normalizeProfileId(value: unknown): string {
+  if (typeof value !== "string" && typeof value !== "number") return "";
+  return String(value).trim().replace(/^pro_/i, "");
+}
 function normalizeCountryCode(value: unknown): string | null {
   const normalized = String(value ?? "").trim().toUpperCase();
   return normalized || null;
@@ -87,25 +125,252 @@ function mediaBuyerFromUtmSource(utm: string | null): string | null {
   if (!utm) return null;
   return MEDIA_BUYER_BY_UTM[utm] ?? "Unknown";
 }
-function maskEmail(value: string | null): string | null {
-  if (!value || !value.includes("@")) return value ? "***" : null;
-  const [local, domain] = value.split("@");
-  return `${local.slice(0, 2)}***@${domain}`;
+function numberOr(value: unknown, fallback: number): number {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
 }
 
-function emailFromListRow(row: JsonRecord): string | null {
-  const direct = normalizeEmail(row.email);
-  if (direct) return direct;
-  const preview = row.preview;
-  if (typeof preview === "string") {
-    const match = preview.match(/[^\s"']+@[^\s"']+\.[^\s"']+/);
-    if (match) return normalizeEmail(match[0]);
+function resolveIntParam(value: unknown, fallback: number, min: number, max: number): number {
+  // An absent param (undefined/null/"") must use the fallback — NOT collapse to Number(null)===0,
+  // which is finite and clamped up to `min` (1): every call that omitted limit / max_pages crawled
+  // one page of one profile.
+  if (value === null || value === undefined || value === "") return fallback;
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.floor(n))) : fallback;
+}
+
+function readNextCursor(pagination: JsonRecord, requestCursor?: string | null): { cursor: string | null; key: CursorKey | null; stuck: boolean } {
+  // FunnelFox paginates with { cursor, has_more } (verified on /funnels and /subscriptions); accept
+  // next_cursor too. A cursor equal to the one the page was requested with would loop forever.
+  let stuck = false;
+  for (const key of ["cursor", "next_cursor"] as const) {
+    const raw = pagination[key];
+    if (typeof raw !== "string" || raw === "") continue;
+    if (requestCursor && raw === requestCursor) {
+      stuck = true;
+      continue;
+    }
+    return { cursor: raw, key, stuck: false };
   }
-  if (preview && typeof preview === "object") {
-    const record = preview as JsonRecord;
-    return normalizeEmail(record.email) ?? normalizeEmail(record.contact_email);
+  return { cursor: null, key: null, stuck };
+}
+
+function readReportedTotal(pagination: JsonRecord): number | null {
+  for (const key of ["total", "total_count", "totalCount", "count"]) {
+    const value = pagination[key];
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) return Number(value);
   }
   return null;
+}
+
+const CROCKFORD_BASE32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+const ULID_MIN_MS = Date.UTC(2015, 0, 1);
+const ULID_MAX_MS = Date.UTC(2100, 0, 1);
+
+function ulidTimestampMs(id: unknown): number | null {
+  const bare = normalizeProfileId(id).toUpperCase();
+  if (!/^[0-9A-HJKMNP-TV-Z]{26}$/.test(bare)) return null;
+  let ms = 0;
+  for (let i = 0; i < 10; i += 1) ms = ms * 32 + CROCKFORD_BASE32.indexOf(bare[i]);
+  return ms >= ULID_MIN_MS && ms <= ULID_MAX_MS ? ms : null;
+}
+function ulidIso(id: unknown): string | null {
+  const ms = ulidTimestampMs(id);
+  return ms == null ? null : new Date(ms).toISOString();
+}
+
+function listRowEmail(row: JsonRecord): { email: string; normalized_email: string } | null {
+  const candidates: unknown[] = [row.email];
+  const preview = row.preview;
+  if (typeof preview === "string") candidates.push(preview.match(/[^\s"']+@[^\s"']+\.[^\s"']+/)?.[0]);
+  if (preview && typeof preview === "object") {
+    const record = preview as JsonRecord;
+    candidates.push(record.email, record.contact_email);
+  }
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string") continue;
+    const email = candidate.trim();
+    const normalized = normalizeEmail(email);
+    if (normalized && looksLikeEmail(normalized)) return { email, normalized_email: normalized };
+  }
+  return null;
+}
+function emailFromListRow(row: JsonRecord): string | null {
+  return listRowEmail(row)?.normalized_email ?? null;
+}
+
+interface ParsedProfile {
+  profile_id: string;
+  created_at: string | null;
+  updated_at: string | null;
+  funnel_id: string | null;
+  email: string | null;
+  normalized_email: string | null;
+  preview: boolean;
+}
+
+function parseProfileListRow(row: JsonRecord): ParsedProfile {
+  const profileId = normalizeProfileId(row.profile_id ?? row.id);
+  const email = listRowEmail(row);
+  return {
+    profile_id: profileId,
+    created_at: strOrNull(row.created_at) ?? ulidIso(profileId),
+    updated_at: strOrNull(row.updated_at),
+    funnel_id: strOrNull(row.funnel_id),
+    email: email?.email ?? null,
+    normalized_email: email?.normalized_email ?? null,
+    preview: row.preview === true,
+  };
+}
+
+interface ProfileScan {
+  store: ParsedProfile[];
+  scanned: number;
+  with_email: number;
+  without_email: number;
+  preview: number;
+  preview_with_email: number;
+  skipped_no_profile_id: number;
+  duplicates: number;
+}
+
+function scanProfileRows(rows: JsonRecord[]): ProfileScan {
+  const seen = new Set<string>();
+  const scan: ProfileScan = {
+    store: [],
+    scanned: 0,
+    with_email: 0,
+    without_email: 0,
+    preview: 0,
+    preview_with_email: 0,
+    skipped_no_profile_id: 0,
+    duplicates: 0,
+  };
+  for (const row of rows) {
+    const profile = parseProfileListRow(row);
+    if (!profile.profile_id) {
+      scan.skipped_no_profile_id += 1;
+      continue;
+    }
+    if (seen.has(profile.profile_id)) {
+      scan.duplicates += 1;
+      continue;
+    }
+    seen.add(profile.profile_id);
+    scan.scanned += 1;
+    if (profile.preview) scan.preview += 1;
+    if (profile.normalized_email) {
+      scan.with_email += 1;
+      if (profile.preview) scan.preview_with_email += 1;
+      scan.store.push(profile);
+    } else {
+      scan.without_email += 1;
+    }
+  }
+  return scan;
+}
+
+// The columns the profile list owns. Conversion columns are reconcile's; funnel_id only when present.
+function profileUpsertRow(profile: ParsedProfile, syncedAt: string): JsonRecord {
+  const row: JsonRecord = {
+    profile_id: profile.profile_id,
+    email: profile.email,
+    normalized_email: profile.normalized_email,
+    email_source: EMAIL_SOURCE_LIST,
+    detail_checked: true,
+    preview: profile.preview,
+    created_at: profile.created_at,
+    updated_at: profile.updated_at,
+    synced_at: syncedAt,
+  };
+  if (profile.funnel_id) row.funnel_id = profile.funnel_id;
+  return row;
+}
+
+// supabase-js fills a key missing from some rows of a bulk upsert with NULL: batch by key set.
+function groupRowsByKeySet<T extends JsonRecord>(rows: T[]): T[][] {
+  const groups = new Map<string, T[]>();
+  for (const row of rows) {
+    const signature = Object.keys(row).sort().join(",");
+    const group = groups.get(signature);
+    if (group) group.push(row);
+    else groups.set(signature, [row]);
+  }
+  return [...groups.values()];
+}
+
+const PASS_COUNTER_KEYS = [
+  "profiles_scanned_total",
+  "profiles_with_email",
+  "profiles_without_email",
+  "preview_excluded",
+  "preview_with_email",
+  "profiles_skipped_no_profile_id",
+  "profiles_duplicates_skipped",
+] as const;
+type PassCounters = Record<(typeof PASS_COUNTER_KEYS)[number], number>;
+
+function readPassCounters(stats: JsonRecord | null | undefined, reset: boolean): PassCounters {
+  const counters = {} as PassCounters;
+  for (const key of PASS_COUNTER_KEYS) {
+    const value = Number(readRecord(stats)[key] ?? 0);
+    counters[key] = reset || !Number.isFinite(value) ? 0 : value;
+  }
+  return counters;
+}
+function addProfileScan(counters: PassCounters, scan: ProfileScan): void {
+  counters.profiles_scanned_total += scan.scanned;
+  counters.profiles_with_email += scan.with_email;
+  counters.profiles_without_email += scan.without_email;
+  counters.preview_excluded += scan.preview;
+  counters.preview_with_email += scan.preview_with_email;
+  counters.profiles_skipped_no_profile_id += scan.skipped_no_profile_id;
+  counters.profiles_duplicates_skipped += scan.duplicates;
+}
+
+interface ParsedSession {
+  session_id: string;
+  profile_id: string;
+  country_code: string | null;
+  user_agent: string | null;
+  funnel_id: string | null;
+  funnel_version: string | null;
+  origin: string | null;
+  created_at: string | null;
+  city: string | null;
+  postal: string | null;
+}
+
+function parseSessionRow(row: JsonRecord): ParsedSession {
+  return {
+    session_id: str(row.session_id ?? row.id),
+    profile_id: normalizeProfileId(row.profile_id),
+    country_code: normalizeCountryCode(row.country),
+    user_agent: strOrNull(row.user_agent),
+    funnel_id: strOrNull(row.funnel_id),
+    funnel_version: strOrNull(row.funnel_version),
+    origin: strOrNull(row.origin),
+    created_at: strOrNull(row.created_at),
+    city: strOrNull(row.city),
+    postal: strOrNull(row.postal),
+  };
+}
+
+function dateMs(value: string | null): number {
+  if (!value) return Number.POSITIVE_INFINITY;
+  const ms = new Date(value).getTime();
+  return Number.isFinite(ms) ? ms : Number.POSITIVE_INFINITY;
+}
+
+function joinSessionsToProfiles(sessions: ParsedSession[]): Map<string, ParsedSession> {
+  const byProfile = new Map<string, ParsedSession>();
+  for (const session of sessions) {
+    if (!session.profile_id) continue;
+    const current = byProfile.get(session.profile_id);
+    if (!current || dateMs(session.created_at) < dateMs(current.created_at)) byProfile.set(session.profile_id, session);
+  }
+  return byProfile;
 }
 
 function parseOriginUrl(origin: string | null): { campaign_path: string | null; campaign_id: string | null; utm_source: string | null } {
@@ -135,45 +400,42 @@ function parseOriginUrl(origin: string | null): { campaign_path: string | null; 
   };
 }
 
-interface ParsedSession {
-  session_id: string;
-  profile_id: string;
-  country_code: string | null;
-  user_agent: string | null;
+interface StoredAttribution {
+  session_created_at: string | null;
   funnel_id: string | null;
-  funnel_version: string | null;
-  origin: string | null;
-  created_at: string | null;
-  city: string | null;
-  postal: string | null;
-  raw: JsonRecord;
 }
 
-function parseSessionRow(row: JsonRecord): ParsedSession {
+// Earliest-wins attribution for a STORED profile; null when not stored or already as early.
+function sessionAttributionRow(profileId: string, session: ParsedSession, existing: StoredAttribution | undefined, syncedAt: string): JsonRecord | null {
+  if (!existing) return null;
+  if (existing.session_created_at && dateMs(existing.session_created_at) <= dateMs(session.created_at)) return null;
+  const attribution = parseOriginUrl(session.origin);
   return {
-    session_id: str(row.session_id ?? row.id),
-    profile_id: str(row.profile_id),
-    country_code: normalizeCountryCode(row.country),
-    user_agent: strOrNull(row.user_agent),
-    funnel_id: strOrNull(row.funnel_id),
-    funnel_version: strOrNull(row.funnel_version),
-    origin: strOrNull(row.origin),
-    created_at: strOrNull(row.created_at),
-    city: strOrNull(row.city),
-    postal: strOrNull(row.postal),
-    raw: row,
+    profile_id: profileId,
+    session_id: session.session_id || null,
+    session_created_at: session.created_at,
+    funnel_version: session.funnel_version,
+    funnel_id: existing.funnel_id ?? session.funnel_id,
+    campaign_path: attribution.campaign_path,
+    campaign_id: attribution.campaign_id,
+    utm_source: attribution.utm_source,
+    media_buyer: attribution.utm_source ? mediaBuyerFromUtmSource(attribution.utm_source) : null,
+    country_code: session.country_code,
+    city: session.city,
+    postal: session.postal,
+    user_agent: session.user_agent,
+    origin: session.origin,
+    synced_at: syncedAt,
   };
 }
 
-function dateMs(value: string | null): number {
-  if (!value) return Number.POSITIVE_INFINITY;
-  const ms = new Date(value).getTime();
-  return Number.isFinite(ms) ? ms : Number.POSITIVE_INFINITY;
+function parseSyncStage(value: unknown): SyncStage | null {
+  const stage = str(value).toLowerCase();
+  return stage === "profiles" || stage === "sessions" || stage === "reconcile" ? stage : null;
 }
 
 function nextIncompleteStage(flags: StageCompletion): SyncStage | null {
   if (!flags.profiles_completed) return "profiles";
-  if (!flags.details_completed) return "profile_details";
   if (!flags.sessions_completed) return "sessions";
   if (!flags.reconcile_completed) return "reconcile";
   return null;
@@ -185,8 +447,10 @@ function determineStopReason(input: {
   hasMoreOnLastPage: boolean;
   timedOut: boolean;
   apiError: boolean;
+  rateLimited?: boolean;
 }): SyncStoppedReason {
   if (input.apiError) return "api_error";
+  if (input.rateLimited) return "rate_limited";
   if (input.timedOut) return "soft_timeout";
   if (!input.hasMoreOnLastPage) return "completed";
   if (input.pages >= input.maxPages) return "max_pages_reached";
@@ -204,30 +468,88 @@ function statusFromStopReason(reason: SyncStoppedReason): "ok" | "partial" | "er
   }
 }
 
-function detailsStopReason(timeoutSkipped: number, apiError = false): SyncStoppedReason {
-  if (apiError) return "api_error";
-  return timeoutSkipped > 0 ? "soft_timeout" : "completed";
-}
-
-type DetailOutcome = "email_checked" | "gone_checked" | "transient_unchecked";
-
-// Decide a profile-detail fetch result. Only 404/410 are terminal "no email" — every other failure is
-// transient (the row stays detail_checked=false so a later run retries it).
-function detailOutcome(ok: boolean, status: number): DetailOutcome {
-  if (ok) return "email_checked";
-  if (status === 404 || status === 410) return "gone_checked";
-  return "transient_unchecked";
-}
-
-// profile_details is complete only when nothing was timed-out-skipped AND no candidate rows remain
-// (transient failures leave rows unchecked → stage stays incomplete → Continue Sync resumes it).
-function detailsStageComplete(timeoutSkipped: number, remainingUnchecked: number): boolean {
-  return timeoutSkipped === 0 && remainingUnchecked === 0;
-}
-
 function resolveStartCursor(savedCursor: string | null | undefined, fullReset: boolean): string | undefined {
   if (fullReset) return undefined;
   return savedCursor ?? undefined;
+}
+
+// Written BEFORE a reset crawls: all stage flags false, both cursors null (details stage is gone → true).
+function fullResetState() {
+  return {
+    profiles_completed: false,
+    details_completed: true,
+    sessions_completed: false,
+    reconcile_completed: false,
+    last_profiles_cursor: null,
+    last_sessions_cursor: null,
+    profiles_scanned_total: 0,
+    sessions_scanned_total: 0,
+    profiles_total_reported_by_api: null,
+    current_stage: "profiles" as SyncStage,
+  };
+}
+
+function parseRetryAfterSeconds(value: string | null | undefined, nowMs: number): number {
+  const raw = (value ?? "").trim();
+  let seconds = Number.NaN;
+  if (/^\d+(\.\d+)?$/.test(raw)) seconds = Math.ceil(Number(raw));
+  else if (raw) {
+    const at = Date.parse(raw);
+    if (Number.isFinite(at)) seconds = Math.ceil((at - nowMs) / 1000);
+  }
+  if (!Number.isFinite(seconds)) return DEFAULT_RETRY_AFTER_SECONDS;
+  return Math.max(1, Math.min(MAX_RETRY_AFTER_SECONDS, seconds));
+}
+
+function readIsoMs(stats: JsonRecord | null | undefined, key: string): number | null {
+  const raw = readRecord(stats)[key];
+  if (typeof raw !== "string" || !raw) return null;
+  const ms = Date.parse(raw);
+  return Number.isFinite(ms) ? ms : null;
+}
+function readRateLimitedUntilMs(stats: JsonRecord | null | undefined): number | null {
+  return readIsoMs(stats, "rate_limited_until");
+}
+function readErrorBackoffUntilMs(stats: JsonRecord | null | undefined): number | null {
+  return readIsoMs(stats, "error_backoff_until");
+}
+
+// Backoff after the Nth consecutive FunnelFox error (N >= 1): 60s · 2^(N-1), at most an hour.
+function errorBackoffSeconds(consecutiveErrors: number): number {
+  const n = Math.max(1, Math.floor(Number.isFinite(consecutiveErrors) ? consecutiveErrors : 1));
+  return Math.min(ERROR_BACKOFF_MAX_SECONDS, ERROR_BACKOFF_BASE_SECONDS * 2 ** Math.min(n - 1, 16));
+}
+
+type RunPlan =
+  | { kind: "idle" }
+  | { kind: "rate_limited"; until: string; stage: SyncStage | null }
+  | { kind: "error_backoff"; until: string; stage: SyncStage | null }
+  | { kind: "run"; stage: SyncStage; reset: boolean };
+
+function planRun(input: {
+  flags: StageCompletion;
+  requestedStage: SyncStage | null;
+  fullReset: boolean;
+  cron: boolean;
+  rateLimitedUntilMs: number | null;
+  nowMs: number;
+  lastStatus?: string | null;
+  errorBackoffUntilMs?: number | null;
+}): RunPlan {
+  const next = nextIncompleteStage(input.flags);
+  // A cron full_reset restarts a complete pipeline (the daily refresh) or one stuck in an error; a
+  // healthy unfinished backfill is only advanced.
+  const reset = input.fullReset && !(input.cron && next !== null && input.lastStatus !== "error");
+  if (!reset && !input.requestedStage && next === null) return { kind: "idle" };
+  if (input.rateLimitedUntilMs != null && input.rateLimitedUntilMs > input.nowMs) {
+    return { kind: "rate_limited", until: new Date(input.rateLimitedUntilMs).toISOString(), stage: input.requestedStage ?? next };
+  }
+  // The error backoff spaces the cron's retries only: a user click and a reset run at once.
+  if (input.cron && !reset && input.errorBackoffUntilMs != null && input.errorBackoffUntilMs > input.nowMs) {
+    return { kind: "error_backoff", until: new Date(input.errorBackoffUntilMs).toISOString(), stage: input.requestedStage ?? next };
+  }
+  if (reset) return { kind: "run", stage: input.requestedStage ?? "profiles", reset: true };
+  return { kind: "run", stage: (input.requestedStage ?? next) as SyncStage, reset: false };
 }
 
 function computeCoveragePercent(scannedTotal: number, totalReported: number | null): number | null {
@@ -235,58 +557,189 @@ function computeCoveragePercent(scannedTotal: number, totalReported: number | nu
   return Math.min(100, Math.round((scannedTotal / totalReported) * 10000) / 100);
 }
 
-function computeCoverageWarning(input: {
-  stoppedReason: SyncStoppedReason;
-  stage: SyncStage;
-  hasPendingDetails: boolean;
-}): { coverage_warning: boolean; coverage_warning_message: string } {
-  if (input.stoppedReason === "max_pages_reached") {
-    return {
-      coverage_warning: true,
-      coverage_warning_message: "Sync stopped because max_pages was reached while FunnelFox still had more profiles.",
-    };
+function computeCoverageWarning(input: { stoppedReason: SyncStoppedReason; stage: SyncStage }): {
+  coverage_warning: boolean;
+  coverage_warning_message: string;
+} {
+  switch (input.stoppedReason) {
+    case "max_pages_reached":
+      return {
+        coverage_warning: true,
+        coverage_warning_message: `Sync stopped because max_pages was reached while FunnelFox still had more ${input.stage === "sessions" ? "sessions" : "profiles"}.`,
+      };
+    case "soft_timeout":
+      return {
+        coverage_warning: true,
+        coverage_warning_message: "Sync stopped because soft timeout was reached before pagination finished.",
+      };
+    case "rate_limited":
+      return {
+        coverage_warning: true,
+        coverage_warning_message: "FunnelFox rate-limited the sync (HTTP 429); it resumes automatically after the backoff.",
+      };
+    case "api_error":
+      return {
+        coverage_warning: true,
+        coverage_warning_message: "Sync stopped because the FunnelFox API returned an error before pagination finished.",
+      };
+    default:
+      return { coverage_warning: false, coverage_warning_message: "" };
   }
-  if (input.stoppedReason === "soft_timeout") {
-    return {
-      coverage_warning: true,
-      coverage_warning_message:
-        input.stage === "profile_details"
-          ? "Sync stopped because soft timeout was reached during profile detail enrichment."
-          : "Sync stopped because soft timeout was reached before pagination finished.",
-    };
-  }
-  if (input.stoppedReason === "api_error") {
-    return {
-      coverage_warning: true,
-      coverage_warning_message: "Sync stopped because the FunnelFox API returned an error before pagination finished.",
-    };
-  }
-  if (input.hasPendingDetails) {
-    return {
-      coverage_warning: true,
-      coverage_warning_message: "Profiles without email may be incomplete because detail enrichment did not finish.",
-    };
-  }
-  return { coverage_warning: false, coverage_warning_message: "" };
 }
 
-function readReportedTotal(pagination: JsonRecord): number | null {
-  for (const key of ["total", "total_count", "totalCount", "count"]) {
-    const value = pagination[key];
-    if (typeof value === "number" && Number.isFinite(value)) return value;
-    if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) return Number(value);
+// ---- diagnose helpers (key names and counts only, never values) ------------------------------
+
+function rateLimitHeaderNames(headers: { forEach(callback: (value: string, key: string) => void): void } | null | undefined): string[] {
+  const names: string[] = [];
+  if (!headers || typeof headers.forEach !== "function") return names;
+  headers.forEach((_value, key) => {
+    const name = key.toLowerCase();
+    if (/rate|retry|limit/.test(name) && !names.includes(name)) names.push(name);
+  });
+  return names.sort();
+}
+
+function rowTimestampMs(row: JsonRecord): number | null {
+  const created = Date.parse(str(row.created_at));
+  if (Number.isFinite(created)) return created;
+  return ulidTimestampMs(row.id ?? row.profile_id);
+}
+
+function detectListOrder(rows: JsonRecord[]): "newest_first" | "oldest_first" | "mixed" | "unknown" {
+  const times = rows.map(rowTimestampMs).filter((value): value is number => value != null);
+  if (times.length < 2) return "unknown";
+  let descending = 0;
+  let ascending = 0;
+  for (let i = 1; i < times.length; i += 1) {
+    if (times[i] < times[i - 1]) descending += 1;
+    else if (times[i] > times[i - 1]) ascending += 1;
   }
-  return null;
+  if (descending > 0 && ascending === 0) return "newest_first";
+  if (ascending > 0 && descending === 0) return "oldest_first";
+  return descending === 0 && ascending === 0 ? "unknown" : "mixed";
+}
+
+function keyCounts(rows: JsonRecord[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const row of rows) for (const key of Object.keys(row)) counts[key] = (counts[key] ?? 0) + 1;
+  return Object.fromEntries(Object.entries(counts).sort(([a], [b]) => a.localeCompare(b)));
+}
+
+function idForms(ids: unknown[]): { pro_prefixed: number; bare: number; missing: number; ulid: number } {
+  const forms = { pro_prefixed: 0, bare: 0, missing: 0, ulid: 0 };
+  for (const value of ids) {
+    const id = str(value);
+    if (!id) forms.missing += 1;
+    else if (/^pro_/i.test(id)) forms.pro_prefixed += 1;
+    else forms.bare += 1;
+    if (id && ulidTimestampMs(id) != null) forms.ulid += 1;
+  }
+  return forms;
+}
+
+// Dot-paths (arrays as `[]`) of string values that look like an email — PATH NAMES only.
+function collectEmailPaths(value: unknown, prefix = "", depth = 5, out: string[] = []): string[] {
+  if (value == null || depth < 0 || out.length >= 12) return out;
+  if (Array.isArray(value)) {
+    for (const item of value) collectEmailPaths(item, `${prefix}[]`, depth - 1, out);
+    return out;
+  }
+  if (typeof value === "object") {
+    for (const [key, entry] of Object.entries(value as JsonRecord)) {
+      const path = prefix ? `${prefix}.${key}` : key;
+      if (typeof entry === "string") {
+        if (looksLikeEmail(entry) && !out.includes(path) && out.length < 12) out.push(path);
+      } else {
+        collectEmailPaths(entry, path, depth - 1, out);
+      }
+    }
+  }
+  return out;
+}
+
+function summarizeProfileSample(rows: JsonRecord[]) {
+  let withEmail = 0;
+  let rootEmail = 0;
+  let previewTrue = 0;
+  let previewWithEmail = 0;
+  let createdAtPresent = 0;
+  const previewTypes: Record<string, number> = {};
+  const emailPaths: string[] = [];
+  for (const row of rows) {
+    const hasEmail = Boolean(emailFromListRow(row));
+    if (hasEmail) withEmail += 1;
+    if (typeof row.email === "string" && looksLikeEmail(row.email)) rootEmail += 1;
+    if (row.preview === true) {
+      previewTrue += 1;
+      if (hasEmail) previewWithEmail += 1;
+    }
+    const previewType = row.preview === undefined ? "missing" : row.preview === null ? "null" : typeof row.preview;
+    previewTypes[previewType] = (previewTypes[previewType] ?? 0) + 1;
+    if (strOrNull(row.created_at)) createdAtPresent += 1;
+    for (const path of collectEmailPaths(row)) if (!emailPaths.includes(path)) emailPaths.push(path);
+  }
+  return {
+    rows: rows.length,
+    key_counts: keyCounts(rows),
+    with_email: withEmail,
+    root_email: rootEmail,
+    without_email: rows.length - withEmail,
+    preview_true: previewTrue,
+    preview_with_email: previewWithEmail,
+    preview_types: previewTypes,
+    id_forms: idForms(rows.map((row) => row.profile_id ?? row.id)),
+    created_at_present: createdAtPresent,
+    order: detectListOrder(rows),
+    email_paths: emailPaths.sort(),
+  };
+}
+
+function summarizeSessionSample(rows: JsonRecord[], profileIds: Set<string>) {
+  const parsed = rows.map(parseSessionRow);
+  return {
+    rows: rows.length,
+    key_counts: keyCounts(rows),
+    with_profile_id: parsed.filter((session) => session.profile_id).length,
+    profile_id_forms: idForms(rows.map((row) => row.profile_id)),
+    matching_profile_sample: parsed.filter((session) => session.profile_id && profileIds.has(session.profile_id)).length,
+    order: detectListOrder(rows),
+  };
 }
 
 // ---- FunnelFox crawling ----------------------------------------------------------------------
 
 interface CrawlPageResult {
   ok: boolean;
+  status?: number;
   rows: JsonRecord[];
   hasMore: boolean;
   nextCursor: string | null;
+  cursorKey?: CursorKey | null;
+  cursorStuck?: boolean;
+  totalReported?: number | null;
+  retryAfterSeconds?: number | null;
+  errorMessage?: string | null;
+  paginationKeys?: string[];
+  rateLimitHeaders?: string[];
+}
+
+interface CrawlOutcome {
+  rows: JsonRecord[];
+  pages: number;
+  scannedRows: number;
+  checkpoints: number;
+  lastCursor: string | null;
+  hasMoreOnLastPage: boolean;
+  stoppedReason: SyncStoppedReason;
   totalReported: number | null;
+  errorMessage: string | null;
+  retryAfterSeconds: number | null;
+  paginationKeys: string[];
+  cursorKey: CursorKey | null;
+  rateLimitHeaders: string[];
+  /** The crawl stopped on a cursor FunnelFox refused (a 4xx in CURSOR_REJECTED_STATUSES, or a cursor
+   * that did not advance) — retrying that cursor cannot succeed. */
+  cursorRejected: boolean;
 }
 
 async function fetchListPage(base: string, cursor: string | undefined, limit: number, secret: string): Promise<CrawlPageResult> {
@@ -294,155 +747,158 @@ async function fetchListPage(base: string, cursor: string | undefined, limit: nu
   if (limit) params.set("limit", String(limit));
   if (cursor) params.set("cursor", cursor);
   const qs = params.toString();
-  const { ok, payload } = await fetchFunnelFox(`${base}${qs ? `?${qs}` : ""}`, secret);
+  let response: Awaited<ReturnType<typeof fetchFunnelFox>>;
+  try {
+    response = await fetchFunnelFox(`${base}${qs ? `?${qs}` : ""}`, secret, { timeoutMs: FUNNELFOX_PAGE_TIMEOUT_MS });
+  } catch (error) {
+    // A network failure or a timeout is an api_error of this page: the crawl keeps what it already has.
+    const message = error instanceof Error ? error.message : "network error";
+    return { ok: false, status: 0, rows: [], hasMore: false, nextCursor: null, errorMessage: `FunnelFox ${base} request failed: ${message}`.slice(0, 300) };
+  }
+  const { ok, status, payload, headers } = response;
   const root = readRecord(payload);
   const pagination = readRecord(root.pagination);
+  const next = readNextCursor(pagination, cursor);
+  const upstreamMessage = str(root.message ?? root.error ?? root.detail).slice(0, 200);
+  // A 2xx without a `data` array (an HTML maintenance page, an unparsable body) is not "an empty last
+  // page": counting it as one would mark the pass complete and silently cut the export short.
+  const shapeOk = !ok || Array.isArray(root.data);
   return {
-    ok,
+    ok: ok && shapeOk,
+    status,
     rows: (Array.isArray(root.data) ? root.data : []).filter((r): r is JsonRecord => Boolean(r && typeof r === "object")),
     hasMore: Boolean(pagination.has_more),
-    nextCursor: typeof pagination.next_cursor === "string" ? pagination.next_cursor : null,
+    nextCursor: next.cursor,
+    cursorKey: next.key,
+    cursorStuck: next.stuck,
     totalReported: readReportedTotal(pagination),
+    retryAfterSeconds: status === 429 ? parseRetryAfterSeconds(headers?.get?.("retry-after") ?? null, Date.now()) : null,
+    errorMessage: !ok
+      ? `FunnelFox ${base} HTTP ${status}${upstreamMessage ? `: ${upstreamMessage}` : ""}`
+      : shapeOk
+        ? null
+        : `FunnelFox ${base} HTTP ${status} returned no data array (body keys: ${Object.keys(root).sort().join(", ").slice(0, 120) || "none"}).`,
+    paginationKeys: Object.keys(pagination).sort(),
+    rateLimitHeaders: rateLimitHeaderNames(headers),
   };
 }
 
-interface CrawlOutcome {
-  rows: JsonRecord[];
-  pages: number;
-  lastCursor: string | null;
-  hasMoreOnLastPage: boolean;
-  stoppedReason: SyncStoppedReason;
-  totalReported: number | null;
-}
-
 async function crawlList(
-  base: string,
-  startCursor: string | undefined,
-  limit: number,
-  maxPages: number,
-  isExpired: () => boolean,
-  secret: string,
+  fetchPage: (cursor: string | undefined) => Promise<CrawlPageResult>,
+  opts: {
+    startCursor?: string;
+    maxPages: number;
+    isExpired: () => boolean;
+    flushEveryPages?: number;
+    onCheckpoint?: (rows: JsonRecord[], resumeCursor: string) => Promise<void>;
+  },
 ): Promise<CrawlOutcome> {
-  const rows: JsonRecord[] = [];
-  let cursor = startCursor;
+  let rows: JsonRecord[] = [];
+  let cursor = opts.startCursor;
   let pages = 0;
-  let lastCursor: string | null = startCursor ?? null;
+  let pagesSinceCheckpoint = 0;
+  let checkpoints = 0;
+  let scannedRows = 0;
+  let lastCursor: string | null = opts.startCursor ?? null;
   let hasMoreOnLastPage = false;
   let apiError = false;
+  let rateLimited = false;
   let timedOut = false;
   let totalReported: number | null = null;
+  let errorMessage: string | null = null;
+  let retryAfterSeconds: number | null = null;
+  let cursorKey: CursorKey | null = null;
+  let cursorRejected = false;
+  const paginationKeys = new Set<string>();
+  const rateLimitHeaders = new Set<string>();
 
-  while (pages < maxPages) {
-    if (isExpired()) {
+  while (pages < opts.maxPages) {
+    if (opts.isExpired()) {
       timedOut = true;
       break;
     }
-    const page = await fetchListPage(base, cursor, limit, secret);
+    const page = await fetchPage(cursor);
+    for (const key of page.paginationKeys ?? []) paginationKeys.add(key);
+    for (const name of page.rateLimitHeaders ?? []) rateLimitHeaders.add(name);
     if (!page.ok) {
-      apiError = true;
+      if (page.status === 429) {
+        rateLimited = true;
+        retryAfterSeconds = page.retryAfterSeconds ?? null;
+      } else {
+        apiError = true;
+        cursorRejected = Boolean(cursor) && CURSOR_REJECTED_STATUSES.has(page.status ?? 0);
+      }
+      errorMessage = page.errorMessage ?? null;
       break;
     }
     rows.push(...page.rows);
+    scannedRows += page.rows.length;
     pages += 1;
+    pagesSinceCheckpoint += 1;
     if (page.totalReported != null) totalReported = page.totalReported;
+    if (page.cursorKey) cursorKey ??= page.cursorKey;
+    if (page.hasMore && !page.nextCursor) {
+      // has_more without a usable next cursor fails closed: either the only cursor offered is the
+      // one this page was requested with (re-requesting it would loop), or the cursor sits under a key
+      // this sync does not read — "completed" would silently cut the export short. The page's rows
+      // are kept; the saved cursor stays on this page.
+      apiError = true;
+      hasMoreOnLastPage = true;
+      if (page.cursorStuck) {
+        cursorRejected = Boolean(cursor);
+        errorMessage = "FunnelFox pagination cursor did not advance.";
+      } else {
+        const keys = (page.paginationKeys ?? []).join(", ").slice(0, 200) || "none";
+        errorMessage = `FunnelFox pagination has has_more=true but no recognised next cursor (pagination keys: ${keys}).`;
+      }
+      break;
+    }
     const more = page.hasMore && Boolean(page.nextCursor);
     hasMoreOnLastPage = more;
     lastCursor = page.nextCursor ?? lastCursor;
     if (!more) break;
     cursor = page.nextCursor ?? undefined;
+    if (
+      opts.onCheckpoint &&
+      opts.flushEveryPages &&
+      pagesSinceCheckpoint >= opts.flushEveryPages &&
+      pages < opts.maxPages &&
+      cursor
+    ) {
+      await opts.onCheckpoint(rows, cursor);
+      rows = [];
+      pagesSinceCheckpoint = 0;
+      checkpoints += 1;
+    }
   }
 
   return {
     rows,
     pages,
+    scannedRows,
+    checkpoints,
     lastCursor,
     hasMoreOnLastPage,
-    stoppedReason: determineStopReason({ pages, maxPages, hasMoreOnLastPage, timedOut, apiError }),
+    stoppedReason: determineStopReason({ pages, maxPages: opts.maxPages, hasMoreOnLastPage, timedOut, apiError, rateLimited }),
     totalReported,
+    errorMessage,
+    retryAfterSeconds,
+    paginationKeys: [...paginationKeys].sort(),
+    cursorKey,
+    rateLimitHeaders: [...rateLimitHeaders].sort(),
+    cursorRejected,
   };
 }
 
-// ---- conversion context (passed by the client from its warehouse) ----------------------------
-
-interface ConversionContext {
-  paidEmails: Set<string>;
-  activeSubEmails: Set<string>;
-  trialDates: Map<string, string>;
-  firstSubDates: Map<string, string>;
-}
-
-function parseConversionContext(raw: unknown): ConversionContext {
-  const record = readRecord(raw);
-  const toSet = (value: unknown) =>
-    new Set((Array.isArray(value) ? value : []).map((v) => normalizeEmail(v)).filter((v): v is string => Boolean(v)));
-  const toMap = (value: unknown) => {
-    const map = new Map<string, string>();
-    for (const [key, val] of Object.entries(readRecord(value))) {
-      const email = normalizeEmail(key);
-      if (email && typeof val === "string") map.set(email, val);
-    }
-    return map;
-  };
-  return {
-    paidEmails: toSet(record.paid_emails),
-    activeSubEmails: toSet(record.active_sub_emails),
-    trialDates: toMap(record.trial_dates),
-    firstSubDates: toMap(record.first_sub_dates),
-  };
-}
-
-// ---- email-extraction diagnostics (dry run only) ---------------------------------------------
-
-function looksLikeEmailLoose(value: string): boolean {
-  return /[^\s@]+@[^\s@]+\.[^\s@]+/.test(value);
-}
-
-// Collect the dot-paths of any "email"-named key holding an email-shaped value. Returns PATH NAMES
-// only (e.g. "customer.email") — never the email itself — so we can report where FunnelFox hides it.
-function collectEmailPaths(value: unknown, prefix: string, depth: number, out: string[]): void {
-  if (value == null || depth < 0 || out.length >= 12) return;
-  if (Array.isArray(value)) {
-    value.forEach((item, i) => collectEmailPaths(item, `${prefix}[${i}]`, depth - 1, out));
-    return;
-  }
-  if (typeof value === "object") {
-    for (const [key, entry] of Object.entries(value as JsonRecord)) {
-      const path = prefix ? `${prefix}.${key}` : key;
-      if (typeof entry === "string" && key.toLowerCase().includes("email") && looksLikeEmailLoose(entry)) {
-        if (!out.includes(path)) out.push(path);
-      } else {
-        collectEmailPaths(entry, path, depth - 1, out);
-      }
-    }
-  }
-}
-
-// Fetch a few profile details and report, per profile, whether the extractor now finds an email and
-// which paths actually carry one. No raw emails or payloads are returned.
-async function probeEmailExtraction(rows: JsonRecord[], secret: string) {
-  const sample = rows.slice(0, 5);
-  const results: JsonRecord[] = [];
-  for (const row of sample) {
-    const id = str(row.profile_id ?? row.id);
-    if (!id) continue;
-    try {
-      const { ok, status, payload } = await fetchFunnelFox(`/profiles/${encodeURIComponent(id)}`, secret);
-      const paths: string[] = [];
-      collectEmailPaths(payload, "", 5, paths);
-      results.push({
-        ok,
-        status,
-        extractor_found_email: Boolean(detectProfileEmail(payload)),
-        email_paths_present: paths,
-        email_in_payload: paths.length > 0,
-        top_level_keys: Object.keys(readRecord(payload)),
-      });
-    } catch {
-      results.push({ ok: false, status: 0, extractor_found_email: false, email_paths_present: [], email_in_payload: false, top_level_keys: [] });
-    }
-  }
-  return results;
-}
+// Stats keys of the removed profile_details stage (dropped from sync_state.stats on the next write).
+const LEGACY_STAT_KEYS = [
+  "profile_details_attempted",
+  "profile_details_fetched",
+  "profile_details_failed",
+  "profile_details_gone",
+  "profile_details_timeout_skipped",
+  "remaining_without_email_after_checked",
+];
 
 // ---- HTTP entry ------------------------------------------------------------------------------
 
@@ -454,57 +910,73 @@ serveWithAccess(FUNNELFOX_LEADS_SYNC_POLICY, async ({ ctx, action, body, url, pg
   const secret = getFunnelFoxSecret();
   if (!secret) return funnelFoxFailure(ctx, 500, { error: "FunnelFox is not configured." });
 
-  // The gate admitted only the data owner with admin.sync.run. Rows are written for the workspace
-  // data key, never for "the caller" as such.
+  // Who may call was decided by the gate: the data owner with admin.sync.run, or the pg_cron tick
+  // (x-cron-secret). Rows are written for the workspace data key, never for "the caller" as such.
   const tenantKey = ctx.tenantKey;
   const db = pg as unknown as ServiceClient;
+  const isCron = ctx.actor.kind === "cron";
 
   // Params from query and/or JSON body (the gate parsed the body after authenticating).
-  const intParam = (value: unknown, fallback: number, min: number, max: number) => {
-    const n = Number(value);
-    return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.floor(n))) : fallback;
-  };
-
-  const limit = intParam(body.limit ?? url.searchParams.get("limit"), DEFAULT_LIMIT, 1, MAX_LIMIT);
+  const limit = resolveIntParam(body.limit ?? url.searchParams.get("limit"), DEFAULT_LIMIT, 1, MAX_LIMIT);
   // The dry_run / full_reset flags were parsed into the authorized action by the policy
   // (funnelFoxSyncFlags — the same rules as before; dry_run wins).
   const dryRun = action === "dry_run";
   const fullReset = action === "sync_full_reset";
-  const maxPages = intParam(
+  const maxPages = resolveIntParam(
     body.max_pages ?? url.searchParams.get("max_pages"),
     dryRun ? DRY_RUN_MAX_PAGES : DEFAULT_MAX_PAGES,
     1,
-    1000,
+    MAX_PAGES_CAP,
   );
-  const stageParam = str(body.stage ?? url.searchParams.get("stage")).toLowerCase();
-  const requestedStage: SyncStage | null =
-    stageParam === "profiles" || stageParam === "profile_details" || stageParam === "sessions" || stageParam === "reconcile"
-      ? stageParam
-      : null;
-  const conversion = parseConversionContext(body.conversion);
+  const requestedStage = parseSyncStage(body.stage ?? url.searchParams.get("stage"));
+  // A `conversion` key in the body (the browser-computed context of the old reconcile) is never read.
 
-  // ---- Phase 6: dry run — diagnostics only, no writes ----------------------------------------
+  const fetchPage = (base: string) => (cursor: string | undefined) => fetchListPage(base, cursor, limit, secret);
+
+  // ---- Diagnose (dry run): key names + counts only, no writes, never /profiles/{id} -----------
   if (dryRun) {
     try {
-      const probePages = Math.min(maxPages, DRY_RUN_MAX_PAGES);
-      const profileProbe = await crawlList("/profiles", undefined, limit, probePages, isExpired, secret);
-      const sessionProbe = await crawlList("/sessions", undefined, limit, 1, isExpired, secret);
-      const listEmails = profileProbe.rows.filter((r) => emailFromListRow(r)).length;
+      const profileProbe = await crawlList(fetchPage("/profiles"), { maxPages: Math.min(maxPages, DRY_RUN_MAX_PAGES), isExpired });
+      const sessionProbe = await crawlList(fetchPage("/sessions"), { maxPages: 1, isExpired });
+      const profiles = summarizeProfileSample(profileProbe.rows);
+      const profileIds = new Set(profileProbe.rows.map((row) => normalizeProfileId(row.profile_id ?? row.id)).filter(Boolean));
+      const sessions = summarizeSessionSample(sessionProbe.rows, profileIds);
       return {
         status: "ok",
         dry_run: true,
         stage: "profiles",
+        made_progress: false,
+        all_stages_completed: false,
         diagnostics: {
           profiles_pages_probed: profileProbe.pages,
           profiles_rows_probed: profileProbe.rows.length,
           profiles_has_more_on_last_page: profileProbe.hasMoreOnLastPage,
           profiles_total_reported_by_api: profileProbe.totalReported,
-          list_row_contains_email: listEmails > 0,
-          list_rows_with_email: listEmails,
+          list_row_contains_email: profiles.with_email > 0,
+          list_rows_with_email: profiles.with_email,
           sample_profile_keys: Object.keys(profileProbe.rows[0] ?? {}),
           sample_session_keys: Object.keys(sessionProbe.rows[0] ?? {}),
-          email_extraction: await probeEmailExtraction(profileProbe.rows, secret),
-          note: "Dry run: no rows written, no raw payloads or emails returned.",
+          sample_size: { profiles: profileProbe.rows.length, sessions: sessionProbe.rows.length },
+          profiles: {
+            pages: profileProbe.pages,
+            stopped_reason: profileProbe.stoppedReason,
+            pagination_keys: profileProbe.paginationKeys,
+            cursor_key: profileProbe.cursorKey,
+            has_more: profileProbe.hasMoreOnLastPage,
+            total_reported: profileProbe.totalReported,
+            ...profiles,
+          },
+          sessions: {
+            pages: sessionProbe.pages,
+            stopped_reason: sessionProbe.stoppedReason,
+            pagination_keys: sessionProbe.paginationKeys,
+            cursor_key: sessionProbe.cursorKey,
+            has_more: sessionProbe.hasMoreOnLastPage,
+            ...sessions,
+          },
+          rate_limit_headers: [...new Set([...profileProbe.rateLimitHeaders, ...sessionProbe.rateLimitHeaders])].sort(),
+          profile_detail_endpoint: "not_called",
+          note: "Diagnose: no rows written; no emails, raw payloads or cursor values returned.",
         },
       };
     } catch (error) {
@@ -513,457 +985,436 @@ serveWithAccess(FUNNELFOX_LEADS_SYNC_POLICY, async ({ ctx, action, body, url, pg
     }
   }
 
-  try {
-    // ---- Load (and optionally reset) sync state --------------------------------------------
-    const { data: stateRow } = await db
-      .from("funnelfox_leads_sync_state")
-      .select("*")
-      .eq("auth_user_id", tenantKey)
-      .maybeSingle();
-
-    if (fullReset) {
-      // Restart from the beginning. Rows are NOT deleted (upsert refreshes them; nothing is lost).
-      // Re-open enrichment only for rows that still have no email — re-checking already-resolved
-      // emails would waste calls and (since the candidate query filters normalized_email is null)
-      // would strand those rows as permanently "unchecked", blocking stage completion.
-      await db
-        .from("funnelfox_leads")
-        .update({ detail_checked: false })
-        .eq("auth_user_id", tenantKey)
-        .is("normalized_email", null);
+  const readState = async (): Promise<JsonRecord | null> => {
+    const { data, error } = await db.from("funnelfox_leads_sync_state").select("*").eq("auth_user_id", tenantKey).maybeSingle();
+    if (error) throw new Error(`sync state read failed: ${error.message}`);
+    return (data ?? null) as JsonRecord | null;
+  };
+  const flagsOf = (state: JsonRecord | null): StageCompletion => ({
+    profiles_completed: Boolean(state?.profiles_completed),
+    sessions_completed: Boolean(state?.sessions_completed),
+    reconcile_completed: Boolean(state?.reconcile_completed),
+  });
+  const planFor = (state: JsonRecord | null) =>
+    planRun({
+      flags: flagsOf(state),
+      requestedStage,
+      fullReset,
+      cron: isCron,
+      rateLimitedUntilMs: readRateLimitedUntilMs(readRecord(state?.stats)),
+      nowMs: Date.now(),
+      lastStatus: strOrNull(state?.last_status),
+      errorBackoffUntilMs: readErrorBackoffUntilMs(readRecord(state?.stats)),
+    });
+  // Idle / rate-limited / backing-off / busy answers: nothing ran, nothing was written.
+  const quietResponse = (plan: RunPlan, state: JsonRecord | null) => {
+    const summary = readRecord(state?.stats);
+    if (plan.kind === "idle") {
+      return {
+        status: "ok",
+        dry_run: false,
+        stage: null,
+        next_stage: null,
+        all_stages_completed: true,
+        made_progress: false,
+        idle: true,
+        stopped_reason: "completed",
+        coverage_warning: false,
+        coverage_warning_message: "",
+        summary,
+      };
     }
+    if (plan.kind === "rate_limited") {
+      return {
+        status: "partial",
+        dry_run: false,
+        stage: plan.stage,
+        next_stage: plan.stage,
+        all_stages_completed: false,
+        made_progress: false,
+        rate_limited: true,
+        rate_limited_until: plan.until,
+        stopped_reason: "rate_limited",
+        ...computeCoverageWarning({ stoppedReason: "rate_limited", stage: plan.stage ?? "profiles" }),
+        summary,
+      };
+    }
+    if (plan.kind === "error_backoff") {
+      // Only the cron gets this (planRun): the last runs failed, the next retry waits until `until`.
+      return {
+        status: "error",
+        dry_run: false,
+        stage: plan.stage,
+        next_stage: plan.stage,
+        all_stages_completed: false,
+        made_progress: false,
+        error_backoff: true,
+        error_backoff_until: plan.until,
+        stopped_reason: "api_error",
+        ...computeCoverageWarning({ stoppedReason: "api_error", stage: plan.stage ?? "profiles" }),
+        summary,
+      };
+    }
+    return {
+      status: "busy",
+      dry_run: false,
+      stage: plan.stage,
+      next_stage: plan.stage,
+      all_stages_completed: false,
+      made_progress: false,
+      busy: true,
+      coverage_warning: false,
+      coverage_warning_message: "",
+      summary,
+    };
+  };
 
-    const flags: StageCompletion = fullReset
-      ? { profiles_completed: false, details_completed: false, sessions_completed: false, reconcile_completed: false }
-      : {
-          profiles_completed: Boolean(stateRow?.profiles_completed),
-          details_completed: Boolean(stateRow?.details_completed),
-          sessions_completed: Boolean(stateRow?.sessions_completed),
-          reconcile_completed: Boolean(stateRow?.reconcile_completed),
-        };
+  // One stage, run while holding the lease.
+  const runLeased = async () => {
+    try {
+      // Re-read under the lease: another call may have advanced the state since the first read.
+      const stateRow = await readState();
+      const plan = planFor(stateRow);
+      if (plan.kind !== "run") return quietResponse(plan, stateRow);
+      const { stage, reset } = plan;
 
-    const profilesCursor = fullReset ? null : (stateRow?.last_profiles_cursor ?? null);
-    const sessionsCursor = fullReset ? null : (stateRow?.last_sessions_cursor ?? null);
-    let scannedTotal = fullReset ? 0 : Number(stateRow?.profiles_scanned_total ?? 0);
-    let sessionsTotal = fullReset ? 0 : Number(stateRow?.sessions_scanned_total ?? 0);
-    let totalReportedByApi: number | null = fullReset ? null : (stateRow?.profiles_total_reported_by_api ?? null);
-    const priorStats = readRecord(stateRow?.stats);
+      const oldStats = readRecord(stateRow?.stats);
+      const priorStats: JsonRecord = { ...oldStats };
+      for (const key of LEGACY_STAT_KEYS) delete priorStats[key];
+      const counters = readPassCounters(oldStats, reset);
+      const flags: StageCompletion = reset
+        ? { profiles_completed: false, sessions_completed: false, reconcile_completed: false }
+        : flagsOf(stateRow);
+      const profilesCursor = reset ? null : ((stateRow?.last_profiles_cursor as string | null | undefined) ?? null);
+      const sessionsCursor = reset ? null : ((stateRow?.last_sessions_cursor as string | null | undefined) ?? null);
+      let sessionsTotal = reset ? 0 : numberOr(stateRow?.sessions_scanned_total, 0);
+      let totalReportedByApi: number | null = reset ? null : ((stateRow?.profiles_total_reported_by_api as number | null | undefined) ?? null);
 
-    const stage: SyncStage = requestedStage ?? nextIncompleteStage(flags) ?? "reconcile";
+      // Record the stage being worked on (and, for a reset, every flag false + both cursors null)
+      // BEFORE crawling: checkpoints below then always land on a consistent row.
+      const { error: startError } = await db.from("funnelfox_leads_sync_state").upsert(
+        { auth_user_id: tenantKey, ...(reset ? fullResetState() : {}), current_stage: stage },
+        { onConflict: "auth_user_id" },
+      );
+      if (startError) throw new Error(`sync state write failed: ${startError.message}`);
 
-    let stoppedReason: SyncStoppedReason = "completed";
-    let madeProgress = true; // false ⇒ this run advanced nothing (lets the driver stop hammering)
-    const runStats: JsonRecord = {};
-    const cursorUpdate: JsonRecord = {};
-    const completionUpdate: JsonRecord = {};
-
-    if (stage === "profiles") {
-      // --- Stage 1: crawl profile list, upsert basic rows (email enriched later) -------------
-      const start = resolveStartCursor(profilesCursor, fullReset);
-      const crawl = await crawlList("/profiles", start, limit, maxPages, isExpired, secret);
-      stoppedReason = crawl.stoppedReason;
-      madeProgress = crawl.pages > 0;
-
-      const parsed = crawl.rows.map((row) => ({
-        profile_id: str(row.profile_id ?? row.id),
-        created_at: strOrNull(row.created_at),
-        updated_at: strOrNull(row.updated_at),
-        funnel_id: strOrNull(row.funnel_id),
-        raw: row,
-      }));
-      const kept = parsed.filter((p) => p.profile_id);
-      const skippedNoProfileId = parsed.length - kept.length;
-
-      const rows = kept.map((p) => ({
-        auth_user_id: tenantKey,
-        profile_id: p.profile_id,
-        created_at: p.created_at,
-        updated_at: p.updated_at,
-        funnel_id: p.funnel_id,
-        // Email unknown until profile_details; mark as not-yet-a-lead so email-less profiles never
-        // leak into the Leads list before reconcile runs.
-        is_lead: false,
-        has_successful_payment: false,
-        has_active_subscription: false,
-        synced_at: new Date().toISOString(),
-        raw_profile_list: p.raw,
-      }));
-      for (let i = 0; i < rows.length; i += UPSERT_BATCH) {
-        const { error } = await db
-          .from("funnelfox_leads")
-          .upsert(rows.slice(i, i + UPSERT_BATCH), { onConflict: "auth_user_id,profile_id" });
-        if (error) throw new Error(`profiles upsert failed: ${error.message}`);
-      }
-
-      scannedTotal += kept.length;
-      if (crawl.totalReported != null) totalReportedByApi = crawl.totalReported;
-      const completed = stoppedReason === "completed";
-      cursorUpdate.last_profiles_cursor = completed ? null : crawl.lastCursor;
-      completionUpdate.profiles_completed = completed;
-
-      Object.assign(runStats, {
-        profiles_pages_processed: crawl.pages,
-        profiles_has_more_on_last_page: crawl.hasMoreOnLastPage,
-        profiles_last_cursor: crawl.lastCursor,
-        profiles_total_scanned_this_run: kept.length,
-        profiles_total_saved_this_run: rows.length,
-        profiles_skipped_no_profile_id: skippedNoProfileId,
-      });
-    } else if (stage === "profile_details") {
-      // --- Stage 2: enrich emails for rows that still have none ------------------------------
-      const { data: candidateRows } = await db
-        .from("funnelfox_leads")
-        .select("profile_id, raw_profile_list")
-        .eq("auth_user_id", tenantKey)
-        .is("normalized_email", null)
-        .eq("detail_checked", false)
-        .limit(DETAIL_CANDIDATE_BATCH);
-      const candidates = (candidateRows ?? []) as Array<{ profile_id: string; raw_profile_list: JsonRecord | null }>;
-
-      let attempted = 0;
-      let fetched = 0;
-      let failed = 0; // transient failures — row stays detail_checked=false for the next run to retry
-      let gone = 0; // permanent (404/410/4xx) — row marked detail_checked=true with no email
-      let index = 0;
-      const updates: JsonRecord[] = [];
-      const worker = async () => {
-        while (index < candidates.length) {
-          if (isExpired()) return;
-          const current = candidates[index];
-          index += 1;
-          attempted += 1;
-          // No-network shortcut: a list-row preview occasionally carries the email.
-          const listEmail = emailFromListRow(readRecord(current.raw_profile_list));
-          if (listEmail) {
-            fetched += 1;
-            updates.push({
-              auth_user_id: tenantKey,
-              profile_id: current.profile_id,
-              email: listEmail,
-              normalized_email: listEmail,
-              detail_checked: true,
-              synced_at: new Date().toISOString(),
-            });
-            continue;
-          }
-          try {
-            const { ok, status, payload } = await fetchFunnelFox(`/profiles/${encodeURIComponent(current.profile_id)}`, secret);
-            const outcome = detailOutcome(ok, status);
-            if (outcome === "email_checked") {
-              fetched += 1;
-              const email = detectProfileEmail(payload);
-              updates.push({
-                auth_user_id: tenantKey,
-                profile_id: current.profile_id,
-                email,
-                normalized_email: normalizeEmail(email),
-                detail_checked: true, // checked: a successful fetch with or without an email is terminal
-                raw_profile_detail: payload,
-                synced_at: new Date().toISOString(),
-              });
-            } else if (outcome === "gone_checked") {
-              // 404/410 — profile gone, won't change on retry. Mark checked, no email.
-              gone += 1;
-              updates.push({
-                auth_user_id: tenantKey,
-                profile_id: current.profile_id,
-                detail_checked: true,
-                synced_at: new Date().toISOString(),
-              });
-            } else {
-              // transient (5xx / 429 / auth / unknown) — leave detail_checked=false so a later run retries.
-              failed += 1;
-            }
-          } catch {
-            failed += 1; // network error — transient, retry next run
+      const upsertLeadRows = async (rows: JsonRecord[]) => {
+        for (const group of groupRowsByKeySet(rows)) {
+          for (let i = 0; i < group.length; i += UPSERT_BATCH) {
+            const { error } = await db.from("funnelfox_leads").upsert(group.slice(i, i + UPSERT_BATCH), { onConflict: "auth_user_id,profile_id" });
+            if (error) throw new Error(`${stage} upsert failed: ${error.message}`);
           }
         }
       };
-      await Promise.all(
-        Array.from({ length: Math.max(1, Math.min(PROFILE_DETAIL_CONCURRENCY, candidates.length)) }, () => worker()),
-      );
-      const timeoutSkipped = candidates.length - attempted;
-
-      for (let i = 0; i < updates.length; i += UPSERT_BATCH) {
+      // Mid-stage checkpoint: rows were written first, so the saved cursor never skips unsaved pages.
+      const checkpointState = async (patch: JsonRecord) => {
+        const stats = { ...priorStats, ...counters, stage, all_stages_completed: false, checkpoint_at: new Date().toISOString() };
         const { error } = await db
-          .from("funnelfox_leads")
-          .upsert(updates.slice(i, i + UPSERT_BATCH), { onConflict: "auth_user_id,profile_id" });
-        if (error) throw new Error(`profile_details upsert failed: ${error.message}`);
-      }
+          .from("funnelfox_leads_sync_state")
+          .update({ ...patch, stats })
+          .eq("auth_user_id", tenantKey);
+        if (error) throw new Error(`sync state checkpoint failed: ${error.message}`);
+      };
 
-      // Authoritative completion: recount rows that still need enrichment AFTER this run's writes.
-      // Transient failures (detail_checked still false) keep the stage incomplete so Continue Sync
-      // resumes profile_details — it never advances past unenriched profiles.
-      const { count: remainingUnchecked } = await db
-        .from("funnelfox_leads")
-        .select("*", { count: "exact", head: true })
-        .eq("auth_user_id", tenantKey)
-        .is("normalized_email", null)
-        .eq("detail_checked", false);
-      const remaining = remainingUnchecked ?? 0;
+      const syncedAt = new Date().toISOString();
+      let stoppedReason: SyncStoppedReason = "completed";
+      let madeProgress = true; // false ⇒ this run advanced nothing (lets the driver stop hammering)
+      let crawlError: string | null = null;
+      let retryAfterSeconds: number | null = null;
+      const runStats: JsonRecord = {};
+      const cursorUpdate: JsonRecord = {};
+      const completionUpdate: Partial<StageCompletion> = {};
+      const passSnapshot: JsonRecord = {};
+      // FunnelFox errors in a row before this run (any run that does not end in api_error resets it).
+      const priorApiErrors = Math.max(0, numberOr(oldStats.consecutive_api_errors, 0));
+      // The crawl stopped on a cursor FunnelFox keeps refusing: drop it, so the next run restarts the
+      // pass from the newest page instead of failing on the same cursor forever.
+      let cursorReset = false;
+      const shouldResetCursor = (crawl: CrawlOutcome) =>
+        crawl.stoppedReason === "api_error" && crawl.cursorRejected && priorApiErrors + 1 >= CURSOR_RESET_AFTER_ERRORS;
 
-      stoppedReason = detailsStopReason(timeoutSkipped);
-      const completed = detailsStageComplete(timeoutSkipped, remaining);
-      completionUpdate.details_completed = completed;
-      madeProgress = candidates.length === 0 ? true : fetched > 0 || gone > 0;
-
-      Object.assign(runStats, {
-        profile_details_attempted: attempted,
-        profile_details_fetched: fetched,
-        profile_details_failed: failed,
-        profile_details_gone: gone,
-        profile_details_timeout_skipped: timeoutSkipped,
-        remaining_detail_unchecked: remaining,
-      });
-    } else if (stage === "sessions") {
-      // --- Stage 3: crawl sessions, attach earliest-session attribution ----------------------
-      const start = resolveStartCursor(sessionsCursor, fullReset);
-      const crawl = await crawlList("/sessions", start, limit, maxPages, isExpired, secret);
-      stoppedReason = crawl.stoppedReason;
-      madeProgress = crawl.pages > 0;
-
-      const sessions = crawl.rows.map(parseSessionRow);
-      const withoutProfileId = sessions.filter((s) => !s.profile_id).length;
-
-      // Earliest session per profile in this batch.
-      const earliest = new Map<string, ParsedSession>();
-      for (const s of sessions) {
-        if (!s.profile_id) continue;
-        const cur = earliest.get(s.profile_id);
-        if (!cur || dateMs(s.created_at) < dateMs(cur.created_at)) earliest.set(s.profile_id, s);
-      }
-
-      let joined = 0;
-      if (earliest.size) {
-        const ids = [...earliest.keys()];
-        // Earliest-wins across runs: only attach if no session yet or this one is earlier.
-        const existingByProfile = new Map<string, string | null>();
-        for (let i = 0; i < ids.length; i += UPSERT_BATCH) {
-          const slice = ids.slice(i, i + UPSERT_BATCH);
-          const { data } = await db
-            .from("funnelfox_leads")
-            .select("profile_id, session_created_at")
-            .eq("auth_user_id", tenantKey)
-            .in("profile_id", slice);
-          for (const r of (data ?? []) as Array<{ profile_id: string; session_created_at: string | null }>) {
-            existingByProfile.set(r.profile_id, r.session_created_at);
-          }
-        }
-
-        const updates: JsonRecord[] = [];
-        for (const [profileId, s] of earliest) {
-          if (!existingByProfile.has(profileId)) continue; // session has no matching profile row → skip
-          const existing = existingByProfile.get(profileId) ?? null;
-          if (existing && dateMs(existing) <= dateMs(s.created_at)) continue; // keep the earlier session
-          const attribution = parseOriginUrl(s.origin);
-          joined += 1;
-          updates.push({
-            auth_user_id: tenantKey,
-            profile_id: profileId,
-            session_id: s.session_id || null,
-            session_created_at: s.created_at,
-            funnel_version: s.funnel_version,
-            funnel_id: s.funnel_id,
-            campaign_path: attribution.campaign_path,
-            campaign_id: attribution.campaign_id,
-            utm_source: attribution.utm_source,
-            media_buyer: attribution.utm_source ? mediaBuyerFromUtmSource(attribution.utm_source) : null,
-            country_code: s.country_code,
-            city: s.city,
-            postal: s.postal,
-            user_agent: s.user_agent,
-            origin: s.origin,
-            raw_session: s.raw,
-            synced_at: new Date().toISOString(),
-          });
-        }
-        for (let i = 0; i < updates.length; i += UPSERT_BATCH) {
-          const { error } = await db
-            .from("funnelfox_leads")
-            .upsert(updates.slice(i, i + UPSERT_BATCH), { onConflict: "auth_user_id,profile_id" });
-          if (error) throw new Error(`sessions upsert failed: ${error.message}`);
-        }
-      }
-
-      sessionsTotal += sessions.length;
-      const completed = stoppedReason === "completed";
-      cursorUpdate.last_sessions_cursor = completed ? null : crawl.lastCursor;
-      completionUpdate.sessions_completed = completed;
-
-      Object.assign(runStats, {
-        sessions_pages_processed: crawl.pages,
-        sessions_has_more_on_last_page: crawl.hasMoreOnLastPage,
-        sessions_last_cursor: crawl.lastCursor,
-        sessions_total_scanned_this_run: sessions.length,
-        sessions_joined: joined,
-        sessions_without_profile_id: withoutProfileId,
-      });
-    } else {
-      // --- Stage 4: reconcile conversion state for every row --------------------------------
-      const all: Array<{ profile_id: string; normalized_email: string | null }> = [];
-      const PAGE = 1000;
-      for (let from = 0; ; from += PAGE) {
-        const { data, error } = await db
-          .from("funnelfox_leads")
-          .select("profile_id, normalized_email")
-          .eq("auth_user_id", tenantKey)
-          .range(from, from + PAGE - 1);
-        if (error) throw new Error(`reconcile read failed: ${error.message}`);
-        const chunk = (data ?? []) as Array<{ profile_id: string; normalized_email: string | null }>;
-        all.push(...chunk);
-        if (chunk.length < PAGE) break;
-      }
-
-      let leadsFound = 0;
-      let convertedExcluded = 0;
-      let activeSubExcluded = 0;
-      const updates = all.map((row) => {
-        const email = row.normalized_email;
-        const paid = Boolean(email && conversion.paidEmails.has(email));
-        const active = Boolean(email && conversion.activeSubEmails.has(email));
-        const isLead = Boolean(email) && !paid && !active;
-        if (paid) convertedExcluded += 1;
-        if (active) activeSubExcluded += 1;
-        if (isLead) leadsFound += 1;
-        return {
-          auth_user_id: tenantKey,
-          profile_id: row.profile_id,
-          has_successful_payment: paid,
-          has_active_subscription: active,
-          is_lead: isLead,
-          first_trial_at: email ? conversion.trialDates.get(email) ?? null : null,
-          first_sub_at: email ? conversion.firstSubDates.get(email) ?? null : null,
+      if (stage === "profiles") {
+        // --- Stage 1: crawl the profile list, store the rows that carry an email ----------------
+        let savedThisRun = 0;
+        let scannedThisRun = 0;
+        let withoutEmailThisRun = 0;
+        let previewThisRun = 0;
+        let skippedThisRun = 0;
+        const storeProfiles = async (rawRows: JsonRecord[]) => {
+          const scan = scanProfileRows(rawRows);
+          await upsertLeadRows(scan.store.map((profile) => ({ auth_user_id: tenantKey, ...profileUpsertRow(profile, syncedAt) })));
+          addProfileScan(counters, scan);
+          savedThisRun += scan.store.length;
+          scannedThisRun += scan.scanned;
+          withoutEmailThisRun += scan.without_email;
+          previewThisRun += scan.preview;
+          skippedThisRun += scan.skipped_no_profile_id;
         };
-      });
-      for (let i = 0; i < updates.length; i += UPSERT_BATCH) {
-        const { error } = await db
-          .from("funnelfox_leads")
-          .upsert(updates.slice(i, i + UPSERT_BATCH), { onConflict: "auth_user_id,profile_id" });
-        if (error) throw new Error(`reconcile upsert failed: ${error.message}`);
+        const crawl = await crawlList(fetchPage("/profiles"), {
+          startCursor: resolveStartCursor(profilesCursor, reset),
+          maxPages,
+          isExpired,
+          flushEveryPages: FLUSH_EVERY_PAGES,
+          onCheckpoint: async (rawRows, resumeCursor) => {
+            await storeProfiles(rawRows);
+            await checkpointState({ last_profiles_cursor: resumeCursor, profiles_scanned_total: counters.profiles_scanned_total });
+          },
+        });
+        await storeProfiles(crawl.rows);
+
+        stoppedReason = crawl.stoppedReason;
+        crawlError = crawl.errorMessage;
+        retryAfterSeconds = crawl.retryAfterSeconds;
+        madeProgress = crawl.pages > 0;
+        if (crawl.totalReported != null) totalReportedByApi = crawl.totalReported;
+        const completed = stoppedReason === "completed";
+        cursorReset = shouldResetCursor(crawl);
+        // A dropped cursor restarts the pass: its scan counters restart with it.
+        if (cursorReset) for (const key of PASS_COUNTER_KEYS) counters[key] = 0;
+        cursorUpdate.last_profiles_cursor = completed || cursorReset ? null : crawl.lastCursor;
+        completionUpdate.profiles_completed = completed;
+        if (completed) passSnapshot.profiles_last_pass = { ...counters, completed_at: new Date().toISOString() };
+
+        Object.assign(runStats, {
+          profiles_pages_processed: crawl.pages,
+          profiles_checkpoints: crawl.checkpoints,
+          profiles_has_more_on_last_page: crawl.hasMoreOnLastPage,
+          profiles_total_scanned_this_run: scannedThisRun,
+          profiles_total_saved_this_run: savedThisRun,
+          profiles_without_email_this_run: withoutEmailThisRun,
+          preview_this_run: previewThisRun,
+          profiles_skipped_no_profile_id_this_run: skippedThisRun,
+        });
+      } else if (stage === "sessions") {
+        // --- Stage 2: crawl sessions, attach earliest-session attribution to stored profiles ---
+        let scannedThisRun = 0;
+        let withoutProfileId = 0;
+        let matched = 0;
+        let joined = 0;
+        const attachSessions = async (rawRows: JsonRecord[]) => {
+          const sessions = rawRows.map(parseSessionRow);
+          scannedThisRun += sessions.length;
+          withoutProfileId += sessions.filter((s) => !s.profile_id).length;
+          const earliest = joinSessionsToProfiles(sessions);
+          if (!earliest.size) return;
+          const ids = [...earliest.keys()];
+          const existing = new Map<string, StoredAttribution>();
+          for (let i = 0; i < ids.length; i += LOOKUP_BATCH) {
+            const { data, error } = await db
+              .from("funnelfox_leads")
+              .select("profile_id, session_created_at, funnel_id")
+              .eq("auth_user_id", tenantKey)
+              .in("profile_id", ids.slice(i, i + LOOKUP_BATCH));
+            if (error) throw new Error(`sessions lookup failed: ${error.message}`);
+            for (const r of (data ?? []) as Array<{ profile_id: string; session_created_at: string | null; funnel_id: string | null }>) {
+              existing.set(r.profile_id, { session_created_at: r.session_created_at, funnel_id: r.funnel_id });
+            }
+          }
+          const updates: JsonRecord[] = [];
+          for (const [profileId, session] of earliest) {
+            if (existing.has(profileId)) matched += 1;
+            const row = sessionAttributionRow(profileId, session, existing.get(profileId), syncedAt);
+            if (row) updates.push({ auth_user_id: tenantKey, ...row });
+          }
+          joined += updates.length;
+          await upsertLeadRows(updates);
+        };
+        const crawl = await crawlList(fetchPage("/sessions"), {
+          startCursor: resolveStartCursor(sessionsCursor, reset),
+          maxPages,
+          isExpired,
+          flushEveryPages: FLUSH_EVERY_PAGES,
+          onCheckpoint: async (rawRows, resumeCursor) => {
+            await attachSessions(rawRows);
+            await checkpointState({ last_sessions_cursor: resumeCursor, sessions_scanned_total: sessionsTotal + scannedThisRun });
+          },
+        });
+        await attachSessions(crawl.rows);
+
+        stoppedReason = crawl.stoppedReason;
+        crawlError = crawl.errorMessage;
+        retryAfterSeconds = crawl.retryAfterSeconds;
+        madeProgress = crawl.pages > 0;
+        sessionsTotal += scannedThisRun;
+        const completed = stoppedReason === "completed";
+        cursorReset = shouldResetCursor(crawl);
+        if (cursorReset) sessionsTotal = 0;
+        cursorUpdate.last_sessions_cursor = completed || cursorReset ? null : crawl.lastCursor;
+        completionUpdate.sessions_completed = completed;
+
+        Object.assign(runStats, {
+          sessions_pages_processed: crawl.pages,
+          sessions_checkpoints: crawl.checkpoints,
+          sessions_has_more_on_last_page: crawl.hasMoreOnLastPage,
+          sessions_total_scanned_this_run: scannedThisRun,
+          sessions_matched_stored_profiles: matched,
+          sessions_joined: joined,
+          sessions_without_profile_id: withoutProfileId,
+        });
+      } else {
+        // --- Stage 3: reconcile conversion server-side (one set-based SQL call) -----------------
+        const { data, error } = await db.rpc("funnelfox_leads_reconcile", { p_data_key: tenantKey });
+        if (error) throw new Error(`reconcile failed: ${error.message}`);
+        const result = readRecord(data);
+        stoppedReason = "completed";
+        completionUpdate.reconcile_completed = true;
+        Object.assign(runStats, {
+          reconcile_rows: numberOr(result.checked, 0),
+          leads_found: numberOr(result.leads, 0),
+          converted_excluded: numberOr(result.paid_excluded, 0),
+          active_sub_excluded: numberOr(result.active_excluded, 0),
+          reconciled_at: new Date().toISOString(),
+        });
       }
 
-      stoppedReason = "completed";
-      completionUpdate.reconcile_completed = true;
-      Object.assign(runStats, {
-        reconcile_rows: all.length,
-        leads_found: leadsFound,
-        converted_excluded: convertedExcluded,
-        active_sub_excluded: activeSubExcluded,
-      });
-    }
+      // ---- Stored population (whole tenant) ----------------------------------------------------
+      const [{ count: savedTotal }, { count: withEmailTotal }] = await Promise.all([
+        db.from("funnelfox_leads").select("*", { count: "exact", head: true }).eq("auth_user_id", tenantKey),
+        db.from("funnelfox_leads").select("*", { count: "exact", head: true }).eq("auth_user_id", tenantKey).not("normalized_email", "is", null),
+      ]);
 
-    // ---- Email coverage over the whole saved population ------------------------------------
-    const { count: savedTotal } = await db
-      .from("funnelfox_leads")
-      .select("*", { count: "exact", head: true })
-      .eq("auth_user_id", tenantKey);
-    const { count: withEmailTotal } = await db
-      .from("funnelfox_leads")
-      .select("*", { count: "exact", head: true })
-      .eq("auth_user_id", tenantKey)
-      .not("normalized_email", "is", null);
-    const { count: pendingDetails } = await db
-      .from("funnelfox_leads")
-      .select("*", { count: "exact", head: true })
-      .eq("auth_user_id", tenantKey)
-      .is("normalized_email", null)
-      .eq("detail_checked", false);
+      // ---- Merge + persist updated state -------------------------------------------------------
+      const updatedFlags: StageCompletion = {
+        profiles_completed: completionUpdate.profiles_completed ?? flags.profiles_completed,
+        sessions_completed: completionUpdate.sessions_completed ?? flags.sessions_completed,
+        reconcile_completed: completionUpdate.reconcile_completed ?? flags.reconcile_completed,
+      };
+      const remainingStage = nextIncompleteStage(updatedFlags);
+      const allCompleted = remainingStage === null;
+      const runStatus = statusFromStopReason(stoppedReason);
+      const overallStatus = runStatus !== "ok" ? runStatus : allCompleted ? "ok" : "partial";
+      const warning = computeCoverageWarning({ stoppedReason, stage });
+      const nowMs = Date.now();
+      const rateLimitedUntil =
+        stoppedReason === "rate_limited"
+          ? new Date(nowMs + (retryAfterSeconds ?? DEFAULT_RETRY_AFTER_SECONDS) * 1000).toISOString()
+          : null;
+      // A FunnelFox error backs the cron off exponentially (the button and resets are not held back).
+      const consecutiveApiErrors = stoppedReason === "api_error" ? priorApiErrors + 1 : 0;
+      const errorBackoffUntil =
+        consecutiveApiErrors > 0 ? new Date(nowMs + errorBackoffSeconds(consecutiveApiErrors) * 1000).toISOString() : null;
+      if (crawlError && cursorReset) {
+        crawlError = `${crawlError} The saved ${stage} cursor was dropped after ${consecutiveApiErrors} errors in a row; the next run restarts the pass.`;
+      }
 
-    const profilesSaved = savedTotal ?? 0;
-    const profilesWithEmail = withEmailTotal ?? 0;
-    const hasPendingDetails = (pendingDetails ?? 0) > 0;
-
-    // ---- Merge + persist updated state -----------------------------------------------------
-    const updatedFlags: StageCompletion = {
-      profiles_completed: completionUpdate.profiles_completed ?? flags.profiles_completed,
-      details_completed: completionUpdate.details_completed ?? flags.details_completed,
-      sessions_completed: completionUpdate.sessions_completed ?? flags.sessions_completed,
-      reconcile_completed: completionUpdate.reconcile_completed ?? flags.reconcile_completed,
-    } as StageCompletion;
-    const remainingStage = nextIncompleteStage(updatedFlags);
-    const allCompleted = remainingStage === null;
-
-    const runStatus = statusFromStopReason(stoppedReason);
-    const overallStatus = runStatus !== "ok" ? runStatus : allCompleted ? "ok" : "partial";
-
-    const warning = computeCoverageWarning({ stoppedReason, stage, hasPendingDetails });
-    const coveragePercent = computeCoveragePercent(scannedTotal, totalReportedByApi);
-
-    const stats: JsonRecord = {
-      ...priorStats,
-      ...runStats,
-      stage,
-      next_stage: remainingStage,
-      all_stages_completed: allCompleted,
-      sync_stopped_reason: stoppedReason,
-      profiles_total_saved: profilesSaved,
-      profiles_with_email: profilesWithEmail,
-      profiles_without_email: profilesSaved - profilesWithEmail,
-      profiles_pending_enrichment: pendingDetails ?? 0,
-      // Enrichment progress (cross-cutting, always present so the UI can prompt Continue Sync).
-      remaining_detail_unchecked: pendingDetails ?? 0,
-      remaining_without_email_after_checked: Math.max(0, profilesSaved - profilesWithEmail - (pendingDetails ?? 0)),
-      profiles_scanned_total: scannedTotal,
-      sessions_scanned_total: sessionsTotal,
-      profiles_total_reported_by_api: totalReportedByApi,
-      profiles_coverage_percent: coveragePercent,
-      coverage_warning: warning.coverage_warning,
-      coverage_warning_message: warning.coverage_warning_message,
-      duration_ms: Date.now() - startedAt,
-      // Legacy aliases (kept so older UI references keep resolving).
-      profiles_scanned: scannedTotal,
-      sessions_scanned: sessionsTotal,
-      emails_found: profilesWithEmail,
-    };
-
-    const nowIso = new Date().toISOString();
-    await db.from("funnelfox_leads_sync_state").upsert(
-      {
-        auth_user_id: tenantKey,
-        ...cursorUpdate,
-        ...completionUpdate,
-        profiles_scanned_total: scannedTotal,
+      const stats: JsonRecord = {
+        ...priorStats,
+        ...runStats,
+        ...counters,
+        ...passSnapshot,
+        stage,
+        next_stage: remainingStage,
+        all_stages_completed: allCompleted,
+        sync_stopped_reason: stoppedReason,
+        rate_limited_until: rateLimitedUntil,
+        consecutive_api_errors: consecutiveApiErrors,
+        error_backoff_until: errorBackoffUntil,
+        cursor_reset: cursorReset,
+        profiles_total_saved: savedTotal ?? 0,
+        emails_found: withEmailTotal ?? 0,
         sessions_scanned_total: sessionsTotal,
         profiles_total_reported_by_api: totalReportedByApi,
-        current_stage: remainingStage ?? stage,
-        last_status: overallStatus,
-        last_error: null,
-        last_full_sync_at: allCompleted ? nowIso : (stateRow?.last_full_sync_at ?? null),
-        last_profiles_synced_at: stage === "profiles" ? nowIso : (stateRow?.last_profiles_synced_at ?? null),
-        last_sessions_synced_at: stage === "sessions" ? nowIso : (stateRow?.last_sessions_synced_at ?? null),
-        stats,
-      },
-      { onConflict: "auth_user_id" },
-    );
+        profiles_coverage_percent: computeCoveragePercent(counters.profiles_scanned_total, totalReportedByApi),
+        coverage_warning: warning.coverage_warning,
+        coverage_warning_message: warning.coverage_warning_message,
+        // The detail stage is gone; kept at 0 so older UI references resolve to "nothing pending".
+        remaining_detail_unchecked: 0,
+        profiles_pending_enrichment: 0,
+        last_actor: ctx.actor.kind,
+        duration_ms: Date.now() - startedAt,
+        // Legacy aliases (kept so older UI references keep resolving).
+        profiles_scanned: counters.profiles_scanned_total,
+        sessions_scanned: sessionsTotal,
+      };
+      delete stats.checkpoint_at;
 
-    console.info("funnelfox-leads-sync", {
-      actor: ctx.actor.kind,
-      stage,
-      status: overallStatus,
-      stopped_reason: stoppedReason,
-      next_stage: remainingStage,
-      profiles_saved: profilesSaved,
-      profiles_with_email: profilesWithEmail,
-    });
+      const nowIso = new Date(nowMs).toISOString();
+      const { error: stateError } = await db.from("funnelfox_leads_sync_state").upsert(
+        {
+          auth_user_id: tenantKey,
+          ...(reset ? fullResetState() : {}),
+          details_completed: true,
+          ...cursorUpdate,
+          ...completionUpdate,
+          profiles_scanned_total: counters.profiles_scanned_total,
+          sessions_scanned_total: sessionsTotal,
+          profiles_total_reported_by_api: totalReportedByApi,
+          current_stage: remainingStage ?? stage,
+          last_status: overallStatus,
+          last_error: stoppedReason === "api_error" || stoppedReason === "rate_limited" ? (crawlError ?? "FunnelFox API returned an error.") : null,
+          last_full_sync_at: allCompleted ? nowIso : ((stateRow?.last_full_sync_at as string | null | undefined) ?? null),
+          last_profiles_synced_at: stage === "profiles" ? nowIso : ((stateRow?.last_profiles_synced_at as string | null | undefined) ?? null),
+          last_sessions_synced_at: stage === "sessions" ? nowIso : ((stateRow?.last_sessions_synced_at as string | null | undefined) ?? null),
+          stats,
+        },
+        { onConflict: "auth_user_id" },
+      );
+      if (stateError) throw new Error(`sync state write failed: ${stateError.message}`);
 
-    return {
-      status: overallStatus,
-      dry_run: false,
-      stage,
-      next_stage: remainingStage,
-      all_stages_completed: allCompleted,
-      made_progress: madeProgress,
-      stopped_reason: stoppedReason,
-      coverage_warning: warning.coverage_warning,
-      coverage_warning_message: warning.coverage_warning_message,
-      summary: stats,
-    };
+      console.info("funnelfox-leads-sync", {
+        actor: ctx.actor.kind,
+        stage,
+        reset,
+        status: overallStatus,
+        stopped_reason: stoppedReason,
+        next_stage: remainingStage,
+        profiles_saved: savedTotal ?? 0,
+        emails_stored: withEmailTotal ?? 0,
+      });
+
+      return {
+        status: overallStatus,
+        dry_run: false,
+        stage,
+        next_stage: remainingStage,
+        all_stages_completed: allCompleted,
+        made_progress: madeProgress,
+        stopped_reason: stoppedReason,
+        rate_limited: stoppedReason === "rate_limited",
+        rate_limited_until: rateLimitedUntil,
+        error_backoff_until: errorBackoffUntil,
+        coverage_warning: warning.coverage_warning,
+        coverage_warning_message: warning.coverage_warning_message,
+        summary: stats,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "sync failed";
+      await db
+        .from("funnelfox_leads_sync_state")
+        .update({ last_status: "error", last_error: message })
+        .eq("auth_user_id", tenantKey);
+      return funnelFoxFailure(ctx, 502, { error: "FunnelFox leads sync failed.", detail: message });
+    }
+  };
+
+  // ---- Decide before taking the lease (an idle or parked tick costs one read, no writes) -------
+  let initialState: JsonRecord | null;
+  try {
+    initialState = await readState();
   } catch (error) {
-    const message = error instanceof Error ? error.message : "sync failed";
-    await db.from("funnelfox_leads_sync_state").upsert(
-      { auth_user_id: tenantKey, last_status: "error", last_error: message },
-      { onConflict: "auth_user_id" },
-    );
+    const message = error instanceof Error ? error.message : "sync state read failed";
     return funnelFoxFailure(ctx, 502, { error: "FunnelFox leads sync failed.", detail: message });
+  }
+  const firstPlan = planFor(initialState);
+  if (firstPlan.kind !== "run") return quietResponse(firstPlan, initialState);
+
+  // The RPC answers this call's lease token, or null while another call holds the lease.
+  const { data: leaseToken, error: leaseError } = await db.rpc("funnelfox_leads_acquire_lease", { p_data_key: tenantKey, p_seconds: LEASE_SECONDS });
+  if (leaseError) {
+    return funnelFoxFailure(ctx, 502, { error: "FunnelFox leads sync failed.", detail: `lease unavailable: ${leaseError.message}` });
+  }
+  // Another call (the cron tick or the page's button) holds the lease: answer "busy", touch nothing.
+  if (typeof leaseToken !== "string" || !leaseToken) return quietResponse(firstPlan, initialState);
+
+  try {
+    return await runLeased();
+  } finally {
+    // Best effort: an unreleased lease expires after LEASE_SECONDS. Only this call's token releases
+    // it, so a call that outlived its lease never frees the next holder's.
+    try {
+      await db.rpc("funnelfox_leads_release_lease", { p_data_key: tenantKey, p_token: leaseToken });
+    } catch {
+      // ignore
+    }
   }
 }, { onError: funnelFoxErrorResponse });

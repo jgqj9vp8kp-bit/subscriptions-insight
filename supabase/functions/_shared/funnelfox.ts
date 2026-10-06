@@ -102,22 +102,48 @@ export function isFunnelFoxDebugEnabled(): boolean {
   return flag === "1" || flag === "true";
 }
 
-export async function fetchFunnelFox(path: string, secret: string): Promise<{ status: number; ok: boolean; payload: unknown }> {
-  const upstream = await fetch(`${FUNNELFOX_BASE_URL}${path}`, {
-    headers: {
-      "Fox-Secret": secret,
-      Accept: "application/json",
-    },
-  });
-
-  let payload: unknown = null;
+/** `headers` are the upstream response headers (the leads sync reads Retry-After
+ * on a 429 and reports rate-limit header NAMES in its diagnose); no caller
+ * forwards them to a client. `timeoutMs` (opt-in; the leads crawl sets it)
+ * aborts a request — headers or body — that takes longer, and rejects with a
+ * timeout error instead of hanging the call. */
+export async function fetchFunnelFox(
+  path: string,
+  secret: string,
+  options: { timeoutMs?: number } = {},
+): Promise<{ status: number; ok: boolean; payload: unknown; headers: Headers }> {
+  const timeoutMs = options.timeoutMs && options.timeoutMs > 0 ? options.timeoutMs : 0;
+  const controller = timeoutMs ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  const timedOut = () => new Error(`FunnelFox request timed out after ${timeoutMs}ms.`);
   try {
-    payload = await upstream.json();
-  } catch {
-    payload = null;
-  }
+    let upstream: Response;
+    try {
+      upstream = await fetch(`${FUNNELFOX_BASE_URL}${path}`, {
+        headers: {
+          "Fox-Secret": secret,
+          Accept: "application/json",
+        },
+        ...(controller ? { signal: controller.signal } : {}),
+      });
+    } catch (error) {
+      if (controller?.signal.aborted) throw timedOut();
+      throw error;
+    }
 
-  return { status: upstream.status, ok: upstream.ok, payload };
+    let payload: unknown = null;
+    try {
+      payload = await upstream.json();
+    } catch {
+      // A body cut off by the timeout is a timeout, not an empty answer.
+      if (controller?.signal.aborted) throw timedOut();
+      payload = null;
+    }
+
+    return { status: upstream.status, ok: upstream.ok, payload, headers: upstream.headers };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function readRecord(value: unknown): JsonRecord {

@@ -456,6 +456,8 @@ export const ACTION_REQUESTS: Readonly<Record<string, Readonly<Record<string, Ac
   "clickhouse-users": {
     ...named("list", "summary", "options", "decline"),
     details: post({ action: "details", user_id: "customer-1" }),
+    leads_list: post({ action: "leads_list" }),
+    leads_overview: post({ action: "leads_overview" }),
   },
   "clickhouse-validate": named("start", "continue", "status", "reset"),
   "dashboard-summary": { summary: post({ filters: {} }) },

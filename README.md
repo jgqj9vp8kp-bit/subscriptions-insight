@@ -158,6 +158,65 @@ What the data owner will notice after this release (expected, not regressions):
 - A ClickHouse backfill killed mid-run holds its lease for up to 10 minutes; Continue / the
   post-import sync then report "Another backfill run holds the lease" with the time to retry.
 
+### FunnelFox Leads export — rollout (in this order)
+
+The Leads tab of /users is now merged on the server (`clickhouse-users` actions `leads_list` /
+`leads_overview`, data owner only), and `funnelfox-leads-sync` exports every FunnelFox profile that
+carries an email into `public.funnelfox_leads` in the background. Details: DEVELOPER_NOTES.md
+"FunnelFox leads export + server-side Leads tab".
+
+1. **Apply `202610060010_funnelfox_leads_export.sql` alone** — not `supabase db push`, which would
+   also apply the cron migration before the functions that serve it are deployed:
+
+   ```text
+   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 -f supabase/migrations/202610060010_funnelfox_leads_export.sql
+   supabase migration repair --status applied 202610060010
+   ```
+
+   It adds `preview` / `email_source` / `lease_until` / `lease_token`, the reconcile / lease /
+   candidates RPCs (service_role only) and a covering index on `public.transactions` (built in
+   place: writes to `transactions` wait a few seconds, about 40 MB). One-way: legacy
+   `funnelfox_leads` rows without a list email are deleted, the raw jsonb payloads of the rows kept
+   are cleared, and the leads sync state (cursors, stage flags, counters, stats) is reset; the crawl
+   rebuilds everything from FunnelFox.
+2. **Deploy every function** with `npm run deploy:functions` (above). Before step 1 the leads sync
+   answers 502 on every call (no lease RPC) and the Leads actions answer 502 (no candidates RPC); the
+   Users actions are unaffected.
+3. **Probe**: as the data owner open Users → Leads, click **Diagnose** (a dry run: at most 2 profile
+   pages + 1 sessions page, key names and counts only, nothing written) and check
+   `profiles.cursor_key`, `profiles.root_email` and `profiles.preview_true`; then click
+   **Continue Sync** once.
+4. **Apply `202610060011_funnelfox_leads_cron.sql`** (`supabase db push`, now the only pending file;
+   it refuses to run before `202610060010`). Applied before step 2, every tick would be a refused
+   (401) Edge invocation. Check `select * from net._http_response order by created desc` for 200s.
+5. **Deploy the frontend.** The new tab needs the step-2 functions; the old tab keeps working until
+   then (the server ignores its `conversion` body and fills in the missing page sizes).
+
+How the background export proceeds:
+
+- `funnelfox-leads-advance` posts every minute and runs ONE stage per call (~50 s budget):
+  `profiles` (crawl the profile list newest first, store only rows with an email; checkpoint every
+  10 pages) → `sessions` (attribution for the stored profiles) → `reconcile` (one SQL call: paid /
+  active emails stop being leads). Each call resumes from the saved cursor.
+- The tick is skipped without an HTTP call while another call holds the lease (120 s), while a
+  FunnelFox 429 pause runs (`stats.rate_limited_until`, Retry-After or 60 s), while the backoff after
+  a FunnelFox error runs (`stats.error_backoff_until`, 60 s doubling to at most 1 h) and once every
+  stage is complete. The Continue button only speeds things up (at most 10 calls per click) and is
+  never held back by the error backoff. A cursor FunnelFox keeps refusing is dropped after 3 errors
+  in a row (the pass restarts from the newest profile).
+- `funnelfox-leads-refresh` (06:15 UTC daily, after the 05:45 subscriptions refresh) re-crawls the
+  whole list. While a healthy pass is still unfinished it only advances it, so the backfill never
+  restarts; a pipeline whose last run failed is restarted.
+- Progress (read-only): `select current_stage, last_status, last_error, lease_until,
+  profiles_completed, sessions_completed, reconcile_completed, stats->>'profiles_scanned_total',
+  stats->>'profiles_with_email', stats->>'rate_limited_until', stats->>'error_backoff_until' from
+  public.funnelfox_leads_sync_state;`
+- Leads tab size: the server merges at most the newest 50 000 FunnelFox profile leads in memory.
+  Past that the tab shows "Showing the newest … of … FunnelFox profile leads" — the signal that
+  profile leads must move to ClickHouse (plan §4 step 7).
+- Pause / resume: `select cron.alter_job(jobid, active := false) from cron.job where jobname like
+  'funnelfox-leads-%';` (`active := true` to resume).
+
 Server-summary flags stay off in production until real-data parity is confirmed
 (see `.env.example`): `VITE_FB_ANALYTICS_SOURCE` and `VITE_DASHBOARD_SOURCE`
 default to `client`; `VITE_COHORTS_DATA_SOURCE` defaults to `clickhouse`.

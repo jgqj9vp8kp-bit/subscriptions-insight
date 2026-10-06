@@ -6,8 +6,8 @@
 // fake dependencies, so these tests prove who may call which action (the raw
 // proxies and the leads sync are data-owner only), that the flag-derived actions
 // are exactly what the browser and pg_cron send, that every funnel-restricted
-// context is refused, that the subscriptions cron is authenticated by the
-// constant-time secret and bound to the workspace tenant (never the body uid),
+// context is refused, that the subscriptions and leads crons are authenticated by
+// the constant-time secret and bound to the workspace tenant (never the body uid),
 // that error bodies stay the owner's (byte-identical) while employees get the
 // gate's generic ones, and that the dev-only api/funnelfox proxy refuses to run
 // without its explicit flag.
@@ -46,7 +46,11 @@ import {
   FUNNELFOX_SUBSCRIPTIONS_SYNC_POLICY,
   normalizeFunnelFoxSubscriptionsSyncAction,
 } from "../../supabase/functions/_shared/access/policies/funnelfox-subscriptions-sync.ts";
-import { FUNNELFOX_LEADS_SYNC_POLICY, normalizeFunnelFoxLeadsSyncAction } from "../../supabase/functions/_shared/access/policies/funnelfox-leads-sync.ts";
+import {
+  FUNNELFOX_LEADS_SYNC_CRON_ACTIONS,
+  FUNNELFOX_LEADS_SYNC_POLICY,
+  normalizeFunnelFoxLeadsSyncAction,
+} from "../../supabase/functions/_shared/access/policies/funnelfox-leads-sync.ts";
 import { FUNNELFOX_FUNNELS_POLICY, normalizeFunnelFoxFunnelsAction } from "../../supabase/functions/_shared/access/policies/funnelfox-funnels.ts";
 import {
   FUNNELFOX_SUBSCRIPTIONS_POLICY,
@@ -188,6 +192,7 @@ const CASES: PolicyCase[] = [
   { policy: FUNNELFOX_SUBSCRIPTIONS_SYNC_POLICY as FunctionPolicy<string>, requests: SYNC_REQUESTS },
   {
     policy: FUNNELFOX_LEADS_SYNC_POLICY as FunctionPolicy<string>,
+    // Older pages still send a `conversion` context; it never changes the action (the function ignores it).
     requests: {
       sync: { body: { ...syncBody(), conversion: { paid_emails: [], active_sub_emails: [], trial_dates: {}, first_sub_dates: {} } } },
       sync_full_reset: { body: { ...syncBody({ fullReset: true }), conversion: { paid_emails: [] } } },
@@ -268,16 +273,41 @@ describe("policy tables", () => {
     }
   });
 
-  it("only the subscriptions sync has a cron branch, and it is exactly what migration 202607250001 sends", () => {
+  it("only the two syncs have a cron branch; the subscriptions one is exactly what migration 202607250001 sends", () => {
     expect(FUNNELFOX_SUBSCRIPTIONS_SYNC_POLICY.cron).toEqual({ header: "x-cron-secret", secretEnv: "FB_CRON_SECRET", actions: ["sync", "sync_full_reset"] });
     expect([...FUNNELFOX_SUBSCRIPTIONS_SYNC_CRON_ACTIONS]).toEqual(["sync", "sync_full_reset"]);
-    for (const { policy } of CASES.slice(1)) expect(policy.cron, policy.fn).toBeUndefined();
+    expect(CASES.filter(({ policy }) => policy.cron).map(({ policy }) => policy.fn).sort()).toEqual(["funnelfox-leads-sync", "funnelfox-subscriptions-sync"]);
     const sql = readFileSync(resolve(process.cwd(), "supabase/migrations/202607250001_funnelfox_subscriptions_cron.sql"), "utf8");
     expect(sql).toContain("'x-cron-secret', cfg.cron_secret");
     expect(sql).toContain("jsonb_build_object('auth_user_id', cfg.auth_user_id, 'full_reset', p_full_reset)");
     // Both ticks map onto the cron actions (and never onto the dry run).
     const tick = (fullReset: boolean) =>
       normalizeFunnelFoxSubscriptionsSyncAction({ method: "POST", body: { auth_user_id: DATA_KEY, full_reset: fullReset }, url: new URL("https://edge.test"), cron: true });
+    expect(tick(true)).toBe("sync_full_reset");
+    expect(tick(false)).toBe("sync");
+  });
+
+  it("the leads sync's cron branch is exactly what migration 202610060011 sends (minute advance tick + daily refresh)", () => {
+    expect(FUNNELFOX_LEADS_SYNC_POLICY.cron).toEqual({ header: "x-cron-secret", secretEnv: "FB_CRON_SECRET", actions: ["sync", "sync_full_reset"] });
+    expect([...FUNNELFOX_LEADS_SYNC_CRON_ACTIONS]).toEqual(["sync", "sync_full_reset"]);
+    // The user actions stay data-owner only; the cron branch is authorized by cron.actions alone.
+    for (const entry of Object.values(FUNNELFOX_LEADS_SYNC_POLICY.actions)) expect(entry.rawOnly).toBe(true);
+    const sql = readFileSync(resolve(process.cwd(), "supabase/migrations/202610060011_funnelfox_leads_cron.sql"), "utf8");
+    expect(sql).toMatch(/create or replace function public\.invoke_funnelfox_leads_sync\(\s*p_full_reset boolean default false\s*\)/i);
+    expect(sql).toContain("'x-cron-secret', cfg.cron_secret");
+    expect(sql).toContain("funnelfox-leads-sync");
+    expect(sql).toMatch(/'auth_user_id',\s*(v_data_key|app\.data_key\(\))/);
+    expect(sql).toMatch(/'full_reset',\s*p_full_reset/);
+    expect(sql).toMatch(/'limit',\s*100\b/);
+    expect(sql).toMatch(/'max_pages',\s*200\b/);
+    // Both ticks map onto the cron actions (and never onto the dry run).
+    const tick = (fullReset: boolean) =>
+      normalizeFunnelFoxLeadsSyncAction({
+        method: "POST",
+        body: { auth_user_id: DATA_KEY, full_reset: fullReset, limit: 100, max_pages: 200 },
+        url: new URL("https://edge.test"),
+        cron: true,
+      });
     expect(tick(true)).toBe("sync_full_reset");
     expect(tick(false)).toBe("sync");
   });
@@ -514,7 +544,7 @@ describe("funnelfox-subscriptions-sync cron (pg_cron → x-cron-secret)", () => 
   });
 
   it("the cron header opens nothing on the other funnelfox functions (session branch → 401)", async () => {
-    for (const { policy, requests } of CASES.slice(1)) {
+    for (const { policy, requests } of CASES.filter(({ policy }) => !policy.cron)) {
       const request = Object.values(requests)[0];
       const result = await call(policy, ownerRow(), {
         ...request,
@@ -525,6 +555,54 @@ describe("funnelfox-subscriptions-sync cron (pg_cron → x-cron-secret)", () => 
       expect(result.deps.workspaceDataKey).not.toHaveBeenCalled();
       const noSession = await expectDenied(policy, ownerRow(), 401, ACCESS_ERROR.INVALID_SESSION, { ...request, headers: { "x-cron-secret": CRON_SECRET } });
       expect(noSession.deps.workspaceDataKey).not.toHaveBeenCalled();
+    }
+  });
+});
+
+describe("funnelfox-leads-sync cron (pg_cron → x-cron-secret; the cron branch is not rawOnly)", () => {
+  const cronHeaders = (secret = CRON_SECRET) => ({ "Content-Type": "application/json", Authorization: "Bearer anon-key", apikey: "anon-key", "x-cron-secret": secret });
+  // What invoke_funnelfox_leads_sync(p_full_reset) posts (migration 202610060011).
+  const tickBody = (fullReset: boolean) => ({ auth_user_id: DATA_KEY, full_reset: fullReset, limit: 100, max_pages: 200 });
+
+  it("both ticks run for the workspace data key with no session involved, although every user action is rawOnly", async () => {
+    for (const [fullReset, action] of [[true, "sync_full_reset"], [false, "sync"]] as const) {
+      const result = await call(FUNNELFOX_LEADS_SYNC_POLICY, ownerRow(), { headers: cronHeaders(), body: tickBody(fullReset) });
+      expect(result.status).toBe(200);
+      expect(result.body).toEqual({ ok: true, action, tenant: DATA_KEY, actor: "cron" });
+      expect(result.deps.getUser).not.toHaveBeenCalled();
+      expect(result.deps.loadAccess).not.toHaveBeenCalled();
+      expect(result.deps.workspaceDataKey).toHaveBeenCalledTimes(1);
+      // The handler sees a cron context: no raw access, tenant = data key.
+      const ctx = (result.handler.mock.calls[0][0] as { ctx: AccessContext }).ctx;
+      expect(ctx.rawAccess).toBe(false);
+      expect(ctx.actor.kind).toBe("cron");
+    }
+    const bare = await call(FUNNELFOX_LEADS_SYNC_POLICY, ownerRow(), { headers: cronHeaders(), body: { full_reset: false } });
+    expect(bare.body).toEqual({ ok: true, action: "sync", tenant: DATA_KEY, actor: "cron" });
+  });
+
+  it("a body auth_user_id other than the data key is refused", async () => {
+    const result = await expectDenied(FUNNELFOX_LEADS_SYNC_POLICY, ownerRow(), 400, ACCESS_ERROR.TENANT_MISMATCH, {
+      headers: cronHeaders(),
+      body: { ...tickBody(false), auth_user_id: EMPLOYEE },
+    });
+    expect(result.deps.getUser).not.toHaveBeenCalled();
+  });
+
+  it("the secret is compared before the body is read; a wrong or unset secret opens nothing", async () => {
+    const wrong = await expectDenied(FUNNELFOX_LEADS_SYNC_POLICY, ownerRow(), 401, ACCESS_ERROR.INVALID_CRON_SECRET, { headers: cronHeaders("nope"), rawBody: "{not json" });
+    expect(wrong.deps.workspaceDataKey).not.toHaveBeenCalled();
+    await expectDenied(FUNNELFOX_LEADS_SYNC_POLICY, ownerRow(), 401, ACCESS_ERROR.INVALID_CRON_SECRET, { headers: cronHeaders(""), body: tickBody(false) });
+    await expectDenied(FUNNELFOX_LEADS_SYNC_POLICY, ownerRow(), 503, ACCESS_ERROR.CRON_NOT_CONFIGURED, { headers: cronHeaders(), body: tickBody(false), env: {} });
+  });
+
+  it("the scheduler cannot run the diagnose (dry run)", async () => {
+    await expectDenied(FUNNELFOX_LEADS_SYNC_POLICY, ownerRow(), 403, ACCESS_ERROR.CRON_ACTION_NOT_ALLOWED, { headers: cronHeaders(), body: { ...tickBody(false), dry_run: true } });
+  });
+
+  it("without the cron header an employee is still refused for raw access, whatever the permissions", async () => {
+    for (const request of [{ body: syncBody() }, { body: syncBody({ fullReset: true }) }]) {
+      await expectDenied(FUNNELFOX_LEADS_SYNC_POLICY, memberRow([...ENFORCED_PERMISSION_KEYS]), 403, ACCESS_ERROR.RAW_ACCESS_REQUIRED, request);
     }
   });
 });

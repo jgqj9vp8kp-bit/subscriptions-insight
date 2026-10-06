@@ -296,8 +296,9 @@ dead: `empty_source`, 0 active for every recent cohort):
 - Downstream: the Cohorts overlay reads the RPC `active_funnelfox_subscription_emails`
   (Supabase columns: normalized_email/renews/status/period_ends_at, sandbox from
   raw); ClickHouse `fact_subscriptions` is read by code but nothing writes it yet.
-- The leads sync (`funnelfox-leads-sync`) has been stalled since 2026-06-21
-  (`max_pages_reached`, 157 profiles, 0 emails) and has no cron.
+- The leads sync (`funnelfox-leads-sync`) was stalled from 2026-06-21
+  (`max_pages_reached`, 157 profiles, 0 emails) until the 2026-10-06 rewrite
+  below; it now has its own cron.
 
 Screen-to-screen conversion (asked 2026-09-21): the public API has no event or
 step endpoints (`/events`, `/steps`, `/screens`, `/analytics` → 404). What
@@ -311,6 +312,102 @@ at ~3k detail requests/day; info-only screens leave no trace. (The former
 `funnelfox-endpoint-probe` discovery function was removed with access control:
 it had no in-function auth. Delete it from the deployed project too:
 `supabase functions delete funnelfox-endpoint-probe`.)
+
+## FunnelFox leads export + server-side Leads tab (2026-10-06)
+
+Why the old sync stored 157 profiles and 0 emails:
+- The browser never sent `limit` / `max_pages`; `Number(null)` is 0, clamped up
+  to 1, so every call crawled ONE page of ONE profile (40 per click). The Edge
+  now uses `resolveIntParam` (absent → default 100 / 200), like the
+  subscriptions sync, and the page always sends both explicitly.
+- Emails come ONLY from the profile LIST: about 24% of list rows carry `email`
+  at the row root. `/profiles/{id}` carries no email at all (probe over 37
+  stored payloads), so the old `profile_details` stage is gone and the function
+  never calls `/profiles/{id}`. `details_completed` is always written as true so
+  older readers and the cron's idle check see the stage as done.
+- The list row has a boolean `preview` (FunnelFox editor / preview runs): it is
+  stored and preview profiles are never leads.
+
+Pipeline (`supabase/functions/funnelfox-leads-sync/index.ts`; pure twin
+`src/services/funnelfoxLeadsTransform.ts` — keep both in lockstep):
+- `profiles` → crawl `/profiles` newest first and upsert only rows that carry an
+  email (light columns + `preview` + `email_source = 'list'`; no raw JSON).
+  Profiles without an email are only counted in `stats`
+  (`profiles_scanned_total`, `profiles_with_email`, `profiles_without_email`,
+  `preview_excluded` — scan counters of the current pass, not table counts).
+  The cursor is read from `pagination.cursor`, then `next_cursor`; a repeated
+  cursor stops the crawl. `has_more` without a recognised next cursor, or a 2xx
+  without a `data` array, is an `api_error` (its `last_error` names the
+  pagination / body key names) — never a silent "completed". Rows and cursor are
+  checkpointed every 10 pages; every page has a 20 s timeout.
+- `sessions` → crawl `/sessions` and attach the earliest session's attribution
+  to STORED profiles only (light columns, no `raw_session`).
+- `reconcile` → one SQL call, `public.funnelfox_leads_reconcile(p_data_key)`:
+  paid emails from `public.transactions`, active ones from
+  `active_funnelfox_subscription_emails` (Cohorts definition). The Edge ignores
+  any `conversion` body key; the browser no longer builds one.
+- A stored profile is also never a lead when ITS OWN subscription
+  (`funnelfox_subscriptions.profile_id`) shows a paying / subscribed customer
+  (its email paid or active, or priced and not cancelled / still in its paid
+  period) — the quiz email can differ from the checkout email. Same rule in
+  reconcile and `leads_profile_candidates`.
+- Upserts are grouped by key set (supabase-js fills missing keys with NULL in a
+  bulk upsert — the same incident as the subscriptions list stage above).
+- A lease (`funnelfox_leads_acquire_lease` returns a token,
+  `funnelfox_leads_release_lease(p_data_key, p_token)` frees only that token's
+  lease; 120 s) keeps the cron tick and the page's button off the same cursor;
+  the loser answers `status: "busy"`. A FunnelFox 429 parks the pipeline until
+  `stats.rate_limited_until` (Retry-After, default 60 s). Any other FunnelFox
+  error backs the cron off (`stats.error_backoff_until`: 60 s · 2^(n-1), at most
+  an hour; `stats.consecutive_api_errors`); a click is not held back. A cursor
+  FunnelFox keeps refusing (400/404/410/422 or one that does not advance) is
+  dropped after 3 errors in a row and the pass restarts (`stats.cursor_reset`).
+  With every stage complete a plain sync is an idle no-op (one read, no
+  writes). A cron `full_reset` that arrives while a pass is unfinished runs as a
+  plain advance — unless the last run ended in an error, then it restarts.
+- Cron (migration `202610060011`): `funnelfox-leads-advance` every minute and
+  `funnelfox-leads-refresh` (full_reset) at 06:15 UTC, after the 05:45
+  subscriptions refresh. `invoke_funnelfox_leads_sync` skips the HTTP call
+  while a lease is held, while a 429 pause or an error backoff runs, or once
+  every stage is complete; the refresh always posts. Auth: `x-cron-secret =
+  FB_CRON_SECRET` through the gate's `policy.cron` branch (actions `sync` /
+  `sync_full_reset`, never the dry run).
+- Diagnose (`dry_run`, owner-only button): at most 2 list pages + 1 sessions
+  page; returns key names and counts only (no email, no cursor value).
+
+Leads tab read path (`clickhouse-users` actions `leads_list` /
+`leads_overview`; `supabase/functions/_shared/clickhouse/leads.ts`, contract in
+`leadsContract.ts`, browser `runClickHouseLeads` + `src/hooks/useLeadsData.ts`):
+- Merged in Edge from (A) one ClickHouse query of warehouse lead candidates,
+  (B) the RPC `leads_profile_candidates(p_data_key, p_profile_limit)` (stored
+  profiles + subscription-only emails + KPI counts) and (C)
+  `activeSubscriptionsByEmail`; `mergeLeads` is pure and parity-tested against
+  `computeLeads`. Filters, the sort allowlist and pagination run in Edge over
+  the merged set, memoized per workspace for 60 s per isolate (`refresh: true`
+  bypasses it and never joins a plain load already in flight; the page sends it
+  once after a sync).
+- A warehouse lead that also has a profile ("both") keeps the warehouse
+  attribution (campaign path, campaign id, media buyer, country); the profile
+  only fills fields the warehouse lacks. Profile campaign paths are normalized
+  like the warehouse import.
+- Size: the merged set lives in Edge memory. The bulk RPC carries no profile
+  `user_agent` / `origin` (`leads_list` reads them for the page's rows only),
+  and at most `LEADS_PROFILE_CANDIDATES_LIMIT` (50 000) profile leads — the
+  newest. Past that, `diagnostics.profile_candidates_truncated` is true, the tab
+  shows a notice and the Edge logs a warning: the trigger to mirror profile
+  leads into ClickHouse (plan §4 step 7). Subscription-only rows and the
+  warehouse rows are not capped.
+- Data-owner only for the first release: both actions are `rawOnly` +
+  `users.view` + `users.pii.view` + `leads.view`, none `scopeReady`. Dropping
+  `rawOnly` later (policy + `accessRoutes.ts` + `Users.tsx`) opens it to members
+  holding the three keys.
+- The tab no longer hydrates the raw warehouse (`useRequireRawTransactions` has
+  no caller now). The `"leads"` query root is deliberately not persisted to
+  IndexedDB (rows carry customer emails).
+
+Deploy order (each step needs the previous one): migration `202610060010` →
+deploy all functions → Diagnose + one Continue → migration `202610060011` (cron)
+→ frontend. See README "FunnelFox Leads export — rollout".
 
 ## FunnelFox Backend Requirement
 
