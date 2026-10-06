@@ -9,23 +9,37 @@
 //   rebuild_force — the same request with a truthy `force` (a full re-classify
 //                   even when the snapshot is current): admin.warehouse.manage.
 //   validate      — admin.warehouse.manage.
+//   cron_tick     — the freshness cron only (access Phase 2, spec §3.8):
+//                   pg_cron → invoke_cohort_membership_tick → this function
+//                   with x-cron-secret (FB_CRON_SECRET). It verifies freshness
+//                   for the funnel-restricted gate, fills a missing campaign
+//                   scope and rebuilds a stale snapshot. The gate authorizes it
+//                   by cron.actions alone; its user-side entry (raw / owner /
+//                   warehouse admin) is never reachable, because a user request
+//                   cannot even name it (the normalizer rejects it).
 //
 // The legacy function mapped ANY other action — and GET — to status. Nothing in
 // src/ relies on that (every call POSTs an explicit action), so unknown or
 // missing actions are now rejected and only POST is served. No action is
-// scopeReady (Milestone A): restricted members get 403 scope_not_supported, and
-// none of these may ever be (whole-tenant artifacts, never R).
+// scopeReady: restricted members get 403 scope_not_supported, and none of these
+// may ever be (whole-tenant artifacts, never R).
 
 import type { FunctionPolicy, NormalizeActionInput } from "../gate.ts";
 import type { AccessContext } from "../accessContext.ts";
 import { ActionNormalizeError } from "../errors.ts";
 
-export type ClickHouseCohortMembershipAction = "status" | "rebuild" | "rebuild_force" | "validate";
+export type ClickHouseCohortMembershipAction = "status" | "rebuild" | "rebuild_force" | "validate" | "cron_tick";
 
 /** The action name the response bodies have always carried. */
-export type CohortMembershipLegacyAction = "status" | "rebuild" | "validate";
+export type CohortMembershipLegacyAction = "status" | "rebuild" | "validate" | "cron_tick";
 
-export function normalizeClickHouseCohortMembershipAction({ body }: NormalizeActionInput): ClickHouseCohortMembershipAction {
+export function normalizeClickHouseCohortMembershipAction({ body, cron }: NormalizeActionInput): ClickHouseCohortMembershipAction {
+  // The cron branch (secret already verified) runs the tick and nothing else; a
+  // body without an action is the tick.
+  if (cron) {
+    if (body.action === undefined || body.action === null || body.action === "cron_tick") return "cron_tick";
+    throw new ActionNormalizeError();
+  }
   switch (body.action) {
     case "status":
       return "status";
@@ -49,7 +63,9 @@ export const CLICKHOUSE_COHORT_MEMBERSHIP_POLICY: FunctionPolicy<ClickHouseCohor
     rebuild: { allOf: ["admin.warehouse.manage"], write: true },
     rebuild_force: { allOf: ["admin.warehouse.manage"], write: true },
     validate: { allOf: ["admin.warehouse.manage"] },
+    cron_tick: { ownerOnly: true, rawOnly: true, allOf: ["admin.warehouse.manage"], write: true },
   },
+  cron: { header: "x-cron-secret", secretEnv: "FB_CRON_SECRET", actions: ["cron_tick"] },
 };
 
 export function legacyMembershipAction(action: ClickHouseCohortMembershipAction): CohortMembershipLegacyAction {

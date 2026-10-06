@@ -1,7 +1,9 @@
 // Funnels admin registry (Funnels page). Config metadata, not analytics —
 // see supabase/migrations/202607240001_create_funnels_admin.sql for the
-// schema and the deployment-shared RLS rationale (no auth.uid() scoping;
-// every authenticated user of this project reads/writes the same rows).
+// schema. Reads are scoped by RLS since access Phase 2
+// (202610060001_access_phase2_scope.sql): a funnel-restricted member reads
+// only their own funnels, their tags and their granted paths; writes stay
+// with funnels.manage (full scope).
 import { supabase } from "@/services/supabaseClient";
 
 export interface TagRecord {
@@ -46,6 +48,19 @@ export interface FunnelPassportFields {
 export const BILLING_PERIODS = ["weekly", "biweekly", "monthly", "quarterly", "annual", "custom"] as const;
 export const FUNNEL_DESTINATIONS = ["web_app", "ios", "android", "content"] as const;
 
+/** Lifecycle of one campaign path of a funnel (funnel_paths, access Phase 2).
+ * Only active and retired paths grant funnel access. */
+export type FunnelPathStatus = "proposed" | "active" | "retired" | "revoked";
+
+/** One campaign path of a funnel, in canonical form. The registry RLS hands a
+ * funnel-restricted member only the active and retired paths of their own
+ * funnels; a full-scope reader also sees proposed and revoked rows. */
+export interface FunnelPathRecord {
+  id: string;
+  path: string;
+  status: FunnelPathStatus;
+}
+
 export interface FunnelRecord extends FunnelPassportFields {
   id: string;
   funnel_path: string;
@@ -56,6 +71,47 @@ export interface FunnelRecord extends FunnelPassportFields {
   created_at: string;
   updated_at: string;
   tags: TagRecord[];
+  /** The campaign paths that make up this funnel (current, old, proposed). */
+  paths: FunnelPathRecord[];
+}
+
+/** Whether a path row grants funnel access (active or retired). */
+export function isGrantingFunnelPath(path: Pick<FunnelPathRecord, "status">): boolean {
+  return path.status === "active" || path.status === "retired";
+}
+
+const SCOPE_PATH_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+
+/**
+ * The campaign paths a funnel-restricted member's reads are bound to: the
+ * server-resolved paths of their funnels (useAccess().funnelScope), kept only
+ * in canonical form, at most 200 characters and never "unknown"; none unless
+ * the mode is "selected" — the same rule as the restricted scope in
+ * supabase/functions/_shared/clickhouse/scopeSql.ts. The server intersects
+ * every campaign_path include filter with this set; the pages use it to offer
+ * only these options and to name the saved values it ignores.
+ */
+export function funnelScopeFilterPaths(
+  scope: { mode: string; paths: readonly string[] } | null | undefined,
+): Set<string> {
+  if (!scope || scope.mode !== "selected") return new Set();
+  return new Set(
+    scope.paths.filter((path) => typeof path === "string" && path !== "unknown" && path.length <= 200 && SCOPE_PATH_RE.test(path)),
+  );
+}
+
+/**
+ * TypeScript mirror of app.canonical_campaign_path (migration 202610060001 §1):
+ * the canonical campaign_path the registry stores a funnel path as — trimmed,
+ * lower-cased, scheme/host, query and fragment stripped, every run of other
+ * characters collapsed to "-". null when there is no canonical form (empty,
+ * "unknown", longer than 200 characters): the database refuses such a path.
+ */
+export function canonicalCampaignPath(raw: string | null | undefined): string | null {
+  const value = String(raw ?? "").replace(/^[ \t\r\n]+|[ \t\r\n]+$/g, "").toLowerCase();
+  const path = value.replace(/^https?:\/\/[^/]+/, "").split("?")[0].split("#")[0];
+  const slug = path.replace(/^\/+|\/+$/g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return slug === "" || slug === "unknown" || slug.length > 200 ? null : slug;
 }
 
 /**
@@ -99,6 +155,22 @@ const FUNNEL_COLUMNS =
   "id,funnel_path,display_name,is_active,funnelfox_funnel_id,created_by,created_at,updated_at," +
   PASSPORT_COLUMNS;
 const TAG_COLUMNS = "id,name,created_by,created_at";
+// funnel_paths exists from migration 202610060001 on (access Phase 2): the
+// embed below needs it in production before this frontend ships.
+const FUNNEL_PATH_COLUMNS = "id,path_canonical,status";
+const FUNNEL_PATH_STATUSES: ReadonlySet<string> = new Set(["proposed", "active", "retired", "revoked"]);
+
+/** The embedded funnel_paths rows. A row with an unknown status is dropped: it
+ * must never read as a grant. */
+function mapFunnelPaths(value: unknown): FunnelPathRecord[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    const row = entry as { id?: unknown; path_canonical?: unknown; status?: unknown } | null;
+    if (!row || typeof row.path_canonical !== "string" || !row.path_canonical) return [];
+    if (typeof row.status !== "string" || !FUNNEL_PATH_STATUSES.has(row.status)) return [];
+    return [{ id: String(row.id ?? ""), path: row.path_canonical, status: row.status as FunnelPathStatus }];
+  });
+}
 
 function ensureSupabase() {
   if (!supabase) throw new Error("Supabase is not configured.");
@@ -112,26 +184,39 @@ async function currentUserId(): Promise<string> {
   return data.user.id;
 }
 
-/** Unique-violation on the (funnel_path | tag name) index -> a friendly message instead of the raw Postgres one. */
+/** Unique-violation on the (funnel_path | tag name) index -> a friendly message instead of the raw Postgres one.
+ * The funnels triggers (access Phase 2) raise P0001 "invalid: …" / "conflict: …"
+ * (no canonical path form, path held by another funnel): the code prefix is dropped. */
 function friendlyConflictMessage(error: { code?: string; message: string }, label: string): string {
-  return error.code === "23505" ? `${label} already exists.` : error.message;
+  if (error.code === "23505") return `${label} already exists.`;
+  if (error.code === "P0001") {
+    const detail = /^(?:invalid|conflict): ([\s\S]+)$/.exec(error.message)?.[1];
+    if (detail) return `${detail.charAt(0).toUpperCase()}${detail.slice(1)}.`;
+  }
+  return error.message;
 }
 
+// The registry RLS scopes this read (access Phase 2): a funnel-restricted
+// member gets only their own funnels, the tags linked to them and their active
+// and retired paths; everyone with funnel scope "all" gets every row.
 export async function listFunnels(): Promise<FunnelRecord[]> {
   const client = ensureSupabase();
   const { data, error } = await client
     .from("funnels")
-    .select(`${FUNNEL_COLUMNS},funnel_tags(tags(${TAG_COLUMNS}))`)
+    .select(`${FUNNEL_COLUMNS},funnel_tags(tags(${TAG_COLUMNS})),funnel_paths(${FUNNEL_PATH_COLUMNS})`)
     .order("created_at", { ascending: false });
   if (error) throw new Error(`Could not load funnels: ${error.message}`);
   return (
-    (data ?? []) as unknown as Array<Record<string, unknown> & { funnel_tags: Array<{ tags: TagRecord | null }> }>
+    (data ?? []) as unknown as Array<
+      Record<string, unknown> & { funnel_tags: Array<{ tags: TagRecord | null }>; funnel_paths?: unknown }
+    >
   ).map(
     (row) => {
-      const { funnel_tags, ...rest } = row;
+      const { funnel_tags, funnel_paths, ...rest } = row;
       return {
-        ...(rest as Omit<FunnelRecord, "tags">),
+        ...(rest as Omit<FunnelRecord, "tags" | "paths">),
         tags: funnel_tags.map((link) => link.tags).filter((tag): tag is TagRecord => tag != null),
+        paths: mapFunnelPaths(funnel_paths),
       };
     },
   );
@@ -148,7 +233,8 @@ export async function createFunnel(input: { funnel_path: string; display_name: s
     .select(FUNNEL_COLUMNS)
     .single();
   if (error) throw new Error(friendlyConflictMessage(error, `A funnel with path "${funnelPath}"`));
-  return { ...(data as unknown as Omit<FunnelRecord, "tags">), tags: [] };
+  // The new path row is written by the funnels trigger; the next listFunnels reads it.
+  return { ...(data as unknown as Omit<FunnelRecord, "tags" | "paths">), tags: [], paths: [] };
 }
 
 // funnel_path is deliberately not part of the update surface in v1 — the
@@ -162,7 +248,7 @@ export async function updateFunnelDisplayName(id: string, displayName: string): 
     .select(FUNNEL_COLUMNS)
     .single();
   if (error) throw new Error(`Could not update funnel: ${error.message}`);
-  return { ...(data as unknown as Omit<FunnelRecord, "tags">), tags: [] };
+  return { ...(data as unknown as Omit<FunnelRecord, "tags" | "paths">), tags: [], paths: [] };
 }
 
 /**
@@ -288,16 +374,33 @@ export async function listFunnelFoxFunnels(): Promise<FunnelFoxImportCandidate[]
 
   const existing = await listFunnels();
   // A row counts as registered if it carries the FunnelFox id OR already
-  // occupies the same path (hand-created before the import existed).
+  // occupies the same path (hand-created before the import existed), also in
+  // canonical form: a path granted to a funnel cannot be imported again.
   const registeredIds = new Set(existing.map((row) => row.funnelfox_funnel_id).filter(Boolean));
   const registeredPaths = new Set(existing.map((row) => row.funnel_path));
+  const grantedPaths = new Set(existing.flatMap((row) => (row.paths ?? []).filter(isGrantingFunnelPath).map((path) => path.path)));
 
   return funnels
     .filter((funnel) => funnel.id && funnel.alias)
     .map((funnel) => ({
       ...funnel,
-      alreadyRegistered: registeredIds.has(funnel.id) || registeredPaths.has(funnel.alias),
+      alreadyRegistered:
+        registeredIds.has(funnel.id) ||
+        registeredPaths.has(funnel.alias) ||
+        grantedPaths.has(canonicalCampaignPath(funnel.alias) ?? ""),
     }));
+}
+
+/** The canonical paths currently granted (active or retired) to any funnel. */
+async function grantedCampaignPaths(): Promise<Set<string>> {
+  const client = ensureSupabase();
+  const { data, error } = await client.from("funnel_paths").select("path_canonical,status");
+  if (error) throw new Error(`Could not load funnel paths: ${error.message}`);
+  return new Set(
+    ((data ?? []) as Array<{ path_canonical?: unknown; status?: unknown }>)
+      .filter((row) => (row.status === "active" || row.status === "retired") && typeof row.path_canonical === "string")
+      .map((row) => row.path_canonical as string),
+  );
 }
 
 /** Case-insensitive name -> tag id, creating any tag that does not exist yet. */
@@ -317,9 +420,21 @@ async function ensureTags(names: string[]): Promise<Map<string, string>> {
   return byLowerName;
 }
 
+/** A selected FunnelFox funnel the import left out, and why. */
+export interface FunnelFoxImportSkip {
+  id: string;
+  alias: string;
+  /** path_taken: its canonical path is granted to another funnel;
+   * no_canonical_path: the alias has no canonical form; duplicate_in_batch:
+   * an earlier row of the same batch has the same canonical path. */
+  reason: "path_taken" | "no_canonical_path" | "duplicate_in_batch";
+}
+
 export interface FunnelFoxImportResult {
   importedFunnels: number;
   createdTags: number;
+  /** Present only when rows were left out. */
+  skipped?: FunnelFoxImportSkip[];
 }
 
 /**
@@ -327,20 +442,42 @@ export interface FunnelFoxImportResult {
  * is_active is NOT taken from FunnelFox's publish state: "active" means traffic
  * is flowing, which a fresh import cannot know. New rows start inactive and the
  * recompute (button + daily cron) flips on the ones with recent traffic.
+ *
+ * The batch is one INSERT, and the funnels trigger refuses a path that is
+ * already granted to another funnel (or has no canonical form) — one such row
+ * would abort the whole batch. They are filtered out first and reported in
+ * `skipped`; a concurrent registry change can still abort the batch.
  */
 export async function importFunnelFoxFunnels(funnels: FunnelFoxFunnel[]): Promise<FunnelFoxImportResult> {
   const client = ensureSupabase();
   if (!funnels.length) return { importedFunnels: 0, createdTags: 0 };
   const userId = await currentUserId();
 
+  const granted = await grantedCampaignPaths();
+  const batchPaths = new Set<string>();
+  const skipped: FunnelFoxImportSkip[] = [];
+  const importable = funnels.filter((funnel) => {
+    const path = canonicalCampaignPath(funnel.alias);
+    const reason: FunnelFoxImportSkip["reason"] | null =
+      path === null ? "no_canonical_path" : granted.has(path) ? "path_taken" : batchPaths.has(path) ? "duplicate_in_batch" : null;
+    if (reason) {
+      skipped.push({ id: funnel.id, alias: funnel.alias, reason });
+      return false;
+    }
+    batchPaths.add(path as string);
+    return true;
+  });
+  const withSkipped = (result: FunnelFoxImportResult): FunnelFoxImportResult => (skipped.length ? { ...result, skipped } : result);
+  if (!importable.length) return withSkipped({ importedFunnels: 0, createdTags: 0 });
+
   const tagsBefore = (await listTags()).length;
-  const tagIdByName = await ensureTags(funnels.flatMap((funnel) => funnel.tags));
+  const tagIdByName = await ensureTags(importable.flatMap((funnel) => funnel.tags));
   const createdTags = tagIdByName.size - tagsBefore;
 
   const { data, error } = await client
     .from("funnels")
     .insert(
-      funnels.map((funnel) => ({
+      importable.map((funnel) => ({
         funnel_path: funnel.alias.trim(),
         display_name: funnel.title.trim(),
         is_active: false,
@@ -351,13 +488,13 @@ export async function importFunnelFoxFunnels(funnels: FunnelFoxFunnel[]): Promis
     .select(FUNNEL_COLUMNS);
   if (error) throw new Error(`Could not import funnels: ${error.message}`);
 
-  const inserted = (data ?? []) as unknown as Array<Omit<FunnelRecord, "tags">>;
+  const inserted = (data ?? []) as unknown as Array<Omit<FunnelRecord, "tags" | "paths">>;
   const idByFunnelFoxId = new Map(inserted.map((row) => [row.funnelfox_funnel_id, row.id]));
 
   // Tag links go through the atomic RPC, one call per funnel. Sequential on
   // purpose: this is a one-off admin action, and a burst of ~59 concurrent
   // RPCs buys nothing.
-  for (const funnel of funnels) {
+  for (const funnel of importable) {
     const funnelId = idByFunnelFoxId.get(funnel.id);
     if (!funnelId || !funnel.tags.length) continue;
     const tagIds = funnel.tags
@@ -366,5 +503,5 @@ export async function importFunnelFoxFunnels(funnels: FunnelFoxFunnel[]): Promis
     if (tagIds.length) await replaceFunnelTags(funnelId, tagIds);
   }
 
-  return { importedFunnels: inserted.length, createdTags: Math.max(0, createdTags) };
+  return withSkipped({ importedFunnels: inserted.length, createdTags: Math.max(0, createdTags) });
 }

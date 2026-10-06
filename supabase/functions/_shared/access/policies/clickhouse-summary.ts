@@ -18,7 +18,10 @@
 // admin.diagnostics.view. Everyone else gets the version-only member view
 // (summary.ts memberWarehouseSummary): strip, don't deny.
 //
-// Not scopeReady (Milestone A): restricted members get 403 scope_not_supported.
+// scopeReady without a scopeSnapshot (access Phase 2): every restricted page
+// runs the probe, and a restricted member always gets the member view — it
+// makes no ClickHouse call (index.ts), and admin.diagnostics.view, the only
+// non-raw way to the KPI branch, is never effective under a restricted scope.
 
 import type { FunctionPolicy, NormalizeActionInput } from "../gate.ts";
 import type { AccessContext } from "../accessContext.ts";
@@ -54,7 +57,7 @@ export const CLICKHOUSE_SUMMARY_POLICY: FunctionPolicy<ClickHouseSummaryAction> 
   methods: ["GET", "POST"],
   normalizeAction: normalizeClickHouseSummaryAction,
   actions: {
-    summary: { anyOf: [...WAREHOUSE_PROBE_VIEW_PERMISSIONS] },
+    summary: { anyOf: [...WAREHOUSE_PROBE_VIEW_PERMISSIONS], scopeReady: true },
   },
 };
 

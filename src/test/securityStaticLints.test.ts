@@ -12,9 +12,12 @@
 //      auth_user_id), nobody but the gate reads the request body, and every SQL
 //      tenant predicate binds {auth_user_id:String} (never an interpolated id or
 //      another parameter name the ScopedReader would not force).
-//   4. Every catch in the runner modules that swallows errors rethrows
-//      ScopeViolation (R7); the exceptions are whitelisted with reasons and
-//      checked mechanically (no warehouse call can throw one there).
+//      Access Phase 2: createRestrictedScopeSql is imported only by the gate and
+//      maskScopeFragments only by the ScopedReader.
+//   4. Every catch in the runner modules (and the routers of the restricted-
+//      reachable functions) that swallows errors rethrows ScopeViolation (R7);
+//      the exceptions are whitelisted with reasons and checked mechanically (no
+//      warehouse call can throw one there).
 //   5. Folded migrations (PGlite end state, every migration + bootstrap + the
 //      lockdown): every public table has RLS; every SECURITY DEFINER function
 //      pins search_path and is not executable by anon; the 2026-10-05 functions
@@ -22,6 +25,10 @@
 //      tables.
 //   6. No access error code or message says "unavailable" (the frontend breaker
 //      matches that word).
+//   7. Access Phase 2 (M15): restricted SQL reads only the columns its scope
+//      fragments project (TX_COLS / FC_COLS / FB_COLS, ...), checked on every
+//      statement the scopeReady actions send for a restricted member — a column
+//      outside the projection would fail every restricted read, live only.
 
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
@@ -41,7 +48,19 @@ import { AccessAdminError, AccessAdminStoreError, accessAdminOnError } from "../
 import { verifyEdgeBearerSession } from "../../supabase/functions/_shared/clickhouse/auth.ts";
 import { REPORT_NOT_FOUND } from "../../supabase/functions/reports-generate/handler.ts";
 import { isWarehouseDownError } from "@/services/clickhouse";
-import { createLockedWorkspace, type SeededWorkspace } from "./support/accessFixtures";
+import { FB_COLS, FC_COLS, TX_COLS } from "../../supabase/functions/_shared/clickhouse/scopeSql.ts";
+import {
+  ALTER_FACT_SUPPORT_REQUESTS_ANSWER_SQL,
+  ALTER_FACT_SUPPORT_REQUESTS_ATTRIBUTION_SQL,
+  ALTER_FACT_SUPPORT_REQUESTS_CLASSIFICATION_SQL,
+  CREATE_ANALYTICS_TRANSACTIONS_SQL,
+  CREATE_FACT_FACEBOOK_STATS_SQL,
+  CREATE_FACT_SUPPORT_REQUESTS_SQL,
+  CREATE_FACT_USER_COHORTS_SQL,
+} from "../../supabase/functions/_shared/clickhouse/schema.ts";
+import { CREATE_FACT_CAMPAIGN_SCOPE_SQL } from "../../supabase/functions/_shared/clickhouse/campaignScope.ts";
+import { FUNNELS, PERSONAS, SCOPE_DAYS, createLockedWorkspace, readThroughRouter, restrictedStatementCorpus, type SeededWorkspace } from "./support/accessFixtures";
+import type { RecordedStatement } from "./support/recordingClickHouse";
 import { listMigrations, readMigration } from "./support/pgliteSupabase";
 
 const ROOT = process.cwd();
@@ -176,6 +195,29 @@ describe("1. the ClickHouse transport is reachable only through the ScopedReader
       }
     }
     expect(offenders).toEqual([]);
+  });
+
+  it("access Phase 2: createRestrictedScopeSql is imported only by the gate, maskScopeFragments only by the ScopedReader", () => {
+    // Under supabase/functions/** only; tests (src/test/**) may import both to
+    // build restricted handles and check the masking directly.
+    const SCOPE_SQL_TS = resolve(CLICKHOUSE_DIR, "scopeSql.ts");
+    const PRIVATE: Record<string, string> = {
+      createRestrictedScopeSql: "_shared/access/gate.ts",
+      maskScopeFragments: "_shared/clickhouse/scopedClient.ts",
+    };
+    const seen = new Set<string>();
+    const offenders: string[] = [];
+    for (const path of FUNCTION_FILES) {
+      for (const ref of moduleReferences(parse(path)).filter((candidate) => resolvesTo(path, candidate.specifier, SCOPE_SQL_TS))) {
+        for (const [name, owner] of Object.entries(PRIVATE)) {
+          if (ref.names !== "*" && !ref.names.includes(name)) continue;
+          if (rel(path) === owner && ref.names !== "*") seen.add(name);
+          else offenders.push(`${rel(path)}:${line(parse(path), ref.node)} imports ${ref.names === "*" ? "*" : name} from ${ref.specifier}`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+    expect([...seen].sort()).toEqual(Object.keys(PRIVATE).sort());
   });
 });
 
@@ -491,8 +533,14 @@ describe("3. no entry point takes the tenant from the request", () => {
 // =========================================================================================
 
 const CATCH_LINT_FILES = [
-  "cohorts", "cohortMembership", "fbCohortStats", "users", "paymentAnalytics", "bankAnalytics", "revenueIntelligence", "support", "facebookStats",
-].map((name) => resolve(CLICKHOUSE_DIR, `${name}.ts`));
+  ...[
+    "cohorts", "cohortMembership", "fbCohortStats", "users", "paymentAnalytics", "bankAnalytics", "revenueIntelligence", "support", "facebookStats",
+    // access Phase 2: the scoped builders and the snapshot / campaign-scope / coverage runners.
+    "cohortSubscriptions", "campaignScope", "pathCoverage", "cohortSnapshotState", "scopeSql",
+  ].map((name) => resolve(CLICKHOUSE_DIR, `${name}.ts`)),
+  // The routers of the restricted-reachable functions (their catches wrap scoped runners).
+  ...["clickhouse-cohorts", "clickhouse-revenue", "clickhouse-facebook", "clickhouse-cohort-membership"].map((fn) => resolve(FUNCTIONS_DIR, fn, "index.ts")),
+];
 
 /** Postgres-only helpers: they take the service-role Supabase client and never
  * a ClickHouse reader, so no ScopeViolation can originate inside them. Checked
@@ -522,7 +570,8 @@ interface CatchSite {
 }
 
 function catchSites(path: string): CatchSite[] {
-  return catchSitesOf(path.split(sep).pop() as string, parse(path));
+  const name = path.split(sep).pop() as string;
+  return catchSitesOf(name === "index.ts" ? rel(path) : name, parse(path));
 }
 
 function catchSitesOf(name: string, file: ts.SourceFile): CatchSite[] {
@@ -556,7 +605,7 @@ function catchSitesOf(name: string, file: ts.SourceFile): CatchSite[] {
       }
       if (!ok && ts.isCallExpression(receiver) && ts.isIdentifier(receiver.expression) && POSTGRES_ONLY_RECEIVERS.includes(receiver.expression.text)) {
         const args = receiver.arguments.map((arg) => arg.getText(file));
-        if (args.length && /(^|\.)supabase$/.test(args[0]) && !args.some((arg) => /clickhouse/i.test(arg))) {
+        if (args.length && /(^|\.)(supabase|pg)$/.test(args[0]) && !args.some((arg) => /clickhouse/i.test(arg))) {
           ok = true;
           reason = `postgres-only receiver ${receiver.expression.text}(${args[0]}, ...)`;
         }
@@ -733,6 +782,8 @@ describe("5. folded migrations", () => {
       "clickhouse_transaction_sync_state", "clickhouse_validation_state", "clickhouse_cohort_snapshot_state",
       "funnelfox_leads_sync_state", "funnelfox_subscriptions_sync_state", "support_mail_sync_state", "support_classification_state",
       "fb_cron_config", "support_mail_cron_config",
+      // access Phase 2: written only by the funnels triggers and the service-role RPCs.
+      "funnel_paths",
     ];
     for (const table of tables) {
       const grants = await folded.h.db.query<{ authenticated: boolean; anon: boolean }>(
@@ -812,6 +863,251 @@ describe("6. access error codes and messages never say 'unavailable'", () => {
 });
 
 // =========================================================================================
+// 7. restricted SQL reads only the columns its scope fragments project (access Phase 2, M15)
+// =========================================================================================
+// A restricted fragment is a subquery with an explicit projection: TX_COLS of
+// analytics_transactions (never raw_payload / normalized_payload), every column of
+// fact_user_cohorts / fact_facebook_stats, normalized_email of fact_support_requests,
+// campaign_id of fact_campaign_scope. A builder that reads another column through
+// it compiles for the owner and fails for every restricted member, live only
+// ("Missing columns"). Checked on the corpus of every statement the scopeReady
+// actions send for a restricted member (router replicas → REAL runners), on:
+//   * `alias.column` references of an aliased fragment (`(...) AS a`);
+//   * the unqualified columns of the SELECT block an unaliased fragment is the FROM of.
+
+/** Column names of a CREATE TABLE (…) ENGINE … statement. */
+function ddlColumns(ddl: string): string[] {
+  const body = ddl.slice(ddl.indexOf("(") + 1, ddl.search(/\)\s*ENGINE/));
+  return body.split("\n").map((entry) => /^\s*([a-z_][a-z0-9_]*)\s+\S/.exec(entry)?.[1]).filter((name): name is string => Boolean(name));
+}
+
+const alterColumns = (statements: readonly string[]) =>
+  statements.map((sql) => /ADD COLUMN IF NOT EXISTS ([a-z_][a-z0-9_]*)/.exec(sql)?.[1]).filter((name): name is string => Boolean(name));
+
+interface FragmentKind {
+  table: string;
+  /** The fragment's text up to its WHERE (scopeSql.ts builders). */
+  head: string;
+  columns: readonly string[];
+  schema: readonly string[];
+}
+
+const FRAGMENT_KINDS: readonly FragmentKind[] = [
+  { table: "analytics_transactions", head: `(SELECT ${TX_COLS.join(", ")} FROM analytics_transactions FINAL WHERE `, columns: TX_COLS, schema: ddlColumns(CREATE_ANALYTICS_TRANSACTIONS_SQL) },
+  { table: "fact_user_cohorts", head: `(SELECT ${FC_COLS.join(", ")} FROM fact_user_cohorts FINAL WHERE `, columns: FC_COLS, schema: ddlColumns(CREATE_FACT_USER_COHORTS_SQL) },
+  { table: "fact_facebook_stats", head: `(SELECT ${FB_COLS.join(", ")} FROM fact_facebook_stats FINAL WHERE `, columns: FB_COLS, schema: ddlColumns(CREATE_FACT_FACEBOOK_STATS_SQL) },
+  {
+    table: "fact_support_requests",
+    head: "(SELECT normalized_email FROM fact_support_requests FINAL WHERE ",
+    columns: ["normalized_email"],
+    schema: [
+      ...ddlColumns(CREATE_FACT_SUPPORT_REQUESTS_SQL),
+      ...alterColumns([...ALTER_FACT_SUPPORT_REQUESTS_ATTRIBUTION_SQL, ...ALTER_FACT_SUPPORT_REQUESTS_CLASSIFICATION_SQL, ...ALTER_FACT_SUPPORT_REQUESTS_ANSWER_SQL]),
+    ],
+  },
+  { table: "fact_campaign_scope", head: "(SELECT campaign_id FROM fact_campaign_scope FINAL WHERE ", columns: ["campaign_id"], schema: ddlColumns(CREATE_FACT_CAMPAIGN_SCOPE_SQL) },
+];
+
+/** Index of the paren closing the one at `open` (string literals skipped). */
+function closingParen(sql: string, open: number): number {
+  let depth = 0;
+  let quoted = false;
+  for (let index = open; index < sql.length; index += 1) {
+    const char = sql[index];
+    if (char === "'") quoted = !quoted;
+    else if (!quoted && char === "(") depth += 1;
+    else if (!quoted && char === ")" && --depth === 0) return index;
+  }
+  return -1;
+}
+
+interface FragmentSpan {
+  start: number;
+  end: number;
+  kind: FragmentKind;
+  alias: string | null;
+}
+
+/** The outermost scope fragments of a statement, with the alias each is bound to. */
+function fragmentSpans(sql: string, kinds: readonly FragmentKind[] = FRAGMENT_KINDS): FragmentSpan[] {
+  const spans: FragmentSpan[] = [];
+  for (const kind of kinds) {
+    for (let at = sql.indexOf(kind.head); at >= 0; at = sql.indexOf(kind.head, at + 1)) {
+      const close = closingParen(sql, at);
+      if (close < 0) throw new Error(`unbalanced ${kind.table} fragment: ${sql.slice(at, at + 120)}`);
+      const alias = /^ AS ([a-z_][a-z0-9_]*)/.exec(sql.slice(close + 1));
+      spans.push({ start: at, end: close + 1 + (alias?.[0].length ?? 0), kind, alias: alias?.[1] ?? null });
+    }
+  }
+  const nested = (span: FragmentSpan) => spans.some((other) => other !== span && other.start <= span.start && other.end >= span.end && other.end - other.start > span.end - span.start);
+  return spans.filter((span) => !nested(span)).sort((a, b) => a.start - b.start);
+}
+
+const blankStrings = (sql: string) => sql.replace(/--[^\n]*/g, " ").replace(/'[^']*'/g, "''");
+
+/** The text of the parenthesized group (or the whole statement) that contains `at`. */
+function enclosingGroup(sql: string, at: number, length: number): string {
+  let start = 0;
+  for (let index = at - 1, depth = 0; index >= 0; index -= 1) {
+    if (sql[index] === ")") depth += 1;
+    else if (sql[index] === "(" && depth-- === 0) {
+      start = index + 1;
+      break;
+    }
+  }
+  let end = sql.length;
+  for (let index = at + length, depth = 0; index < sql.length; index += 1) {
+    if (sql[index] === "(") depth += 1;
+    else if (sql[index] === ")" && depth-- === 0) {
+      end = index;
+      break;
+    }
+  }
+  return sql.slice(start, end);
+}
+
+/** A group without its nested subqueries ("(SELECT …)" / "(WITH …)"). */
+function withoutSubqueries(group: string): string {
+  let out = group;
+  for (let at = out.search(/\(\s*(SELECT|WITH)\b/i); at >= 0; at = out.search(/\(\s*(SELECT|WITH)\b/i)) {
+    const close = closingParen(out, at);
+    if (close < 0) break;
+    out = `${out.slice(0, at)} __subquery__ ${out.slice(close + 1)}`;
+  }
+  return out;
+}
+
+/** Columns a restricted statement reads through a fragment that does not project them. */
+function unprojectedColumnReads(sql: string): string[] {
+  return columnReadCheck(sql).offenders;
+}
+
+/** …and how many column references were checked (for the non-vacuity assertion). */
+function columnReadCheck(sql: string, kinds: readonly FragmentKind[] = FRAGMENT_KINDS): { offenders: string[]; checked: number } {
+  const spans = fragmentSpans(sql, kinds);
+  if (!spans.length) return { offenders: [], checked: 0 };
+  const offenders: string[] = [];
+  let checked = 0;
+  let masked = "";
+  let cursor = 0;
+  spans.forEach((span, index) => {
+    masked += `${sql.slice(cursor, span.start)} __sf${index}__ ${span.alias ? `AS ${span.alias}` : ""}`;
+    cursor = span.end;
+  });
+  masked = blankStrings(masked + sql.slice(cursor));
+
+  // Aliased fragments: every alias.column must be projected by that fragment.
+  const aliases = new Map<string, FragmentKind>();
+  for (const span of spans.filter((candidate) => candidate.alias)) {
+    const bound = aliases.get(span.alias!);
+    if (bound && bound !== span.kind) offenders.push(`alias ${span.alias} names both ${bound.table} and ${span.kind.table}`);
+    aliases.set(span.alias!, span.kind);
+  }
+  for (const [alias, kind] of aliases) {
+    // The same alias bound to a non-fragment source in this statement would make the check meaningless.
+    if (new RegExp(String.raw`\b(?:FROM|JOIN)\s+(?!__sf)[a-z_][a-z0-9_]*(?:\s+FINAL)?\s+(?:AS\s+)?${alias}\b`, "i").test(masked)) {
+      offenders.push(`alias ${alias} also names a non-fragment source`);
+    }
+    for (const match of masked.matchAll(new RegExp(String.raw`\b${alias}\.([a-z_][a-z0-9_]*)\b`, "g"))) {
+      checked += 1;
+      if (!kind.columns.includes(match[1])) offenders.push(`${alias}.${match[1]} (${kind.table})`);
+    }
+  }
+
+  // Unaliased fragments: the unqualified columns of the block they are the FROM of.
+  spans.forEach((span, index) => {
+    if (span.alias) return;
+    const marker = `__sf${index}__`;
+    const group = withoutSubqueries(enclosingGroup(masked, masked.indexOf(marker), marker.length));
+    const others = spans.filter((other, otherIndex) => otherIndex !== index && group.includes(`__sf${otherIndex}__`));
+    const tokens = group
+      .replace(/\{[^}]*\}/g, " ")
+      .replace(/\b[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*\b/gi, " ")
+      .replace(/\bAS\s+[a-z_][a-z0-9_]*\b/gi, " ")
+      .matchAll(/\b([a-z_][a-z0-9_]*)\b(?!\s*\()/g);
+    for (const [, token] of tokens) {
+      if (!span.kind.schema.includes(token)) continue;
+      checked += 1;
+      if (span.kind.columns.includes(token)) continue;
+      if (others.some((other) => other.kind.columns.includes(token))) continue;
+      offenders.push(`${token} (${span.kind.table}, unaliased)`);
+    }
+  });
+  return { offenders: [...new Set(offenders)], checked };
+}
+
+describe("7. restricted SQL reads only the columns its scope fragments project (access Phase 2, M15)", () => {
+  let corpus: RecordedStatement[] = [];
+
+  beforeAll(async () => {
+    const extra: Array<[string, Record<string, unknown>]> = [
+      ["clickhouse-cohorts", { action: "details", funnel_key: { campaign_path: FUNNELS.A.path }, date_from: SCOPE_DAYS[0], date_to: SCOPE_DAYS[1], filters: { media_buyer: ["utm:facebook"] } }],
+      ["clickhouse-cohorts", { action: "list", filters: { campaign_path_exclude: [FUNNELS.B.path], refund_status: "refunded", platform: ["ios"] } }],
+      ["clickhouse-revenue", { action: "bundle", bucket: "week", filters: { campaign_path: [FUNNELS.A.path], country: ["US"] } }],
+      ["clickhouse-facebook", { action: "report", level: "ad", filters: { buyer: ["Alice"], ad_account_id: ["act_shared"], campaign_id: ["fb_a"] } }],
+      ["clickhouse-facebook", { action: "status", level: "adset" }],
+    ];
+    corpus = [...await restrictedStatementCorpus(PERSONAS.buyerA), ...await restrictedStatementCorpus(PERSONAS.buyerAB)];
+    for (const [fn, body] of extra) {
+      const result = await readThroughRouter(PERSONAS.buyerA, fn, body);
+      if (result.status !== 200) throw new Error(`${fn} ${JSON.stringify(body)}: ${result.status} ${result.text.slice(0, 300)}`);
+      corpus.push(...result.clickhouse.statements);
+    }
+  }, 120_000);
+
+  it("the projection lists name real columns: TX_COLS ⊂ analytics_transactions minus the payloads, FC_COLS / FB_COLS = the whole table", () => {
+    const tx = ddlColumns(CREATE_ANALYTICS_TRANSACTIONS_SQL);
+    expect(tx.length).toBeGreaterThan(50);
+    expect(TX_COLS.filter((column) => !tx.includes(column))).toEqual([]);
+    expect(TX_COLS).not.toContain("raw_payload");
+    expect(TX_COLS).not.toContain("normalized_payload");
+    expect([...FC_COLS].sort()).toEqual(ddlColumns(CREATE_FACT_USER_COHORTS_SQL).sort());
+    expect([...FB_COLS].sort()).toEqual(ddlColumns(CREATE_FACT_FACEBOOK_STATS_SQL).sort());
+    for (const kind of FRAGMENT_KINDS) expect(kind.columns.filter((column) => !kind.schema.includes(column)), kind.table).toEqual([]);
+  });
+
+  it("covers every scope fragment kind, aliased and not (non-vacuous)", () => {
+    expect(corpus.length).toBeGreaterThan(60);
+    const kinds = new Set<string>();
+    let aliased = 0;
+    let unaliased = 0;
+    for (const statement of corpus) {
+      for (const span of fragmentSpans(statement.query)) {
+        kinds.add(span.kind.table);
+        if (span.alias) aliased += 1;
+        else unaliased += 1;
+      }
+    }
+    expect([...kinds].sort()).toEqual(FRAGMENT_KINDS.map((kind) => kind.table).sort());
+    expect(aliased).toBeGreaterThan(10);
+    expect(unaliased).toBeGreaterThan(10);
+  });
+
+  it("no restricted statement reads a column its fragment does not project", () => {
+    const results = corpus.map((statement) => ({ statement, ...columnReadCheck(statement.query) }));
+    const offenders = results.flatMap(({ statement, offenders: found }) => found.map((offender) => `${offender} in: ${statement.query.replace(/\s+/g, " ").slice(0, 140)}`));
+    expect([...new Set(offenders)]).toEqual([]);
+    expect(results.reduce((sum, result) => sum + result.checked, 0)).toBeGreaterThan(500);
+  });
+
+  it("the corpus exercises the lint: a projection missing columns the runners read is flagged, aliased and unaliased", () => {
+    const trimmed: Record<string, readonly string[]> = {
+      analytics_transactions: ["billing_reason", "utm_source", "media_buyer", "transaction_date"],
+      fact_user_cohorts: ["platform", "price_plan"],
+      fact_facebook_stats: ["adset_name", "spend"],
+    };
+    const kinds = FRAGMENT_KINDS.map((kind) => ({ ...kind, columns: kind.columns.filter((column) => !(trimmed[kind.table] ?? []).includes(column)) }));
+    const flagged = new Set(corpus.flatMap((statement) => columnReadCheck(statement.query, kinds).offenders));
+    for (const expected of [
+      "a.billing_reason (analytics_transactions)", "utm_source (analytics_transactions, unaliased)", "transaction_date (analytics_transactions, unaliased)",
+      "fc.platform (fact_user_cohorts)", "price_plan (fact_user_cohorts, unaliased)", "spend (fact_facebook_stats, unaliased)",
+    ]) {
+      expect(flagged.has(expected), `${expected} in ${[...flagged].join(" | ")}`).toBe(true);
+    }
+  });
+});
+
+// =========================================================================================
 // the lints are not vacuous: each one flags a known-bad snippet
 // =========================================================================================
 
@@ -884,6 +1180,18 @@ describe("the lints catch known-bad code (self-test)", () => {
     ].join("\n")));
     expect(offenders).toHaveLength(7);
     expect(offenders.join("\n")).not.toContain("push('fine')");
+  });
+
+  it("restricted reads of columns a scope fragment does not project", () => {
+    const tx = `${FRAGMENT_KINDS[0].head}auth_user_id = {auth_user_id:String} AND user_id IN (SELECT canonical_user_id FROM fact_user_cohorts FINAL WHERE 0))`;
+    expect(unprojectedColumnReads(`SELECT a.user_id, sum(a.gross_amount_usd) g FROM ${tx} AS a WHERE a.is_success = 1 GROUP BY a.user_id`)).toEqual([]);
+    expect(unprojectedColumnReads(`SELECT a.raw_payload, a.is_refund FROM ${tx} AS a`)).toEqual(["a.raw_payload (analytics_transactions)", "a.is_refund (analytics_transactions)"]);
+    expect(unprojectedColumnReads(
+      `SELECT sum(gross_amount_usd) AS source FROM ${tx} WHERE country_code = 'US' AND user_id IN (SELECT user_id FROM other WHERE processor = 'x')`,
+    )).toEqual(["country_code (analytics_transactions, unaliased)"]);
+    expect(unprojectedColumnReads(`SELECT a.user_id FROM finx AS a INNER JOIN ${tx} AS a ON 1`)).toEqual(["alias a also names a non-fragment source"]);
+    // The owner's text has no fragment: nothing to check.
+    expect(unprojectedColumnReads("SELECT raw_payload FROM analytics_transactions FINAL WHERE auth_user_id = {auth_user_id:String}")).toEqual([]);
   });
 
   it("swallowing catches", () => {

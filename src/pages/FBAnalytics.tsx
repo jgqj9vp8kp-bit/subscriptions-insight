@@ -54,6 +54,7 @@ import {
 } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { FbWarehouseAnalytics } from "@/components/FbWarehouseAnalytics";
+import { FunnelScopeBanner } from "@/components/access/FunnelScopeBanner";
 import { useToast } from "@/hooks/use-toast";
 import { ChartContainer, ChartTooltip, ChartTooltipContent, type ChartConfig } from "@/components/ui/chart";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
@@ -503,6 +504,8 @@ const roasChartConfig = {
  * over the downloaded transaction warehouse and the raw Capsuled tables, so
  * they are the data owner's view only (rawAccess; legacy ⇒ true). Everyone else
  * gets the server-driven warehouse tab alone — there is no other tab to land on.
+ * A funnel-restricted member gets that tab too, scoped server-side to the
+ * campaigns of their funnels (campaign / ad set / ad levels only).
  * UX only — the Edge gate is authoritative. */
 export default function FBAnalyticsPage() {
   const access = useAccess();
@@ -514,9 +517,14 @@ function FBAnalyticsWarehousePage() {
   return (
     <AppLayout title="FB-Analytics" description="Facebook traffic performance by Campaign ID">
       <section className="space-y-4">
-        <Card className="p-3 text-xs text-muted-foreground shadow-card" data-testid="fb-analytics-server-only-note">
-          Showing the server-computed Facebook warehouse. The blended (browser-computed) views are available to the data owner only.
-        </Card>
+        {/* A funnel-restricted member sees which funnels (and campaigns) the tab covers instead. */}
+        {access.restricted ? (
+          <FunnelScopeBanner surface="fb" />
+        ) : (
+          <Card className="p-3 text-xs text-muted-foreground shadow-card" data-testid="fb-analytics-server-only-note">
+            Showing the server-computed Facebook warehouse. The blended (browser-computed) views are available to the data owner only.
+          </Card>
+        )}
         {/* Reconciliation history is a diagnostics surface (recon_history). */}
         {access.can("admin.diagnostics.view") && <FbWarehouseHealth />}
         <FbWarehouseAnalytics />

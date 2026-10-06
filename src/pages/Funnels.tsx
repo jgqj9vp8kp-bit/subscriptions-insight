@@ -2,6 +2,10 @@
 // conversion or trial metrics belong on this page (see the plan's out-of-scope
 // list). Data comes from Postgres via @/services/funnels; ClickHouse is only
 // consulted by the "Import from warehouse" bootstrap action (Phase 6).
+// A funnel's campaign paths (funnel_paths, access Phase 2) render as chips:
+// the current path plus the old (retired) ones that still count for it. A
+// funnel-restricted member reads only their own funnels (registry RLS), and
+// the page is read-only for them like for any member without funnels.manage.
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Activity, ArrowDown, ArrowUp, ArrowUpDown, ChevronDown, Download, Loader2, RefreshCw, Route } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
@@ -29,9 +33,11 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useToast } from "@/hooks/use-toast";
-import { useCan } from "@/hooks/useAccess";
+import { useAccess } from "@/hooks/useAccess";
+import { FunnelPathChips } from "@/components/access/FunnelPathChips";
 import {
   importFunnelFoxFunnels,
+  isGrantingFunnelPath,
   isPassportComplete,
   listFunnelFoxFunnels,
   listFunnels,
@@ -61,7 +67,8 @@ export default function FunnelsPage() {
   // Registry writes (status switch, recompute, FunnelFox import, passport edits)
   // need funnels.manage; funnels.view alone is a read-only registry. UX only —
   // the server (RLS / Edge) is authoritative.
-  const canManage = useCan("funnels.manage");
+  const access = useAccess();
+  const canManage = access.can("funnels.manage");
   const [funnels, setFunnels] = useState<FunnelRecord[]>([]);
   const [tags, setTags] = useState<TagRecord[]>([]);
   const [loading, setLoading] = useState(false);
@@ -180,11 +187,17 @@ export default function FunnelsPage() {
     setImporting(true);
     try {
       const result = await importFunnelFoxFunnels(selected);
+      const skipped = result.skipped?.length ?? 0;
       toast({
         title: `Imported ${result.importedFunnels} funnel${result.importedFunnels === 1 ? "" : "s"}`,
-        description: result.createdTags
-          ? `${result.createdTags} new tag${result.createdTags === 1 ? "" : "s"} created from FunnelFox labels.`
-          : "Tags mirrored from FunnelFox.",
+        description: [
+          result.createdTags
+            ? `${result.createdTags} new tag${result.createdTags === 1 ? "" : "s"} created from FunnelFox labels.`
+            : "Tags mirrored from FunnelFox.",
+          skipped
+            ? `${skipped} skipped: ${skipped === 1 ? "its path already belongs" : "their paths already belong"} to another funnel or ${skipped === 1 ? "has" : "have"} no usable campaign path.`
+            : "",
+        ].filter(Boolean).join(" "),
       });
       setImportOpen(false);
       await refresh();
@@ -253,7 +266,8 @@ export default function FunnelsPage() {
         if (!selectedTagIds.some((id) => funnelTagIds.has(id))) return false;
       }
       if (query) {
-        const haystack = `${funnel.display_name} ${funnel.funnel_path}`.toLowerCase();
+        const paths = (funnel.paths ?? []).map((entry) => entry.path).join(" ");
+        const haystack = `${funnel.display_name} ${funnel.funnel_path} ${paths}`.toLowerCase();
         if (!haystack.includes(query)) return false;
       }
       return true;
@@ -447,7 +461,17 @@ export default function FunnelsPage() {
                     <TableCell className="font-medium">
                       {funnel.display_name || <span className="text-muted-foreground">—</span>}
                     </TableCell>
-                    <TableCell className="font-mono text-xs">{funnel.funnel_path}</TableCell>
+                    <TableCell className="font-mono text-xs">
+                      {(funnel.paths ?? []).some(isGrantingFunnelPath) ? (
+                        <FunnelPathChips paths={funnel.paths} />
+                      ) : (
+                        // No granted path (e.g. the registry path has no canonical
+                        // form): the funnel grants no data; show what is stored.
+                        <span className="text-muted-foreground" title="No campaign path of this funnel grants access yet">
+                          {funnel.funnel_path}
+                        </span>
+                      )}
+                    </TableCell>
                     <TableCell>
                       {funnel.tags.length ? (
                         <div className="flex flex-wrap gap-1">
@@ -501,6 +525,11 @@ export default function FunnelsPage() {
                       </span>
                     ) : hasFilters ? (
                       "No funnels match the current filters"
+                    ) : access.restricted ? (
+                      <span className="inline-flex items-center gap-2">
+                        <Route className="h-4 w-4" />
+                        No funnels are assigned to you.
+                      </span>
                     ) : (
                       <span className="inline-flex items-center gap-2">
                         <Route className="h-4 w-4" />

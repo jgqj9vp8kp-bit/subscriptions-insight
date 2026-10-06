@@ -7,7 +7,8 @@
 //  E. the purge registry handlers of every cache owner;
 //  F. IndexedDB datasets: raw access only, partition-stamped;
 //  G. usePersistedPageState keys are principal-suffixed;
-//  H. SavedDataAutoLoader runs per partition and only with raw access.
+//  H. SavedDataAutoLoader runs per partition and only with raw access;
+//  I. the page hooks type a funnel-restricted 409 / 403 and poll only the 409.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, render, renderHook, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
@@ -64,6 +65,10 @@ import {
 } from "@/services/clickhouse";
 import { transientRetry, useWarehouseVersion } from "@/hooks/useAnalyticsCache";
 import { prefetchCohortsNav, useCohortsListQuery } from "@/hooks/useCohortsCache";
+import { useRevenueBundle } from "@/hooks/useRevenueIntelligence";
+import { useFbReportQuery } from "@/hooks/useFbWarehouse";
+import type { RevenueIntelligenceRequest } from "@/services/revenueIntelligence";
+import type { FbReportQuery } from "@/services/fbWarehouse";
 import { useUsersData } from "@/hooks/useUsersCache";
 import { AccessContext, buildAccessValue, type AccessContextValue } from "@/contexts/accessContext";
 import type { MyAccess } from "@/services/accessClient";
@@ -793,5 +798,70 @@ describe("H. AnalyticsCacheGate / SavedDataAutoLoader", () => {
     const owner = buildAccessValue({ status: "ok", access: okRow({ user_id: "user-a", raw_access: true, is_data_owner: true, partition: "p-owner" }), userId: "user-a" });
     view.rerender(tree(owner));
     await waitFor(() => expect(loader.autoLoadWarehouseIntoStore).toHaveBeenCalledTimes(2));
+  });
+});
+
+// =========================================================================================
+// I. funnel-restricted pending state (access Phase 2: 409 scope_snapshot_not_ready)
+// =========================================================================================
+
+describe("I. the page hooks on a funnel-restricted 409 / 403", () => {
+  const restrictedAccess = () =>
+    buildAccessValue({
+      status: "ok",
+      access: okRow({ funnel_scope: { mode: "selected", funnel_ids: ["f-a"], paths: ["soulmate-sketch"] }, partition: "p-buyer" }),
+      userId: "user-b",
+    });
+  const refused = (status: number, code: string) =>
+    edgeHttpError(status, { ok: false, error_code: code, error: `Request refused (${code}).`, request_id: "r-1" });
+  const revenueRequest: RevenueIntelligenceRequest = { action: "bundle", bucket: "day", date_from: null, date_to: null, filters: { campaign_path: [], price_plan: [] } };
+  const fbQuery: FbReportQuery = { level: "campaign", date_from: null, date_to: null, buyer: [], ad_account_id: [], campaign_id: [] };
+
+  function mountHooks(client: QueryClient) {
+    return renderHook(
+      () => ({
+        revenue: useRevenueBundle({ request: revenueRequest, userScopeHash: "x", warehouseVersion: "whv_x", enabled: true }),
+        cohorts: useCohortsListQuery({ request: cohortsRequest, dataSource: "clickhouse", userScopeHash: "x", warehouseVersion: "whv_x", enabled: true }),
+        fb: useFbReportQuery({ query: fbQuery, userScopeHash: "x", warehouseVersion: "fbv_x", enabled: true }),
+      }),
+      { wrapper: hookWrapper(client, restrictedAccess()) },
+    );
+  }
+
+  /** The refetchInterval each hook's query resolves to right now. */
+  function intervals(client: QueryClient) {
+    return ["revenue", "cohorts", "fb-analytics"].map((root) => {
+      const query = client.getQueryCache().findAll({ queryKey: [root] })[0];
+      const option = query?.observers[0]?.options.refetchInterval;
+      return typeof option === "function" ? option(query as never) : option;
+    });
+  }
+
+  it("409 scope_snapshot_not_ready: typed code + status, the revenue card code, never retried or the breaker, polled every 60 s", async () => {
+    sb.invoke.mockImplementation(async () => refused(409, "scope_snapshot_not_ready"));
+    const client = new QueryClient();
+    const { result } = mountHooks(client);
+    await waitFor(() => {
+      expect(result.current.revenue.errorCode).toBe("scope_snapshot_not_ready");
+      expect(result.current.cohorts.chStatus.errorCode).toBe("scope_snapshot_not_ready");
+      expect(result.current.fb.errorCode).toBe("scope_snapshot_not_ready");
+    });
+    expect(result.current.revenue).toMatchObject({ error: "cohort_snapshot_not_ready", errorStatus: 409 });
+    expect(result.current.cohorts.chStatus.errorStatus).toBe(409);
+    expect(result.current.fb.errorStatus).toBe(409);
+    // One request per hook: a 409 is never retried per query, and never opens the breaker.
+    expect(sb.invoke).toHaveBeenCalledTimes(3);
+    expect(isClickHouseCircuitOpen()).toBe(false);
+    expect(intervals(client)).toEqual([60_000, 60_000, 60_000]);
+  });
+
+  it("403 scope_not_supported is typed but never polled", async () => {
+    sb.invoke.mockImplementation(async () => refused(403, "scope_not_supported"));
+    const client = new QueryClient();
+    const { result } = mountHooks(client);
+    await waitFor(() => expect(result.current.cohorts.chStatus.errorCode).toBe("scope_not_supported"));
+    await waitFor(() => expect(result.current.fb.errorStatus).toBe(403));
+    expect(result.current.revenue.error).toMatch(/^ClickHouse Edge Function failed:/);
+    expect(intervals(client)).toEqual([false, false, false]);
   });
 });

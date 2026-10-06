@@ -565,6 +565,7 @@ describe("Funnels", () => {
       display_name: "Soulmate",
       is_active: true,
       tags: [],
+      paths: [{ id: "1", path: "soulmate-1", status: "active" }],
       created_at: "2026-09-01T00:00:00Z",
       updated_at: "2026-09-02T00:00:00Z",
     }];
@@ -580,6 +581,8 @@ describe("Funnels", () => {
     const row = toggle.closest("tr") as HTMLElement;
     expect(within(row).getByText(/заполнен/i)).toBeInTheDocument();
     expect(within(row).queryByRole("button")).toBeNull();
+    // The funnel's granted campaign path renders as a chip (funnel_paths, Phase 2).
+    expect(within(row).getByTestId("funnel-path-chip")).toHaveTextContent("soulmate-1");
   });
 
   it("funnels.manage (and the owner) keep every registry control", async () => {

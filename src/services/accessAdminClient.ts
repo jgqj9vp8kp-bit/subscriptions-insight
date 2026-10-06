@@ -36,7 +36,10 @@ export type AccessAdminAction =
   | "roles.delete"
   | "roles.seed_templates"
   | "audit.list"
-  | "funnels.list";
+  | "funnels.list"
+  | "paths.coverage"
+  | "paths.attach"
+  | "paths.set_status";
 
 export type FunnelScopeMode = "all" | "selected" | "none";
 
@@ -101,7 +104,8 @@ export interface EffectiveAccess {
   /** Effective keys (server effectivePermissions()); [] while disabled. */
   permissions: string[];
   raw_access: boolean;
-  funnel_scope: AdminFunnelScope & { names: string[] };
+  /** paths: the sorted granted (active ∪ retired) paths of the selected funnels. */
+  funnel_scope: AdminFunnelScope & { names: string[]; paths: string[] };
 }
 
 export interface AuditEvent {
@@ -126,12 +130,87 @@ export interface AuditPage {
   next_before_id: number | null;
 }
 
+export type FunnelPathStatus = "proposed" | "active" | "retired" | "revoked";
+export type FunnelPathSource = "registry_seed" | "registry" | "funnelfox_alias_seed" | "admin_alias";
+
+/** One public.funnel_paths row (access Phase 2, SHARED CONTRACT 8). Only
+ * active and retired rows grant access; the bigint id travels as a string. */
+export interface AdminFunnelPath {
+  id: string;
+  funnel_id: string;
+  path: string;
+  status: FunnelPathStatus;
+  source: FunnelPathSource;
+  funnelfox_funnel_id: string | null;
+  note: string;
+  confirmed_at: string | null;
+  retired_at: string | null;
+  revoked_at: string | null;
+}
+
 export interface AdminFunnelOption {
   id: string;
   funnel_path: string;
   display_name: string;
   is_active: boolean;
   tags: string[];
+  /** Every funnel_paths row of the funnel, any status (active, retired,
+   * proposed, then revoked). */
+  paths: AdminFunnelPath[];
+}
+
+export type PathCoverageState = "granted" | "proposed" | "unregistered" | "unscopable";
+
+/** One anchor campaign_path of the active cohort snapshot, diffed against the
+ * funnel registry. */
+export interface FunnelCoveragePath {
+  path: string;
+  /** Real (non-synthetic) users anchored to the path. */
+  users: number;
+  synthetic_users: number;
+  /** Lifetime net revenue (USD) of every user anchored here. */
+  net_revenue: number;
+  first_cohort_date: string | null;
+  last_cohort_date: string | null;
+  state: PathCoverageState;
+  /** The granting row (state granted), else null. */
+  funnel_id: string | null;
+  path_id: string | null;
+  path_status: FunnelPathStatus | null;
+  /** Every proposed row for this path (a granted path may still have some). */
+  proposals: Array<{ path_id: string; funnel_id: string }>;
+  /** Only for a retired grant: users anchored since it was retired. */
+  users_since_retired: number | null;
+}
+
+/** paths.coverage → 200: how much of the active cohort snapshot the registry
+ * attributes to a funnel (restricted members never see the rest). */
+export interface FunnelCoverage {
+  ok: true;
+  snapshot: { status: "current" | "stale"; warehouse_version: string; generated_at: string | null };
+  totals: {
+    users: number;
+    synthetic_users: number;
+    registered_users: number;
+    registered_pct: number;
+    net_revenue: number;
+    registered_net_revenue: number;
+  };
+  paths: FunnelCoveragePath[];
+  /** Retired grants that still collect new users (the path may have been reused). */
+  reuse_alerts: Array<{ path: string; funnel_id: string; path_id: string; retired_at: string; users_since_retired: number }>;
+  funnels: Array<{ funnel_id: string; users: number; net_revenue: number; granted_paths: number }>;
+  /** Funnel ids whose granted paths hold no user of the snapshot. */
+  registry_without_data: string[];
+}
+
+/** paths.attach / paths.set_status → 200. */
+export interface PathMutationResult {
+  ok: true;
+  changed: boolean;
+  path: AdminFunnelPath;
+  /** Active members whose selected scope holds the path's funnel. */
+  affected_members: number;
 }
 
 export interface AuditQuery {
@@ -294,12 +373,13 @@ export function parseEffectiveAccess(value: unknown): EffectiveAccess | null {
   const row = asRecord(value);
   if (!row) return null;
   const scope = parseScope(row.funnel_scope);
+  const scopeRow = asRecord(row.funnel_scope);
   return {
     status: text(row.status) ?? "",
     role: parseRoleRef(row.role),
     permissions: stringArray(row.permissions),
     raw_access: row.raw_access === true,
-    funnel_scope: { ...scope, names: stringArray(asRecord(row.funnel_scope)?.names) },
+    funnel_scope: { ...scope, names: stringArray(scopeRow?.names), paths: scope.mode === "selected" ? stringArray(scopeRow?.paths) : [] },
   };
 }
 
@@ -326,6 +406,38 @@ function parseAuditEvent(value: unknown): AuditEvent | null {
   };
 }
 
+const FUNNEL_PATH_STATUSES: ReadonlySet<string> = new Set(["proposed", "active", "retired", "revoked"]);
+const FUNNEL_PATH_SOURCES: ReadonlySet<string> = new Set(["registry_seed", "registry", "funnelfox_alias_seed", "admin_alias"]);
+const COVERAGE_STATES: ReadonlySet<string> = new Set(["granted", "proposed", "unregistered", "unscopable"]);
+
+function pathStatus(value: unknown): FunnelPathStatus | null {
+  return typeof value === "string" && FUNNEL_PATH_STATUSES.has(value) ? (value as FunnelPathStatus) : null;
+}
+
+/** A funnel_paths row. An unknown status is dropped (it must never read as a
+ * grant); `parentFunnelId` fills funnel_id for rows nested under a funnel. */
+export function parseAdminFunnelPath(value: unknown, parentFunnelId: string | null = null): AdminFunnelPath | null {
+  const row = asRecord(value);
+  const id = nonEmpty(row?.id);
+  const funnelId = nonEmpty(row?.funnel_id) ?? parentFunnelId;
+  const path = nonEmpty(row?.path) ?? nonEmpty(row?.path_canonical);
+  const status = pathStatus(row?.status);
+  if (!row || !id || !funnelId || !path || !status) return null;
+  const source = text(row.source) ?? "";
+  return {
+    id,
+    funnel_id: funnelId,
+    path,
+    status,
+    source: (FUNNEL_PATH_SOURCES.has(source) ? source : "registry") as FunnelPathSource,
+    funnelfox_funnel_id: nonEmpty(row.funnelfox_funnel_id),
+    note: text(row.note) ?? "",
+    confirmed_at: nonEmpty(row.confirmed_at),
+    retired_at: nonEmpty(row.retired_at),
+    revoked_at: nonEmpty(row.revoked_at),
+  };
+}
+
 function parseFunnelOption(value: unknown): AdminFunnelOption | null {
   const row = asRecord(value);
   const id = nonEmpty(row?.id);
@@ -336,6 +448,77 @@ function parseFunnelOption(value: unknown): AdminFunnelOption | null {
     display_name: text(row.display_name) ?? "",
     is_active: row.is_active === true,
     tags: stringArray(row.tags),
+    paths: Array.isArray(row.paths) ? row.paths.map((entry) => parseAdminFunnelPath(entry, id)).filter(keep) : [],
+  };
+}
+
+function finite(value: unknown): number {
+  const parsed = typeof value === "number" ? value : typeof value === "string" && value.trim() !== "" ? Number(value) : NaN;
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function parseCoveragePath(value: unknown): FunnelCoveragePath | null {
+  const row = asRecord(value);
+  if (!row || typeof row.path !== "string") return null;
+  const state = text(row.state) ?? "";
+  return {
+    path: row.path,
+    users: finite(row.users),
+    synthetic_users: finite(row.synthetic_users),
+    net_revenue: finite(row.net_revenue),
+    first_cohort_date: nonEmpty(row.first_cohort_date),
+    last_cohort_date: nonEmpty(row.last_cohort_date),
+    // Unknown states read as unscopable: never offered for a write.
+    state: (COVERAGE_STATES.has(state) ? state : "unscopable") as PathCoverageState,
+    funnel_id: nonEmpty(row.funnel_id),
+    path_id: nonEmpty(row.path_id),
+    path_status: pathStatus(row.path_status),
+    proposals: list(row.proposals, (entry) => {
+      const proposal = asRecord(entry);
+      const pathId = nonEmpty(proposal?.path_id);
+      const funnelId = nonEmpty(proposal?.funnel_id);
+      return pathId && funnelId ? { path_id: pathId, funnel_id: funnelId } : null;
+    }),
+    users_since_retired: row.users_since_retired === null || row.users_since_retired === undefined ? null : finite(row.users_since_retired),
+  };
+}
+
+export function parseFunnelCoverage(value: unknown): FunnelCoverage | null {
+  const row = asRecord(value);
+  const snapshot = asRecord(row?.snapshot);
+  const totals = asRecord(row?.totals);
+  if (!row || !snapshot || !totals) return null;
+  return {
+    ok: true,
+    snapshot: {
+      status: snapshot.status === "current" ? "current" : "stale",
+      warehouse_version: text(snapshot.warehouse_version) ?? "",
+      generated_at: nonEmpty(snapshot.generated_at),
+    },
+    totals: {
+      users: finite(totals.users),
+      synthetic_users: finite(totals.synthetic_users),
+      registered_users: finite(totals.registered_users),
+      registered_pct: finite(totals.registered_pct),
+      net_revenue: finite(totals.net_revenue),
+      registered_net_revenue: finite(totals.registered_net_revenue),
+    },
+    paths: list(row.paths, parseCoveragePath),
+    reuse_alerts: list(row.reuse_alerts, (entry) => {
+      const alert = asRecord(entry);
+      const path = nonEmpty(alert?.path);
+      const funnelId = nonEmpty(alert?.funnel_id);
+      const pathId = nonEmpty(alert?.path_id);
+      if (!alert || !path || !funnelId || !pathId) return null;
+      return { path, funnel_id: funnelId, path_id: pathId, retired_at: text(alert.retired_at) ?? "", users_since_retired: finite(alert.users_since_retired) };
+    }),
+    funnels: list(row.funnels, (entry) => {
+      const funnel = asRecord(entry);
+      const funnelId = nonEmpty(funnel?.funnel_id);
+      if (!funnel || !funnelId) return null;
+      return { funnel_id: funnelId, users: finite(funnel.users), net_revenue: finite(funnel.net_revenue), granted_paths: finite(funnel.granted_paths) };
+    }),
+    registry_without_data: stringArray(row.registry_without_data),
   };
 }
 
@@ -506,4 +689,42 @@ export async function listAccessAudit(query: AuditQuery = {}): Promise<AuditPage
 
 export async function listAccessFunnels(): Promise<AdminFunnelOption[]> {
   return list((await accessAdminRequest("funnels.list")).funnels, parseFunnelOption);
+}
+
+/** Funnel coverage of the active cohort snapshot. A 409 conflict means no
+ * validated snapshot exists yet (the message says so). */
+export async function fetchPathCoverage(): Promise<FunnelCoverage> {
+  const coverage = parseFunnelCoverage(await accessAdminRequest("paths.coverage"));
+  if (!coverage) throw new AccessAdminRequestError("The access service returned no coverage.", { status: 0 });
+  return coverage;
+}
+
+function requirePathResult(body: Record<string, unknown>): PathMutationResult {
+  const path = parseAdminFunnelPath(body.path);
+  if (!path) throw new AccessAdminRequestError("The access service returned no funnel path.", { status: 0 });
+  return { ok: true, changed: body.changed !== false, path, affected_members: integer(body.affected_members) ?? 0 };
+}
+
+/** Grants a canonical campaign path to a funnel (sent as typed: the server
+ * transforms nothing and refuses a path another funnel holds). */
+export async function attachFunnelPath(input: { funnel_id: string; path: string; note?: string }): Promise<PathMutationResult> {
+  return requirePathResult(
+    await accessAdminRequest("paths.attach", {
+      funnel_id: input.funnel_id,
+      path: input.path,
+      ...(input.note ? { note: input.note } : {}),
+    }),
+  );
+}
+
+/** Confirm (proposed → active), reject / revoke (→ revoked), retire
+ * (active → retired) or reactivate (retired → active) one funnel_paths row. */
+export async function setFunnelPathStatus(input: { path_id: string; status: "active" | "retired" | "revoked"; note?: string }): Promise<PathMutationResult> {
+  return requirePathResult(
+    await accessAdminRequest("paths.set_status", {
+      path_id: input.path_id,
+      status: input.status,
+      ...(input.note ? { note: input.note } : {}),
+    }),
+  );
 }

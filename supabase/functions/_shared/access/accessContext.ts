@@ -12,7 +12,15 @@
 //     data owner (D1). Runners receive it as `authUserId`.
 //   * restricted = funnel scope is not `all`. Restricted contexts are denied on
 //     every action not explicitly marked scopeReady (R6), and the ScopedReader
-//     records a violation for any protected-table read (R7).
+//     records a violation for any protected-table read outside a registered
+//     scope fragment (R7).
+//
+// Hardening (Phase 2, spec §3.6): contexts are issued only by the two builders
+// below. Each is frozen (actor, role, scope and its arrays included; permissions
+// is a read-only Set facade) and remembered in a private WeakSet, so
+// createScopedReader / createRestrictedScopeSql can refuse a hand-made or
+// spread copy (isIssuedAccessContext). `violations` alone stays a mutable array:
+// the reader and the gate append to it.
 
 import { ENFORCED_PERMISSION_KEYS, effectivePermissions } from "./permissions.ts";
 import { canonicalFunnelIds, canonicalScopePaths, type FunnelScope } from "./scope.ts";
@@ -35,25 +43,25 @@ export interface AccessRole {
 }
 
 export interface AccessContext {
-  requestId: string;
-  actor: AccessActor;
+  readonly requestId: string;
+  readonly actor: AccessActor;
   /** workspace data_key; bind to {auth_user_id:String}; NEVER the caller unless the caller is the data owner. */
-  tenantKey: string;
+  readonly tenantKey: string;
   /** Empty string in cron contexts (workspace_data_key() returns only the key; the workspace is a singleton). */
-  workspaceId: string;
+  readonly workspaceId: string;
   /** The data owner only (actor.userId === tenantKey): raw-download / client-compute paths (D8). */
-  rawAccess: boolean;
-  role: AccessRole | null;
+  readonly rawAccess: boolean;
+  readonly role: AccessRole | null;
   /** Effective permissions (§8): enforced, requires-satisfied, full-scope keys only with scope `all`. */
-  permissions: ReadonlySet<string>;
-  scope: { funnel: FunnelScope };
+  readonly permissions: ReadonlySet<string>;
+  readonly scope: { readonly funnel: FunnelScope };
   /** funnel scope mode !== "all" */
-  restricted: boolean;
-  accessVersion: string;
+  readonly restricted: boolean;
+  readonly accessVersion: string;
   /** Server-issued client cache partition (§20). */
-  partition: string;
+  readonly partition: string;
   /** Recorded by the ScopedReader; the serve wrapper turns a non-empty list into a 500. */
-  violations: string[];
+  readonly violations: string[];
 }
 
 /** Policy of one canonical action of one function (§10 step 4). */
@@ -70,6 +78,13 @@ export interface ActionPolicy {
   fullScopeOnly?: boolean;
   /** The action's reads go through scope helpers; restricted contexts may call it (Milestone B). */
   scopeReady?: boolean;
+  /** Restricted contexts only (requires scopeReady): the gate loads the cohort
+   * snapshot state and answers 409 scope_snapshot_not_ready unless it is fresh
+   * and validated; "campaign" also requires the FB campaign scope (spec §3.5). */
+  scopeSnapshot?: "cohort" | "campaign";
+  /** Restricted contexts only: at least one of these must be effective, on top
+   * of anyOf / allOf (403 scope_not_supported otherwise). */
+  restrictedAnyOf?: string[];
   /** Mutates state (informational in Phase 1; audit / rate limits key on it later). */
   write?: boolean;
 }
@@ -188,6 +203,62 @@ function funnelScopeOf(row: ResolveAccessRow): FunnelScope {
 const sameId = (a: string | null | undefined, b: string | null | undefined) =>
   typeof a === "string" && typeof b === "string" && a.length > 0 && a.toLowerCase() === b.toLowerCase();
 
+// ---- issued contexts (spec §3.6) ------------------------------------------------
+
+const issuedContexts = new WeakSet<object>();
+
+/** True only for a context returned by buildAccessContext / buildCronAccessContext
+ * (not a spread copy, not a literal): the ScopedReader and the scope-SQL
+ * registry accept nothing else. */
+export function isIssuedAccessContext(ctx: unknown): ctx is AccessContext {
+  return typeof ctx === "object" && ctx !== null && issuedContexts.has(ctx);
+}
+
+/** Read-only view of a permission set: the ReadonlySet surface the gate and the
+ * policies use, frozen, with no add / delete / clear to reach the inner Set. */
+function frozenPermissionSet(keys: Iterable<string>): ReadonlySet<string> {
+  const inner = new Set(keys);
+  const facade = {
+    has: (key: string) => inner.has(key),
+    get size() {
+      return inner.size;
+    },
+    forEach(callback: (value: string, key: string, set: ReadonlySet<string>) => void, thisArg?: unknown): void {
+      inner.forEach((value) => callback.call(thisArg, value, value, facade as unknown as ReadonlySet<string>));
+    },
+    keys: () => inner.keys(),
+    values: () => inner.values(),
+    entries: () => inner.entries(),
+    [Symbol.iterator]: () => inner.values(),
+  };
+  // Cast: newer TS libs add the ES2025 set-algebra methods to ReadonlySet; no
+  // access code calls them, and the facade deliberately exposes nothing else.
+  return Object.freeze(facade) as unknown as ReadonlySet<string>;
+}
+
+function freezeFunnelScope(scope: FunnelScope): FunnelScope {
+  if (scope.mode !== "selected") return Object.freeze({ mode: scope.mode }) as FunnelScope;
+  return Object.freeze({
+    mode: "selected" as const,
+    funnelIds: Object.freeze([...scope.funnelIds]) as string[],
+    paths: Object.freeze([...scope.paths]) as string[],
+  });
+}
+
+function issue(ctx: Omit<AccessContext, "permissions" | "scope" | "violations"> & { permissions: Iterable<string>; scope: { funnel: FunnelScope } }): AccessContext {
+  const issued: AccessContext = Object.freeze({
+    ...ctx,
+    actor: Object.freeze({ ...ctx.actor }),
+    role: ctx.role ? Object.freeze({ ...ctx.role }) : null,
+    permissions: frozenPermissionSet(ctx.permissions),
+    scope: Object.freeze({ funnel: freezeFunnelScope(ctx.scope.funnel) }),
+    // The one mutable member: the reader / gate record violations here.
+    violations: [],
+  });
+  issuedContexts.add(issued);
+  return issued;
+}
+
 /** Builds the context of a USER (or API-key) request from an `ok` resolve_access
  * row. Throws on any other status — the gate maps those before calling. */
 export function buildAccessContext(
@@ -203,7 +274,7 @@ export function buildAccessContext(
   // Defence in depth: the SQL flag alone does not grant raw access — the actor
   // must also BE the data key (D8). A mismatch fails closed to "not raw".
   const rawAccess = actor.kind === "user" && row.raw_access === true && sameId(actor.userId, tenantKey) && sameId(row.user_id, tenantKey);
-  return {
+  return issue({
     requestId,
     actor: { kind: actor.kind, userId: actor.userId, memberId: row.member_id, email: actor.email ?? row.email ?? null },
     tenantKey,
@@ -215,27 +286,25 @@ export function buildAccessContext(
     restricted: funnel.mode !== "all",
     accessVersion: row.access_version,
     partition: row.partition,
-    violations: [],
-  };
+  });
 }
 
 /** Cron context (§10 "Other contexts"): tenant from the workspace, never from the
  * request; every enforced permission; scope all; not raw (no browser). */
 export function buildCronAccessContext(input: { tenantKey: string; workspaceId?: string | null; requestId: string }): AccessContext {
-  return {
+  return issue({
     requestId: input.requestId,
     actor: { kind: "cron", userId: null, memberId: null, email: null },
     tenantKey: input.tenantKey,
     workspaceId: input.workspaceId ?? "",
     rawAccess: false,
     role: null,
-    permissions: new Set(ENFORCED_PERMISSION_KEYS),
+    permissions: ENFORCED_PERMISSION_KEYS,
     scope: { funnel: { mode: "all" } },
     restricted: false,
     accessVersion: "cron",
     partition: `cron:${input.tenantKey}`,
-    violations: [],
-  };
+  });
 }
 
 /** Checks one action policy against a context. null = allowed. Order: identity
@@ -249,5 +318,8 @@ export function authorizeAction(ctx: AccessContext, policy: ActionPolicy | null 
   if (policy.anyOf && !policy.anyOf.some((key) => ctx.permissions.has(key))) return accessDenial(403, ACCESS_ERROR.PERMISSION_DENIED);
   if (policy.fullScopeOnly && ctx.restricted) return accessDenial(403, ACCESS_ERROR.FULL_SCOPE_REQUIRED);
   if (ctx.restricted && !policy.scopeReady) return accessDenial(403, ACCESS_ERROR.SCOPE_NOT_SUPPORTED);
+  if (ctx.restricted && policy.restrictedAnyOf && !policy.restrictedAnyOf.some((key) => ctx.permissions.has(key))) {
+    return accessDenial(403, ACCESS_ERROR.SCOPE_NOT_SUPPORTED);
+  }
   return null;
 }

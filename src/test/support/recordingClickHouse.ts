@@ -24,6 +24,11 @@ export interface RecordedStatement {
   format?: string;
   table?: string;
   values?: Record<string, unknown>[];
+  /** Restricted-read capacity settings (ScopedReader, Phase 2). Present only when
+   * the transport input carried them — owner / cron statements never do. */
+  settings?: Record<string, string | number>;
+  /** Present only when the transport input carried one (restricted reads). */
+  query_id?: string;
 }
 
 /** Rows returned for a query; a thrown error rejects the query (warehouse fault). */
@@ -58,7 +63,12 @@ export function createRecordingClickHouse(responder: ClickHouseResponder = () =>
       return closed;
     },
     async query(input): Promise<ClickHouseResultSet> {
-      const statement = record({ kind: "query", query: String(input.query ?? ""), params: { ...(input.query_params ?? {}) }, format: input.format });
+      const recorded: RecordedStatement = { kind: "query", query: String(input.query ?? ""), params: { ...(input.query_params ?? {}) }, format: input.format };
+      // Only when the input has them, so an owner statement keeps exactly its
+      // Phase-1 shape (the owner SQL golden corpus compares statement fields).
+      if (input.settings !== undefined) recorded.settings = { ...input.settings };
+      if (input.query_id !== undefined) recorded.query_id = input.query_id;
+      const statement = record(recorded);
       const rows = await respond(statement);
       return { json: async () => rows };
     },

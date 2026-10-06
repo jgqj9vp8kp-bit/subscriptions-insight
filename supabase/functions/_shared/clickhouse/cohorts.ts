@@ -18,9 +18,18 @@
 // errors but rethrows a ScopeViolation (plan §13 R7): the access gate turns a
 // recorded violation into a 500 anyway, and rethrowing keeps a swallowed one
 // from silently producing a partial "ok" response first.
+//
+// Funnel scope (access Phase 2): the helpers the materialized Cohorts path
+// shares with this module (support_emails, the data-status probes, FX
+// diagnostics, the details SELECT bodies) take an optional ScopeSql. With the
+// default ALL_SCOPE_SQL their text is exactly today's; a restricted handle
+// swaps each protected-table reference for its scopeSql.ts fragment. The
+// dynamic engine below (runCohortList / runCohortOptions / runCohortDetails)
+// is never reached by a funnel-restricted request.
 
 import type { ClickHouseClientLike, SupabaseLikeClient } from "./types.ts";
 import { ScopeViolation } from "./scopedClient.ts";
+import { ALL_SCOPE_SQL, presenceProbeSql, supportEmailsFrom, txFrom, type ScopeSql } from "./scopeSql.ts";
 import {
   activeSubscriptionsByEmail,
   aggregateActiveSubscriptions,
@@ -402,8 +411,16 @@ export interface RawCohortRow {
   support_users: number;
 }
 
-export function supportEmailsCTE(status: CohortSupportDataStatus = "ready"): string {
+export function supportEmailsCTE(status: CohortSupportDataStatus = "ready", scope: ScopeSql = ALL_SCOPE_SQL): string {
   if (status !== "ready") return `support_emails AS (SELECT '' AS normalized_email WHERE 0)`;
+  // Restricted: only support requests of the member's scoped users' emails.
+  if (scope.restricted) {
+    return `support_emails AS (
+  SELECT DISTINCT lowerUTF8(trim(BOTH ' ' FROM normalized_email)) AS normalized_email
+  FROM ${supportEmailsFrom(scope)}
+  WHERE lowerUTF8(trim(BOTH ' ' FROM normalized_email)) != ''
+)`;
+  }
   return `support_emails AS (
   SELECT DISTINCT lowerUTF8(trim(BOTH ' ' FROM normalized_email)) AS normalized_email
   FROM ${FACT_SUPPORT_REQUESTS_TABLE} FINAL
@@ -454,14 +471,14 @@ export const AGGREGATE_MEASURES = `uniqExact(uid) trial_users,
 // Per-user authoritative first-trial utm_source as an IN-subquery over user ids.
 // argMin picks the utm_source OF the first successful trial (not the first
 // non-empty utm), matching the snapshot engine's trial_transaction_id lookup.
-function firstTrialUtmUserSubquery(utms: string[], prefix: string, params: Record<string, unknown>): string {
+function firstTrialUtmUserSubquery(utms: string[], prefix: string, params: Record<string, unknown>, scope: ScopeSql = ALL_SCOPE_SQL): string {
   const placeholders = utms.map((value, index) => {
     const key = `p_${prefix}_${index}`;
     params[key] = value;
     return `{${key}:String}`;
   });
   return `(SELECT user_id FROM (SELECT user_id, argMin(utm_source, (event_time, transaction_id)) first_trial_utm ` +
-    `FROM ${CH} FINAL WHERE auth_user_id = {auth_user_id:String} AND is_success = 1 AND transaction_type = 'trial' ` +
+    `FROM ${txFrom(scope)} WHERE auth_user_id = {auth_user_id:String} AND is_success = 1 AND transaction_type = 'trial' ` +
     `GROUP BY user_id) WHERE first_trial_utm IN (${placeholders.join(", ")}))`;
 }
 
@@ -631,10 +648,18 @@ function computeTotals(rows: CohortAggregateRow[]): CohortTotals {
 
 // ---- Subscription snapshot status (Phase 4) -------------------------------
 
-export async function subscriptionDataStatus(client: ClickHouseClientLike, authUserId: string): Promise<SubscriptionDataStatus> {
+export async function subscriptionDataStatus(
+  client: ClickHouseClientLike,
+  authUserId: string,
+  scope: ScopeSql = ALL_SCOPE_SQL,
+): Promise<SubscriptionDataStatus> {
+  // Restricted: a 0/1 presence probe — the tenant-wide count is not the member's data.
+  const query = scope.restricted
+    ? presenceProbeSql(scope, "fact_subscriptions")
+    : `SELECT count() AS c FROM ${FACT_SUBSCRIPTIONS_TABLE} FINAL WHERE auth_user_id = {auth_user_id:String}`;
   try {
     const rs = await client.query({
-      query: `SELECT count() AS c FROM ${FACT_SUBSCRIPTIONS_TABLE} FINAL WHERE auth_user_id = {auth_user_id:String}`,
+      query,
       query_params: { auth_user_id: authUserId },
       format: "JSONEachRow",
     });
@@ -652,7 +677,25 @@ export interface SupportDataProbe {
   support_unique_emails: number;
 }
 
-export async function supportDataStatus(client: ClickHouseClientLike, authUserId: string): Promise<SupportDataProbe> {
+export async function supportDataStatus(
+  client: ClickHouseClientLike,
+  authUserId: string,
+  scope: ScopeSql = ALL_SCOPE_SQL,
+): Promise<SupportDataProbe> {
+  // Restricted (access Phase 2): no system.tables lookup and no tenant-wide
+  // counts — one presence probe decides whether support_emails is built, and
+  // the counts stay 0 (the member sees support_matched_cohort_users instead).
+  if (scope.restricted) {
+    const query = presenceProbeSql(scope, "fact_support_requests");
+    try {
+      const rs = await client.query({ query, query_params: { auth_user_id: authUserId }, format: "JSONEachRow" });
+      const rows = (await rs.json()) as Array<{ c?: number | string }>;
+      return { support_data_status: n(rows[0]?.c) > 0 ? "ready" : "empty_source", support_requests: 0, support_unique_emails: 0 };
+    } catch (error) {
+      if (error instanceof ScopeViolation) throw error;
+      return { support_data_status: "unavailable", support_requests: 0, support_unique_emails: 0 };
+    }
+  }
   try {
     const exists = await client.query({
       query: `SELECT count() AS c FROM system.tables WHERE database = currentDatabase() AND name = {table:String}`,
@@ -723,16 +766,22 @@ async function scanDiagnostics(client: ClickHouseClientLike, authUserId: string)
 // the dataset-level UNMATCHED split (tokens matching no cohort user at all) is
 // not reproduced server-side (returned as 0 / empty).
 
-export async function fxDiagnostics(client: ClickHouseClientLike, authUserId: string, mediaBuyer: string[]): Promise<CohortFxDiagnostics> {
+export async function fxDiagnostics(
+  client: ClickHouseClientLike,
+  authUserId: string,
+  mediaBuyer: string[],
+  scope: ScopeSql = ALL_SCOPE_SQL,
+): Promise<CohortFxDiagnostics> {
   const params: Record<string, unknown> = { auth_user_id: authUserId };
   // Same union semantics as the cohort member filter: buyer names scope by the
   // transaction-level media_buyer, "utm:<value>" selections scope by the user's
-  // authoritative first-trial utm_source.
+  // authoritative first-trial utm_source. A restricted scope recomputes the
+  // panel over the member's scoped users' transactions only.
   const { buyers, utms } = splitMediaBuyerSelections(mediaBuyer);
   const mbParts: string[] = [];
   const buyerClause = inClause("media_buyer", buyers, "fxmb", params);
   if (buyerClause) mbParts.push(buyerClause);
-  if (utms.length) mbParts.push(`user_id IN ${firstTrialUtmUserSubquery(utms, "fxmbutm", params)}`);
+  if (utms.length) mbParts.push(`user_id IN ${firstTrialUtmUserSubquery(utms, "fxmbutm", params, scope)}`);
   const mb = mbParts.length ? ` AND (${mbParts.join(" OR ")})` : "";
   const rs = await client.query({
     query: `SELECT
@@ -745,7 +794,7 @@ export async function fxDiagnostics(client: ClickHouseClientLike, authUserId: st
       countIf(fx_status = 'invalid_amount') AS transactions_invalid_amount,
       sumIf(toFloat64(original_amount), is_success = 1 AND fx_status IN ('missing_currency','missing_fx_rate','invalid_amount')) AS excluded_amount_original,
       countIf(is_success = 1 AND fx_status IN ('missing_currency','missing_fx_rate','invalid_amount')) AS excluded_transactions
-      FROM ${CH} FINAL WHERE auth_user_id = {auth_user_id:String}${mb}`,
+      FROM ${txFrom(scope)} WHERE auth_user_id = {auth_user_id:String}${mb}`,
     query_params: params,
     format: "JSONEachRow",
   });
@@ -985,8 +1034,9 @@ export async function runCohortOptions(input: {
 
 // ---- Lazy per-cohort details (Phase 5) -----------------------------------
 
-// Scope `fin` to a single cohort key. Binds ck_* params.
-function cohortKeyWhere(key: { cohort_date: string; funnel: string; campaign_path: string }, params: Record<string, unknown>): string {
+// Scope `fin` to a single cohort key. Binds ck_* params. Both key scopes are
+// shared with the materialized details (cohortMembership.ts).
+export function cohortKeyWhere(key: { cohort_date: string; funnel: string; campaign_path: string }, params: Record<string, unknown>): string {
   params.ck_date = key.cohort_date;
   params.ck_funnel = key.funnel;
   params.ck_camp = key.campaign_path;
@@ -1000,7 +1050,7 @@ function cohortKeyWhere(key: { cohort_date: string; funnel: string; campaign_pat
 // without them the breakdown would not reconcile with the funnel row.
 // refund_status is NOT reproduced (it is a per-cohort-group HAVING; the UI
 // hardcodes "all" since the filter's removal).
-function funnelKeyWhere(
+export function funnelKeyWhere(
   key: { campaign_path: string },
   nreq: NormalizedCohortRequest,
   params: Record<string, unknown>,
@@ -1023,17 +1073,12 @@ function funnelKeyWhere(
 /** `error` of a failed plan breakdown for callers without detailed errors. */
 export const PRICE_BREAKDOWN_FAILED = "price_breakdown_failed";
 
-export async function runCohortDetails(input: {
-  authUserId: string;
-  clickhouse: ClickHouseClientLike;
-  request: CohortRequest;
-  /** Echo the warehouse error text of a failed plan breakdown — the data owner
-   * only (plan §12.7 / T19: employees never see warehouse or SQL text). Off by
-   * default; the response then carries PRICE_BREAKDOWN_FAILED instead. */
-  detailedErrors?: boolean;
-}): Promise<CohortDetailsResponse> {
-  const started = Date.now();
-  const nreq = normalizeCohortRequest(input.request);
+/** The scope of a details request: cohort_key wins; funnel_key otherwise.
+ * Neither (or a cohort_key without a date) is a client fault (400). */
+export function cohortDetailsKeys(nreq: NormalizedCohortRequest): {
+  key: NormalizedCohortRequest["cohortKey"];
+  funnelKey: NormalizedCohortRequest["funnelKey"];
+} {
   const key = nreq.cohortKey;
   const funnelKey = key ? null : nreq.funnelKey;
   if ((!key || !key.cohort_date) && !funnelKey) {
@@ -1041,57 +1086,15 @@ export async function runCohortDetails(input: {
       "action=details requires cohort_key {cohort_date, funnel, campaign_path} or funnel_key {campaign_path}.",
     );
   }
+  return { key, funnelKey };
+}
 
-  // Details read finx (fin + email-matched token rows) so the expanded row's
-  // token packs / currency mix / net_revenue_1m agree with the list row. The
-  // member filters (country/card/campaign_id/traffic/media buyer) are ANDed
-  // into the cohort scope for the same reason: with a filter active the parent
-  // row counts only matching users, and an unfiltered breakdown would not
-  // reconcile with it. support_emails is in scope because the plan breakdown
-  // reuses the list's full measure set, which includes support_users.
-  const supportStatus: CohortSupportDataStatus = await supportDataStatus(input.clickhouse, input.authUserId)
-    .then((probe) => probe.support_data_status)
-    .catch((error) => {
-      if (error instanceof ScopeViolation) throw error;
-      return "unavailable" as const;
-    });
-  const base = (extra: string, params: Record<string, unknown>) => {
-    const memberConds = memberFilterConds(nreq.filters, params);
-    const scopeWhere = key ? cohortKeyWhere(key, params) : funnelKeyWhere(funnelKey!, nreq, params);
-    return `WITH
-${supportEmailsCTE(supportStatus)},
-${classifierSQL(`a.auth_user_id = {auth_user_id:String}`, "")}
-, ${emailTokenSQL(memberFilterWhere(nreq.filters, params))}
-, scoped AS (SELECT * FROM finx WHERE ${scopeWhere}${memberConds.length ? ` AND ${memberConds.join(" AND ")}` : ""})
-${extra}
-FORMAT JSONEachRow`;
-  };
-
-  const p1: Record<string, unknown> = { auth_user_id: input.authUserId };
-  const summarySql = base(`SELECT
-    uniqExact(uid) trial_users,
-    max(c_date) max_cohort_date,
-    sumIf(nn, is_success = 1 AND d <= 30) net_revenue_1m,
-    uniqExactIf(uid, slot = 1) u1u, uniqExactIf(uid, slot = 2) u2u, uniqExactIf(uid, slot = 3) u3u, uniqExactIf(uid, slot >= 4) uxu,
-    sumIf(g, slot = 1) u1r, sumIf(g, slot = 2) u2r, sumIf(g, slot = 3) u3r, sumIf(g, slot >= 4) uxr
-    FROM scoped`, p1);
-
-  const p2: Record<string, unknown> = { auth_user_id: input.authUserId };
-  const currencySql = base(`SELECT cur currency,
-    uniqExactIf(uid, is_success = 1 AND lt = 'trial') trial_users,
-    countIf(is_success = 1) transactions,
-    sumIf(amt, is_success = 1) gross_original,
-    sumIf(g, is_success = 1) gross_usd,
-    sumIf(nn, is_success = 1) net_usd,
-    sum(rr) refunds_usd
-    FROM scoped GROUP BY cur`, p2);
-
-  const p3: Record<string, unknown> = { auth_user_id: input.authUserId };
-  const tokenSql = base(`SELECT pid product_id, pname product, round(amt, 2) price,
-    count() purchases, uniqExact(uid) buyers, sum(g) gross_revenue
-    FROM scoped WHERE is_success = 1 AND lt = 'token_purchase' GROUP BY pid, pname, round(amt, 2)`, p3);
-
-  const p4: Record<string, unknown> = { auth_user_id: input.authUserId };
+/** The four details statement bodies. Each reads the `scoped` CTE (one cohort,
+ * or one campaign_path over the window, of finx) and follows it in the WITH
+ * chain. Shared verbatim by the dynamic details below and the materialized
+ * ones (cohortMembership.ts runMaterializedCohortDetails), so both engines
+ * define every breakdown metric once. */
+export function cohortDetailsSelects(): { summary: string; currency: string; token: string; plan: string } {
   // The price-plan breakdown. plankey assigns each cohort member the price of
   // their first successful non-upsell, non-token transaction — the SAME rule and
   // rounding the membership snapshot uses for its price_plan column
@@ -1105,7 +1108,26 @@ FORMAT JSONEachRow`;
   // The measure list is AGGREGATE_MEASURES — shared verbatim with the list
   // aggregate, never duplicated. Alias-trap note (see 2026-07-23 fix below in
   // git history): no aggregate here is aliased onto its own source column.
-  const planSql = base(`, plankey AS (
+  return {
+    summary: `SELECT
+    uniqExact(uid) trial_users,
+    max(c_date) max_cohort_date,
+    sumIf(nn, is_success = 1 AND d <= 30) net_revenue_1m,
+    uniqExactIf(uid, slot = 1) u1u, uniqExactIf(uid, slot = 2) u2u, uniqExactIf(uid, slot = 3) u3u, uniqExactIf(uid, slot >= 4) uxu,
+    sumIf(g, slot = 1) u1r, sumIf(g, slot = 2) u2r, sumIf(g, slot = 3) u3r, sumIf(g, slot >= 4) uxr
+    FROM scoped`,
+    currency: `SELECT cur currency,
+    uniqExactIf(uid, is_success = 1 AND lt = 'trial') trial_users,
+    countIf(is_success = 1) transactions,
+    sumIf(amt, is_success = 1) gross_original,
+    sumIf(g, is_success = 1) gross_usd,
+    sumIf(nn, is_success = 1) net_usd,
+    sum(rr) refunds_usd
+    FROM scoped GROUP BY cur`,
+    token: `SELECT pid product_id, pname product, round(amt, 2) price,
+    count() purchases, uniqExact(uid) buyers, sum(g) gross_revenue
+    FROM scoped WHERE is_success = 1 AND lt = 'token_purchase' GROUP BY pid, pname, round(amt, 2)`,
+    plan: `, plankey AS (
       SELECT uid,
         countIf(is_success = 1 AND lt NOT IN ('upsell','token_purchase')) plan_candidates,
         argMinIf(round(g, 2), (ets, tprio, tid), is_success = 1 AND lt NOT IN ('upsell','token_purchase')) plan_price
@@ -1120,18 +1142,38 @@ FORMAT JSONEachRow`;
       FROM scoped s INNER JOIN plankey pk ON pk.uid = s.uid
     )
     GROUP BY plan_name, price
-    ORDER BY plan_name = 'Unknown', price`, p4);
+    ORDER BY plan_name = 'Unknown', price`,
+  };
+}
 
+export interface CohortDetailsStatement {
+  query: string;
+  params: Record<string, unknown>;
+}
+
+/** Runs the four details statements and maps the response: summary, currency
+ * and token packs in parallel, then the plan breakdown. Shared by both details
+ * engines, so the response shape and the error policy are one definition. */
+export async function runCohortDetailsStatements(input: {
+  clickhouse: ClickHouseClientLike;
+  statements: { summary: CohortDetailsStatement; currency: CohortDetailsStatement; token: CohortDetailsStatement; plan: CohortDetailsStatement };
+  nreq: NormalizedCohortRequest;
+  key: NormalizedCohortRequest["cohortKey"];
+  funnelKey: NormalizedCohortRequest["funnelKey"];
+  started: number;
+  detailedErrors?: boolean;
+}): Promise<CohortDetailsResponse> {
+  const { nreq, key, funnelKey, statements } = input;
   const [sumRes, curRes, tokRes] = await Promise.all([
-    input.clickhouse.query({ query: summarySql, query_params: p1, format: "JSONEachRow" }).then((r) => r.json()).catch((error) => {
+    input.clickhouse.query({ query: statements.summary.query, query_params: statements.summary.params, format: "JSONEachRow" }).then((r) => r.json()).catch((error) => {
       if (error instanceof ScopeViolation) throw error;
       return [];
     }),
-    input.clickhouse.query({ query: currencySql, query_params: p2, format: "JSONEachRow" }).then((r) => r.json()).catch((error) => {
+    input.clickhouse.query({ query: statements.currency.query, query_params: statements.currency.params, format: "JSONEachRow" }).then((r) => r.json()).catch((error) => {
       if (error instanceof ScopeViolation) throw error;
       return [];
     }),
-    input.clickhouse.query({ query: tokenSql, query_params: p3, format: "JSONEachRow" }).then((r) => r.json()).catch((error) => {
+    input.clickhouse.query({ query: statements.token.query, query_params: statements.token.params, format: "JSONEachRow" }).then((r) => r.json()).catch((error) => {
       if (error instanceof ScopeViolation) throw error;
       return [];
     }),
@@ -1140,7 +1182,7 @@ FORMAT JSONEachRow`;
   // it), but a failure is no longer silent: the message travels in `error` so
   // the UI can say "unavailable" instead of the misleading "no breakdown".
   let planError: string | undefined;
-  const planRes = await input.clickhouse.query({ query: planSql, query_params: p4, format: "JSONEachRow" }).then((r) => r.json()).catch((error) => {
+  const planRes = await input.clickhouse.query({ query: statements.plan.query, query_params: statements.plan.params, format: "JSONEachRow" }).then((r) => r.json()).catch((error) => {
     if (error instanceof ScopeViolation) throw error;
     planError = error instanceof Error ? error.message : String(error);
     return [];
@@ -1160,7 +1202,7 @@ FORMAT JSONEachRow`;
     ok: true,
     source: "clickhouse",
     generated_at: new Date().toISOString(),
-    query_duration_ms: Date.now() - started,
+    query_duration_ms: Date.now() - input.started,
     cohort_key: responseKey,
     // Each plan row reuses toAggregateRow — the exact mapper the list rows go
     // through — so a plan's gross/net/renewal/CR semantics can never drift from
@@ -1210,6 +1252,65 @@ FORMAT JSONEachRow`;
       ? { error: input.detailedErrors === true ? `price_breakdown: ${planError}` : PRICE_BREAKDOWN_FAILED }
       : {}),
   };
+}
+
+export async function runCohortDetails(input: {
+  authUserId: string;
+  clickhouse: ClickHouseClientLike;
+  request: CohortRequest;
+  /** Echo the warehouse error text of a failed plan breakdown — the data owner
+   * only (plan §12.7 / T19: employees never see warehouse or SQL text). Off by
+   * default; the response then carries PRICE_BREAKDOWN_FAILED instead. */
+  detailedErrors?: boolean;
+}): Promise<CohortDetailsResponse> {
+  const started = Date.now();
+  const nreq = normalizeCohortRequest(input.request);
+  const { key, funnelKey } = cohortDetailsKeys(nreq);
+
+  // Details read finx (fin + email-matched token rows) so the expanded row's
+  // token packs / currency mix / net_revenue_1m agree with the list row. The
+  // member filters (country/card/campaign_id/traffic/media buyer) are ANDed
+  // into the cohort scope for the same reason: with a filter active the parent
+  // row counts only matching users, and an unfiltered breakdown would not
+  // reconcile with it. support_emails is in scope because the plan breakdown
+  // reuses the list's full measure set, which includes support_users.
+  const supportStatus: CohortSupportDataStatus = await supportDataStatus(input.clickhouse, input.authUserId)
+    .then((probe) => probe.support_data_status)
+    .catch((error) => {
+      if (error instanceof ScopeViolation) throw error;
+      return "unavailable" as const;
+    });
+  const base = (extra: string, params: Record<string, unknown>) => {
+    const memberConds = memberFilterConds(nreq.filters, params);
+    const scopeWhere = key ? cohortKeyWhere(key, params) : funnelKeyWhere(funnelKey!, nreq, params);
+    return `WITH
+${supportEmailsCTE(supportStatus)},
+${classifierSQL(`a.auth_user_id = {auth_user_id:String}`, "")}
+, ${emailTokenSQL(memberFilterWhere(nreq.filters, params))}
+, scoped AS (SELECT * FROM finx WHERE ${scopeWhere}${memberConds.length ? ` AND ${memberConds.join(" AND ")}` : ""})
+${extra}
+FORMAT JSONEachRow`;
+  };
+
+  const selects = cohortDetailsSelects();
+  const statement = (extra: string): CohortDetailsStatement => {
+    const params: Record<string, unknown> = { auth_user_id: input.authUserId };
+    return { query: base(extra, params), params };
+  };
+  return runCohortDetailsStatements({
+    clickhouse: input.clickhouse,
+    statements: {
+      summary: statement(selects.summary),
+      currency: statement(selects.currency),
+      token: statement(selects.token),
+      plan: statement(selects.plan),
+    },
+    nreq,
+    key,
+    funnelKey,
+    started,
+    detailedErrors: input.detailedErrors,
+  });
 }
 
 export { round2 as cohortRound2, toAggregateRow, computeTotals, buildListQuery };

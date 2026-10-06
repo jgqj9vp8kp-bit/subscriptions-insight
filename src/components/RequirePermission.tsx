@@ -8,13 +8,15 @@
 // `route` pulls the rule from ROUTE_ACCESS (single source with the sidebar and
 // the "/" redirect); anyOf / allOf / rawOnly add explicit requirements and all
 // given requirements must pass. Legacy access (server not bootstrapped) passes
-// everything, exactly as today. UX only — the Edge gate is authoritative.
+// everything, exactly as today. A page the role grants but funnel-restricted
+// access does not include renders the "scope" NoAccess copy, which names the
+// pages that are available. UX only — the Edge gate is authoritative.
 
 import { lazy, Suspense, type ReactNode } from "react";
 import { Loader2 } from "lucide-react";
 import { NoAccess } from "@/components/NoAccess";
 import { useAccess } from "@/hooks/useAccess";
-import { checkAccessRule, findRouteAccess } from "@/services/accessRoutes";
+import { accessRuleDenial, findRouteAccess, type AccessDenialReason } from "@/services/accessRoutes";
 
 // Lazy so the app shell (sidebar, AI drawer, stores) stays out of the eagerly
 // loaded route-guard chunk; pages load it anyway.
@@ -49,15 +51,16 @@ export function RequirePermission({ anyOf, allOf, rawOnly, route, children, fall
   }
 
   const routeRule = route === undefined ? null : findRouteAccess(route);
-  const routeAllowed = route === undefined || access.legacy || (routeRule !== null && checkAccessRule(routeRule, access));
-  const allowed = routeAllowed && checkAccessRule({ anyOf, allOf, rawOnly }, access);
-  if (allowed) return <>{children}</>;
+  const routeDenial: AccessDenialReason | null =
+    route === undefined || access.legacy ? null : routeRule === null ? "permission" : accessRuleDenial(routeRule, access);
+  const denial = routeDenial ?? accessRuleDenial({ anyOf, allOf, rawOnly }, access);
+  if (denial === null) return <>{children}</>;
 
   if (fallback !== undefined) return <>{fallback}</>;
   return (
-    <Suspense fallback={<NoAccess />}>
+    <Suspense fallback={<NoAccess reason={denial} />}>
       <AppLayout title={title}>
-        <NoAccess />
+        <NoAccess reason={denial} />
       </AppLayout>
     </Suspense>
   );

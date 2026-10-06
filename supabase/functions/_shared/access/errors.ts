@@ -25,6 +25,10 @@ export const ACCESS_ERROR = {
   OWNER_REQUIRED: "owner_required",
   FULL_SCOPE_REQUIRED: "full_scope_required",
   SCOPE_NOT_SUPPORTED: "scope_not_supported",
+  /** 409: a funnel-restricted read needs a fresh, validated cohort snapshot (Phase 2). */
+  SCOPE_SNAPSHOT_NOT_READY: "scope_snapshot_not_ready",
+  /** 403: an explicit cohort_key / funnel_key names a funnel outside the member's scope (R11). */
+  FUNNEL_OUT_OF_SCOPE: "funnel_out_of_scope",
   SCOPE_VIOLATION: "scope_violation",
   CRON_NOT_CONFIGURED: "cron_not_configured",
   INVALID_CRON_SECRET: "invalid_cron_secret",
@@ -53,6 +57,8 @@ export const ACCESS_ERROR_MESSAGES: Readonly<Record<AccessErrorCode, string>> = 
   owner_required: "Only the workspace Owner can use this action.",
   full_scope_required: "This action requires access to all funnels.",
   scope_not_supported: "This action is not yet enabled for funnel-restricted access.",
+  scope_snapshot_not_ready: "Funnel-scoped data is being prepared. Please retry in a few minutes.",
+  funnel_out_of_scope: "This funnel is outside your funnel access.",
   scope_violation: "Request failed.",
   cron_not_configured: "Scheduled-job authentication is not configured.",
   invalid_cron_secret: "Invalid cron secret.",

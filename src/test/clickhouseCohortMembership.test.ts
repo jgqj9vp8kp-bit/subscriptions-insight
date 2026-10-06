@@ -1,14 +1,20 @@
 import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   activeCohortMemberWhere,
   buildCohortMembershipInsertSql,
   buildMaterializedFilterOptionsQuery,
   buildMaterializedCohortListQuery,
+  CAMPAIGN_SCOPE_BUDGET_MS,
   COHORT_CLASSIFICATION_VERSION,
+  CohortRebuildBusyError,
   rebuildCohortMembership,
   runMaterializedCohortList,
+  snapshotRetentionSql,
+  TICK_FAILURE_BACKOFF_MAX_MS,
 } from "../../supabase/functions/_shared/clickhouse/cohortMembership.ts";
+import { CAMPAIGN_SCOPE_VERSION } from "../../supabase/functions/_shared/clickhouse/cohortSnapshotState.ts";
+import { ScopeViolation } from "../../supabase/functions/_shared/clickhouse/scopedClient.ts";
 import { normalizeCohortRequest } from "../../supabase/functions/_shared/clickhouse/cohorts.ts";
 import type { ClickHouseClientLike, SupabaseLikeClient } from "../../supabase/functions/_shared/clickhouse/types.ts";
 import type { CohortFilters, CohortRequest } from "../../supabase/functions/_shared/clickhouse/cohortContract.ts";
@@ -212,6 +218,7 @@ describe("ClickHouse cohort membership materialization", () => {
 
   it("skips a rebuild when the active snapshot already matches the warehouse version", async () => {
     const rpcCalls: SnapshotRpcCall[] = [];
+    const commands: string[] = [];
     const result = await rebuildCohortMembership({
       authUserId: "user-1",
       supabase: fakeSupabase({
@@ -223,11 +230,18 @@ describe("ClickHouse cohort membership materialization", () => {
         duplicate_users: 0,
         diagnostics: { validation: { status: "PASS" } },
       }, rpcCalls),
-      clickhouse: fakeClickHouse(),
+      clickhouse: fakeClickHouse({ commands }),
     });
     expect(result.rows_inserted).toBe(0);
     expect(result.unchanged_users).toBe(4);
-    expect(rpcCalls).toHaveLength(0);
+    // No claim, no reclassification. Phase 2: freshness is observed, and the
+    // campaign scope this pre-Phase-2 snapshot lacks is filled in (PASS → recorded).
+    expect(commands.some((query) => query.includes("INSERT INTO fact_user_cohorts"))).toBe(false);
+    expect(rpcCalls.map((call) => call.functionName)).toEqual([
+      "observe_clickhouse_cohort_snapshot_fingerprint",
+      "set_clickhouse_campaign_scope_version",
+    ]);
+    expect(result.campaign_scope?.status).toBe("PASS");
   });
 
   it("activates a completed snapshot only after rows are inserted", async () => {
@@ -243,11 +257,19 @@ describe("ClickHouse cohort membership materialization", () => {
     expect(result.status).toBe("completed");
     expect(result.users_classified).toBe(4);
     expect(rpcCalls.map((call) => call.functionName)).toEqual([
+      "observe_clickhouse_cohort_snapshot_fingerprint",
       "claim_clickhouse_cohort_snapshot_build",
       "complete_clickhouse_cohort_snapshot_build",
+      "set_clickhouse_campaign_scope_version",
     ]);
-    expect(JSON.stringify(rpcCalls.at(-1)?.params)).toContain('"p_warehouse_version":"wh_abc123"');
-    expect(JSON.stringify(rpcCalls.at(-1)?.params)).toContain('"validation":{"status":"PASS"');
+    const complete = JSON.stringify(rpcCalls[2]?.params);
+    expect(complete).toContain('"p_warehouse_version":"wh_abc123"');
+    expect(complete).toContain('"validation":{"status":"PASS"');
+    // Activation carries exactly the pre-Phase-2 diagnostics; the campaign
+    // scope is built after it and recorded by its own RPC.
+    expect(complete).not.toContain("campaign_scope");
+    // A first attempt claims with exactly the pre-Phase-2 diagnostics.
+    expect(Object.keys(rpcCalls[1]?.params.p_diagnostics as object)).toEqual(["warehouse"]);
   });
 
   it("does not activate a built snapshot when membership validation fails", async () => {
@@ -467,5 +489,364 @@ describe("email-matched token revenue on the snapshot path (TODO_MONETIZATION it
     expect(sql).toContain("0 lvl, 0 slot");
     // The member filters bind into the email-map CTE too.
     expect(sql).toContain("fc.campaign_id IN ({p_mcid_0:String})");
+  });
+});
+
+// ---- access Phase 2: freshness, campaign scope, retention, the cron tick (spec §3.8) ----
+
+describe("snapshot rebuild for funnel-restricted freshness", () => {
+  /** One ordered event log over both clients, plus every RPC / command / insert. */
+  function rebuildHarness(options: {
+    state?: Record<string, unknown> | null;
+    rpcResult?: Partial<Record<string, boolean>>;
+    rpcError?: Partial<Record<string, string>>;
+    campaignScopeFails?: boolean;
+    campaignScopeHangs?: boolean;
+    insertFails?: boolean;
+    retentionError?: () => Error;
+  } = {}) {
+    const events: string[] = [];
+    const rpcCalls: SnapshotRpcCall[] = [];
+    const commands: Array<{ query: string; params: Record<string, unknown> }> = [];
+    const inserts: Array<{ table: string; values: Record<string, unknown>[] }> = [];
+    const supabase: SupabaseLikeClient = {
+      from() {
+        const builder = {
+          select: () => builder,
+          eq: () => builder,
+          maybeSingle: async () => ({ data: options.state ?? null, error: null }),
+        };
+        return builder as never;
+      },
+      rpc: async (functionName, params = {}) => {
+        rpcCalls.push({ functionName, params });
+        events.push(`rpc:${functionName}`);
+        const error = options.rpcError?.[functionName];
+        if (error) return { data: null, error: { message: error } };
+        return { data: options.rpcResult?.[functionName] ?? true, error: null };
+      },
+    };
+    const clickhouse: ClickHouseClientLike = {
+      command: async ({ query, query_params }) => {
+        commands.push({ query, params: query_params ?? {} });
+        const head = query.trim().split(/\s+/).slice(0, 3).join(" ");
+        events.push(`command:${head}`);
+        if (options.retentionError && query.startsWith("ALTER TABLE")) throw options.retentionError();
+        if (options.insertFails && query.includes("INSERT INTO fact_user_cohorts")) throw new Error("insert failed");
+      },
+      insert: async ({ table, values }) => {
+        inserts.push({ table, values: values as Record<string, unknown>[] });
+        events.push(`insert:${table}`);
+      },
+      query: async ({ query }) => ({
+        json: async () => {
+          if (query.includes("warehouse_hash")) {
+            return [{ transaction_count: 10, unique_users: 4, max_row_version: "99", max_source_updated_at: "2026-10-06 00:00:00", warehouse_hash: "abc123" }];
+          }
+          if (query.includes("(SELECT count() FROM dynamic) dynamic_users")) {
+            return [{ dynamic_users: 4, materialized_users: 4, duplicate_users: 0, missing_users: 0, extra_users: 0 }];
+          }
+          // Campaign scope evidence and its FINAL read-back (campaignScope.ts).
+          if (query.includes("AS cid") && options.campaignScopeHangs) return new Promise<never>(() => undefined);
+          if (query.includes("AS cid")) return [{ cid: "c1", campaign_path: "soulmate-sketch", users: 3 }, { cid: "c2", campaign_path: "palm-reading", users: 1 }];
+          if (query.includes("AS scope_rows")) {
+            return [{ scope_rows: options.campaignScopeFails ? 1 : 2, campaign_ids: 2, bad_resolved: 0, bad_mixed: 0, anchor_total: 4 }];
+          }
+          if (query.includes("count() - uniqExact(canonical_user_id)")) return [{ c: 0 }];
+          if (query.includes("count() AS c")) return [{ c: 4 }];
+          return [{ common_users: 0, unchanged_users: 0 }];
+        },
+      }),
+    };
+    return { supabase, clickhouse, events, rpcCalls, commands, inserts };
+  }
+
+  const CURRENT = {
+    status: "completed",
+    active_warehouse_version: "wh_abc123",
+    active_classification_version: COHORT_CLASSIFICATION_VERSION,
+    active_generated_at: "2026-10-06T00:00:00Z",
+    users_classified: 4,
+    duplicate_users: 0,
+    diagnostics: { validation: { status: "PASS" } },
+    active_validation: { status: "PASS" },
+    active_campaign_scope_version: CAMPAIGN_SCOPE_VERSION,
+  };
+  const OLD = {
+    status: "completed",
+    active_warehouse_version: "wh_old",
+    active_classification_version: "cohort_classifier_v2",
+    users_classified: 3,
+    duplicate_users: 0,
+    diagnostics: { validation: { status: "PASS" } },
+  };
+  const names = (calls: SnapshotRpcCall[]) => calls.map((call) => call.functionName);
+  const ago = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
+
+  it("observes freshness first (fingerprint + classifier version); a current snapshot is left alone", async () => {
+    const h = rebuildHarness({ state: CURRENT });
+    const result = await rebuildCohortMembership({ authUserId: "user-1", supabase: h.supabase, clickhouse: h.clickhouse, mode: "tick" });
+    expect(names(h.rpcCalls)).toEqual(["observe_clickhouse_cohort_snapshot_fingerprint"]);
+    expect(h.rpcCalls[0].params).toEqual({
+      p_auth_user_id: "user-1",
+      p_warehouse_version: "wh_abc123",
+      p_classification_version: COHORT_CLASSIFICATION_VERSION,
+    });
+    expect(result).toMatchObject({ status: "completed", rows_inserted: 0, tick_status: "current" });
+    expect(result.campaign_scope).toBeUndefined();
+    expect(h.commands.map((command) => command.query).filter((query) => !query.includes("CREATE TABLE IF NOT EXISTS fact_user_cohorts"))).toEqual([]);
+    expect(h.inserts).toEqual([]);
+  });
+
+  it("an observe fault (migration not applied, RPC error) never fails the rebuild", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const h = rebuildHarness({ state: CURRENT, rpcError: { observe_clickhouse_cohort_snapshot_fingerprint: "function does not exist" } });
+    await expect(rebuildCohortMembership({ authUserId: "user-1", supabase: h.supabase, clickhouse: h.clickhouse })).resolves.toMatchObject({ status: "completed" });
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("current snapshot without a campaign scope: builds it for the ACTIVE versions and records it, no reclassify", async () => {
+    const h = rebuildHarness({ state: { ...CURRENT, active_campaign_scope_version: null } });
+    const result = await rebuildCohortMembership({ authUserId: "user-1", supabase: h.supabase, clickhouse: h.clickhouse, mode: "tick" });
+    expect(result.tick_status).toBe("campaign_scope_rebuilt");
+    expect(result.campaign_scope).toMatchObject({ version: CAMPAIGN_SCOPE_VERSION, status: "PASS", rows: 2, resolved: 1, unresolved: 1 });
+    expect(names(h.rpcCalls)).toEqual(["observe_clickhouse_cohort_snapshot_fingerprint", "set_clickhouse_campaign_scope_version"]);
+    expect(h.rpcCalls[1].params).toEqual({
+      p_auth_user_id: "user-1",
+      p_warehouse_version: "wh_abc123",
+      p_classification_version: COHORT_CLASSIFICATION_VERSION,
+      p_scope_version: CAMPAIGN_SCOPE_VERSION,
+    });
+    expect(h.inserts.map((insert) => insert.table)).toEqual(["fact_campaign_scope"]);
+    expect(h.inserts[0].values.every((row) => row.warehouse_version === "wh_abc123" && row.classification_version === COHORT_CLASSIFICATION_VERSION)).toBe(true);
+    expect(h.commands.some((command) => command.query.includes("INSERT INTO fact_user_cohorts"))).toBe(false);
+    expect(h.commands.some((command) => command.query.startsWith("ALTER TABLE"))).toBe(false);
+    // The user action reports the same fill, without a tick_status.
+    const user = rebuildHarness({ state: { ...CURRENT, active_campaign_scope_version: null } });
+    const userResult = await rebuildCohortMembership({ authUserId: "user-1", supabase: user.supabase, clickhouse: user.clickhouse });
+    expect(userResult.tick_status).toBeUndefined();
+    expect(userResult.campaign_scope?.status).toBe("PASS");
+  });
+
+  it("a FAIL on the fill path records nothing (the tick retries next time)", async () => {
+    const h = rebuildHarness({ state: { ...CURRENT, active_campaign_scope_version: null }, campaignScopeFails: true });
+    const result = await rebuildCohortMembership({ authUserId: "user-1", supabase: h.supabase, clickhouse: h.clickhouse, mode: "tick" });
+    expect(result.campaign_scope?.status).toBe("FAIL");
+    expect(result.tick_status).toBe("current");
+    expect(names(h.rpcCalls)).toEqual(["observe_clickhouse_cohort_snapshot_fingerprint"]);
+  });
+
+  it("the fill path is time-bounded too: past the budget it reports FAIL and answers", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = rebuildHarness({ state: { ...CURRENT, active_campaign_scope_version: null }, campaignScopeHangs: true });
+      const pending = rebuildCohortMembership({ authUserId: "user-1", supabase: h.supabase, clickhouse: h.clickhouse, mode: "tick" });
+      await vi.advanceTimersByTimeAsync(CAMPAIGN_SCOPE_BUDGET_MS);
+      const result = await pending;
+      expect(result).toMatchObject({ status: "completed", tick_status: "current", rows_inserted: 0 });
+      expect(result.campaign_scope).toMatchObject({ status: "FAIL", error: expect.stringMatching(/exceeded/) });
+      expect(names(h.rpcCalls)).toEqual(["observe_clickhouse_cohort_snapshot_fingerprint"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a current snapshot whose last build failed is rebuilt (the owner's materialized path needs it completed)", async () => {
+    const h = rebuildHarness({ state: { ...CURRENT, status: "failed", building_warehouse_version: "wh_other", finished_at: ago(5) } });
+    const result = await rebuildCohortMembership({ authUserId: "user-1", supabase: h.supabase, clickhouse: h.clickhouse });
+    expect(names(h.rpcCalls)).toContain("claim_clickhouse_cohort_snapshot_build");
+    expect(result.rows_inserted).toBe(4);
+  });
+
+  it("full build: the campaign scope of the NEW versions is built after activation; a FAIL never fails the build", async () => {
+    const h = rebuildHarness({ state: OLD, campaignScopeFails: true });
+    const result = await rebuildCohortMembership({ authUserId: "user-1", supabase: h.supabase, clickhouse: h.clickhouse, mode: "tick" });
+    expect(result).toMatchObject({ status: "completed", tick_status: "rebuilt", warehouse_version: "wh_abc123" });
+    expect(result.campaign_scope?.status).toBe("FAIL");
+    const complete = h.rpcCalls.find((call) => call.functionName === "complete_clickhouse_cohort_snapshot_build");
+    const diagnostics = complete?.params.p_diagnostics as Record<string, unknown>;
+    // Owner-regression review: activation is the pre-Phase-2 path — no
+    // campaign-scope statement runs before the complete CAS, and its
+    // diagnostics carry no campaign_scope.
+    expect(diagnostics).not.toHaveProperty("campaign_scope");
+    expect(diagnostics.validation).toMatchObject({ status: "PASS" });
+    expect(h.inserts[0].values.every((row) => row.warehouse_version === "wh_abc123")).toBe(true);
+    const completeAt = h.events.indexOf("rpc:complete_clickhouse_cohort_snapshot_build");
+    expect(h.events.indexOf("command:INSERT INTO fact_user_cohorts")).toBeLessThan(completeAt);
+    expect(h.events.indexOf("insert:fact_campaign_scope")).toBeGreaterThan(completeAt);
+    const firstScopeStatement = h.commands.findIndex((command) => command.query.includes("fact_campaign_scope"));
+    expect(h.commands.slice(0, firstScopeStatement).some((command) => command.query.includes("INSERT INTO fact_user_cohorts"))).toBe(true);
+    expect(h.events.lastIndexOf("command:CREATE TABLE IF")).toBeGreaterThan(completeAt); // the fact_campaign_scope ensure
+    // A FAIL records nothing.
+    expect(names(h.rpcCalls)).not.toContain("set_clickhouse_campaign_scope_version");
+  });
+
+  it("full build: a PASS is recorded for the NEW versions after activation, before retention", async () => {
+    const h = rebuildHarness({ state: OLD });
+    const result = await rebuildCohortMembership({ authUserId: "user-1", supabase: h.supabase, clickhouse: h.clickhouse, mode: "tick" });
+    expect(result.campaign_scope?.status).toBe("PASS");
+    expect(names(h.rpcCalls)).toEqual([
+      "observe_clickhouse_cohort_snapshot_fingerprint",
+      "claim_clickhouse_cohort_snapshot_build",
+      "complete_clickhouse_cohort_snapshot_build",
+      "set_clickhouse_campaign_scope_version",
+    ]);
+    expect(h.rpcCalls[3].params).toEqual({
+      p_auth_user_id: "user-1",
+      p_warehouse_version: "wh_abc123",
+      p_classification_version: COHORT_CLASSIFICATION_VERSION,
+      p_scope_version: CAMPAIGN_SCOPE_VERSION,
+    });
+    expect(h.events.indexOf("insert:fact_campaign_scope")).toBeGreaterThan(h.events.indexOf("rpc:complete_clickhouse_cohort_snapshot_build"));
+    expect(h.events.indexOf("rpc:set_clickhouse_campaign_scope_version")).toBeLessThan(h.events.indexOf("command:ALTER TABLE fact_user_cohorts"));
+  });
+
+  it("a campaign-scope build past its budget reports FAIL; the activated rebuild still answers", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = rebuildHarness({ state: OLD, campaignScopeHangs: true });
+      let settled = false;
+      const pending = rebuildCohortMembership({ authUserId: "user-1", supabase: h.supabase, clickhouse: h.clickhouse, mode: "tick" })
+        .finally(() => {
+          settled = true;
+        });
+      await vi.advanceTimersByTimeAsync(CAMPAIGN_SCOPE_BUDGET_MS - 1);
+      expect(settled).toBe(false);
+      expect(names(h.rpcCalls)).toContain("complete_clickhouse_cohort_snapshot_build");
+      await vi.advanceTimersByTimeAsync(1);
+      const result = await pending;
+      expect(result).toMatchObject({ status: "completed", tick_status: "rebuilt" });
+      expect(result.campaign_scope).toMatchObject({ version: CAMPAIGN_SCOPE_VERSION, status: "FAIL" });
+      expect(result.campaign_scope?.error).toMatch(/exceeded 10000 ms/);
+      expect(names(h.rpcCalls)).not.toContain("set_clickhouse_campaign_scope_version");
+      expect(h.commands.filter((command) => command.query.startsWith("ALTER TABLE"))).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("retention runs only after the complete CAS, for both tables, keeping the new and the previously active versions", async () => {
+    const h = rebuildHarness({ state: OLD });
+    const result = await rebuildCohortMembership({ authUserId: "user-1", supabase: h.supabase, clickhouse: h.clickhouse });
+    const retention = h.commands.filter((command) => command.query.startsWith("ALTER TABLE"));
+    expect(retention.map((command) => command.query)).toEqual([snapshotRetentionSql("fact_user_cohorts"), snapshotRetentionSql("fact_campaign_scope")]);
+    for (const command of retention) {
+      expect(command.params).toEqual({
+        auth_user_id: "user-1",
+        generated_at: result.generated_at,
+        keep_wh_1: "wh_abc123",
+        keep_cls_1: COHORT_CLASSIFICATION_VERSION,
+        keep_wh_2: "wh_old",
+        keep_cls_2: "cohort_classifier_v2",
+      });
+    }
+    expect(h.events.indexOf("rpc:complete_clickhouse_cohort_snapshot_build")).toBeLessThan(h.events.indexOf("command:ALTER TABLE fact_user_cohorts"));
+    expect(snapshotRetentionSql("fact_user_cohorts")).toBe(
+      "ALTER TABLE fact_user_cohorts DELETE WHERE auth_user_id = {auth_user_id:String}\n" +
+      "  AND generated_at < parseDateTime64BestEffort({generated_at:String}, 3, 'UTC')\n" +
+      "  AND (warehouse_version, classification_version) NOT IN (({keep_wh_1:String}, {keep_cls_1:String}), ({keep_wh_2:String}, {keep_cls_2:String}))",
+    );
+  });
+
+  it("retention keeps the new pair twice on a first build, skips a superseded build, and is best effort", async () => {
+    const first = rebuildHarness({ state: null });
+    await rebuildCohortMembership({ authUserId: "user-1", supabase: first.supabase, clickhouse: first.clickhouse });
+    const params = first.commands.find((command) => command.query.startsWith("ALTER TABLE"))?.params;
+    expect(params).toMatchObject({ keep_wh_1: "wh_abc123", keep_wh_2: "wh_abc123", keep_cls_2: COHORT_CLASSIFICATION_VERSION });
+
+    const superseded = rebuildHarness({ state: OLD, rpcResult: { complete_clickhouse_cohort_snapshot_build: false } });
+    await expect(rebuildCohortMembership({ authUserId: "user-1", supabase: superseded.supabase, clickhouse: superseded.clickhouse })).rejects.toThrow("superseded");
+    expect(superseded.commands.some((command) => command.query.startsWith("ALTER TABLE"))).toBe(false);
+
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const failing = rebuildHarness({ state: OLD, retentionError: () => new Error("mutation rejected") });
+    await expect(rebuildCohortMembership({ authUserId: "user-1", supabase: failing.supabase, clickhouse: failing.clickhouse })).resolves.toMatchObject({ status: "completed" });
+    expect(failing.commands.filter((command) => command.query.startsWith("ALTER TABLE"))).toHaveLength(2);
+    warn.mockRestore();
+
+    const violating = rebuildHarness({ state: OLD, retentionError: () => new ScopeViolation("restricted_write") });
+    await expect(rebuildCohortMembership({ authUserId: "user-1", supabase: violating.supabase, clickhouse: violating.clickhouse })).rejects.toBeInstanceOf(ScopeViolation);
+  });
+
+  it("a claim lost to another build is a CohortRebuildBusyError (today's message)", async () => {
+    const h = rebuildHarness({ state: OLD, rpcResult: { claim_clickhouse_cohort_snapshot_build: false } });
+    const error = await rebuildCohortMembership({ authUserId: "user-1", supabase: h.supabase, clickhouse: h.clickhouse, mode: "tick" }).catch((caught) => caught);
+    expect(error).toBeInstanceOf(CohortRebuildBusyError);
+    expect(error.message).toBe("A cohort snapshot rebuild is already in progress for this account.");
+  });
+
+  it("tick backoff: an abandoned build of the same versions (lease expired, still building) waits like a failed one", async () => {
+    const abandoned = {
+      ...OLD, status: "building", building_warehouse_version: "wh_abc123", building_classification_version: COHORT_CLASSIFICATION_VERSION,
+      started_at: ago(20), lease_expires_at: ago(15), diagnostics: { warehouse: {} },
+    };
+    const h = rebuildHarness({ state: abandoned });
+    const result = await rebuildCohortMembership({ authUserId: "user-1", supabase: h.supabase, clickhouse: h.clickhouse, mode: "tick" });
+    expect(result).toMatchObject({ tick_status: "backoff", rows_inserted: 0 });
+    expect(names(h.rpcCalls)).toEqual(["observe_clickhouse_cohort_snapshot_fingerprint"]);
+
+    // After the window it is claimed again as attempt 2 (recorded for the next backoff).
+    const later = rebuildHarness({ state: { ...abandoned, started_at: ago(61), lease_expires_at: ago(56) } });
+    await rebuildCohortMembership({ authUserId: "user-1", supabase: later.supabase, clickhouse: later.clickhouse, mode: "tick" });
+    const claim = later.rpcCalls.find((call) => call.functionName === "claim_clickhouse_cohort_snapshot_build");
+    expect((claim?.params.p_diagnostics as Record<string, unknown>).attempt).toBe(2);
+
+    // A live lease is another build at work: no backoff, the claim decides (in_progress).
+    const live = rebuildHarness({
+      state: { ...abandoned, lease_expires_at: new Date(Date.now() + 60_000).toISOString() },
+      rpcResult: { claim_clickhouse_cohort_snapshot_build: false },
+    });
+    await expect(rebuildCohortMembership({ authUserId: "user-1", supabase: live.supabase, clickhouse: live.clickhouse, mode: "tick" })).rejects.toBeInstanceOf(CohortRebuildBusyError);
+    // An abandoned build of other versions does not hold the tick back.
+    const other = rebuildHarness({ state: { ...abandoned, building_warehouse_version: "wh_other" } });
+    await rebuildCohortMembership({ authUserId: "user-1", supabase: other.supabase, clickhouse: other.clickhouse, mode: "tick" });
+    expect(names(other.rpcCalls)).toContain("claim_clickhouse_cohort_snapshot_build");
+  });
+
+  it("tick backoff doubles per consecutive attempt of the same versions, capped at 6 hours", async () => {
+    const failed = (attempt: number, minutesAgo: number) => ({
+      ...OLD, status: "failed", building_warehouse_version: "wh_abc123", building_classification_version: COHORT_CLASSIFICATION_VERSION,
+      finished_at: ago(minutesAgo), diagnostics: { warehouse: {}, error: "validation failed", attempt },
+    });
+    const tickOn = async (state: Record<string, unknown>) => {
+      const h = rebuildHarness({ state });
+      const result = await rebuildCohortMembership({ authUserId: "user-1", supabase: h.supabase, clickhouse: h.clickhouse, mode: "tick" });
+      return { result, h };
+    };
+    // attempt 3 → a 4 h window.
+    expect((await tickOn(failed(3, 3 * 60))).result.tick_status).toBe("backoff");
+    const retried = await tickOn(failed(3, 4 * 60 + 1));
+    expect(retried.result.tick_status).toBe("rebuilt");
+    const claim = retried.h.rpcCalls.find((call) => call.functionName === "claim_clickhouse_cohort_snapshot_build");
+    expect((claim?.params.p_diagnostics as Record<string, unknown>).attempt).toBe(4);
+    // The cap: attempt 10 waits 6 h, not 512.
+    expect((await tickOn(failed(10, TICK_FAILURE_BACKOFF_MAX_MS / 60_000 - 1))).result.tick_status).toBe("backoff");
+    expect((await tickOn(failed(10, TICK_FAILURE_BACKOFF_MAX_MS / 60_000 + 1))).result.tick_status).toBe("rebuilt");
+    // A failed attempt > 1 records its number for the next tick.
+    const failing = rebuildHarness({ state: failed(2, 3 * 60), insertFails: true });
+    await expect(rebuildCohortMembership({ authUserId: "user-1", supabase: failing.supabase, clickhouse: failing.clickhouse, mode: "tick" })).rejects.toThrow("insert failed");
+    const fail = failing.rpcCalls.find((call) => call.functionName === "fail_clickhouse_cohort_snapshot_build");
+    expect(fail?.params.p_diagnostics).toMatchObject({ error: "insert failed", attempt: 3 });
+  });
+
+  it("tick backoff: no retry within 60 minutes of a failed build of the same versions", async () => {
+    const failedNow = { ...OLD, status: "failed", building_warehouse_version: "wh_abc123", building_classification_version: COHORT_CLASSIFICATION_VERSION, finished_at: ago(10) };
+    const backoff = rebuildHarness({ state: failedNow });
+    const result = await rebuildCohortMembership({ authUserId: "user-1", supabase: backoff.supabase, clickhouse: backoff.clickhouse, mode: "tick" });
+    expect(result).toMatchObject({ status: "failed", tick_status: "backoff", rows_inserted: 0 });
+    expect(names(backoff.rpcCalls)).toEqual(["observe_clickhouse_cohort_snapshot_fingerprint"]);
+
+    // The user action always retries; so does a tick after the window, or for other versions.
+    for (const [state, mode] of [
+      [failedNow, "user"],
+      [{ ...failedNow, finished_at: ago(61) }, "tick"],
+      [{ ...failedNow, building_warehouse_version: "wh_other" }, "tick"],
+      [{ ...failedNow, building_classification_version: "cohort_classifier_v2" }, "tick"],
+    ] as const) {
+      const h = rebuildHarness({ state });
+      await rebuildCohortMembership({ authUserId: "user-1", supabase: h.supabase, clickhouse: h.clickhouse, mode });
+      expect(names(h.rpcCalls), `${mode} ${JSON.stringify(state)}`).toContain("claim_clickhouse_cohort_snapshot_build");
+    }
   });
 });

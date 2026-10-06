@@ -1,14 +1,17 @@
 // Effective access of one member (plan §15 "Access Preview (v1)"): what the
 // server says the member can do right now (members.effective), rendered with
 // the SAME route table the member's own app uses (ROUTE_ACCESS +
-// checkAccessRule), so "Pages 4/13" and the sidebar preview match what they
-// will see. Read-only; no impersonation.
+// accessRuleDenial), so "Pages 4/13" and the sidebar preview match what they
+// will see. A funnel-restricted member (selected funnels / no data) also gets
+// the granted paths their scope resolves to and the pages hidden only because
+// of the restriction. Read-only; no impersonation.
 
 import { useMemo } from "react";
 import {
   BarChart3,
   Calculator,
   FileText,
+  Filter,
   Headphones,
   Layers,
   LayoutDashboard,
@@ -19,7 +22,6 @@ import {
   Route,
   ScrollText,
   ShieldCheck,
-  TriangleAlert,
   Upload,
   UserCog,
   UserPlus,
@@ -51,6 +53,7 @@ const PAGE_ICONS: Readonly<Record<string, LucideIcon>> = {
   "/admin/members": UserCog,
   "/admin/roles": ShieldCheck,
   "/admin/audit": ScrollText,
+  "/admin/funnels": Filter,
 };
 
 export interface EffectiveAccessPanelProps {
@@ -139,7 +142,8 @@ export function EffectiveAccessPanel({ effective, loading = false, error, onRetr
 
   const active = effective.status === "active";
   const allowedPages = pages.filter((page) => page.allowed);
-  const hiddenPages = pages.filter((page) => !page.allowed);
+  const scopeHiddenPages = pages.filter((page) => page.denial === "scope");
+  const hiddenPages = pages.filter((page) => !page.allowed && page.denial !== "scope");
   const scope = effective.funnel_scope;
   const funnelsText =
     scope.mode === "all"
@@ -175,15 +179,15 @@ export function EffectiveAccessPanel({ effective, loading = false, error, onRetr
         )}
       </div>
 
-      {active && scope.mode !== "all" && (
-        <div role="status" className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning">
-          <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
-          <span>Funnel-restricted access is not live yet: analytics pages refuse this member's requests until it is.</span>
-        </div>
-      )}
-
       {scope.mode === "selected" && scope.names.length > 0 && (
         <p className="text-xs text-muted-foreground">Funnels: {listText(scope.names, 8)}</p>
+      )}
+      {scope.mode === "selected" && (
+        <p className="text-xs text-muted-foreground" data-testid="effective-paths">
+          {scope.paths.length
+            ? `Paths: ${listText(scope.paths, 8)}`
+            : "Paths: none granted. The selected funnels have no active or retired path, so this member sees no data."}
+        </p>
       )}
 
       <div className="grid gap-3 sm:grid-cols-[minmax(0,180px)_1fr]">
@@ -191,6 +195,14 @@ export function EffectiveAccessPanel({ effective, loading = false, error, onRetr
         <div className="space-y-1 text-xs">
           <div className="text-muted-foreground">Can open</div>
           <div className="text-foreground">{allowedPages.length ? allowedPages.map((page) => page.title).join(", ") : "Nothing"}</div>
+          {scopeHiddenPages.length > 0 && (
+            <>
+              <div className="pt-1 text-muted-foreground">Hidden by funnel-restricted access</div>
+              <div className="text-muted-foreground" data-testid="effective-scope-hidden">
+                {scopeHiddenPages.map((page) => page.title).join(", ")}
+              </div>
+            </>
+          )}
           {hiddenPages.length > 0 && (
             <>
               <div className="pt-1 text-muted-foreground">Hidden</div>

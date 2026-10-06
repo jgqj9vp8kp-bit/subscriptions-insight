@@ -11,8 +11,12 @@
 // bypasses RLS, so the RPC must be told whose subscriptions to read — the
 // p_data_key overload (202610050001_phase0_isolation_fixes.sql). The legacy
 // no-arg form returned every account's subscriptions merged into one map.
+//
+// Funnel scope (access Phase 2): the cohort-email read takes the request's
+// ScopeSql. A restricted member's overlay therefore joins only the emails of
+// their scoped cohort users; the all-scope text is unchanged.
 import type { ClickHouseClientLike, SupabaseLikeClient } from "./types.ts";
-import { FACT_USER_COHORTS_TABLE } from "./schema.ts";
+import { ALL_SCOPE_SQL, cohortsFrom, type ScopeSql } from "./scopeSql.ts";
 
 export interface CohortActiveSubs {
   active_users: number;
@@ -101,6 +105,8 @@ export async function activeSubscriptionMetricsByCohort(input: {
   authUserId: string;
   warehouseVersion: string;
   classificationVersion: string;
+  /** ALL_SCOPE_SQL unless the caller is funnel-restricted. */
+  scope?: ScopeSql;
 }): Promise<Map<string, CohortActiveSubs>> {
   const activeByEmail = await activeSubscriptionsByEmail(input.supabase, input.authUserId);
   if (activeByEmail.size === 0) return new Map();
@@ -108,7 +114,7 @@ export async function activeSubscriptionMetricsByCohort(input: {
   const rs = await input.clickhouse.query({
     query: `SELECT lowerUTF8(trim(BOTH ' ' FROM normalized_email)) email,
         toString(cohort_date) cohort_date, funnel, campaign_path
-      FROM ${FACT_USER_COHORTS_TABLE} FINAL
+      FROM ${cohortsFrom(input.scope ?? ALL_SCOPE_SQL)}
       WHERE auth_user_id = {auth_user_id:String}
         AND warehouse_version = {warehouse_version:String}
         AND classification_version = {classification_version:String}

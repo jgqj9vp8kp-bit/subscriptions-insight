@@ -7,8 +7,11 @@
 //
 // Access is decided by ACCESS_POLICY before the handler runs (admin.users.* /
 // admin.roles.* / admin.audit.view; seeding role templates is Owner only;
-// funnel-restricted members are refused). Writes go through the SECURITY
-// DEFINER RPCs of 202610050002_access_core.sql with the caller as p_actor; they
+// funnel coverage (paths.coverage) admits admin.users.view or funnels.manage,
+// and the path writes (paths.attach / paths.set_status) need funnels.manage
+// with funnel scope all; funnel-restricted members are refused). Writes go
+// through the SECURITY DEFINER RPCs of 202610050002_access_core.sql and
+// 202610060001_access_phase2_scope.sql with the caller as p_actor; they
 // re-check permission and anti-escalation under the workspace lock and write
 // the audit row in the same transaction. The logic lives in the pure,
 // vitest-tested _shared/access/adminApi.ts.

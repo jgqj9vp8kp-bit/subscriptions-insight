@@ -21,9 +21,18 @@ import { partitionedVersionKey } from "@/services/analyticsCache";
 import { recordDuration } from "@/services/analyticsProgress";
 import { GC_MS, STALE_MS, transientRetry, useAnalyticsProgress, useCacheScope } from "@/hooks/useAnalyticsCache";
 import { useOptionalAccess } from "@/hooks/useAccess";
+import { ClickHouseRequestError } from "@/services/clickhouse";
 import { traceHash, traceRequest } from "@/services/performanceTrace";
+import { SCOPE_PENDING_POLL_MS, SCOPE_SNAPSHOT_NOT_READY } from "@/components/access/ScopeDataPending";
 
 const NS = "fb-analytics";
+
+const typedError = (error: unknown): ClickHouseRequestError | null => (error instanceof ClickHouseRequestError ? error : null);
+// A funnel-restricted member's FB reads answer 409 scope_snapshot_not_ready
+// until the cohort snapshot and the campaign scope are ready: ask again every
+// minute until they are.
+const scopePendingInterval = (query: { state: { error: unknown } }): number | false =>
+  typedError(query.state.error)?.errorCode === SCOPE_SNAPSHOT_NOT_READY ? SCOPE_PENDING_POLL_MS : false;
 
 export function useFbWarehouseStatus(enabled: boolean): {
   status: FbStatusResponse | null;
@@ -47,6 +56,7 @@ export function useFbWarehouseStatus(enabled: boolean): {
     retry: transientRetry,
     refetchOnWindowFocus: false,
     refetchOnReconnect: true,
+    refetchInterval: scopePendingInterval,
   });
   const status = (query.data as FbStatusResponse | undefined) ?? null;
   return {
@@ -61,6 +71,10 @@ export interface UseFbReportResult {
   report: FbReportResponse | null;
   loading: boolean;
   error: string | null;
+  /** The gate's error_code of a failed request (ClickHouseRequestError). */
+  errorCode: string | null;
+  /** HTTP status of a failed request (ClickHouseRequestError). */
+  errorStatus: number | null;
   isBackgroundRefreshing: boolean;
   isInitialLoading: boolean;
   progressPercent: number;
@@ -104,6 +118,7 @@ export function useFbReportQuery(params: {
     retry: transientRetry,
     refetchOnWindowFocus: false,
     refetchOnReconnect: true,
+    refetchInterval: scopePendingInterval,
   });
 
   // Reject schema-incompatible bundles (rehydrated from an older session) —
@@ -120,10 +135,13 @@ export function useFbReportQuery(params: {
     void refetch();
   }, [enabled, rawReport, report, isFetching, refetch, queryHash]);
 
+  const failure = q.isError ? typedError(q.error) : null;
   return {
     report,
     loading: isFetching && enabled,
     error: q.isError ? (q.error instanceof Error ? q.error.message : "FB Analytics request failed") : null,
+    errorCode: failure?.errorCode ?? null,
+    errorStatus: failure?.status ?? null,
     isBackgroundRefreshing: isFetching && report != null,
     isInitialLoading: isFetching && report == null,
     progressPercent: progress.percent,

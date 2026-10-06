@@ -20,6 +20,13 @@
 // same-ISO-week and same-month pairs at once, so the Day/Week/Month switch
 // changes semantics correctly instead of summing same-day splits.
 //
+// Funnel-restricted members (access Phase 2): the runners take the request's
+// ScopeSql. The attributed stream then reads only the member's scoped users
+// (anchor attribution: every payment of a customer acquired through one of
+// their funnels), filtersActive is forced so the Unattributed and Facebook
+// spend streams are never queried, and the snapshot is the one the gate
+// validated. With ALL_SCOPE_SQL every statement is today's text.
+//
 // Pure module: no Deno, no fetch, no clock (now injected). Vitest imports the
 // src/services stub.
 
@@ -27,6 +34,7 @@ import type { ClickHouseClientLike, SupabaseLikeClient } from "./types.ts";
 import { activeCohortMemberWhere, activeCohortSnapshotVersion, getCohortSnapshotState } from "./cohortMembership.ts";
 import type { CohortFilters } from "./cohortContract.ts";
 import { ANALYTICS_TRANSACTIONS_TABLE, FACT_FACEBOOK_STATS_TABLE, FACT_USER_COHORTS_TABLE } from "./schema.ts";
+import { ALL_SCOPE_SQL, cohortsFrom, ScopeSnapshotNotReadyError, txFrom, type ScopeSql } from "./scopeSql.ts";
 import {
   REVENUE_AGE_BUCKETS,
   type RevenueAgeRow,
@@ -123,7 +131,7 @@ export function normalizeRevenueFilters(raw?: Partial<RevenueIntelligenceFilters
 // (c_plan). The typing runs over the user's FULL history (no date window) —
 // windowing before typing would misnumber first_subscription/renewal levels.
 
-function classifiedCTE(memberWhere = ""): string {
+function classifiedCTE(memberWhere = "", scope: ScopeSql = ALL_SCOPE_SQL): string {
   return `
 base AS (
   SELECT a.user_id uid, a.transaction_id tid, a.event_time et, toUnixTimestamp64Milli(a.event_time) ets,
@@ -140,8 +148,8 @@ base AS (
     fc.cohort_date c_d, fc.campaign_path c_camp, fc.price_plan c_plan,
     fc.trial_transaction_id trial_transaction_id,
     toUnixTimestamp64Milli(fc.trial_event_time) trial_ts
-  FROM ${ANALYTICS_TRANSACTIONS_TABLE} AS a FINAL
-  INNER JOIN ${FACT_USER_COHORTS_TABLE} AS fc FINAL
+  FROM ${txFrom(scope, "a")}
+  INNER JOIN ${cohortsFrom(scope, "fc")}
     ON fc.auth_user_id = a.auth_user_id
    AND fc.canonical_user_id = a.user_id
   WHERE a.auth_user_id = {auth_user_id:String}
@@ -181,9 +189,9 @@ const TYPE_SUMS = `
 /** Attributed daily series over the FULL account history (52k rows — cheap;
  * full history is required for the cumulative-profit line anyway). Carries the
  * same-day, same-week and same-month new/existing pairs simultaneously. */
-export function buildAttributedDailySql(params: Record<string, unknown>, authUserId: string, memberWhere = ""): string {
+export function buildAttributedDailySql(params: Record<string, unknown>, authUserId: string, memberWhere = "", scope: ScopeSql = ALL_SCOPE_SQL): string {
   params.auth_user_id = authUserId;
-  return `WITH ${classifiedCTE(memberWhere)}
+  return `WITH ${classifiedCTE(memberWhere, scope)}
 SELECT toString(toDate(et)) day,
   sumIf(g, is_success = 1) gross,
   sum(rr) refunds,
@@ -257,11 +265,11 @@ export function sameBucketPredicate(bucket: RevenueBucket): string {
 /** Period slice by campaign_path ('' stays a distinct Unknown key).
  * gross_existing = successful − new (NOT `toDate(et) > c_d`), so future-cohort
  * rows fold into Existing exactly as the bucket rows compute it. */
-export function buildByFunnelSql(params: Record<string, unknown>, authUserId: string, dateFrom: string | null, dateTo: string | null, memberWhere = "", bucket: RevenueBucket = "day"): string {
+export function buildByFunnelSql(params: Record<string, unknown>, authUserId: string, dateFrom: string | null, dateTo: string | null, memberWhere = "", bucket: RevenueBucket = "day", scope: ScopeSql = ALL_SCOPE_SQL): string {
   params.auth_user_id = authUserId;
   const win = windowWhere(params, dateFrom, dateTo);
   const pair = sameBucketPredicate(bucket);
-  return `WITH ${classifiedCTE(memberWhere)}
+  return `WITH ${classifiedCTE(memberWhere, scope)}
 SELECT c_camp key,
   sumIf(g, is_success = 1) gross,
   sumIf(g, is_success = 1) - sum(rr) net,
@@ -273,11 +281,11 @@ GROUP BY key ORDER BY gross DESC
 FORMAT JSONEachRow`;
 }
 
-export function buildByPlanSql(params: Record<string, unknown>, authUserId: string, dateFrom: string | null, dateTo: string | null, memberWhere = "", bucket: RevenueBucket = "day"): string {
+export function buildByPlanSql(params: Record<string, unknown>, authUserId: string, dateFrom: string | null, dateTo: string | null, memberWhere = "", bucket: RevenueBucket = "day", scope: ScopeSql = ALL_SCOPE_SQL): string {
   params.auth_user_id = authUserId;
   const win = windowWhere(params, dateFrom, dateTo);
   const pair = sameBucketPredicate(bucket);
-  return `WITH ${classifiedCTE(memberWhere)}
+  return `WITH ${classifiedCTE(memberWhere, scope)}
 SELECT c_plan key,
   sumIf(g, is_success = 1) gross,
   sumIf(g, is_success = 1) - sum(rr) net,
@@ -291,10 +299,10 @@ FORMAT JSONEachRow`;
 
 /** Cohort-age buckets of the period's revenue: d = whole days between the
  * user's trial anchor and the payment (precomputed by the classifier). */
-export function buildByAgeSql(params: Record<string, unknown>, authUserId: string, dateFrom: string | null, dateTo: string | null, memberWhere = ""): string {
+export function buildByAgeSql(params: Record<string, unknown>, authUserId: string, dateFrom: string | null, dateTo: string | null, memberWhere = "", scope: ScopeSql = ALL_SCOPE_SQL): string {
   params.auth_user_id = authUserId;
   const win = windowWhere(params, dateFrom, dateTo);
-  return `WITH ${classifiedCTE(memberWhere)}
+  return `WITH ${classifiedCTE(memberWhere, scope)}
 SELECT multiIf(d = 0, 'd0', d <= 7, 'd1_7', d <= 30, 'd8_30', d <= 60, 'd31_60', d <= 90, 'd61_90', 'd90_plus') bucket,
   sumIf(g, is_success = 1) gross,
   sumIf(g, is_success = 1) - sum(rr) net
@@ -306,10 +314,10 @@ FORMAT JSONEachRow`;
 
 /** One revenue day explained: which cohorts (exact recent dates, month rollups
  * beyond DAY_BREAKDOWN_EXACT_DAYS, then "older") and funnels produced it. */
-export function buildDayBreakdownSql(params: Record<string, unknown>, authUserId: string, day: string, memberWhere = ""): string {
+export function buildDayBreakdownSql(params: Record<string, unknown>, authUserId: string, day: string, memberWhere = "", scope: ScopeSql = ALL_SCOPE_SQL): string {
   params.auth_user_id = authUserId;
   params.break_day = day;
-  return `WITH ${classifiedCTE(memberWhere)}
+  return `WITH ${classifiedCTE(memberWhere, scope)}
 SELECT toString(c_d) cohort_date, c_camp campaign_path,
   sumIf(g, is_success = 1) gross,
   sumIf(g, is_success = 1) - sum(rr) net,
@@ -596,16 +604,37 @@ async function requireActiveSnapshot(supabase: SupabaseLikeClient, authUserId: s
   return activeCohortSnapshotVersion(state);
 }
 
+/** diagnostics.note of a funnel-restricted bundle (replaces the filter note). */
+export const RESTRICTED_REVENUE_NOTE =
+  "Funnel-restricted view: revenue of customers acquired through your funnels; unattributed revenue and Facebook spend are not included.";
+
+/** The snapshot versions a runner reads. Restricted: the one the gate already
+ * validated for this request (no second state read, no fallback); a missing
+ * one is a 409, never the "not ready" body. Otherwise the active snapshot. */
+async function revenueSnapshot(
+  supabase: SupabaseLikeClient,
+  authUserId: string,
+  scope: ScopeSql,
+): Promise<{ warehouse_version: string; classification_version: string } | null> {
+  if (!scope.restricted) return requireActiveSnapshot(supabase, authUserId);
+  const snapshot = scope.snapshot;
+  if (!snapshot) throw new ScopeSnapshotNotReadyError("snapshot_missing");
+  return { warehouse_version: snapshot.warehouseVersion, classification_version: snapshot.classificationVersion };
+}
+
 export async function runRevenueIntelligence(input: {
   authUserId: string;
   supabase: SupabaseLikeClient;
   clickhouse: ClickHouseClientLike;
   request: RevenueIntelligenceRequest;
   now?: Date;
+  /** ALL_SCOPE_SQL unless the caller is funnel-restricted (see the header). */
+  scope?: ScopeSql;
 }): Promise<RevenueIntelligenceBundle> {
   const started = Date.now();
+  const scope = input.scope ?? ALL_SCOPE_SQL;
   const req = normalizeRevenueRequest({ ...input.request, action: "bundle" });
-  const active = await requireActiveSnapshot(input.supabase, input.authUserId);
+  const active = await revenueSnapshot(input.supabase, input.authUserId, scope);
   if (!active) {
     return {
       ok: false, source: "clickhouse", action: "bundle", generated_at: new Date().toISOString(),
@@ -634,14 +663,17 @@ export async function runRevenueIntelligence(input: {
   // Member filters narrow the SET OF USERS in the attributed stream (Cohorts
   // semantics). The Unattributed and Facebook-spend streams have no user rows
   // to filter — under an active filter they are EXCLUDED (never silently kept
-  // project-wide), and diagnostics.filters_active tells the UI to say so.
-  const memberWhere = (params: Record<string, unknown>) => activeCohortMemberWhere(req.filters, params);
-  const attributed = await jsonRows<AttributedDailyRow>(input.clickhouse, buildAttributedDailySql(pA, input.authUserId, memberWhere(pA)), pA);
-  const unattributed = req.filtersActive ? [] : await jsonRows<UnattributedDailyRow>(input.clickhouse, buildUnattributedDailySql(pU, input.authUserId), pU);
-  const spend = req.filtersActive ? [] : await jsonRows<SpendDailyRow>(input.clickhouse, buildSpendDailySql(pS, input.authUserId), pS);
-  const byFunnel = await jsonRows<{ key: string; gross: number; net: number; gross_new: number; gross_existing: number }>(input.clickhouse, buildByFunnelSql(pF, input.authUserId, effFrom, effTo, memberWhere(pF), req.bucket), pF);
-  const byPlan = await jsonRows<{ key: string; gross: number; net: number; gross_new: number; gross_existing: number }>(input.clickhouse, buildByPlanSql(pP, input.authUserId, effFrom, effTo, memberWhere(pP), req.bucket), pP);
-  const byAge = await jsonRows<{ bucket: string; gross: number; net: number }>(input.clickhouse, buildByAgeSql(pG, input.authUserId, effFrom, effTo, memberWhere(pG)), pG);
+  // project-wide), and diagnostics.filters_active tells the UI to say so. A
+  // funnel-restricted member is always in that mode: their scope IS a member
+  // filter, so those two streams are never queried for them.
+  const filtersActive = req.filtersActive || scope.restricted;
+  const memberWhere = (params: Record<string, unknown>) => activeCohortMemberWhere(req.filters, params, scope);
+  const attributed = await jsonRows<AttributedDailyRow>(input.clickhouse, buildAttributedDailySql(pA, input.authUserId, memberWhere(pA), scope), pA);
+  const unattributed = filtersActive ? [] : await jsonRows<UnattributedDailyRow>(input.clickhouse, buildUnattributedDailySql(pU, input.authUserId), pU);
+  const spend = filtersActive ? [] : await jsonRows<SpendDailyRow>(input.clickhouse, buildSpendDailySql(pS, input.authUserId), pS);
+  const byFunnel = await jsonRows<{ key: string; gross: number; net: number; gross_new: number; gross_existing: number }>(input.clickhouse, buildByFunnelSql(pF, input.authUserId, effFrom, effTo, memberWhere(pF), req.bucket, scope), pF);
+  const byPlan = await jsonRows<{ key: string; gross: number; net: number; gross_new: number; gross_existing: number }>(input.clickhouse, buildByPlanSql(pP, input.authUserId, effFrom, effTo, memberWhere(pP), req.bucket, scope), pP);
+  const byAge = await jsonRows<{ bucket: string; gross: number; net: number }>(input.clickhouse, buildByAgeSql(pG, input.authUserId, effFrom, effTo, memberWhere(pG), scope), pG);
   const numify = <T,>(rows: T[]): T[] => rows.map((row) => {
     const out: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(row as Record<string, unknown>)) {
@@ -661,8 +693,9 @@ export async function runRevenueIntelligence(input: {
     dateTo: effTo,
     snapshot: active,
     now: input.now ?? new Date(),
-    filtersActive: req.filtersActive,
+    filtersActive,
   });
+  if (scope.restricted) assembled.diagnostics.note = RESTRICTED_REVENUE_NOTE;
   return {
     ok: true, source: "clickhouse", action: "bundle",
     generated_at: new Date().toISOString(), query_duration_ms: Date.now() - started,
@@ -704,20 +737,25 @@ export async function runRevenueDayBreakdown(input: {
   supabase: SupabaseLikeClient;
   clickhouse: ClickHouseClientLike;
   request: RevenueIntelligenceRequest;
+  /** ALL_SCOPE_SQL unless the caller is funnel-restricted (see the header). */
+  scope?: ScopeSql;
 }): Promise<RevenueDayBreakdown> {
   const started = Date.now();
+  const scope = input.scope ?? ALL_SCOPE_SQL;
   const req = normalizeRevenueRequest({ ...input.request, action: "day_breakdown" });
   const day = req.day as string;
-  const active = await requireActiveSnapshot(input.supabase, input.authUserId);
+  const active = await revenueSnapshot(input.supabase, input.authUserId, scope);
   if (!active) {
     return { ok: false, source: "clickhouse", action: "day_breakdown", generated_at: new Date().toISOString(), query_duration_ms: Date.now() - started, date: day, gross: 0, by_cohort: [], by_funnel: [], error: "cohort_snapshot_not_ready" };
   }
   const base = { auth_user_id: input.authUserId, warehouse_version: active.warehouse_version, classification_version: active.classification_version };
   const pB = { ...base } as Record<string, unknown>;
   const pU = { ...base } as Record<string, unknown>;
+  // Restricted: filtersActive is forced, so the unattributed row never exists.
+  const filtersActive = req.filtersActive || scope.restricted;
   const [rows, [unatt]] = await Promise.all([
-    jsonRows<Record<string, unknown>>(input.clickhouse, buildDayBreakdownSql(pB, input.authUserId, day, activeCohortMemberWhere(req.filters, pB)), pB),
-    req.filtersActive
+    jsonRows<Record<string, unknown>>(input.clickhouse, buildDayBreakdownSql(pB, input.authUserId, day, activeCohortMemberWhere(req.filters, pB, scope), scope), pB),
+    filtersActive
       ? Promise.resolve([] as Array<{ gross?: unknown; net?: unknown }>)
       : jsonRows<{ gross?: unknown; net?: unknown }>(input.clickhouse, buildDayUnattributedSql(pU, input.authUserId, day), pU),
   ]);

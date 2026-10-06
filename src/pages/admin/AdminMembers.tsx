@@ -3,9 +3,14 @@
 // member" grants an existing account access. Reads need admin.users.view (the
 // route guard); every change needs admin.users.manage and is re-checked by the
 // `access` Edge function and the SQL mutation RPCs (UX only here).
+//
+// While any active member is funnel-restricted the page also reads the funnel
+// coverage of the active cohort snapshot: a member whose selected funnels hold
+// no user gets a warning icon, and a banner says how many users belong to no
+// funnel (invisible to every restricted member).
 
 import { useMemo, useState } from "react";
-import { Loader2, RefreshCw, UserCog, UserPlus } from "lucide-react";
+import { Loader2, RefreshCw, TriangleAlert, UserCog, UserPlus } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import {
   AlertDialog,
@@ -24,10 +29,11 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useToast } from "@/hooks/use-toast";
 import { useAccess } from "@/hooks/useAccess";
 import { AddMemberDialog } from "@/components/admin/AddMemberDialog";
-import { AccessNotSetUpNotice } from "@/components/admin/AdminNotices";
+import { AccessNotSetUpNotice, CoverageGapNotice } from "@/components/admin/AdminNotices";
 import { MemberSheet } from "@/components/admin/MemberSheet";
 import {
   useAccessAdminErrorToast,
@@ -36,6 +42,7 @@ import {
   useAccessFunnels,
   useAccessMembers,
   useAccessRoles,
+  usePathCoverage,
 } from "@/components/admin/useAccessAdmin";
 import {
   actorFromAccess,
@@ -44,7 +51,9 @@ import {
   isSelfMember,
   memberDisplayName,
   memberEditBlockReason,
+  scopeWithoutData,
 } from "@/components/admin/accessAdminModel";
+import { canAccessRoute } from "@/services/accessRoutes";
 import { describeAccessAdminError, updateAccessMember, type AdminMember } from "@/services/accessAdminClient";
 
 type StatusFilter = "all" | "active" | "disabled";
@@ -82,6 +91,11 @@ export default function AdminMembersPage() {
   const [statusSaving, setStatusSaving] = useState(false);
 
   const memberRows = useMemo(() => members.data ?? [], [members.data]);
+  // Coverage (one ClickHouse read, 10-minute cache) only matters while someone
+  // is funnel-restricted; a 409 (no validated snapshot yet) just hides it.
+  const anyRestricted = memberRows.some((member) => member.status === "active" && member.funnel_scope.mode !== "all");
+  const coverage = usePathCoverage(enabled && anyRestricted);
+  const coverageData = anyRestricted ? coverage.data : undefined;
   const roleRows = useMemo(() => roles.data ?? [], [roles.data]);
   const rolesById = useMemo(() => new Map(roleRows.map((role) => [role.id, role])), [roleRows]);
   const selected = useMemo(() => memberRows.find((member) => member.id === selectedId) ?? null, [memberRows, selectedId]);
@@ -149,6 +163,9 @@ export default function AdminMembersPage() {
         ) : undefined
       }
     >
+      {coverageData && coverageData.totals.registered_pct < 100 && (
+        <CoverageGapNotice coverage={coverageData} showLink={canAccessRoute("/admin/funnels", access)} />
+      )}
       <Card className="p-4 shadow-card">
         <div className="flex flex-wrap items-center gap-2 border-b border-border pb-3">
           <Input
@@ -257,7 +274,26 @@ export default function AdminMembersPage() {
                         </Badge>
                       </TableCell>
                       <TableCell className={`text-sm ${member.funnel_scope.mode === "none" ? "text-warning" : ""}`}>
-                        {funnelScopeLabel(member.funnel_scope)}
+                        <span className="inline-flex items-center gap-1.5">
+                          {funnelScopeLabel(member.funnel_scope)}
+                          {member.status === "active" && scopeWithoutData(member.funnel_scope, coverageData) && (
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <span
+                                  className="inline-flex text-warning"
+                                  role="img"
+                                  aria-label="No data in the selected funnels"
+                                  data-testid={`member-no-data-${member.id}`}
+                                >
+                                  <TriangleAlert className="h-3.5 w-3.5" />
+                                </span>
+                              </TooltipTrigger>
+                              <TooltipContent className="max-w-xs text-xs">
+                                None of this member's funnels has users in the current cohort snapshot: they see no data.
+                              </TooltipContent>
+                            </Tooltip>
+                          )}
+                        </span>
                       </TableCell>
                       <TableCell onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()}>
                         <div className="flex items-center gap-2" title={lock ?? undefined}>

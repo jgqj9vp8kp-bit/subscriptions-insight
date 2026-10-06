@@ -1,4 +1,4 @@
-import { BarChart3, FileText, Headphones, LayoutDashboard, Receipt, Users, Layers, Upload, Repeat, Calculator, Plug, Route, UserCog, ShieldCheck, ScrollText, type LucideIcon } from "lucide-react";
+import { BarChart3, FileText, Filter, Headphones, LayoutDashboard, Receipt, Users, Layers, Upload, Repeat, Calculator, Plug, Route, UserCog, ShieldCheck, ScrollText, type LucideIcon } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { NavLink } from "@/components/NavLink";
 import { useAccess } from "@/hooks/useAccess";
@@ -45,9 +45,10 @@ const adminItems: NavItem[] = [
   { title: "Members", url: "/admin/members", icon: UserCog, end: false },
   { title: "Roles", url: "/admin/roles", icon: ShieldCheck, end: false },
   { title: "Audit log", url: "/admin/audit", icon: ScrollText, end: false },
+  { title: "Funnel coverage", url: "/admin/funnels", icon: Filter, end: false },
 ];
 
-const ADMIN_VIEW_PERMISSIONS = ["admin.users.view", "admin.roles.view", "admin.audit.view"] as const;
+const ADMIN_VIEW_PERMISSIONS = ["admin.users.view", "admin.roles.view", "admin.audit.view", "funnels.manage"] as const;
 
 export function AppSidebar() {
   const { state } = useSidebar();
@@ -56,8 +57,9 @@ export function AppSidebar() {
   const access = useAccess();
 
   // UX only (the Edge gate is authoritative): show the pages this member may
-  // open, from the same ROUTE_ACCESS table as the route guards. Legacy access
-  // (server not bootstrapped) shows every page, as today.
+  // open, from the same ROUTE_ACCESS table as the route guards (a
+  // funnel-restricted member sees only the restricted-ready pages). Legacy
+  // access (server not bootstrapped) shows every page, as today.
   const visibleItems = items.filter((item) => canAccessRoute(item.url, access));
   // The admin pages manage workspace members; before bootstrap (legacy) there
   // is nothing to manage, so the group stays hidden and the sidebar is today's.
@@ -67,9 +69,11 @@ export function AppSidebar() {
   // Warm the Cohorts cache when the user shows intent to navigate there. Only in
   // ClickHouse mode; respects staleTime (no duplicate when already fresh). Keyed
   // by the access partition, and never for a member without Cohorts or before
-  // access has resolved (empty partition).
+  // access has resolved (empty partition). Never for a funnel-restricted
+  // member: their (funnel-scoped) list is fetched when the page opens, never on
+  // hover. Scope-all members keep the pre-Phase-2 prefetch.
   const prefetchCohorts = () => {
-    if (!access.can("cohorts.view") || !access.partition) return;
+    if (access.restricted || !access.can("cohorts.view") || !access.partition) return;
     if (cohortsDataSourceMode() !== "clickhouse") return;
     prefetchCohortsNav(queryClient, access.partition, loadMaxRenewalColumns());
   };

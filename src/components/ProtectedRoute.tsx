@@ -1,3 +1,4 @@
+import { Fragment } from "react";
 import { Navigate, Outlet, useLocation } from "react-router-dom";
 import { Loader2 } from "lucide-react";
 import { useAuth } from "@/hooks/useAuth";
@@ -63,10 +64,16 @@ export function ProtectedRoute() {
   // The auto-loader downloads raw tables into the browser (warehouse, Palmer,
   // FunnelFox subscriptions, traffic): data owner only (D8). Legacy ⇒ rawAccess,
   // so the owner keeps today's behaviour.
+  // A funnel-restricted member's page remounts when the access partition
+  // changes (new funnels, re-pathed registry): pages that keep the registry or
+  // filter options in useState must not carry the old scope across. Everyone
+  // else keeps a stable key, so their pages never remount on a refresh.
   return (
     <>
       {access.rawAccess && <SavedDataAutoLoader loadTransactions={loadTransactions} />}
-      <Outlet />
+      <Fragment key={access.restricted ? access.partition : "stable"}>
+        <Outlet />
+      </Fragment>
     </>
   );
 }

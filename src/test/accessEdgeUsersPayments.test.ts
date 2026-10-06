@@ -3,7 +3,9 @@
 // driven through the pure gate core (handleWithAccess) with fake dependencies,
 // and the runners they dispatch to are driven through a real ScopedReader, so
 // these tests prove: who may call which action, that every funnel-restricted
-// context is refused, that the payments router no longer falls back to the
+// context is refused (except the revenue reads, scopeReady behind the cohort
+// snapshot freshness gate since Phase 2 — revenueScoped.test.ts covers their
+// scoped SQL), that the payments router no longer falls back to the
 // bundle, that the AI pass-rate call is reduced for non-Payment-Pass members,
 // that runners bind the workspace tenant (scratch tables included), and that
 // best-effort catches no longer swallow a ScopeViolation.
@@ -53,6 +55,7 @@ import {
 import { runUsersList } from "../../supabase/functions/_shared/clickhouse/users.ts";
 import { FACT_SUBSCRIPTIONS_TABLE } from "../../supabase/functions/_shared/clickhouse/factSubscriptions.ts";
 import type { ClickHouseClientLike } from "../../supabase/functions/_shared/clickhouse/types.ts";
+import { COHORT_CLASSIFICATION_VERSION, type CohortSnapshotState } from "../../supabase/functions/_shared/clickhouse/cohortSnapshotState.ts";
 
 const DATA_KEY = "11111111-1111-4111-8111-111111111111";
 const EMPLOYEE = "22222222-2222-4222-8222-222222222222";
@@ -92,9 +95,39 @@ function fakeRaw() {
   };
 }
 
-function makeDeps(row: ReturnType<typeof accessRow>): AccessGateDeps {
+/** A fresh, validated cohort snapshot (the Phase 2 freshness gate admits it). */
+const READY_SNAPSHOT_STATE = {
+  auth_user_id: DATA_KEY,
+  snapshot_name: "fact_user_cohorts",
+  status: "completed",
+  active_warehouse_version: "wh_live",
+  active_classification_version: COHORT_CLASSIFICATION_VERSION,
+  active_generated_at: "2026-10-06T09:00:00.000Z",
+  building_warehouse_version: null,
+  building_classification_version: null,
+  started_at: null,
+  finished_at: "2026-10-06T09:00:00.000Z",
+  duration_ms: 1,
+  users_classified: 5,
+  rows_inserted: 5,
+  duplicate_users: 0,
+  removed_or_invalidated: 0,
+  source_transactions: 50,
+  source_unique_users: 5,
+  last_error: null,
+  diagnostics: { validation: { status: "PASS" } },
+  active_validation: { status: "PASS" },
+  active_campaign_scope_version: null,
+  fresh_verified_at: "2026-10-06T11:52:00.000Z",
+  stale_since: null,
+} satisfies CohortSnapshotState;
+const GATE_NOW = new Date("2026-10-06T12:00:00.000Z");
+
+function makeDeps(row: ReturnType<typeof accessRow>, snapshotState: CohortSnapshotState | null = READY_SNAPSHOT_STATE): AccessGateDeps {
   const raw = fakeRaw();
   return {
+    loadCohortSnapshotState: vi.fn(async () => snapshotState),
+    now: () => GATE_NOW,
     configError: null,
     pg: { from: vi.fn(), rpc: vi.fn(), auth: { getUser: vi.fn() } } as unknown as AccessGateDeps["pg"],
     getUser: vi.fn(async () => ({ data: { user: { id: row.user_id, email: "member@example.com" } }, error: null })),
@@ -107,14 +140,14 @@ function makeDeps(row: ReturnType<typeof accessRow>): AccessGateDeps {
   };
 }
 
-async function call<A extends string>(policy: FunctionPolicy<A>, body: unknown, row: ReturnType<typeof accessRow>) {
+async function call<A extends string>(policy: FunctionPolicy<A>, body: unknown, row: ReturnType<typeof accessRow>, snapshotState?: CohortSnapshotState | null) {
   const handler = vi.fn(async ({ action, ctx }: Parameters<AccessHandler<A>>[0]) => ({ ok: true, action, tenant: ctx.tenantKey }));
   const req = new Request("https://edge.test/functions/v1/fn", {
     method: "POST",
     headers: { Authorization: "Bearer good-token", "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  const response = await handleWithAccess(req, policy, handler as unknown as AccessHandler<A>, makeDeps(row));
+  const response = await handleWithAccess(req, policy, handler as unknown as AccessHandler<A>, makeDeps(row, snapshotState));
   return { status: response.status, body: (await response.json()) as Record<string, unknown>, handler };
 }
 
@@ -168,7 +201,7 @@ describe("policy tables", () => {
     ]);
   });
 
-  it("match the Phase-1 permission table exactly (none is scopeReady)", () => {
+  it("match the permission table exactly (Phase 2: only the revenue reads are scopeReady)", () => {
     expect(CLICKHOUSE_USERS_POLICY.actions).toEqual({
       list: { allOf: ["users.view", "users.pii.view"] },
       summary: { allOf: ["users.view", "users.pii.view"] },
@@ -182,12 +215,15 @@ describe("policy tables", () => {
       bank_detail: { anyOf: ["payment_pass.banks.view"] },
       ai_pass_rates: { allOf: ["ai.use"], anyOf: ["cohorts.view", "facebook_analytics.view"] },
     });
-    expect(CLICKHOUSE_REVENUE_POLICY.actions).toEqual({ bundle: { anyOf: ["dashboard.view"] }, day_breakdown: { anyOf: ["dashboard.view"] } });
+    expect(CLICKHOUSE_REVENUE_POLICY.actions).toEqual({
+      bundle: { anyOf: ["dashboard.view"], scopeReady: true, scopeSnapshot: "cohort" },
+      day_breakdown: { anyOf: ["dashboard.view"], scopeReady: true, scopeSnapshot: "cohort" },
+    });
     expect(DASHBOARD_SUMMARY_POLICY.actions).toEqual({ summary: { rawOnly: true, anyOf: ["dashboard.view"] } });
     expect(FB_ANALYTICS_SUMMARY_POLICY.actions).toEqual({ summary: { rawOnly: true, anyOf: ["facebook_analytics.view"] } });
     for (const { policy } of MATRIX) {
       for (const entry of Object.values(policy.actions)) {
-        expect(entry.scopeReady).toBeFalsy();
+        if (policy.fn !== "clickhouse-revenue") expect(entry.scopeReady).toBeFalsy();
         // every key a policy names is a real, enforced permission
         for (const key of [...(entry.anyOf ?? []), ...(entry.allOf ?? [])]) expect(ENFORCED_PERMISSION_KEYS).toContain(key);
       }
@@ -302,10 +338,26 @@ describe("gate decisions per function", () => {
     }
   });
 
-  it("Milestone A: every funnel-restricted context gets 403 scope_not_supported on every action", async () => {
+  it("Phase 2: restricted contexts reach the revenue reads behind the freshness gate (409 / 503 otherwise)", async () => {
+    for (const scope of ["selected", "none"] as const) {
+      for (const [action, body] of Object.entries(MATRIX[2].bodies)) {
+        const restricted = memberRow(["dashboard.view"], scope);
+        await expectAllowed(CLICKHOUSE_REVENUE_POLICY, body, restricted, action as "bundle" | "day_breakdown");
+        const notReady = await call(CLICKHOUSE_REVENUE_POLICY, body, restricted, null);
+        expect(notReady.status).toBe(409);
+        expect(notReady.body.error_code).toBe(ACCESS_ERROR.SCOPE_SNAPSHOT_NOT_READY);
+        expect(notReady.handler).not.toHaveBeenCalled();
+        const stale = await call(CLICKHOUSE_REVENUE_POLICY, body, restricted, { ...READY_SNAPSHOT_STATE, fresh_verified_at: "2026-10-05T00:00:00.000Z" });
+        expect(stale.status).toBe(409);
+      }
+    }
+  });
+
+  it("Milestone A: every funnel-restricted context gets 403 scope_not_supported on every other action", async () => {
     const employeeAll = (scope: Scope) => memberRow([...ENFORCED_PERMISSION_KEYS], scope);
     for (const scope of ["selected", "none"] as const) {
       for (const { policy, bodies } of MATRIX) {
+        if (policy.fn === "clickhouse-revenue") continue;
         for (const [action, body] of Object.entries(bodies)) {
           // rawOnly actions are refused to employees before scope; a (hypothetical)
           // restricted data owner proves the scope check itself.

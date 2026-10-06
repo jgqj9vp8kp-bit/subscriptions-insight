@@ -7,6 +7,12 @@ export interface ClickHouseClientLike {
     query: string;
     query_params?: Record<string, unknown>;
     format?: "JSONEachRow" | string;
+    /** Per-query server settings (URL params; the transport accepts a fixed
+     * allowlist). Set by the ScopedReader for funnel-restricted reads only. */
+    settings?: Record<string, string | number>;
+    query_id?: string;
+    /** Aborts the HTTP request (ScopedReader.close() for restricted readers). */
+    signal?: AbortSignal;
   }): Promise<ClickHouseResultSet>;
   command(input: { query: string; query_params?: Record<string, unknown> }): Promise<void>;
   insert(input: {

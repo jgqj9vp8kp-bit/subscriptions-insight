@@ -1,13 +1,15 @@
 // Access migration of the Facebook Edge functions (plan §7 rows "FB warehouse",
 // "FB status", "FB history/recon", "FB writes", "FB cron", "Spend ledger",
-// "Funnel spend", "Capsuled syncs"; §10, §13, §27 — Milestone A).
+// "Funnel spend", "Capsuled syncs"; §10, §13, §27 — Milestone A; Phase 2 spec §4).
 //
 // Both policies are driven through the pure gate core (handleWithAccess) with
-// fake dependencies, so these tests prove who may call which action, that every
-// funnel-restricted context is refused, that the cron tick is authenticated by
-// the secret (before the body is read) and bound to the workspace tenant, that
-// error bodies stay the owner's while employees get generic ones, that status /
-// sync responses are redacted for non-owners, and that the FB runners no longer
+// fake dependencies, so these tests prove who may call which action, that a
+// funnel-restricted context reaches exactly the six FB warehouse reads (behind
+// the campaign-scope freshness gate) and is refused everywhere else, that the
+// cron tick is authenticated by the secret (before the body is read) and bound
+// to the workspace tenant, that error bodies stay the owner's while employees
+// get generic ones, that status / sync responses are redacted for non-owners
+// (and further for restricted members), and that the FB runners no longer
 // swallow a ScopeViolation or read known gaps across tenants.
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -34,9 +36,17 @@ import {
   fbStatusDetailVisible,
   fbV2PreviewRead,
   normalizeClickHouseFacebookAction,
+  projectFbSyncStateForRestricted,
   projectFbSyncStateForViewer,
   type ClickHouseFacebookAction,
 } from "../../supabase/functions/_shared/access/policies/clickhouse-facebook.ts";
+import {
+  CAMPAIGN_SCOPE_VERSION,
+  COHORT_CLASSIFICATION_VERSION,
+  COHORT_SNAPSHOT_NAME,
+  type CohortSnapshotState,
+} from "../../supabase/functions/_shared/clickhouse/cohortSnapshotState.ts";
+import type { ScopeSql } from "../../supabase/functions/_shared/clickhouse/scopeSql.ts";
 import {
   CAPSULED_FACEBOOK_SYNC_POLICY,
   CapsuledSyncError,
@@ -90,7 +100,45 @@ function accessRow(options: { userId?: string; permissions?: string[]; isOwner?:
 const ownerRow = (scope: Scope = "all") => accessRow({ userId: DATA_KEY, isOwner: true, scope });
 const memberRow = (permissions: string[], scope: Scope = "all") => accessRow({ permissions, scope });
 
-function makeDeps(row: ReturnType<typeof accessRow>, env: Record<string, string> = {}): AccessGateDeps {
+const NOW = new Date("2026-10-06T12:00:00.000Z");
+const PASS = { status: "PASS", duplicate_users: 0, dynamic_users: 5, materialized_users: 5 };
+
+/** A fresh, validated cohort snapshot with the FB campaign scope built. */
+function readySnapshotState(overrides: Partial<CohortSnapshotState> = {}): CohortSnapshotState {
+  return {
+    auth_user_id: DATA_KEY,
+    snapshot_name: COHORT_SNAPSHOT_NAME,
+    status: "completed",
+    active_warehouse_version: "wh_live",
+    active_classification_version: COHORT_CLASSIFICATION_VERSION,
+    active_generated_at: "2026-10-06T09:00:00.000Z",
+    building_warehouse_version: null,
+    building_classification_version: null,
+    started_at: null,
+    finished_at: "2026-10-06T09:00:00.000Z",
+    duration_ms: 1,
+    users_classified: 5,
+    rows_inserted: 5,
+    duplicate_users: 0,
+    removed_or_invalidated: 0,
+    source_transactions: 50,
+    source_unique_users: 5,
+    last_error: null,
+    diagnostics: { validation: PASS },
+    active_validation: PASS,
+    active_validated_at: "2026-10-06T09:00:00.000Z",
+    active_campaign_scope_version: CAMPAIGN_SCOPE_VERSION,
+    fresh_verified_at: "2026-10-06T11:52:00.000Z",
+    stale_since: null,
+    ...overrides,
+  };
+}
+
+function makeDeps(
+  row: ReturnType<typeof accessRow>,
+  env: Record<string, string> = {},
+  snapshot: { state?: CohortSnapshotState | null; loader?: boolean } = {},
+): AccessGateDeps {
   const raw: ClickHouseClientLike = {
     query: vi.fn(async () => ({ json: async () => [] as unknown })),
     command: vi.fn(async () => undefined),
@@ -107,6 +155,10 @@ function makeDeps(row: ReturnType<typeof accessRow>, env: Record<string, string>
     createClickHouse: vi.fn((ctx: AccessContext) => createScopedReader(ctx, raw)),
     newRequestId: () => "req-test-1",
     log: vi.fn(),
+    // Phase 2 freshness gate (restricted scopeSnapshot actions only).
+    ...(snapshot.loader === false
+      ? {}
+      : { loadCohortSnapshotState: vi.fn(async () => (snapshot.state === undefined ? readySnapshotState() : snapshot.state)), now: () => NOW }),
   };
 }
 
@@ -117,7 +169,13 @@ async function call<A extends string>(
   policy: FunctionPolicy<A>,
   body: unknown,
   row: ReturnType<typeof accessRow>,
-  options: { method?: string; url?: string; handler?: ReturnType<typeof echoHandler>; serve?: ServeWithAccessOptions } = {},
+  options: {
+    method?: string;
+    url?: string;
+    handler?: ReturnType<typeof echoHandler>;
+    serve?: ServeWithAccessOptions;
+    snapshot?: { state?: CohortSnapshotState | null; loader?: boolean };
+  } = {},
 ) {
   const handler = options.handler ?? echoHandler();
   const method = options.method ?? "POST";
@@ -126,7 +184,7 @@ async function call<A extends string>(
     headers: { Authorization: "Bearer good-token", "Content-Type": "application/json" },
     ...(method === "GET" ? {} : { body: JSON.stringify(body) }),
   });
-  const response = await handleWithAccess(req, policy, handler as unknown as AccessHandler<A>, makeDeps(row), options.serve);
+  const response = await handleWithAccess(req, policy, handler as unknown as AccessHandler<A>, makeDeps(row, {}, options.snapshot), options.serve);
   return { status: response.status, body: (await response.json()) as Record<string, unknown>, handler };
 }
 
@@ -187,16 +245,17 @@ describe("policy tables", () => {
     expect(CAPSULED_FACEBOOK_SYNC_POLICY.cron).toBeUndefined();
   });
 
-  it("match the Phase-1 permission table exactly (none is scopeReady)", () => {
+  it("match the permission table exactly (Phase 2: only the six FB warehouse reads are scopeReady)", () => {
     const FB = ["facebook_analytics.view"];
     const DIAG = ["admin.diagnostics.view"];
+    const SCOPED = { scopeReady: true, scopeSnapshot: "campaign" };
     expect(CLICKHOUSE_FACEBOOK_POLICY.actions).toEqual({
-      report: { anyOf: FB },
-      list: { anyOf: FB },
-      charts: { anyOf: FB },
-      filters: { anyOf: FB },
-      summary: { anyOf: FB },
-      status: { anyOf: ["facebook_analytics.view", "cohorts.view"] },
+      report: { anyOf: FB, ...SCOPED },
+      list: { anyOf: FB, ...SCOPED },
+      charts: { anyOf: FB, ...SCOPED },
+      filters: { anyOf: FB, ...SCOPED },
+      summary: { anyOf: FB, ...SCOPED },
+      status: { anyOf: ["facebook_analytics.view", "cohorts.view"], ...SCOPED },
       v2_preview: { allOf: [...FB, ...DIAG] },
       funnel_spend: { anyOf: FB, fullScopeOnly: true },
       spend_ledger: { anyOf: ["forecasting.view"] },
@@ -218,9 +277,19 @@ describe("policy tables", () => {
       cron_daily: { ownerOnly: true, rawOnly: true, allOf: ["admin.sync.run", "admin.warehouse.manage"], write: true },
     });
     expect(CAPSULED_FACEBOOK_SYNC_POLICY.actions).toEqual({ sync: { allOf: ["admin.sync.run"], write: true } });
+    // The allowlist: exactly these, each behind the campaign-scope snapshot, none
+    // a write and none narrowed by restrictedAnyOf.
+    const scopeReady = Object.entries(CLICKHOUSE_FACEBOOK_POLICY.actions).filter(([, entry]) => entry.scopeReady).map(([action]) => action);
+    expect(scopeReady.sort()).toEqual(["charts", "filters", "list", "report", "status", "summary"]);
+    for (const action of scopeReady) {
+      const entry = CLICKHOUSE_FACEBOOK_POLICY.actions[action as ClickHouseFacebookAction];
+      expect(entry.scopeSnapshot, action).toBe("campaign");
+      expect(entry.write, action).toBeFalsy();
+      expect(entry.restrictedAnyOf, action).toBeUndefined();
+    }
+    for (const entry of Object.values(CAPSULED_FACEBOOK_SYNC_POLICY.actions as Record<string, { scopeReady?: boolean }>)) expect(entry.scopeReady).toBeFalsy();
     for (const policy of [CLICKHOUSE_FACEBOOK_POLICY, CAPSULED_FACEBOOK_SYNC_POLICY] as FunctionPolicy<string>[]) {
       for (const entry of Object.values(policy.actions)) {
-        expect(entry.scopeReady).toBeFalsy();
         // Every policy names permissions (no "any active member" action).
         expect([...(entry.anyOf ?? []), ...(entry.allOf ?? [])].length).toBeGreaterThan(0);
         for (const key of [...(entry.anyOf ?? []), ...(entry.allOf ?? [])]) expect(ENFORCED_PERMISSION_KEYS).toContain(key);
@@ -346,9 +415,21 @@ describe("gate decisions — clickhouse-facebook", () => {
     }
   });
 
-  it("Milestone A: every funnel-restricted context gets 403 on every action", async () => {
+  const SCOPE_READY: UserAction[] = ["report", "list", "charts", "filters", "summary", "status"];
+  const scopeHandler = () =>
+    vi.fn(async ({ action, ctx, scope }: { action: string; ctx: AccessContext; scope: ScopeSql }) => ({
+      ok: true,
+      action,
+      restricted: ctx.restricted,
+      scope_restricted: scope.restricted,
+      paths: [...(scope.paths ?? [])],
+      campaign_scope_ready: scope.snapshot?.campaignScopeReady ?? null,
+      warehouse_version: scope.snapshot?.warehouseVersion ?? null,
+    }));
+
+  it("Phase 2: a funnel-restricted context is refused on every action but the six FB warehouse reads", async () => {
     for (const scope of ["selected", "none"] as const) {
-      for (const action of USER_ACTIONS) {
+      for (const action of USER_ACTIONS.filter((candidate) => !SCOPE_READY.includes(candidate))) {
         // A (hypothetical) restricted Owner holds every permission, so this
         // proves the scope check itself: scope_not_supported, or
         // full_scope_required for the whole-tenant funnel_spend.
@@ -359,6 +440,57 @@ describe("gate decisions — clickhouse-facebook", () => {
         await expectDenied(CLICKHOUSE_FACEBOOK_POLICY, FB_BODIES[action], memberRow([...ENFORCED_PERMISSION_KEYS], scope), 403);
       }
     }
+  });
+
+  it("Phase 2: the six reads reach the handler with a restricted handle bound to the active snapshot", async () => {
+    for (const scope of ["selected", "none"] as const) {
+      for (const action of SCOPE_READY) {
+        for (const row of [ownerRow(scope), memberRow(["facebook_analytics.view", "cohorts.view"], scope)]) {
+          const result = await call(CLICKHOUSE_FACEBOOK_POLICY, FB_BODIES[action], row, { handler: scopeHandler() as never });
+          expect(result.status, `${scope}/${action}`).toBe(200);
+          expect(result.body).toEqual({
+            ok: true,
+            action,
+            restricted: true,
+            scope_restricted: true,
+            paths: scope === "selected" ? ["soulmate"] : [],
+            campaign_scope_ready: true,
+            warehouse_version: "wh_live",
+          });
+        }
+      }
+    }
+    // A Cohorts-only buyer reads status (the Cohorts page keys its FB columns on it).
+    const status = await call(CLICKHOUSE_FACEBOOK_POLICY, FB_BODIES.status, memberRow(["cohorts.view"], "selected"), { handler: scopeHandler() as never });
+    expect(status.status).toBe(200);
+    await expectDenied(CLICKHOUSE_FACEBOOK_POLICY, FB_BODIES.report, memberRow(["cohorts.view"], "selected"), 403, ACCESS_ERROR.PERMISSION_DENIED);
+  });
+
+  it("Phase 2: no campaign scope / stale / unvalidated snapshot → 409 before the handler; no loader → 503", async () => {
+    const notReady: Array<Partial<CohortSnapshotState> | null> = [
+      { active_campaign_scope_version: null },
+      { active_campaign_scope_version: "campaign_scope_v0" },
+      { fresh_verified_at: "2026-10-06T05:00:00.000Z" },
+      { active_validation: { status: "FAIL" } },
+      { active_warehouse_version: null },
+      null,
+    ];
+    for (const overrides of notReady) {
+      const state = overrides === null ? null : readySnapshotState(overrides);
+      for (const action of SCOPE_READY) {
+        const result = await call(CLICKHOUSE_FACEBOOK_POLICY, FB_BODIES[action], memberRow(["facebook_analytics.view"], "selected"), { snapshot: { state } });
+        expect(result.status, `${JSON.stringify(overrides)}/${action}`).toBe(409);
+        expect(result.body).toEqual({ ok: false, error_code: ACCESS_ERROR.SCOPE_SNAPSHOT_NOT_READY, error: expect.any(String) });
+        expect(result.handler).not.toHaveBeenCalled();
+      }
+    }
+    const unwired = await call(CLICKHOUSE_FACEBOOK_POLICY, FB_BODIES.report, memberRow(["facebook_analytics.view"], "selected"), { snapshot: { loader: false } });
+    expect(unwired.status).toBe(503);
+    expect(unwired.handler).not.toHaveBeenCalled();
+    // Scope all never loads the snapshot state: the owner is unaffected by it.
+    const owner = await call(CLICKHOUSE_FACEBOOK_POLICY, FB_BODIES.report, ownerRow(), { snapshot: { state: null }, handler: scopeHandler() as never });
+    expect(owner.status).toBe(200);
+    expect(owner.body).toMatchObject({ restricted: false, scope_restricted: false, paths: [], campaign_scope_ready: null });
   });
 });
 
@@ -565,6 +697,73 @@ describe("status: tenant-wide spend diagnostics are stripped for viewers", () =>
     expect(fbStatusDetailVisible(contextFor(memberRow(["facebook_analytics.view", "admin.sync.run"])))).toBe(false);
     expect(fbStatusDetailVisible(contextFor(memberRow(["cohorts.view"])))).toBe(false);
   });
+
+  it("restricted members: lifecycle, cursor and window only — no tenant-wide counters", () => {
+    const FULL = {
+      ...STATE,
+      stopped_reason: "completed",
+      last_run_mode: "continue",
+      started_at: "2026-09-14T09:59:00Z",
+      updated_at: "2026-09-14T10:00:01Z",
+      rows_scanned: 4321,
+      rows_mapped: 4300,
+      rows_skipped: 21,
+      batches_processed: 77,
+      source_total: 4321,
+      diagnostics: {
+        ...STATE.diagnostics,
+        date_from: "2026-09-12",
+        date_to: "2026-09-14",
+        levels: ["campaign", "adset"],
+        api_last_import_at: "2026-09-14T09:38:45.048Z",
+        api_requests: 66,
+        api_latency_ms: 12345,
+        api_payload_bytes: 999999,
+        range_splits: 3,
+        rows_updated: 55,
+        active_days: 3,
+        strategy: "per_day_entity_fetch",
+        merged_rows_detected: 0,
+        validation_status: "PASSED",
+        error_code: null,
+        error_message_safe: null,
+      },
+    };
+    const projected = projectFbSyncStateForRestricted(FULL)!;
+    expect(projected).toEqual({
+      sync_name: "fact_facebook_stats_sync",
+      status: "completed",
+      current_stage: "idle",
+      stopped_reason: "completed",
+      last_run_mode: "continue",
+      cursor_transaction_id: "2026-09-14",
+      cursor_updated_at: "2026-09-14T09:38:45.048Z",
+      started_at: "2026-09-14T09:59:00Z",
+      finished_at: "2026-09-14T10:00:00Z",
+      duration_ms: 4000,
+      updated_at: "2026-09-14T10:00:01Z",
+      diagnostics: {
+        mode: "incremental",
+        date_from: "2026-09-12",
+        date_to: "2026-09-14",
+        levels: ["campaign", "adset"],
+        fb_stats_to: "2026-09-13",
+        api_last_import_at: "2026-09-14T09:38:45.048Z",
+        warehouse_version: "fbwh_abc",
+        strategy: "per_day_entity_fetch",
+        validation_status: "PASSED",
+        error_code: null,
+        error_message_safe: null,
+      },
+    });
+    const text = JSON.stringify(projected);
+    for (const secret of [String(SENTINEL_SPEND), DATA_KEY, "upstream body", "4321", "3000", "999999"]) expect(text).not.toContain(secret);
+    expect(projectFbSyncStateForRestricted(null)).toBeNull();
+    expect(projectFbSyncStateForRestricted({ status: "running", diagnostics: [] })).toEqual({ status: "running", diagnostics: null });
+    // The browser's FB warehouse version (cursor + finished_at + warehouse_rows) is unchanged.
+    const diagnostics = { warehouse_rows: 12 } as FbStatusResponse["diagnostics"];
+    expect(fbWarehouseVersionFromStatus({ ok: true, state: projected, diagnostics })).toBe(fbWarehouseVersionFromStatus({ ok: true, state: FULL, diagnostics }));
+  });
 });
 
 describe("capsuled sync response: upstream payloads stay with the data owner", () => {
@@ -740,10 +939,34 @@ describe("index.ts entrypoints are on the gate", () => {
     const text = source("clickhouse-facebook");
     expect(text.match(/ensureFactFacebookStatsSchema\(/g)).toHaveLength(1);
     expect(text).toContain("if (FB_SCHEMA_WRITE_ACTIONS.has(action)) await ensureFactFacebookStatsSchema(ch);");
-    const catches = text.match(/catch \(error\) \{/g) ?? [];
-    const rethrows = text.match(/if \(error instanceof ScopeViolation( \|\| error instanceof FbActionError)?\) throw error;/g) ?? [];
+    const catches = text.match(/catch \(error\) \{|\.catch\(\(error\) => \{|\.catch\(\(\) =>/g) ?? [];
+    const rethrows = text.match(/if \(error instanceof ScopeViolation( \|\| error instanceof \w+)*\) throw error;/g) ?? [];
     expect(catches.length).toBeGreaterThan(0);
+    expect(text).not.toMatch(/\.catch\(\(\) =>/);
     expect(rethrows.length).toBe(catches.length);
+    // The read actions' catch hands the scope refusals to the gate (403 / 409).
+    expect(text).toContain(
+      "if (error instanceof ScopeViolation || error instanceof FbActionError || error instanceof ScopeForbiddenError || error instanceof ScopeSnapshotNotReadyError) throw error;",
+    );
+  });
+
+  it("clickhouse-facebook: restricted reads assert the level, pass the scope and project the status state", () => {
+    const text = source("clickhouse-facebook");
+    expect(text).toContain("async ({ ctx, action, body, pg, clickhouse, scope }) =>");
+    expect(text).toContain("if (ctx.restricted) assertFbLevelInScope(scope, level);");
+    expect(text).toContain('if (ctx.restricted && read !== "filters") assertFbLevelInScope(scope, normalizeFbLevel((body as FbReadRequest).level));');
+    expect(text).toContain("? projectFbSyncStateForRestricted(state)");
+    for (const call of [
+      "runFbReport({ clickhouse: ch, supabase: pg, authUserId, request: body as FbReadRequest, scope })",
+      "runFbList(ch, authUserId, body as FbReadRequest, scope)",
+      "runFbCharts(ch, authUserId, body as FbReadRequest, scope)",
+      "runFbFilterOptions(ch, authUserId, body as FbReadRequest, scope)",
+    ]) {
+      expect(text, call).toContain(call);
+    }
+    // Every warehouse read call site of the six actions carries the scope.
+    expect(text.match(/runFbReport\(\{[^}]*\}\)/g)?.every((site) => site.includes("scope"))).toBe(true);
+    expect(text.match(/buildFbDiagnostics\(\{[\s\S]*?\}\)/g)?.every((site) => site.includes("scope"))).toBe(true);
   });
 
   it("capsuled-facebook-sync writes every row under the tenant key, never the caller", () => {

@@ -1,8 +1,9 @@
 // Member detail sheet of Admin → Members (plan §15): General (role, name,
 // status), Page / feature access (read-only preview of the role, with an "Edit
-// role" link), Data access (FunnelScopePicker) and Effective access (what the
-// server resolves for the member right now). There are no per-user overrides
-// in v1: capabilities come from the role.
+// role" link), Data access (FunnelScopePicker, with the coverage impact preview
+// while "Selected funnels" is picked) and Effective access (what the server
+// resolves for the member right now). There are no per-user overrides in v1:
+// capabilities come from the role.
 //
 // Role / name / scope edits are saved together (planMemberSave orders the
 // calls so the server's "admin roles require All funnels" rule never trips).
@@ -24,7 +25,7 @@ import { useToast } from "@/hooks/use-toast";
 import { EffectiveAccessPanel } from "@/components/admin/EffectiveAccessPanel";
 import { FunnelScopePicker } from "@/components/admin/FunnelScopePicker";
 import { RoleSelect } from "@/components/admin/RoleSelect";
-import { useAccessAdminMutation, useMemberEffectiveAccess } from "@/components/admin/useAccessAdmin";
+import { useAccessAdminMutation, useMemberEffectiveAccess, usePathCoverage } from "@/components/admin/useAccessAdmin";
 import {
   groupPermissions,
   isPrivilegedRole,
@@ -59,6 +60,11 @@ export interface MemberSheetProps {
   canViewRoles: boolean;
   onRequestStatusChange: (member: AdminMember, next: "active" | "disabled") => void;
 }
+
+/** Narrowing a member from All funnels does not re-scope what they saved
+ * meanwhile (0003 TODO, Phase 4 saved-object scope stamps). */
+const SAVED_OBJECTS_NARROWING_NOTICE =
+  "Reports, forecasts and AI history this member saved while on All funnels stay readable to them after this change.";
 
 function draftOf(member: AdminMember): MemberDraft {
   return {
@@ -129,6 +135,8 @@ export function MemberSheet({
   const [draft, setDraft] = useState<MemberDraft | null>(member ? draftOf(member) : null);
   const [saving, setSaving] = useState(false);
   const effective = useMemberEffectiveAccess(member?.id ?? null, open && Boolean(member));
+  // The impact preview of the scope picker (selected funnels only).
+  const coverage = usePathCoverage(open && Boolean(member) && (draft ?? (member ? draftOf(member) : null))?.scope.mode === "selected");
 
   // Re-seed the draft whenever the saved member changes (another member, or
   // this one after a save / refetch).
@@ -291,7 +299,15 @@ export function MemberSheet({
                   loading={funnelsLoading}
                   disabled={!accessEditable || saving}
                   requireAll={requireAll}
+                  coverage={coverage.data}
+                  coverageLoading={coverage.isLoading}
+                  coverageError={coverage.error}
                 />
+                {member.funnel_scope.mode === "all" && current.scope.mode !== "all" && (
+                  <p className="mt-2 text-xs text-warning" data-testid="scope-narrowing-saved-objects">
+                    {SAVED_OBJECTS_NARROWING_NOTICE}
+                  </p>
+                )}
               </section>
 
               <Separator />

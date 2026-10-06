@@ -10,14 +10,17 @@
 import { formatDistanceStrict } from "date-fns";
 import type { AccessContextValue } from "@/contexts/accessContext";
 import type { AccessSubject } from "@/services/accessRoutes";
-import { ROUTE_ACCESS, checkAccessRule } from "@/services/accessRoutes";
+import { ROUTE_ACCESS, accessRuleDenial } from "@/services/accessRoutes";
 import type {
   AdminFunnelOption,
+  AdminFunnelPath,
   AdminFunnelScope,
   AdminMember,
   AdminRole,
   AuditEvent,
   EffectiveAccess,
+  FunnelCoverage,
+  FunnelCoveragePath,
   FunnelScopeMode,
 } from "@/services/accessAdminClient";
 import {
@@ -315,6 +318,217 @@ export function funnelPathLabel(funnel: AdminFunnelOption | undefined, id: strin
   return path || funnel?.display_name.trim() || shortId(id);
 }
 
+/** Statuses that grant access (app.funnel_scope_paths): active ∪ retired. */
+export function isGrantedPathStatus(status: AdminFunnelPath["status"] | null | undefined): boolean {
+  return status === "active" || status === "retired";
+}
+
+/** The funnel's granted paths, active first then retired, by path. */
+export function grantedPaths(funnel: Pick<AdminFunnelOption, "paths"> | undefined): AdminFunnelPath[] {
+  return (funnel?.paths ?? [])
+    .filter((entry) => isGrantedPathStatus(entry.status))
+    .sort((a, b) => (a.status === b.status ? a.path.localeCompare(b.path) : a.status === "active" ? -1 : 1));
+}
+
+/** Browser mirror of app.canonical_campaign_path (rule A, non-URL branch plus
+ * scheme/host strip): "/Soulmate-Sketch?x=1" → "soulmate-sketch"; null when
+ * nothing canonical is left. UX only (which registry path is a funnel's own). */
+export function canonicalCampaignPath(raw: string | null | undefined): string | null {
+  const lowered = String(raw ?? "").replace(/^[ \t\r\n]+|[ \t\r\n]+$/g, "").toLowerCase().replace(/^https?:\/\/[^/]+/, "");
+  const bare = lowered.split("?", 1)[0].split("#", 1)[0].replace(/^\/+|\/+$/g, "");
+  const path = bare.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return path === "" || path === "unknown" || path.length > 200 ? null : path;
+}
+
+/** The path that is the funnel's own funnel_path: the server refuses to retire
+ * or revoke it ("edit the funnel's path instead"). */
+export function isPrimaryFunnelPath(funnel: Pick<AdminFunnelOption, "funnel_path"> | undefined, path: string): boolean {
+  return Boolean(funnel) && canonicalCampaignPath(funnel?.funnel_path) === path;
+}
+
+/** Active members whose selected scope holds `funnelId` (who start seeing a
+ * path attached to that funnel). */
+export function membersHoldingFunnel(members: readonly AdminMember[], funnelId: string): number {
+  const key = funnelId.toLowerCase();
+  return members.filter(
+    (member) =>
+      member.status === "active" &&
+      member.funnel_scope.mode === "selected" &&
+      member.funnel_scope.funnel_ids.some((id) => id.toLowerCase() === key),
+  ).length;
+}
+
+// ---- coverage and scope impact ------------------------------------------------------------
+
+/** "12,345". */
+export function formatCount(value: number): string {
+  return Math.round(value).toLocaleString("en-US");
+}
+
+/** "$12,345" / "-$80" (whole dollars). */
+export function formatUsd(value: number): string {
+  const rounded = Math.round(value);
+  return `${rounded < 0 ? "-" : ""}$${Math.abs(rounded).toLocaleString("en-US")}`;
+}
+
+/** Share in percent, floored to one decimal so a partial share never reads as
+ * 100% ("<0.1%" for a tiny non-zero one); "—" without a denominator. */
+export function formatPct(part: number, whole: number): string {
+  if (!(whole > 0)) return "—";
+  const pct = Math.floor((part / whole) * 1000) / 10;
+  if (part > 0 && pct < 0.1) return "<0.1%";
+  return `${Math.max(0, pct)}%`;
+}
+
+export interface ScopeImpact {
+  /** Selected funnels (ids the registry may or may not know). */
+  funnels: number;
+  /** Distinct granted paths of the selected funnels, and how many are retired. */
+  paths: number;
+  retiredPaths: number;
+  /** Null until coverage is loaded. */
+  users: number | null;
+  usersPct: string | null;
+  netRevenue: number | null;
+  netPct: string | null;
+  /** Selected funnels whose granted paths hold no user of the snapshot. */
+  funnelsWithoutData: Array<{ id: string; label: string }>;
+  /** Snapshot paths no funnel holds (unregistered, proposed or unscopable):
+   * invisible to every funnel-restricted member. */
+  unregisteredPaths: number | null;
+  unregisteredUsersPct: string | null;
+}
+
+/** What a selected-funnels scope would show the member (plan §17 "Impact
+ * preview"): registry paths come from the funnel list, users and net revenue
+ * from the coverage of the active snapshot. Pure. */
+export function computeScopeImpact(
+  scope: AdminFunnelScope,
+  funnels: readonly AdminFunnelOption[],
+  coverage: FunnelCoverage | null | undefined,
+): ScopeImpact {
+  const ids = scope.mode === "selected" ? [...new Set(scope.funnel_ids.map((id) => id.toLowerCase()))] : [];
+  const byId = new Map(funnels.map((funnel) => [funnel.id.toLowerCase(), funnel]));
+  const granted = new Map<string, AdminFunnelPath["status"]>();
+  for (const id of ids) {
+    for (const entry of grantedPaths(byId.get(id))) {
+      if (granted.get(entry.path) !== "active") granted.set(entry.path, entry.status);
+    }
+  }
+  const impact: ScopeImpact = {
+    funnels: ids.length,
+    paths: granted.size,
+    retiredPaths: [...granted.values()].filter((status) => status === "retired").length,
+    users: null,
+    usersPct: null,
+    netRevenue: null,
+    netPct: null,
+    funnelsWithoutData: [],
+    unregisteredPaths: null,
+    unregisteredUsersPct: null,
+  };
+  if (!coverage) return impact;
+
+  const coverageByFunnel = new Map(coverage.funnels.map((entry) => [entry.funnel_id.toLowerCase(), entry]));
+  let users = 0;
+  let net = 0;
+  for (const id of ids) {
+    const entry = coverageByFunnel.get(id);
+    users += entry?.users ?? 0;
+    net += entry?.net_revenue ?? 0;
+    if (!entry || entry.users <= 0) impact.funnelsWithoutData.push({ id, label: funnelOptionLabel(byId.get(id), id) });
+  }
+  const unregistered = coverage.paths.filter((row) => row.state !== "granted");
+  const unregisteredUsers = unregistered.reduce((sum, row) => sum + row.users, 0);
+  return {
+    ...impact,
+    users,
+    usersPct: formatPct(users, coverage.totals.users),
+    netRevenue: net,
+    netPct: formatPct(net, coverage.totals.net_revenue),
+    unregisteredPaths: unregistered.length,
+    unregisteredUsersPct: formatPct(unregisteredUsers, coverage.totals.users),
+  };
+}
+
+/** A selected-funnels scope none of whose funnels has a user in the snapshot:
+ * the member sees no data at all (members table warning). False without
+ * coverage or for any other mode. */
+export function scopeWithoutData(scope: AdminFunnelScope, coverage: FunnelCoverage | null | undefined): boolean {
+  if (!coverage || scope.mode !== "selected") return false;
+  const users = new Map(coverage.funnels.map((entry) => [entry.funnel_id.toLowerCase(), entry.users]));
+  return scope.funnel_ids.every((id) => (users.get(id.toLowerCase()) ?? 0) <= 0);
+}
+
+/** "3 funnels · 4 paths (1 retired) · 1,234 users (8.3%) · $56,789 net (9.1%)". */
+export function scopeImpactSummary(impact: ScopeImpact): string {
+  const parts = [
+    `${impact.funnels} funnel${impact.funnels === 1 ? "" : "s"}`,
+    `${impact.paths} path${impact.paths === 1 ? "" : "s"}${impact.retiredPaths ? ` (${impact.retiredPaths} retired)` : ""}`,
+  ];
+  if (impact.users !== null) parts.push(`${formatCount(impact.users)} user${impact.users === 1 ? "" : "s"} (${impact.usersPct})`);
+  if (impact.netRevenue !== null) parts.push(`${formatUsd(impact.netRevenue)} net (${impact.netPct})`);
+  return parts.join(" · ");
+}
+
+/** Confirmation line of a path grant change:
+ *   add    → "+1,234 users / +$5,678 into Soulmate Sketch; 2 members holding it will see this data"
+ *   remove → "−1,234 users / −$5,678 from Soulmate Sketch; 2 members holding it will lose this data"
+ * `members` null (the admin cannot list members) leaves the count out. */
+export function pathImpactText(
+  direction: "add" | "remove",
+  row: Pick<FunnelCoveragePath, "users" | "net_revenue">,
+  funnelLabel: string,
+  members: number | null,
+): string {
+  const users = `${direction === "add" ? "+" : "−"}${formatCount(row.users)} users`;
+  // Net revenue can be negative (refunds): sign the change, not the label.
+  const delta = direction === "add" ? row.net_revenue : -row.net_revenue;
+  const money = delta < 0 || (delta === 0 && direction === "remove") ? `−${formatUsd(Math.abs(delta))}` : `+${formatUsd(delta)}`;
+  const holders = members === null ? "members holding it" : `${members} member${members === 1 ? "" : "s"} holding it`;
+  const verb = direction === "add" ? "will see this data" : "will lose this data";
+  return `${users} / ${money} ${direction === "add" ? "into" : "from"} ${funnelLabel}; ${holders} ${verb}`;
+}
+
+export const COVERAGE_STATE_LABELS: Readonly<Record<FunnelCoveragePath["state"], string>> = Object.freeze({
+  granted: "Granted",
+  proposed: "Proposed",
+  unregistered: "Unregistered",
+  unscopable: "Unscopable",
+});
+
+/** The path-row write actions an admin with funnels.manage may take (the
+ * server re-checks every transition, §2.1 §9):
+ *   unregistered / proposed → attach to a funnel;
+ *   each proposal           → confirm (active) unless another funnel holds
+ *                             the path, reject (revoked) always;
+ *   granted active          → retire, revoke; granted retired → reactivate,
+ *                             revoke — never for the funnel's own path. */
+export interface CoveragePathActions {
+  attach: boolean;
+  proposals: Array<{ path_id: string; funnel_id: string; canConfirm: boolean }>;
+  retire: boolean;
+  reactivate: boolean;
+  revoke: boolean;
+  /** Why retire / revoke are not offered on a granted path, else null. */
+  lockedReason: string | null;
+}
+
+export function coveragePathActions(row: FunnelCoveragePath, funnels: readonly AdminFunnelOption[]): CoveragePathActions {
+  const granted = row.state === "granted";
+  const holder = granted && row.funnel_id ? funnels.find((funnel) => funnel.id.toLowerCase() === row.funnel_id?.toLowerCase()) : undefined;
+  const primary = granted && isPrimaryFunnelPath(holder, row.path);
+  const editable = granted && Boolean(row.path_id) && !primary;
+  return {
+    attach: row.state === "unregistered" || row.state === "proposed",
+    proposals: row.state === "unscopable" ? [] : row.proposals.map((proposal) => ({ ...proposal, canConfirm: !granted })),
+    retire: editable && row.path_status === "active",
+    reactivate: editable && row.path_status === "retired",
+    revoke: editable,
+    lockedReason: primary ? "This is the funnel's own path: edit the funnel's path on the Funnels page instead." : null,
+  };
+}
+
 // ---- member save plan --------------------------------------------------------------------
 
 export interface MemberDraft {
@@ -366,6 +580,7 @@ export const PAGE_TITLES: Readonly<Record<string, string>> = Object.freeze({
   "/admin/members": "Members",
   "/admin/roles": "Roles",
   "/admin/audit": "Audit log",
+  "/admin/funnels": "Funnel coverage",
 });
 
 export interface PagePreview {
@@ -373,33 +588,47 @@ export interface PagePreview {
   title: string;
   group: "workspace" | "admin";
   allowed: boolean;
+  /** Why the page is hidden (accessRuleDenial), null when allowed: a missing
+   * permission, data-owner only, or not open with funnel-restricted access. */
+  denial: "permission" | "raw" | "scope" | null;
 }
 
+type EffectiveSubjectInput = Pick<EffectiveAccess, "status" | "permissions" | "raw_access"> & {
+  funnel_scope: Pick<EffectiveAccess["funnel_scope"], "mode">;
+};
+
 /** An AccessSubject over a member's server-computed effective access, so the
- * preview runs the SAME route rules (ROUTE_ACCESS + checkAccessRule) as the
- * member's own sidebar and route guards. */
-export function effectiveAccessSubject(effective: Pick<EffectiveAccess, "status" | "permissions" | "raw_access">): AccessSubject {
+ * preview runs the SAME route rules (ROUTE_ACCESS + accessRuleDenial) as the
+ * member's own sidebar and route guards. Restricted = any scope but "all"
+ * (selected funnels or no data access), as the member's own access value. */
+export function effectiveAccessSubject(effective: EffectiveSubjectInput): AccessSubject {
   const permissions = new Set(effective.permissions);
   const active = effective.status === "active";
   const can = (key: string) => active && permissions.has(key);
-  return {
+  const subject: AccessSubject = {
     status: active ? "ok" : "disabled",
     legacy: false,
     rawAccess: active && effective.raw_access,
+    restricted: effective.funnel_scope.mode !== "all",
     can,
     canAny: (keys: readonly string[]) => Array.isArray(keys) && keys.some((key) => can(key)),
   };
+  return subject;
 }
 
-/** Every ROUTE_ACCESS page with whether the member may open it. */
-export function previewPages(effective: Pick<EffectiveAccess, "status" | "permissions" | "raw_access">): PagePreview[] {
+/** Every ROUTE_ACCESS page with whether the member may open it, and why not. */
+export function previewPages(effective: EffectiveSubjectInput): PagePreview[] {
   const subject = effectiveAccessSubject(effective);
-  return ROUTE_ACCESS.map((rule) => ({
-    path: rule.path,
-    title: PAGE_TITLES[rule.path] ?? rule.path,
-    group: rule.path.startsWith("/admin/") ? "admin" : "workspace",
-    allowed: checkAccessRule(rule, subject),
-  }));
+  return ROUTE_ACCESS.map((rule) => {
+    const denial = accessRuleDenial(rule, subject);
+    return {
+      path: rule.path,
+      title: PAGE_TITLES[rule.path] ?? rule.path,
+      group: rule.path.startsWith("/admin/") ? "admin" : "workspace",
+      allowed: denial === null,
+      denial,
+    };
+  });
 }
 
 export interface CapabilitySummary {
@@ -444,6 +673,15 @@ export const AUDIT_EVENT_LABELS: Readonly<Record<string, string>> = Object.freez
   "sync.triggered": "Sync started",
   "warehouse.admin": "Warehouse operation",
   "registry.changed": "Funnel registry changed",
+  "registry.path_registered": "Funnel path registered",
+  "registry.path_repathed": "Funnel re-pathed",
+  "registry.path_attached": "Funnel path attached",
+  "registry.path_confirmed": "Funnel path confirmed",
+  "registry.path_rejected": "Funnel path proposal rejected",
+  "registry.path_retired": "Funnel path retired",
+  "registry.path_reactivated": "Funnel path reactivated",
+  "registry.path_revoked": "Funnel path revoked",
+  "registry.paths_seeded": "Funnel paths seeded",
   "bootstrap.completed": "Workspace set up",
   "owner.recovered": "Owner recovered",
 });

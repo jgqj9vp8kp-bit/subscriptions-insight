@@ -6,10 +6,13 @@
 //                          longer accepts this session; other devices keep theirs.
 //   403 no_membership | membership_disabled | permission_denied |
 //       scope_not_supported | raw_access_required | owner_required |
-//       full_scope_required
+//       full_scope_required | funnel_out_of_scope
 //                        → refresh my_access() (debounced): the role or funnel
 //                          scope probably changed under this tab. If it did,
 //                          the provider purges caches before publishing it.
+//   409 scope_snapshot_not_ready
+//                        → nothing: the funnel-scoped snapshot is being
+//                          prepared; the page polls it (never sign out).
 //   503 auth_service_error | access_service_error | workspace_not_bootstrapped
 //                        → nothing: transient server trouble, never sign out.
 //   anything else        → nothing (pages render their own errors).
@@ -33,6 +36,7 @@ const REFRESH_ON_403: ReadonlySet<string> = new Set([
   "raw_access_required",
   "owner_required",
   "full_scope_required",
+  "funnel_out_of_scope",
 ]);
 
 /** A page fires several queries at once; one refresh answers the burst. */

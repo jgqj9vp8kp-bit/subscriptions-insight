@@ -8,13 +8,20 @@
 //     admin-facing SQL errors kept, service faults sanitized;
 //   * the pure core: validation, SQL error mapping, members/roles/audit
 //     shaping, effective access, auth bans, template seeding;
+//   * funnel paths (access Phase 2, spec §6 contract 8): paths.attach /
+//     paths.set_status RPC calls and results, paths.coverage over a recording
+//     ClickHouse behind the real ScopedReader (409 while no validated snapshot);
 //   * the live store adapter over a recording PostgREST fake;
-//   * parity of every RPC call with the migration's function signatures.
+//   * parity of every RPC call with the migrations' function signatures.
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { assertValidPolicy, handleWithAccess, type AccessGateDeps } from "../../supabase/functions/_shared/access/gate.ts";
 import { ACCESS_ERROR, ActionNormalizeError } from "../../supabase/functions/_shared/access/errors.ts";
+import { createScopedReader, ScopeViolation } from "../../supabase/functions/_shared/clickhouse/scopedClient.ts";
+import { COHORT_CLASSIFICATION_VERSION, type CohortSnapshotState } from "../../supabase/functions/_shared/clickhouse/cohortSnapshotState.ts";
+import { PATH_COVERAGE_SQL } from "../../supabase/functions/_shared/clickhouse/pathCoverage.ts";
+import { createRecordingClickHouse, type RecordingClickHouse } from "./support/recordingClickHouse.ts";
 import { buildAccessContext, parseResolveAccessRow, type AccessContext } from "../../supabase/functions/_shared/access/accessContext.ts";
 import {
   ENFORCED_PERMISSION_KEYS,
@@ -46,8 +53,10 @@ import {
   runAccessAdminAction,
   scrubDataKey,
   seedTemplatesPayload,
+  parseFunnelPath,
   type AccessAdminPgClient,
   type AccessAdminStore,
+  type AdminFunnelPath,
   type AuditQuery,
   type AuditRow,
   type FunnelRow,
@@ -107,9 +116,37 @@ const VALUES: ScopeValueRow[] = [
   { member_id: MEMBER_VIEWER, funnel_id: FUNNEL_A },
 ];
 
+function funnelPath(id: string, funnelId: string, path: string, status: AdminFunnelPath["status"], extra: Partial<AdminFunnelPath> = {}): AdminFunnelPath {
+  return {
+    id,
+    funnel_id: funnelId,
+    path,
+    status,
+    source: "registry_seed",
+    funnelfox_funnel_id: null,
+    note: "",
+    confirmed_at: status === "proposed" ? null : "2026-10-06T00:00:00Z",
+    retired_at: null,
+    revoked_at: null,
+    ...extra,
+  };
+}
+
 const FUNNELS: FunnelRow[] = [
-  { id: FUNNEL_B, funnel_path: "past-life", display_name: "", is_active: false, tags: [] },
-  { id: FUNNEL_A, funnel_path: "soulmate-sketch", display_name: "Soulmate Sketch", is_active: true, tags: ["WEB", "TikTok", "WEB"] },
+  { id: FUNNEL_B, funnel_path: "past-life", display_name: "", is_active: false, tags: [], paths: [funnelPath("3", FUNNEL_B, "past-life", "active")] },
+  {
+    id: FUNNEL_A,
+    funnel_path: "soulmate-sketch",
+    display_name: "Soulmate Sketch",
+    is_active: true,
+    tags: ["WEB", "TikTok", "WEB"],
+    paths: [
+      funnelPath("5", FUNNEL_A, "soulmate-x", "revoked", { revoked_at: "2026-09-20T00:00:00Z" }),
+      funnelPath("4", FUNNEL_A, "soulmate-1-tariff-month-veb", "proposed", { source: "funnelfox_alias_seed", funnelfox_funnel_id: "01KTKBKEHTK6WCNV9TVDJWQHBS" }),
+      funnelPath("2", FUNNEL_A, "soulmate-old", "retired", { source: "registry", retired_at: "2026-09-01T10:00:00Z" }),
+      funnelPath("1", FUNNEL_A, "soulmate-sketch", "active"),
+    ],
+  },
 ];
 
 const OK = (data: Record<string, unknown> = {}) => ({ data: { ok: true, ...data }, error: null });
@@ -117,8 +154,47 @@ const SQL_ERROR = (message: string, code = "P0001") => ({ data: null, error: { m
 
 type RpcImpl = (fn: string, params: Record<string, unknown>) => { data: unknown; error: unknown } | Promise<{ data: unknown; error: unknown }>;
 
+/** A validated active snapshot, verified current an hour before `now`. */
+function snapshotState(overrides: Partial<CohortSnapshotState> = {}, now = Date.now()): CohortSnapshotState {
+  return {
+    auth_user_id: DATA_KEY,
+    snapshot_name: "fact_user_cohorts",
+    status: "completed",
+    active_warehouse_version: "wv-active",
+    active_classification_version: COHORT_CLASSIFICATION_VERSION,
+    active_generated_at: "2026-10-05T22:00:00.000Z",
+    building_warehouse_version: null,
+    building_classification_version: null,
+    started_at: null,
+    finished_at: "2026-10-05T22:00:00.000Z",
+    duration_ms: 1000,
+    users_classified: 125,
+    rows_inserted: 125,
+    duplicate_users: 0,
+    removed_or_invalidated: 0,
+    source_transactions: 1000,
+    source_unique_users: 125,
+    last_error: null,
+    diagnostics: { validation: { status: "PASS", duplicate_users: 0 } },
+    active_validation: { status: "PASS", duplicate_users: 0 },
+    active_validated_at: "2026-10-05T22:00:00.000Z",
+    active_campaign_scope_version: null,
+    fresh_verified_at: new Date(now - 3_600_000).toISOString(),
+    stale_since: null,
+    ...overrides,
+  };
+}
+
 function fakeStore(
-  seed: { members?: MemberRow[]; roles?: RoleRow[]; rules?: ScopeRuleRow[]; values?: ScopeValueRow[]; funnels?: FunnelRow[]; audit?: AuditRow[] } = {},
+  seed: {
+    members?: MemberRow[];
+    roles?: RoleRow[];
+    rules?: ScopeRuleRow[];
+    values?: ScopeValueRow[];
+    funnels?: FunnelRow[];
+    audit?: AuditRow[];
+    snapshot?: CohortSnapshotState | null;
+  } = {},
   rpc: RpcImpl = () => OK(),
 ) {
   const members = seed.members ?? MEMBERS;
@@ -133,6 +209,7 @@ function fakeStore(
     listAuditEvents: vi.fn(async (query: AuditQuery) => (seed.audit ?? []).slice(0, query.limit + 1)),
     rpc: vi.fn(async (fn: string, params: Record<string, unknown>) => rpc(fn, params)),
     setUserBan: vi.fn(async (_userId: string, _duration: string) => ({ ok: true }) as { ok: boolean; reason?: "not_supported" | "failed" }),
+    loadCohortSnapshotState: vi.fn(async (_tenantKey: string) => (seed.snapshot === undefined ? snapshotState() : seed.snapshot)),
   } satisfies AccessAdminStore;
 }
 
@@ -228,6 +305,9 @@ describe("ACCESS_POLICY", () => {
       "roles.delete": { allOf: ["admin.roles.manage"], write: true },
       "roles.seed_templates": { ownerOnly: true, allOf: ["admin.roles.manage"], write: true },
       "audit.list": { anyOf: ["admin.audit.view"] },
+      "paths.coverage": { anyOf: ["admin.users.view", "funnels.manage"] },
+      "paths.attach": { allOf: ["funnels.manage"], fullScopeOnly: true, write: true },
+      "paths.set_status": { allOf: ["funnels.manage"], fullScopeOnly: true, write: true },
     });
   });
 
@@ -243,7 +323,9 @@ describe("ACCESS_POLICY", () => {
 
 // ---- through the real gate --------------------------------------------------------------
 
-function gateDeps(row: ReturnType<typeof accessRow>): AccessGateDeps {
+/** `warehouse`: the transport under the real ScopedReader (only paths.coverage
+ * opens ClickHouse; without it, opening one fails the test). */
+function gateDeps(row: ReturnType<typeof accessRow>, warehouse?: RecordingClickHouse): AccessGateDeps {
   return {
     configError: null,
     pg: { from: vi.fn(), rpc: vi.fn(), auth: { getUser: vi.fn() } } as unknown as AccessGateDeps["pg"],
@@ -251,22 +333,23 @@ function gateDeps(row: ReturnType<typeof accessRow>): AccessGateDeps {
     loadAccess: vi.fn(async () => ({ data: row, error: null })),
     workspaceDataKey: vi.fn(async () => ({ data: DATA_KEY, error: null })),
     readEnv: vi.fn(() => undefined),
-    createClickHouse: vi.fn(() => {
-      throw new Error("the access API never opens ClickHouse");
+    createClickHouse: vi.fn((ctx: AccessContext) => {
+      if (!warehouse) throw new Error("only paths.coverage opens ClickHouse");
+      return createScopedReader(ctx, warehouse);
     }),
     newRequestId: () => "req-test-1",
     log: vi.fn(),
   };
 }
 
-async function callAccess(body: unknown, row: ReturnType<typeof accessRow>, store: AccessAdminStore = fakeStore(), method = "POST") {
+async function callAccess(body: unknown, row: ReturnType<typeof accessRow>, store: AccessAdminStore = fakeStore(), method = "POST", warehouse?: RecordingClickHouse) {
   const req = new Request("https://edge.test/functions/v1/access", {
     method,
     headers: { Authorization: "Bearer good-token", "Content-Type": "application/json" },
     body: method === "GET" ? undefined : JSON.stringify(body),
   });
   const handler = createAccessAdminHandler({ makeStore: () => store, log: vi.fn() });
-  const response = await handleWithAccess(req, ACCESS_POLICY, handler, gateDeps(row), { onError: accessAdminOnError });
+  const response = await handleWithAccess(req, ACCESS_POLICY, handler, gateDeps(row, warehouse), { onError: accessAdminOnError });
   const textBody = await response.text();
   return { status: response.status, text: textBody, body: JSON.parse(textBody) as Record<string, unknown>, headers: response.headers };
 }
@@ -319,12 +402,16 @@ describe("access function through the gate", () => {
       const restricted = await callAccess({ action: "members.list" }, memberRow([...ENFORCED_PERMISSION_KEYS], scope), store);
       expect(restricted.status).toBe(403);
       expect(restricted.body.error_code).toBe(ACCESS_ERROR.PERMISSION_DENIED);
-      // A (theoretical) restricted Owner role still gets scope_not_supported (R6).
+      // A (theoretical) restricted Owner role still gets scope_not_supported (R6),
+      // or full_scope_required on the fullScopeOnly path writes (checked first).
       for (const action of ACCESS_ADMIN_ACTIONS) {
         const owner = await callAccess({ action }, accessRow({ isOwner: true, scope }), store);
         expect(owner.status, action).toBe(403);
-        expect(owner.body.error_code, action).toBe(ACCESS_ERROR.SCOPE_NOT_SUPPORTED);
+        expect(owner.body.error_code, action).toBe(
+          ACCESS_POLICY.actions[action].fullScopeOnly ? ACCESS_ERROR.FULL_SCOPE_REQUIRED : ACCESS_ERROR.SCOPE_NOT_SUPPORTED,
+        );
       }
+      expect(store.loadCohortSnapshotState).not.toHaveBeenCalled();
       expect(store.listMembers).not.toHaveBeenCalled();
       expect(store.rpc).not.toHaveBeenCalled();
     }
@@ -668,7 +755,7 @@ describe("members.effective", () => {
       role: { id: OWNER_ROLE, key: "owner", name: "Owner", is_owner: true },
       permissions: [...ENFORCED_PERMISSION_KEYS],
       raw_access: true,
-      funnel_scope: { mode: "all", funnel_ids: [], names: [] },
+      funnel_scope: { mode: "all", funnel_ids: [], names: [], paths: [] },
     });
   });
 
@@ -680,7 +767,25 @@ describe("members.effective", () => {
       role: { id: CUSTOM_ROLE, key: "buyer_plus", name: "Buyer plus", is_owner: false },
       permissions: ["cohorts.view", "cohorts.export"],
       raw_access: false,
-      funnel_scope: { mode: "selected", funnel_ids: [FUNNEL_A, FUNNEL_B], names: ["Soulmate Sketch", "past-life"] },
+      // paths: the granted (active ∪ retired) paths of the selected funnels,
+      // sorted — never a proposed or revoked one.
+      funnel_scope: {
+        mode: "selected",
+        funnel_ids: [FUNNEL_A, FUNNEL_B],
+        names: ["Soulmate Sketch", "past-life"],
+        paths: ["past-life", "soulmate-old", "soulmate-sketch"],
+      },
+    });
+  });
+
+  it("lists no paths for a selected funnel that is missing from the registry or holds none", async () => {
+    const funnels = [{ ...FUNNELS[0], paths: [funnelPath("3", FUNNEL_B, "past-life", "revoked")] }];
+    const result = await run("members.effective", { member_id: MEMBER_BUYER }, fakeStore({ funnels }));
+    expect((result.effective as { funnel_scope: unknown }).funnel_scope).toEqual({
+      mode: "selected",
+      funnel_ids: [FUNNEL_A, FUNNEL_B],
+      names: [FUNNEL_A, "past-life"],
+      paths: [],
     });
   });
 
@@ -697,7 +802,7 @@ describe("members.effective", () => {
 
   it("gives a disabled member nothing", async () => {
     const result = await run("members.effective", { member_id: MEMBER_VIEWER }, fakeStore());
-    expect(result.effective).toMatchObject({ status: "disabled", permissions: [], raw_access: false, funnel_scope: { mode: "none", funnel_ids: [], names: [] } });
+    expect(result.effective).toMatchObject({ status: "disabled", permissions: [], raw_access: false, funnel_scope: { mode: "none", funnel_ids: [], names: [], paths: [] } });
   });
 
   it("never claims raw access for a data-owner flag that does not match the tenant key", async () => {
@@ -920,17 +1025,412 @@ describe("catalog and funnels.list", () => {
     expect(result.templates).toEqual(ROLE_TEMPLATES);
   });
 
-  it("funnels.list returns registry rows with sorted, de-duplicated tags", async () => {
+  it("funnels.list returns registry rows with sorted, de-duplicated tags and every path row (active, retired, proposed, revoked)", async () => {
     const result = await run("funnels.list", {}, fakeStore());
     expect(result.funnels).toEqual([
-      { id: FUNNEL_B, funnel_path: "past-life", display_name: "", is_active: false, tags: [] },
-      { id: FUNNEL_A, funnel_path: "soulmate-sketch", display_name: "Soulmate Sketch", is_active: true, tags: ["TikTok", "WEB"] },
+      { id: FUNNEL_B, funnel_path: "past-life", display_name: "", is_active: false, tags: [], paths: [funnelPath("3", FUNNEL_B, "past-life", "active")] },
+      {
+        id: FUNNEL_A,
+        funnel_path: "soulmate-sketch",
+        display_name: "Soulmate Sketch",
+        is_active: true,
+        tags: ["TikTok", "WEB"],
+        paths: [FUNNELS[1].paths[3], FUNNELS[1].paths[2], FUNNELS[1].paths[1], FUNNELS[1].paths[0]],
+      },
     ]);
+    expect((result.funnels as Array<{ paths: AdminFunnelPath[] }>)[1].paths.map((entry) => entry.status)).toEqual(["active", "retired", "proposed", "revoked"]);
   });
 
   it("refuses non-user contexts outright", async () => {
     const cron = { ...adminCtx(), actor: { kind: "cron" as const, userId: null, memberId: null, email: null }, workspaceId: "" };
     await expectAdminError(run("members.list", {}, fakeStore(), cron), "permission_denied", 403);
+  });
+});
+
+// ---- funnel paths (Phase 2) --------------------------------------------------------------
+
+/** The RPC result of a path mutation: to_jsonb(funnel_paths row) + the count. */
+function pathRpcResult(changed: boolean, row: Record<string, unknown> = {}, affected: unknown = 2) {
+  return OK({
+    changed,
+    path: {
+      id: 12,
+      funnel_id: FUNNEL_A,
+      path_canonical: "soulmate-sketch-v2",
+      status: "active",
+      source: "admin_alias",
+      funnelfox_funnel_id: null,
+      note: "renamed landing",
+      created_by: ADMIN_USER,
+      created_at: "2026-10-06T00:00:00Z",
+      confirmed_by: ADMIN_USER,
+      confirmed_at: "2026-10-06T00:00:00Z",
+      retired_at: null,
+      revoked_by: null,
+      revoked_at: null,
+      updated_at: "2026-10-06T00:00:00Z",
+      ...row,
+    },
+    affected_members: affected,
+  });
+}
+
+describe("paths.attach", () => {
+  const valid = { funnel_id: FUNNEL_A.toUpperCase(), path: " soulmate-sketch-v2 ", note: " renamed landing " };
+
+  it.each([
+    ["missing funnel_id", { ...valid, funnel_id: undefined }],
+    ["non-uuid funnel_id", { ...valid, funnel_id: "soulmate-sketch" }],
+    ["missing path", { ...valid, path: undefined }],
+    ["non-string path", { ...valid, path: 7 }],
+    ["upper-case path (never transformed)", { ...valid, path: "Soulmate-Sketch" }],
+    ["leading slash", { ...valid, path: "/soulmate-sketch" }],
+    ["double dash", { ...valid, path: "a--b" }],
+    ["leading dash", { ...valid, path: "-a" }],
+    ["unknown", { ...valid, path: "unknown" }],
+    ["empty", { ...valid, path: "   " }],
+    ["201 characters", { ...valid, path: "a".repeat(201) }],
+    ["underscore", { ...valid, path: "a_b" }],
+    ["note too long", { ...valid, note: "x".repeat(501) }],
+    ["note not a string", { ...valid, note: 5 }],
+  ])("rejects %s before any RPC", async (_label, body) => {
+    const store = fakeStore();
+    await expectAdminError(run("paths.attach", body as Record<string, unknown>, store), "invalid", 400);
+    expect(store.rpc).not.toHaveBeenCalled();
+  });
+
+  it("calls access_attach_funnel_path as the caller with the exact canonical path and returns the row", async () => {
+    const store = fakeStore({}, () => pathRpcResult(true));
+    const result = await run("paths.attach", valid, store);
+    expect(store.rpc).toHaveBeenCalledTimes(1);
+    expect(store.rpc).toHaveBeenCalledWith("access_attach_funnel_path", {
+      p_actor: ADMIN_USER,
+      p_funnel_id: FUNNEL_A,
+      p_path: "soulmate-sketch-v2",
+      p_note: "renamed landing",
+    });
+    expect(store.rpc.mock.calls[0][1].p_actor).not.toBe(DATA_KEY);
+    expect(result).toEqual({
+      ok: true,
+      changed: true,
+      path: funnelPath("12", FUNNEL_A, "soulmate-sketch-v2", "active", { source: "admin_alias", note: "renamed landing" }),
+      affected_members: 2,
+    });
+    // No user id of the row (created_by / confirmed_by / revoked_by) is served.
+    expect(JSON.stringify(result)).not.toContain(ADMIN_USER);
+    recordRpc(store);
+  });
+
+  it("accepts the 200-character and multi-segment boundaries, and an absent note as ''", async () => {
+    for (const path of ["a-b-1", "a".repeat(200), "2024"]) {
+      const store = fakeStore({}, () => pathRpcResult(false, { path_canonical: path }, "0"));
+      const result = await run("paths.attach", { funnel_id: FUNNEL_A, path }, store);
+      expect(store.rpc.mock.calls[0][1]).toEqual({ p_actor: ADMIN_USER, p_funnel_id: FUNNEL_A, p_path: path, p_note: "" });
+      expect(result).toMatchObject({ ok: true, changed: false, affected_members: 0, path: { path } });
+    }
+  });
+
+  it.each([
+    ["conflict: path is already part of another funnel; revoke it there first", "conflict", 409],
+    ["not_found: funnel not found", "not_found", 404],
+    ["permission_denied: funnels.manage is required", "permission_denied", 403],
+    ["invalid: note must be at most 500 characters", "invalid", 400],
+  ])("maps %s", async (message, code, status) => {
+    const error = await expectAdminError(run("paths.attach", valid, fakeStore({}, () => SQL_ERROR(message))), code, status);
+    expect(error.message).toBe(message.slice(message.indexOf(":") + 1).trim());
+  });
+
+  it("maps a unique violation to 409 and treats an unreadable result as a service fault", async () => {
+    await expectAdminError(run("paths.attach", valid, fakeStore({}, () => SQL_ERROR("duplicate key", "23505"))), "conflict", 409);
+    await expect(run("paths.attach", valid, fakeStore({}, () => OK({ changed: true, path: { id: 1 } })))).rejects.toBeInstanceOf(AccessAdminStoreError);
+    await expect(run("paths.attach", valid, fakeStore({}, () => ({ data: null, error: null })))).rejects.toBeInstanceOf(AccessAdminStoreError);
+  });
+});
+
+describe("paths.set_status", () => {
+  it.each([
+    ["missing path_id", { status: "retired" }],
+    ["non-numeric path_id", { path_id: "x", status: "retired" }],
+    ["zero path_id", { path_id: 0, status: "retired" }],
+    ["negative path_id", { path_id: -1, status: "retired" }],
+    ["fractional path_id", { path_id: 1.5, status: "retired" }],
+    ["exponent path_id", { path_id: "1e3", status: "retired" }],
+    ["missing status", { path_id: 4 }],
+    ["proposed (never a target)", { path_id: 4, status: "proposed" }],
+    ["unknown status", { path_id: 4, status: "deleted" }],
+    ["note too long", { path_id: 4, status: "revoked", note: "x".repeat(501) }],
+  ])("rejects %s before any RPC", async (_label, body) => {
+    const store = fakeStore();
+    await expectAdminError(run("paths.set_status", body as Record<string, unknown>, store), "invalid", 400);
+    expect(store.rpc).not.toHaveBeenCalled();
+  });
+
+  it("calls access_set_funnel_path_status as the caller (confirm, reject, retire, revoke)", async () => {
+    for (const [status, rowStatus] of [["active", "active"], [" Revoked ", "revoked"], ["retired", "retired"]] as const) {
+      const store = fakeStore({}, () => pathRpcResult(true, { id: 4, path_canonical: "soulmate-1-tariff-month-veb", status: rowStatus }, 3));
+      const result = await run("paths.set_status", { path_id: "4", status, note: " ok " }, store);
+      expect(store.rpc).toHaveBeenCalledWith("access_set_funnel_path_status", {
+        p_actor: ADMIN_USER,
+        p_funnel_path_id: 4,
+        p_status: rowStatus,
+        p_note: "ok",
+      });
+      expect(result).toMatchObject({ ok: true, changed: true, affected_members: 3, path: { id: "4", funnel_id: FUNNEL_A, status: rowStatus } });
+      recordRpc(store);
+    }
+  });
+
+  it.each([
+    ["invalid: this is the funnel path itself: edit the funnel path instead", "invalid", 400],
+    ["invalid: a revoked path cannot become retired", "invalid", 400],
+    ["not_found: funnel path not found", "not_found", 404],
+    ["conflict: path is already part of another funnel; revoke it there first", "conflict", 409],
+    ["permission_denied: funnels.manage is required", "permission_denied", 403],
+  ])("maps %s", async (message, code, status) => {
+    await expectAdminError(run("paths.set_status", { path_id: 4, status: "retired" }, fakeStore({}, () => SQL_ERROR(message))), code, status);
+  });
+});
+
+/** Rows PATH_COVERAGE_SQL returns for the fixture registry (FUNNELS). */
+const COVERAGE_ROWS = [
+  { path: "soulmate-sketch", users: "100", synthetic_users: "2", first_cohort: "2026-01-01", last_cohort: "2026-10-05", net_revenue: 1000.504, users_since_retired: "0" },
+  { path: "soulmate-old", users: "10", synthetic_users: "0", first_cohort: "2025-06-01", last_cohort: "2026-09-30", net_revenue: "50", users_since_retired: "3" },
+  { path: "soulmate-1-tariff-month-veb", users: "5", synthetic_users: "0", first_cohort: "2026-02-01", last_cohort: "2026-03-01", net_revenue: 20, users_since_retired: "0" },
+  { path: "soulmate-x", users: "2", synthetic_users: "0", first_cohort: "2026-02-01", last_cohort: "2026-02-02", net_revenue: 5, users_since_retired: "0" },
+  { path: "new-path", users: "4", synthetic_users: "0", first_cohort: "2026-09-01", last_cohort: "2026-10-01", net_revenue: 12.5, users_since_retired: "0" },
+  { path: "", users: "0", synthetic_users: "7", first_cohort: "2026-01-01", last_cohort: "2026-10-01", net_revenue: 3, users_since_retired: "0" },
+  { path: "unknown", users: "3", synthetic_users: "0", first_cohort: "2026-01-01", last_cohort: "2026-01-02", net_revenue: 1, users_since_retired: "0" },
+  { path: "Soulmate-Sketch", users: "1", synthetic_users: "0", first_cohort: "2026-01-03", last_cohort: "2026-01-03", net_revenue: 0, users_since_retired: "0" },
+];
+
+function coverageWarehouse(rows: unknown[] = COVERAGE_ROWS): RecordingClickHouse {
+  return createRecordingClickHouse((statement) => (statement.query === PATH_COVERAGE_SQL ? rows : []));
+}
+
+async function runCoverage(store: AccessAdminStore, warehouse: RecordingClickHouse, ctx: AccessContext = adminCtx()) {
+  return runAccessAdminAction({ ctx, action: "paths.coverage", body: { action: "paths.coverage" }, store, log: vi.fn(), clickhouse: () => createScopedReader(ctx, warehouse) });
+}
+
+describe("paths.coverage", () => {
+  it("diffs the active snapshot's anchor paths against the registry", async () => {
+    const warehouse = coverageWarehouse();
+    const store = fakeStore();
+    const result = await runCoverage(store, warehouse);
+
+    // One all-scope statement over the ACTIVE versions, the retired grant's date bound.
+    expect(warehouse.statements).toHaveLength(1);
+    expect(warehouse.statements[0]).toEqual({
+      kind: "query",
+      query: PATH_COVERAGE_SQL,
+      params: {
+        auth_user_id: DATA_KEY,
+        warehouse_version: "wv-active",
+        classification_version: COHORT_CLASSIFICATION_VERSION,
+        retired_paths: "['soulmate-old']",
+        retired_since: "['2026-09-01']",
+      },
+      format: "JSONEachRow",
+    });
+    expect(store.loadCohortSnapshotState).toHaveBeenCalledWith(DATA_KEY);
+
+    expect(result.snapshot).toEqual({ status: "current", warehouse_version: "wv-active", generated_at: "2026-10-05T22:00:00.000Z" });
+    expect(result.totals).toEqual({
+      users: 125,
+      synthetic_users: 9,
+      registered_users: 110,
+      registered_pct: 88,
+      net_revenue: 1092,
+      registered_net_revenue: 1050.5,
+    });
+    const byPath = new Map((result.paths as Array<Record<string, unknown>>).map((entry) => [entry.path, entry]));
+    expect([...byPath.keys()]).toEqual(["soulmate-sketch", "soulmate-old", "soulmate-1-tariff-month-veb", "new-path", "unknown", "soulmate-x", "Soulmate-Sketch", ""]);
+    expect(byPath.get("soulmate-sketch")).toEqual({
+      path: "soulmate-sketch",
+      users: 100,
+      synthetic_users: 2,
+      net_revenue: 1000.5,
+      first_cohort_date: "2026-01-01",
+      last_cohort_date: "2026-10-05",
+      state: "granted",
+      funnel_id: FUNNEL_A,
+      path_id: "1",
+      path_status: "active",
+      proposals: [],
+      users_since_retired: null,
+    });
+    expect(byPath.get("soulmate-old")).toMatchObject({ state: "granted", path_status: "retired", path_id: "2", users_since_retired: 3 });
+    expect(byPath.get("soulmate-1-tariff-month-veb")).toMatchObject({
+      state: "proposed",
+      funnel_id: null,
+      path_id: null,
+      path_status: "proposed",
+      proposals: [{ path_id: "4", funnel_id: FUNNEL_A }],
+    });
+    expect(byPath.get("soulmate-x")).toMatchObject({ state: "unregistered", path_status: "revoked", funnel_id: null, proposals: [] });
+    expect(byPath.get("new-path")).toMatchObject({ state: "unregistered", path_status: null });
+    for (const path of ["", "unknown", "Soulmate-Sketch"]) expect(byPath.get(path), path).toMatchObject({ state: "unscopable", path_status: null, funnel_id: null });
+
+    expect(result.reuse_alerts).toEqual([{ path: "soulmate-old", funnel_id: FUNNEL_A, path_id: "2", retired_at: "2026-09-01T10:00:00Z", users_since_retired: 3 }]);
+    expect(result.funnels).toEqual([
+      { funnel_id: FUNNEL_A, users: 110, net_revenue: 1050.5, granted_paths: 2 },
+      { funnel_id: FUNNEL_B, users: 0, net_revenue: 0, granted_paths: 1 },
+    ]);
+    expect(result.registry_without_data).toEqual([FUNNEL_B]);
+    expect(JSON.stringify(result)).not.toContain(DATA_KEY);
+  });
+
+  it("answers 409 conflict, before any ClickHouse statement, while no validated active snapshot exists", async () => {
+    for (const snapshot of [
+      null,
+      snapshotState({ active_warehouse_version: null, active_classification_version: null, status: "never_started" }),
+      // a failed first build: diagnostics FAIL, no active validation
+      snapshotState({ status: "failed", active_validation: null, diagnostics: { validation: { status: "FAIL" } } }),
+      snapshotState({ active_validation: { status: "FAIL" } }),
+      snapshotState({ duplicate_users: 4 }),
+    ]) {
+      const warehouse = coverageWarehouse();
+      const store = fakeStore({ snapshot });
+      const error = await expectAdminError(runCoverage(store, warehouse), "conflict", 409);
+      expect(error.message).toContain("cohort snapshot is not ready");
+      expect(warehouse.statements).toEqual([]);
+      expect(store.listFunnels).not.toHaveBeenCalled();
+    }
+  });
+
+  it("serves a validated but stale snapshot, flagged stale (the numbers are still the active ones)", async () => {
+    const hours = (count: number) => new Date(Date.now() - count * 3_600_000).toISOString();
+    for (const snapshot of [
+      snapshotState({ fresh_verified_at: hours(7) }),
+      snapshotState({ fresh_verified_at: null }),
+      snapshotState({ stale_since: hours(1) }),
+      snapshotState({ active_classification_version: "cohort_classifier_v2" }),
+      // during a rebuild claim/fail overwrite status + diagnostics; active_* still decide
+      snapshotState({ status: "building", diagnostics: {}, fresh_verified_at: hours(8) }),
+    ]) {
+      const result = await runCoverage(fakeStore({ snapshot }), coverageWarehouse());
+      expect((result.snapshot as { status: string }).status, JSON.stringify(snapshot)).toBe("stale");
+    }
+    const building = await runCoverage(fakeStore({ snapshot: snapshotState({ status: "building", diagnostics: {} }) }), coverageWarehouse());
+    expect((building.snapshot as { status: string }).status).toBe("current");
+  });
+
+  it("binds a never-matching retired pair when nothing is retired", async () => {
+    const funnels = FUNNELS.map((funnel) => ({ ...funnel, paths: funnel.paths.filter((entry) => entry.status !== "retired") }));
+    const warehouse = coverageWarehouse([]);
+    const result = await runCoverage(fakeStore({ funnels }), warehouse);
+    expect(warehouse.statements[0].params).toMatchObject({ retired_paths: "['']", retired_since: "['2149-06-06']" });
+    expect(result.totals).toEqual({ users: 0, synthetic_users: 0, registered_users: 0, registered_pct: 100, net_revenue: 0, registered_net_revenue: 0 });
+    expect(result.registry_without_data).toEqual([FUNNEL_A, FUNNEL_B]);
+  });
+
+  it("refuses a restricted context and runs no statement", async () => {
+    const warehouse = coverageWarehouse();
+    const store = fakeStore();
+    const restricted = ctxOf(memberRow(["cohorts.view"], "selected"));
+    await expectAdminError(runCoverage(store, warehouse, restricted), "permission_denied", 403);
+    expect(warehouse.statements).toEqual([]);
+    expect(store.loadCohortSnapshotState).not.toHaveBeenCalled();
+  });
+
+  it("turns a warehouse fault into a service fault but keeps a ScopeViolation one", async () => {
+    const failing = createRecordingClickHouse(() => {
+      throw new Error("ClickHouse HTTP 500: Code: 241. Memory limit exceeded");
+    });
+    await expect(runCoverage(fakeStore(), failing)).rejects.toBeInstanceOf(AccessAdminStoreError);
+
+    // A reader bound to another tenant's context: the tenant guard fires.
+    const ctx = adminCtx();
+    const other = ctxOf({ ...adminRow(), data_key: "99999999-9999-4999-8999-999999999999" });
+    const warehouse = coverageWarehouse();
+    const promise = runAccessAdminAction({ ctx, action: "paths.coverage", body: {}, store: fakeStore(), clickhouse: () => createScopedReader(other, warehouse) });
+    await expect(promise).rejects.toBeInstanceOf(ScopeViolation);
+    expect(other.violations).toEqual(["tenant_param_mismatch"]);
+    expect(warehouse.statements).toEqual([]);
+  });
+
+  it("is a service fault without a snapshot-state reader or a ClickHouse reader", async () => {
+    const store = fakeStore();
+    const bare: AccessAdminStore = { ...store, loadCohortSnapshotState: undefined };
+    await expect(runCoverage(bare, coverageWarehouse())).rejects.toBeInstanceOf(AccessAdminStoreError);
+    await expect(run("paths.coverage", {}, fakeStore())).rejects.toBeInstanceOf(AccessAdminStoreError);
+  });
+});
+
+describe("paths.* through the gate", () => {
+  const MANAGER = () => memberRow(["funnels.view", "funnels.manage"]);
+
+  it("admin.users.view reads coverage through the ScopedReader but cannot attach or change a path", async () => {
+    const warehouse = coverageWarehouse();
+    const store = fakeStore({}, () => pathRpcResult(true));
+    const row = memberRow(["admin.users.view"]);
+    const coverage = await callAccess({ action: "paths.coverage" }, row, store, "POST", warehouse);
+    expect(coverage.status, coverage.text).toBe(200);
+    expect(coverage.body).toMatchObject({ ok: true, snapshot: { status: "current" }, totals: { users: 125, registered_users: 110 } });
+    expect(warehouse.boundTenants()).toEqual([DATA_KEY]);
+    // An all-scope reader: no restricted capacity settings on the statement.
+    expect(warehouse.statements[0].settings).toBeUndefined();
+    expect(warehouse.closed).toBe(1);
+
+    for (const body of [
+      { action: "paths.attach", funnel_id: FUNNEL_A, path: "soulmate-sketch-v2" },
+      { action: "paths.set_status", path_id: 4, status: "active" },
+    ]) {
+      const result = await callAccess(body, row, store);
+      expect(result.status, body.action).toBe(403);
+      expect(result.body.error_code, body.action).toBe(ACCESS_ERROR.PERMISSION_DENIED);
+    }
+    expect(store.rpc).not.toHaveBeenCalled();
+  });
+
+  it("funnels.manage (scope all) reaches coverage and both writes, and nothing else of the access API", async () => {
+    const store = fakeStore({}, () => pathRpcResult(true));
+    expect((await callAccess({ action: "paths.coverage" }, MANAGER(), store, "POST", coverageWarehouse())).status).toBe(200);
+    const attach = await callAccess({ action: "paths.attach", funnel_id: FUNNEL_A, path: "soulmate-sketch-v2" }, MANAGER(), store);
+    expect(attach.status, attach.text).toBe(200);
+    expect(attach.body).toMatchObject({ ok: true, changed: true, path: { id: "12", status: "active" }, affected_members: 2 });
+    const setStatus = await callAccess({ action: "paths.set_status", path_id: "12", status: "retired" }, MANAGER(), store);
+    expect(setStatus.status, setStatus.text).toBe(200);
+    expect(store.rpc.mock.calls.map(([fn, params]) => [fn, params.p_actor])).toEqual([
+      ["access_attach_funnel_path", ADMIN_USER],
+      ["access_set_funnel_path_status", ADMIN_USER],
+    ]);
+    for (const action of ["members.list", "roles.list", "funnels.list", "catalog", "audit.list"]) {
+      expect((await callAccess({ action }, MANAGER(), store)).status, action).toBe(403);
+    }
+  });
+
+  it("keeps the 409 conflict message for a non-owner admin (an admin-facing refusal, not sanitized)", async () => {
+    const warehouse = coverageWarehouse();
+    const result = await callAccess({ action: "paths.coverage" }, adminRow(), fakeStore({ snapshot: null }), "POST", warehouse);
+    expect(result.status).toBe(409);
+    expect(result.body).toMatchObject({ ok: false, error_code: "conflict", request_id: "req-test-1" });
+    expect(String(result.body.error)).toContain("cohort snapshot is not ready");
+    expect(warehouse.statements).toEqual([]);
+  });
+
+  it("refuses every paths.* action to funnel-restricted members before the handler", async () => {
+    for (const scope of ["selected", "none"] as const) {
+      const warehouse = coverageWarehouse();
+      const store = fakeStore();
+      for (const action of ["paths.coverage", "paths.attach", "paths.set_status"]) {
+        const result = await callAccess({ action, funnel_id: FUNNEL_A, path: "soulmate-sketch", path_id: 1, status: "active" }, memberRow([...ENFORCED_PERMISSION_KEYS], scope), store, "POST", warehouse);
+        expect(result.status, action).toBe(403);
+        expect(result.body.error_code, action).toBe(ACCESS_ERROR.PERMISSION_DENIED);
+      }
+      expect(store.loadCohortSnapshotState).not.toHaveBeenCalled();
+      expect(store.rpc).not.toHaveBeenCalled();
+      expect(warehouse.statements).toEqual([]);
+    }
+  });
+
+  it("maps a warehouse fault to 503 access_service_error with a fixed message", async () => {
+    const failing = createRecordingClickHouse(() => {
+      throw new Error("ClickHouse HTTP 500: secret detail");
+    });
+    const result = await callAccess({ action: "paths.coverage" }, ownerRow(), fakeStore(), "POST", failing);
+    expect(result.status).toBe(503);
+    expect(result.body.error_code).toBe(ACCESS_ERROR.ACCESS_SERVICE_ERROR);
+    expect(result.text).not.toContain("secret detail");
   });
 });
 
@@ -964,6 +1464,11 @@ function fakePg(tables: Record<string, Array<Record<string, unknown>>>, options:
         recorded.ops.push(["range", from, to]);
         range = [from, to];
         return builder;
+      };
+      builder.maybeSingle = () => {
+        recorded.ops.push(["maybeSingle"]);
+        if (options.failTable === table) return Promise.resolve({ data: null, error: { message: "relation does not exist" } });
+        return Promise.resolve({ data: (tables[table] ?? [])[0] ?? null, error: null });
       };
       builder.then = (resolve: (value: unknown) => unknown, reject: (reason: unknown) => unknown) => {
         if (options.failTable === table) return Promise.resolve({ data: null, error: { message: "relation does not exist" } }).then(resolve, reject);
@@ -1033,13 +1538,90 @@ describe("createSupabaseAccessAdminStore", () => {
     }
   });
 
-  it("flattens funnel tags from funnel_tags(tags(name))", async () => {
+  it("flattens funnel tags from funnel_tags(tags(name)) and reads the embedded funnel_paths rows", async () => {
     const { pg, queries } = fakePg({
-      funnels: [{ id: FUNNEL_A, funnel_path: "soulmate-sketch", display_name: "Soulmate", is_active: true, funnel_tags: [{ tags: { name: " WEB " } }, { tags: null }, { tags: [{ name: "TikTok" }] }] }],
+      funnels: [
+        {
+          id: FUNNEL_A,
+          funnel_path: "soulmate-sketch",
+          display_name: "Soulmate",
+          is_active: true,
+          funnel_tags: [{ tags: { name: " WEB " } }, { tags: null }, { tags: [{ name: "TikTok" }] }],
+          funnel_paths: [
+            // PostgREST: bigint id as a JSON number, no funnel_id in the embed.
+            { id: 1, path_canonical: "soulmate-sketch", status: "active", source: "registry_seed", funnelfox_funnel_id: null, note: "", confirmed_at: "2026-10-06T00:00:00Z", retired_at: null, revoked_at: null },
+            { id: 4, path_canonical: "soulmate-1-tariff-month-veb", status: "proposed", source: "funnelfox_alias_seed", funnelfox_funnel_id: "01KTKBKEHTK6WCNV9TVDJWQHBS", note: "alias", confirmed_at: null, retired_at: null, revoked_at: null },
+            // outside the CHECK vocabulary / malformed: dropped, never read as a grant
+            { id: 7, path_canonical: "x", status: "granted", source: "registry" },
+            { id: 8, path_canonical: "y", status: "active", source: "manual" },
+            { id: null, path_canonical: "z", status: "active", source: "registry" },
+            "garbage",
+          ],
+        },
+        { id: FUNNEL_B, funnel_path: "past-life", display_name: null, is_active: false },
+      ],
     });
     const store = createSupabaseAccessAdminStore(pg);
-    expect(await store.listFunnels()).toEqual([{ id: FUNNEL_A, funnel_path: "soulmate-sketch", display_name: "Soulmate", is_active: true, tags: ["WEB", "TikTok"] }]);
-    expect(queries[0].ops[0]).toEqual(["select", "id,funnel_path,display_name,is_active,funnel_tags(tags(name))"]);
+    expect(await store.listFunnels()).toEqual([
+      {
+        id: FUNNEL_A,
+        funnel_path: "soulmate-sketch",
+        display_name: "Soulmate",
+        is_active: true,
+        tags: ["WEB", "TikTok"],
+        paths: [
+          funnelPath("1", FUNNEL_A, "soulmate-sketch", "active"),
+          funnelPath("4", FUNNEL_A, "soulmate-1-tariff-month-veb", "proposed", { source: "funnelfox_alias_seed", funnelfox_funnel_id: "01KTKBKEHTK6WCNV9TVDJWQHBS", note: "alias" }),
+        ],
+      },
+      { id: FUNNEL_B, funnel_path: "past-life", display_name: "", is_active: false, tags: [], paths: [] },
+    ]);
+    expect(queries[0].ops[0]).toEqual([
+      "select",
+      "id,funnel_path,display_name,is_active,funnel_tags(tags(name)),funnel_paths(id,path_canonical,status,source,funnelfox_funnel_id,note,confirmed_at,retired_at,revoked_at)",
+    ]);
+  });
+
+  it("parses an RPC's to_jsonb(funnel_paths) row (funnel_id kept, user ids dropped)", () => {
+    const row = {
+      id: 12,
+      funnel_id: FUNNEL_B,
+      path_canonical: "past-life-2",
+      status: "retired",
+      source: "admin_alias",
+      funnelfox_funnel_id: null,
+      note: "renamed",
+      created_by: ADMIN_USER,
+      created_at: "2026-10-01T00:00:00Z",
+      confirmed_by: ADMIN_USER,
+      confirmed_at: "2026-10-01T00:00:00Z",
+      retired_at: "2026-10-05T00:00:00Z",
+      revoked_by: null,
+      revoked_at: null,
+      updated_at: "2026-10-05T00:00:00Z",
+    };
+    expect(parseFunnelPath(row, FUNNEL_A)).toEqual(
+      funnelPath("12", FUNNEL_B, "past-life-2", "retired", { source: "admin_alias", note: "renamed", confirmed_at: "2026-10-01T00:00:00Z", retired_at: "2026-10-05T00:00:00Z" }),
+    );
+    expect(parseFunnelPath(JSON.stringify(row))?.id).toBe("12");
+    expect(parseFunnelPath({ ...row, funnel_id: undefined })).toBeNull();
+    expect(parseFunnelPath({ ...row, path_canonical: "" })).toBeNull();
+    expect(parseFunnelPath(null)).toBeNull();
+  });
+
+  it("reads the cohort snapshot state of the tenant through getCohortSnapshotState, faults as AccessAdminStoreError", async () => {
+    const state = snapshotState();
+    const { pg, queries } = fakePg({ clickhouse_cohort_snapshot_state: [{ ...state }] });
+    const store = createSupabaseAccessAdminStore(pg);
+    expect(await store.loadCohortSnapshotState?.(DATA_KEY)).toEqual(state);
+    expect(queries[0]).toEqual({
+      table: "clickhouse_cohort_snapshot_state",
+      ops: [["select", "*"], ["eq", "auth_user_id", DATA_KEY], ["eq", "snapshot_name", "fact_user_cohorts"], ["maybeSingle"]],
+    });
+    expect(await createSupabaseAccessAdminStore(fakePg({}).pg).loadCohortSnapshotState?.(DATA_KEY)).toBeNull();
+    await expect(createSupabaseAccessAdminStore(fakePg({}, { failTable: "clickhouse_cohort_snapshot_state" }).pg).loadCohortSnapshotState?.(DATA_KEY)).rejects.toBeInstanceOf(
+      AccessAdminStoreError,
+    );
   });
 
   it("builds the audit query: workspace, keyset, exact or escaped prefix event, outcome, limit + 1", async () => {
@@ -1094,7 +1676,10 @@ describe("createSupabaseAccessAdminStore", () => {
 // ---- parity with the migration and the entrypoint ------------------------------------
 
 describe("SQL and entrypoint parity", () => {
-  const migration = readFileSync(resolve(process.cwd(), "supabase/migrations/202610050002_access_core.sql"), "utf8");
+  // The access core RPCs, then the funnel-path RPCs of Phase 2.
+  const migration = ["202610050002_access_core.sql", "202610060001_access_phase2_scope.sql"]
+    .map((file) => readFileSync(resolve(process.cwd(), "supabase/migrations", file), "utf8"))
+    .join("\n");
 
   function sqlParams(fn: string): string[] {
     const match = new RegExp(`create or replace function public\\.${fn}\\(([\\s\\S]*?)\\)\\s*returns`, "i").exec(migration);
@@ -1106,9 +1691,11 @@ describe("SQL and entrypoint parity", () => {
     const fns = new Set(RPC_CALLS.map((call) => call.fn));
     expect([...fns].sort()).toEqual([
       "access_add_member",
+      "access_attach_funnel_path",
       "access_create_role",
       "access_delete_role",
       "access_seed_role_templates",
+      "access_set_funnel_path_status",
       "access_set_member_scope",
       "access_update_member",
       "access_update_role",
@@ -1132,7 +1719,11 @@ describe("SQL and entrypoint parity", () => {
   });
 
   it("the policy and the core stay importable by vitest (no remote imports)", () => {
-    for (const file of ["supabase/functions/_shared/access/policies/access.ts", "supabase/functions/_shared/access/adminApi.ts"]) {
+    for (const file of [
+      "supabase/functions/_shared/access/policies/access.ts",
+      "supabase/functions/_shared/access/adminApi.ts",
+      "supabase/functions/_shared/clickhouse/pathCoverage.ts",
+    ]) {
       const source = readFileSync(resolve(process.cwd(), file), "utf8");
       expect(source, file).not.toMatch(/from\s+["']https?:/);
       expect(source, file).not.toContain("Deno.");

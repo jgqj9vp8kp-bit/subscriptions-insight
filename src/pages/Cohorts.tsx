@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ArrowDown, ArrowUp, ArrowUpDown, ChevronDown, ChevronRight, EyeOff, GripVertical, Check, Loader2, Plus, Trash2 } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { AiActionChip } from "@/components/ai/AiActionChip";
@@ -44,7 +44,10 @@ import {
 } from "@/services/funnelfoxSubscriptionsSync";
 import type { CardType, CohortRow, MediaBuyer, PlanBreakdownRow } from "@/services/types";
 import { cohortsDataSourceMode, loadCohortDetailsFromClickHouse, loadFunnelDetailsFromClickHouse, mapDetailsPlanBreakdown } from "@/services/cohortsDataSource";
-import { isClickHouseCircuitOpen } from "@/services/clickhouse";
+import { ClickHouseRequestError, isClickHouseCircuitOpen } from "@/services/clickhouse";
+import { FunnelScopeBanner } from "@/components/access/FunnelScopeBanner";
+import { ScopeDataPending, SCOPE_SNAPSHOT_NOT_READY } from "@/components/access/ScopeDataPending";
+import { ACCESS_ERROR } from "../../supabase/functions/_shared/access/errors";
 import { deriveCohortSnapshotHealth, ensureCohortSnapshotRebuild } from "@/services/cohortSnapshotHealth";
 import {
   FB_COHORT_COLUMN_LABELS,
@@ -61,7 +64,7 @@ import {
 import { useFbWarehouseStatus } from "@/hooks/useFbWarehouse";
 import { buildCohortsExportTable, cohortsTableToCsv } from "@/services/cohortsExport";
 import { pruneInvalidCohortSelections, pruneLegacyCampaignPathSelection } from "@/services/cohortFilterSelection";
-import { listFunnels } from "@/services/funnels";
+import { funnelScopeFilterPaths, listFunnels } from "@/services/funnels";
 import type { CohortRequest } from "../../supabase/functions/_shared/clickhouse/cohortContract";
 import type { FbAllocationStatus, FbTimezoneSource } from "../../supabase/functions/_shared/clickhouse/fbCohortStats";
 import { useAuth } from "@/hooks/useAuth";
@@ -1026,6 +1029,29 @@ const FB_ALLOCATION_STATUSES: FbAllocationStatus[] = [
 ];
 const FB_TIMEZONE_SOURCES: FbTimezoneSource[] = ["payload", "account_config", "default_config", "unverified"];
 
+/** Why an FB cell shows no value. campaign_not_visible (access Phase 2): the
+ * cohort's campaign also serves other funnels, so a funnel-restricted member's
+ * FB columns leave it out. */
+function fbCellUnavailableReason(status: string | null | undefined): string | null {
+  return status === "campaign_not_visible" ? "Campaign shared with other funnels — hidden" : fbUnavailableReason(status);
+}
+
+/** A failed cohort / funnel details load: `error` (row tooltip) and, for the
+ * access states a restricted member can meet, a `notice` shown in place of
+ * "Price plans unavailable" — an explicit funnel key outside their funnels is
+ * refused (403 funnel_out_of_scope), and their scoped snapshot may still be in
+ * preparation (409 scope_snapshot_not_ready). */
+function detailsFailure(error: unknown): { error: string; notice?: string } {
+  const message = error instanceof Error ? error.message : String(error);
+  if (error instanceof ClickHouseRequestError && error.errorCode === ACCESS_ERROR.FUNNEL_OUT_OF_SCOPE) {
+    return { error: message, notice: "Not available for your funnel access" };
+  }
+  if (error instanceof ClickHouseRequestError && error.errorCode === SCOPE_SNAPSHOT_NOT_READY) {
+    return { error: message, notice: "Funnel-scoped data is being prepared…" };
+  }
+  return { error: message };
+}
+
 // Stable empty inputs for principals without raw access (see `rawAccess` below).
 const NO_TRANSACTIONS: ReturnType<typeof useTransactions> = [];
 const NO_SUBSCRIPTIONS: ReturnType<typeof useDataStore.getState>["subscriptions"] = [];
@@ -1046,7 +1072,12 @@ export default function CohortsPage() {
   const canRebuildSnapshot = access.can("admin.warehouse.manage");
   // The diagnostics payload is stripped server-side for everyone else; don't ask for it.
   const canViewFbAllocationDiagnostics = rawAccess || access.can("admin.diagnostics.view");
-  const canUseAi = access.can("ai.use");
+  // The diagnostics strip's tenant details (warehouse / snapshot counts,
+  // subscriptions, support, FB) need the same; everyone else sees only when
+  // the snapshot was updated.
+  const canViewDiagnosticsDetail = canViewFbAllocationDiagnostics;
+  // AI is hidden from funnel-restricted members until it is scoped (Phase 2.4).
+  const canUseAi = access.can("ai.use") && !access.restricted;
   // Cloud copies of the Cohorts view live in data_snapshots, a data-owner
   // table (plan §7, RESTRICTIVE data_key policy): everyone else keeps their
   // view in this browser only.
@@ -1847,16 +1878,32 @@ export default function CohortsPage() {
   const clickHouseDriving =
     cohortsSource === "clickhouse" && chResult != null && !legacyRowsReady && (rawAccess || chStatus.applicable);
   // Why a principal without raw access sees no rows where the owner would get
-  // the legacy engine — rendered in place of the empty-table message.
-  const serverOnlyNotice: string | null = rawAccess
+  // the legacy engine — rendered in place of the empty-table message. A
+  // funnel-restricted member's 409 (scoped snapshot being prepared; the list
+  // re-asks every minute) and 403 scope_not_supported (the server does not
+  // serve restricted Cohorts yet) are states, not failures.
+  const serverOnlyNotice: ReactNode = rawAccess
     ? null
     : cohortsSource !== "clickhouse"
       ? "Cohorts are computed in the browser in this deployment, which only the data owner can use."
       : chStatus.error !== null && chResult == null
-        ? `Cohorts could not be loaded from the server: ${chStatus.error}`
+        ? chStatus.errorCode === SCOPE_SNAPSHOT_NOT_READY
+          ? <ScopeDataPending inline />
+          : chStatus.errorCode === ACCESS_ERROR.SCOPE_NOT_SUPPORTED
+            ? "Restricted access is being enabled for Cohorts. Please check back later."
+            : `Cohorts could not be loaded from the server: ${chStatus.error}`
         : chResult != null && !chStatus.applicable
           ? `The server cannot apply the active filters (${chStatus.unsupportedFilters.join(", ")}). Clear them to see cohorts.`
           : null;
+  // Saved campaign-path filters outside a restricted member's funnels: the
+  // server ignores them (R11); the banner names them and [Clear] drops them.
+  const scopePaths = useMemo(() => funnelScopeFilterPaths(access.funnelScope), [access.funnelScope]);
+  const outOfScopeCampaignPaths = useMemo(
+    () => (access.restricted ? selectedCampaignPaths.filter((path) => !scopePaths.has(path)) : []),
+    [access.restricted, selectedCampaignPaths, scopePaths],
+  );
+  const clearOutOfScopeCampaignPaths = () =>
+    updateUiState({ selectedCampaignPaths: selectedCampaignPaths.filter((path) => scopePaths.has(path)), campaignPathFilter: "all" });
   const fbAllocationDiagnostics = clickHouseDriving ? chResult?.fbAllocationDiagnostics : undefined;
   // In ClickHouse mode with ClickHouse driving, feed an EMPTY list to the legacy
   // compute + option builders so the browser performs NO transaction scan.
@@ -2186,6 +2233,8 @@ export default function CohortsPage() {
     status: "loading" | "ready" | "error";
     rows: PlanBreakdownRow[];
     error?: string;
+    /** Shown in place of "Price plans unavailable" (access states, see detailsFailure). */
+    notice?: string;
     /** Funnel-grain details only: breakdowns the pseudo-row cannot carry
      * itself (per-cohort rows get these on the list row already). */
     tokenPacks?: TokenPackRow[];
@@ -2252,7 +2301,7 @@ export default function CohortsPage() {
           setPlanDetails((current) => new Map(current).set(cohortId, {
             status: "error",
             rows: [],
-            error: error instanceof Error ? error.message : String(error),
+            ...detailsFailure(error),
           }));
         });
     }
@@ -2894,7 +2943,7 @@ export default function CohortsPage() {
       case "fb_profit":
       case "fb_margin": {
         const text = fbCohortCellText(c, id);
-        const unavailableReason = fbUnavailableReason(c.fb_match_status);
+        const unavailableReason = fbCellUnavailableReason(c.fb_match_status);
         return <TableCell key={id} className={className} title={unavailableReason ?? undefined}>{text === "—" ? dash : text}</TableCell>;
       }
       case "renewal_2_to_renewal_3_cr":
@@ -3391,6 +3440,15 @@ export default function CohortsPage() {
       title="Cohorts"
       description={isFunnelsView ? "Grouped by campaign path over the selected period" : "Grouped by trial date"}
     >
+      {access.restricted && (
+        <div className="mb-3">
+          <FunnelScopeBanner
+            surface="cohorts"
+            droppedFilterValues={outOfScopeCampaignPaths.length}
+            onClearFilters={clearOutOfScopeCampaignPaths}
+          />
+        </div>
+      )}
       <Card className="rounded-lg border bg-card text-card-foreground shadow-sm p-4 shadow-card py-[20px]">
         {/* Two views of ONE dataset: same filters, same rows, same totals
             engine — only the row grain changes (Users-page Tabs pattern). */}
@@ -4051,7 +4109,12 @@ export default function CohortsPage() {
               {chStatus.durationMs != null && !chStatus.error && !isInitialLoading && !isBackgroundRefreshing && (
                 <span>ClickHouse {chStatus.durationMs} ms</span>
               )}
-              {clickHouseDriving && snapshotHealth.known && (
+              {/* Tenant counts need raw access or admin.diagnostics.view (and are
+                  redacted server-side for a restricted member anyway). */}
+              {clickHouseDriving && !canViewDiagnosticsDetail && snapshotHealth.snapshotGeneratedAt && (
+                <span>snapshot updated {formatUpdatedAgo(Date.parse(snapshotHealth.snapshotGeneratedAt))}</span>
+              )}
+              {clickHouseDriving && canViewDiagnosticsDetail && snapshotHealth.known && (
                 <>
                   <span className={snapshotHealth.status === "stale" ? "text-warning" : undefined}>
                     snapshot:{" "}
@@ -4078,7 +4141,10 @@ export default function CohortsPage() {
                   )}
                 </>
               )}
-              {chStatus.error && chResult == null && (
+              {chStatus.error && chResult == null && chStatus.errorCode === SCOPE_SNAPSHOT_NOT_READY && (
+                <span className="text-muted-foreground">funnel-scoped data is being prepared</span>
+              )}
+              {chStatus.error && chResult == null && chStatus.errorCode !== SCOPE_SNAPSHOT_NOT_READY && (
                 <span className="text-destructive">
                   {rawAccess ? "ClickHouse error — using legacy" : "ClickHouse error"}: {chStatus.error}
                 </span>
@@ -4112,10 +4178,10 @@ export default function CohortsPage() {
                   Legacy warehouse load failed{legacyWarehouseProgress.error ? `: ${legacyWarehouseProgress.error}` : ""}
                 </span>
               )}
-              {chStatus.subStatus && (
+              {canViewDiagnosticsDetail && chStatus.subStatus && (
                 <span>subscriptions: <span className="font-mono text-foreground">{chStatus.subStatus}</span></span>
               )}
-              {chResult?.diagnostics?.support_data_status && (
+              {canViewDiagnosticsDetail && chResult?.diagnostics?.support_data_status && (
                 <span>
                   support: <span className="font-mono text-foreground">{chResult.diagnostics.support_data_status}</span>
                   {typeof chResult.diagnostics.support_matched_cohort_users === "number" && (
@@ -4123,7 +4189,7 @@ export default function CohortsPage() {
                   )}
                 </span>
               )}
-              {clickHouseDriving && chResult?.fbDiagnostics && (
+              {clickHouseDriving && canViewDiagnosticsDetail && chResult?.fbDiagnostics && (
                 <>
                   <span>
                     fb: <span className={chResult.fbDiagnostics.fb_data_status === "ready" ? "font-mono text-foreground" : "font-mono text-warning"}>{chResult.fbDiagnostics.fb_data_status}</span>
@@ -4172,7 +4238,9 @@ export default function CohortsPage() {
           </div>
         )}
 
-        {clickHouseDriving && chResult?.fbDiagnostics && (
+        {/* Restricted responses carry no FB source counts (the source-scoped
+            diagnostics are skipped server-side): zeros would mislead. */}
+        {clickHouseDriving && !access.restricted && chResult?.fbDiagnostics && (
           <section
             className="mb-2 space-y-2 rounded-md border border-border/70 bg-muted/20 px-3 py-3 text-xs"
             aria-label="Facebook source reconciliation"
@@ -4571,7 +4639,7 @@ export default function CohortsPage() {
                           className={`${CELL_BASE} sticky left-0 z-10 shadow-[1px_0_0_0_hsl(var(--border))] text-xs italic text-muted-foreground whitespace-nowrap pl-8`}
                           title={planFailed ? planEntry?.error : undefined}
                         >
-                          {planLoading ? "Loading price plans…" : planFailed ? "Price plans unavailable" : "No price breakdown"}
+                          {planLoading ? "Loading price plans…" : planFailed ? planEntry?.notice ?? "Price plans unavailable" : "No price breakdown"}
                         </TableCell>
                         {visibleColumnOrder.map((id) => (
                           <TableCell key={id} className="py-1.5 px-3" />

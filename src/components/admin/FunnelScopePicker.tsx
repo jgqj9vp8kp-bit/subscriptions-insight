@@ -1,28 +1,36 @@
 // Funnel data-scope picker (plan §17): All funnels / Selected funnels / No data
 // access. "Selected" opens a searchable multi-select over the funnel registry
-// (funnels.list) showing the display name, path chip and tags. "Select by tag"
-// expands a tag into the funnel ids that carry it NOW: tags are never dynamic
-// grants. Roles with admin permissions require All funnels (D10), so the
-// restricted modes are locked for them.
+// (funnels.list) showing the display name, the granted path chips (active and
+// retired) and tags. "Select by tag" expands a tag into the funnel ids that
+// carry it NOW: tags are never dynamic grants. Roles with admin permissions
+// require All funnels (D10), so the restricted modes are locked for them.
 //
-// Milestone A: only "All funnels" is live. A member with selected funnels or
-// no data access is refused by every analytics action (403
-// scope_not_supported) until restricted scope rolls out, and the picker says so.
+// Access Phase 2: restricted scopes are live on the media-buyer surfaces only
+// (Dashboard Revenue Intelligence, Cohorts, Funnels, FB-Analytics); every other
+// page refuses a member without All funnels. With `coverage` the picker shows
+// what the selection covers in the active cohort snapshot (ScopeImpactPreview).
 
 import { useMemo, useRef } from "react";
-import { Check, Tag, TriangleAlert, X } from "lucide-react";
+import { Check, Info, Tag, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from "@/components/ui/command";
 import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { cn } from "@/lib/utils";
+import { FunnelPathChips } from "@/components/access/FunnelPathChips";
+import { ScopeImpactPreview } from "@/components/admin/ScopeImpactPreview";
 import {
+  formatCount,
   funnelIdsWithTag,
   funnelOptionLabel,
   funnelTagCounts,
+  grantedPaths,
 } from "@/components/admin/accessAdminModel";
-import type { AdminFunnelOption, AdminFunnelScope, FunnelScopeMode } from "@/services/accessAdminClient";
+import type { AdminFunnelOption, AdminFunnelScope, FunnelCoverage, FunnelScopeMode } from "@/services/accessAdminClient";
+
+/** The pages a funnel-restricted member can open (RESTRICTED_READY_ROUTES). */
+export const RESTRICTED_PAGES_NOTICE = "Restricted members can open: Dashboard (Revenue Intelligence), Cohorts, Funnels, FB-Analytics";
 
 const MODES: Array<{ value: FunnelScopeMode; label: string; description: string }> = [
   {
@@ -44,9 +52,25 @@ export interface FunnelScopePickerProps {
   requireAll?: boolean;
   /** Prefix for the radio ids (two pickers can be mounted at once). */
   idPrefix?: string;
+  /** Coverage of the active cohort snapshot (paths.coverage): impact preview
+   * and per-funnel user counts. Optional; the picker works without it. */
+  coverage?: FunnelCoverage;
+  coverageLoading?: boolean;
+  coverageError?: unknown;
 }
 
-export function FunnelScopePicker({ value, onChange, funnels, loading = false, disabled = false, requireAll = false, idPrefix = "scope" }: FunnelScopePickerProps) {
+export function FunnelScopePicker({
+  value,
+  onChange,
+  funnels,
+  loading = false,
+  disabled = false,
+  requireAll = false,
+  idPrefix = "scope",
+  coverage,
+  coverageLoading = false,
+  coverageError,
+}: FunnelScopePickerProps) {
   // Remember the last selection so All → Selected restores it.
   const lastSelection = useRef<string[]>(value.mode === "selected" ? value.funnel_ids : []);
   if (value.mode === "selected") lastSelection.current = value.funnel_ids;
@@ -54,14 +78,19 @@ export function FunnelScopePicker({ value, onChange, funnels, loading = false, d
   const byId = useMemo(() => new Map(funnels.map((funnel) => [funnel.id.toLowerCase(), funnel])), [funnels]);
   const selected = useMemo(() => new Set(value.funnel_ids.map((id) => id.toLowerCase())), [value.funnel_ids]);
   const tags = useMemo(() => funnelTagCounts(funnels), [funnels]);
+  // Granted paths (active ∪ retired) are what the member's scope resolves to;
+  // a funnel_path without a granted row grants nothing.
   const selectedPaths = useMemo(() => {
     const paths = new Set<string>();
     for (const id of selected) {
-      const path = byId.get(id)?.funnel_path;
-      if (path) paths.add(path);
+      for (const entry of grantedPaths(byId.get(id))) paths.add(entry.path);
     }
     return paths.size;
   }, [byId, selected]);
+  const usersByFunnel = useMemo(
+    () => (coverage ? new Map(coverage.funnels.map((entry) => [entry.funnel_id.toLowerCase(), entry.users])) : null),
+    [coverage],
+  );
 
   function setMode(mode: FunnelScopeMode) {
     if (disabled) return;
@@ -110,13 +139,13 @@ export function FunnelScopePicker({ value, onChange, funnels, loading = false, d
       {value.mode !== "all" && (
         <div
           role="status"
-          className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning"
+          className="flex items-start gap-2 rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
+          data-testid="scope-restricted-notice"
         >
-          <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
+          <Info className="mt-0.5 h-4 w-4 shrink-0" />
           <span>
             {value.mode === "none" ? "This member will see no analytics data. " : ""}
-            Funnel-restricted access is not live yet: until it is, every analytics page refuses requests from a member
-            without All funnels.
+            {RESTRICTED_PAGES_NOTICE}.
           </span>
         </div>
       )}
@@ -186,6 +215,8 @@ export function FunnelScopePicker({ value, onChange, funnels, loading = false, d
             </div>
           )}
 
+          <ScopeImpactPreview scope={value} funnels={funnels} coverage={coverage} loading={coverageLoading} error={coverageError} />
+
           <Command className="rounded-md border border-border">
             <CommandInput placeholder="Search funnels…" disabled={disabled} />
             <CommandList className="max-h-64">
@@ -193,10 +224,11 @@ export function FunnelScopePicker({ value, onChange, funnels, loading = false, d
               <CommandGroup>
                 {funnels.map((funnel) => {
                   const isSelected = selected.has(funnel.id.toLowerCase());
+                  const users = usersByFunnel ? usersByFunnel.get(funnel.id.toLowerCase()) ?? 0 : null;
                   return (
                     <CommandItem
                       key={funnel.id}
-                      value={`${funnel.display_name} ${funnel.funnel_path} ${funnel.tags.join(" ")} ${funnel.id}`}
+                      value={`${funnel.display_name} ${funnel.funnel_path} ${grantedPaths(funnel).map((entry) => entry.path).join(" ")} ${funnel.tags.join(" ")} ${funnel.id}`}
                       onSelect={() => toggle(funnel.id)}
                       disabled={disabled}
                       className={cn("items-start gap-2", !funnel.is_active && "text-muted-foreground")}
@@ -211,26 +243,35 @@ export function FunnelScopePicker({ value, onChange, funnels, loading = false, d
                       >
                         {isSelected && <Check className="h-3 w-3" />}
                       </span>
-                      <span className="min-w-0 flex-1">
-                        <span className="flex flex-wrap items-center gap-1.5">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center gap-1.5">
                           <span className="truncate text-sm">{funnel.display_name || funnel.funnel_path}</span>
                           {!funnel.is_active && (
                             <Badge variant="outline" className="text-[10px] font-normal text-muted-foreground">
                               inactive
                             </Badge>
                           )}
-                        </span>
-                        <span className="mt-0.5 flex flex-wrap items-center gap-1">
-                          <Badge variant="outline" className="font-mono text-[10px] font-normal">
-                            {funnel.funnel_path}
-                          </Badge>
+                          {users !== null && (
+                            <span className={cn("ml-auto text-[11px]", users > 0 ? "text-muted-foreground" : "text-warning")}>
+                              {users > 0 ? `${formatCount(users)} users` : "no data"}
+                            </span>
+                          )}
+                        </div>
+                        <div className="mt-0.5 flex flex-wrap items-center gap-1">
+                          {grantedPaths(funnel).length > 0 ? (
+                            <FunnelPathChips paths={funnel.paths} />
+                          ) : (
+                            <Badge variant="outline" className="text-[10px] font-normal text-warning" title={funnel.funnel_path || undefined}>
+                              no granted path
+                            </Badge>
+                          )}
                           {funnel.tags.map((tag) => (
                             <Badge key={tag} variant="secondary" className="text-[10px] font-normal">
                               {tag}
                             </Badge>
                           ))}
-                        </span>
-                      </span>
+                        </div>
+                      </div>
                     </CommandItem>
                   );
                 })}
@@ -238,7 +279,8 @@ export function FunnelScopePicker({ value, onChange, funnels, loading = false, d
             </CommandList>
           </Command>
           <p className="text-xs text-muted-foreground">
-            Paths missing from the funnel registry and unattributed data stay hidden for members with selected funnels.
+            Paths no funnel holds, unattributed data and campaigns shared with other funnels stay hidden for members with
+            selected funnels.
           </p>
         </div>
       )}

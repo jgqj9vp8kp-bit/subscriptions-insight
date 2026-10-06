@@ -75,7 +75,8 @@ SUPABASE_SERVICE_ROLE_KEY=... npm run deploy:functions -- --project-ref wsjbpkde
 
 1. refuses to deploy anything unless `public.workspace_data_key()` returns the data key (migrations
    `202610050001` + `202610050002` applied and the workspace bootstrapped — before that every new
-   function answers 503 to every call, cron and Export API key);
+   function answers 503 to every call, cron and Export API key), and unless `public.funnel_paths` exists
+   (`202610060001`, access Phase 2);
 2. stamps a fresh `BUILD_ID` (git sha + time) into `_shared/access/buildId.ts` for this run and restores
    the file afterwards;
 3. deploys every folder of `supabase/functions` (27 today);
@@ -109,7 +110,8 @@ it idempotently creates/extends the warehouse schema (including Warehouse V2 tab
 2. **Freeze the crons**: `select cron.alter_job(jobid, active := false) from cron.job where jobname in
    ('fb-daily-warehouse-tick', 'funnelfox-subscriptions-advance', 'funnelfox-subscriptions-refresh',
    'support-mail-sync-tick', 'support-classification-tick', 'support-sent-backfill-tick',
-   'funnels-active-from-traffic');`
+   'funnels-active-from-traffic', 'cohort-membership-freshness');` (the last one exists from access
+   Phase 2 on; use the same list for every later deploy, and `active := true` to unfreeze).
 3. **Apply `202610050001` and `202610050002` only** — not `supabase db push`, which would also attempt
    `202610050003` (it aborts before bootstrap, and a runner that applies all pending files in one
    transaction rolls back the first two as well):
@@ -161,6 +163,132 @@ What the data owner will notice after this release (expected, not regressions):
 Server-summary flags stay off in production until real-data parity is confirmed
 (see `.env.example`): `VITE_FB_ANALYTICS_SOURCE` and `VITE_DASHBOARD_SOURCE`
 default to `client`; `VITE_COHORTS_DATA_SOURCE` defaults to `clickhouse`.
+
+### Funnel-scoped access (access Phase 2) — in this order
+
+Members with **Selected funnels** can open Dashboard (Revenue Intelligence only), Cohorts, Funnels
+(read-only) and FB Analytics (warehouse tab, campaign / adset / ad levels). They see the customers
+whose acquisition funnel (`fact_user_cohorts.campaign_path`) is one of their funnels' paths, with every
+later payment of those customers; unregistered, `unknown` and synthetic `unknown_user_*` data, and FB
+campaigns shared by several funnels, stay visible with scope **All funnels** only. Every other page and
+action answers 403 `scope_not_supported`; while the funnel-scoped snapshot is not ready the four pages
+answer 409 `scope_snapshot_not_ready` ("Funnel-scoped data is being prepared").
+
+The SQL comes first: the frontend embeds `funnel_paths`, and the functions read the new snapshot columns.
+
+1. **Pre-flight** (read-only). Non-canonical anchor paths stay invisible to restricted members until a
+   separate, signed-off data rewrite:
+
+   ```sql
+   -- Q1 (Postgres): non-canonical transaction paths of the data key
+   select source, campaign_path, count(*), count(distinct user_id) from public.transactions
+   where auth_user_id = (select data_key from public.workspaces) and deleted_at is null
+     and (campaign_path !~ '^[a-z0-9]+(-[a-z0-9]+)*$' or campaign_path is null) group by 1, 2 order by 4 desc;
+   -- Q2 (Postgres): registry rows the migration will not seed as active
+   select id, funnel_path from public.funnels where funnel_path !~ '^[a-z0-9]+(-[a-z0-9]+)*$';
+   -- Q3 (ClickHouse console): non-canonical anchors of the active snapshot (expected: only 'unknown')
+   SELECT campaign_path, uniqExact(canonical_user_id) FROM fact_user_cohorts FINAL
+   WHERE auth_user_id = '<data key>' AND warehouse_version = '<active>'
+     AND NOT match(campaign_path, '^[a-z0-9]+(-[a-z0-9]+)*$') GROUP BY 1;
+   ```
+
+   Q2 also matters after the release: a funnel created or re-pathed from now on stores the canonical
+   path (a FunnelFox alias `Soulmate_Sketch` is stored as `soulmate-sketch`), while the daily
+   `funnels-active-from-traffic` recompute still compares the raw `ff_campaign_path`. Such a funnel stays
+   inactive until a separate, owner-signed migration compares canonical forms there. The FunnelFox
+   aliases seen so far are already canonical; existing rows are not rewritten.
+
+2. **Apply `202610060001_access_phase2_scope.sql`** to production, outside `supabase db push` (which would
+   also apply `202610060002` before the functions exist), and record it as applied:
+
+   ```text
+   npx.cmd supabase db query --linked -f supabase/migrations/202610060001_access_phase2_scope.sql
+   npx.cmd supabase migration repair --status applied 202610060001
+   ```
+
+   (or paste the file into the SQL editor, then run the `migration repair` line). Without `--linked`,
+   `db query` targets the local stack; without the repair, the next `supabase db push` runs the file again
+   and aborts on `relation "funnel_paths" already exists`, which blocks every later migration. It refuses
+   to run before `202610050003`. Check `select status, source, count(*) from public.funnel_paths group by 1, 2;`
+   and `select public.resolve_access('<an all-scope member uuid>');`.
+3. **Deploy every function**: `npm.cmd run deploy:functions -- --project-ref wsjbpkderyhdefukppvb`, then
+   `--verify-only` (freeze / unfreeze the crons as above). The script now also refuses to deploy until
+   `public.funnel_paths` exists (step 2): the `access` function's member and funnel lists embed it.
+4. **Apply `202610060002_cohort_membership_freshness_cron.sql`** the same way (the cron calls the new
+   `cron_tick` action, so the functions must be live first):
+
+   ```text
+   npx.cmd supabase db query --linked -f supabase/migrations/202610060002_cohort_membership_freshness_cron.sql
+   npx.cmd supabase migration repair --status applied 202610060002
+   ```
+5. **Build the campaign scope and the freshness stamp**: `select public.invoke_cohort_membership_tick(true);`,
+   then
+   - `select status_code, left(content, 400) from net._http_response order by id desc limit 1;` → 200 with
+     `tick_status` `campaign_scope_rebuilt` or `rebuilt` (`current` when the scope was already built).
+     `backoff` means a build of the same warehouse version failed or was abandoned recently: the tick
+     waits 1 h after the first attempt, doubling per attempt up to 6 h. The owner's own rebuild has no
+     backoff: read `last_error` in `clickhouse_cohort_snapshot_state`, then open Cohorts as the data owner
+     (it rebuilds a stale snapshot) and run the tick again. `in_progress` means another build holds the
+     lease: run the tick again in a few minutes;
+   - `select active_campaign_scope_version, fresh_verified_at, stale_since from public.clickhouse_cohort_snapshot_state;`
+     → `campaign_scope_v1` and a fresh timestamp. The campaign scope is built after the snapshot is
+     activated, so its result is in the tick response (`campaign_scope`), not in `diagnostics`;
+   - the rebuild `duration_ms` (classification and validation, up to activation) stays under 40 s. The
+     campaign scope then gets at most 10 s more, and the whole call must answer within the 55 s function
+     limit.
+
+   The tick then runs every 15 minutes (`7,22,37,52 * * * *`) while any restricted member exists. Restricted
+   reads need a snapshot verified within `SCOPE_SNAPSHOT_MAX_STALENESS_HOURS` (Edge secret, default 6).
+6. **Push the frontend** to `main` (Lovable).
+7. **Admin → Funnel coverage**: registered users ≈ 98% of the snapshot; confirm the seeded proposals
+   (`soulmate-1-tariff-month-veb → soulmate-sketch`, `starseed-reading-spain → starseed-reading-sp`);
+   review the unregistered queue. Attaching, confirming or retiring a path changes what its members see
+   on their next request.
+8. **Smoke test and parity**, before any real buyer:
+   - add the owner's second account as a Media Buyer with ONE funnel that has no synthetic
+     `unknown_user_*` customers, then run `select public.invoke_cohort_membership_tick(true);` right away.
+     While no restricted member exists the tick does not run, so the freshness stamp can be older than 6 h,
+     and the member would get 409 until the next tick;
+   - open the four pages; replay tampered requests (another funnel's path in the filters, another
+     funnel's `cohort_key` / `funnel_key`, FB `level: "account"`): zero rows / 403;
+   - run the read-only parity check (exit 0 = parity, 1 = a difference above the tolerance, 2 = error;
+     the JWTs come from signed-in browser sessions and are never printed):
+
+     ```text
+     SUPABASE_URL=https://wsjbpkderyhdefukppvb.supabase.co SUPABASE_ANON_KEY=... OWNER_JWT=... MEMBER_JWT=... \
+     MEMBER_PATHS=<the test funnel's paths, comma-separated> node scripts/scope-parity-check.mjs [--date-from … --date-to …]
+     ```
+9. **First real buyer.** Keep at most 3 restricted members active at the same time until the separate
+   read-only ClickHouse user exists (plan Phase 8): six concurrent classifier passes do not finish.
+
+Rollback (Phase 2):
+
+1. Disable the restricted members first.
+2. Cron: `select cron.unschedule('cohort-membership-freshness');` (before the functions, so no tick
+   reaches a build without `cron_tick`).
+3. Functions: redeploy commit `470a153` with the deploy script — restricted members get 403 everywhere again.
+4. SQL: run `supabase/rollback/202610060001_rollback.sql`. `funnel_paths`, the new snapshot columns and
+   `fact_campaign_scope` stay in place, unused. Leave the `schema_migrations` rows of `202610060001` /
+   `202610060002` in place: `202610060001` is one-shot (plain `create table` / `create trigger` /
+   `create policy`), so a later roll-forward needs a dedicated script, not a re-run of the file.
+5. Frontend: revert the commit (the `funnel_paths` embed keeps working, the table still exists).
+6. The ClickHouse retention deletes cannot be undone; they only remove versions older than the previous
+   active snapshot.
+
+Known limits of Phase 2 (accepted, or waiting for a later phase):
+
+- **Email-matched token purchases** (owner decision pending). Cohorts folds a non-member token purchase
+  into the cohort of the member with the same email. A restricted list does that within the member's own
+  funnels, exactly like the owner's Cohorts filtered to those funnels (spec R-2). When two funnels' members
+  share an email, both buyers see that purchase, while the owner's unfiltered view gives it to the earliest
+  trial. Other by-email channels: support requests and active subscriptions.
+- **Re-pathing** keeps the old path granted (retired), so cohorts acquired under it stay visible. A path
+  set by mistake stays granted until it is revoked under Admin → Funnel coverage. A revoked path is never
+  re-granted by editing the funnel's path: attach it again first.
+- **Saved objects**: reports, forecasts and AI history a member saved while on All funnels stay readable
+  to them after they are narrowed (Phase 4 scope stamps; the member sheet says so).
+- **Capacity**: no per-member limit on parallel restricted requests yet (each request runs at most 3
+  ClickHouse queries at once) — the step-9 cap and the Phase 8 ClickHouse user are the gate.
 
 ### Supabase Edge Function secret
 

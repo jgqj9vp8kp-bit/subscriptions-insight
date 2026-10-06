@@ -3,8 +3,10 @@
 // Fixtures plant these values where only the data owner (or nobody) may see
 // them — in warehouse rows, stored sync diagnostics, raw upstream payloads,
 // error messages — and scanForLeaks() looks for them in whatever reached the
-// caller: a JSON body, a Response (body AND headers), a log line. A hit names
-// the sentinel, so a failing test says what leaked, not just "something did".
+// caller: a JSON body, a Response (body AND headers), a log line — or, for access
+// Phase 2, what reached the warehouse (scanStatementsForLeaks decodes the
+// unhex(...) literals scope fragments bind). A hit names the sentinel, so a
+// failing test says what leaked, not just "something did".
 //
 // The values are synthetic and unique on purpose (no real customer data):
 //   * e-mail addresses under the reserved .test TLD;
@@ -64,6 +66,39 @@ export function scanForLeaks(value: unknown, options: LeakScanOptions = {}): str
   }
   for (const extra of options.extra ?? []) if (extra && text.includes(extra)) found.push(extra);
   return [...new Set(found)];
+}
+
+// ---- warehouse statements (access Phase 2) ------------------------------------------
+// Restricted SQL binds its scope values as unhex('<hex>') literals in the body
+// (scopeSql.ts sqlStringLiteral), so a plain text scan would miss funnel B
+// inside a fragment. Statement scans decode every literal first.
+
+const UNHEX_LITERAL = /unhex\('((?:[0-9a-fA-F]{2})*)'\)/g;
+
+function decodeHex(hex: string): string {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let index = 0; index < bytes.length; index += 1) bytes[index] = parseInt(hex.slice(index * 2, index * 2 + 2), 16);
+  return new TextDecoder().decode(bytes);
+}
+
+/** Every unhex('<hex>') literal of a SQL text, decoded, in order. */
+export function unhexLiterals(sql: string): string[] {
+  return [...String(sql ?? "").matchAll(UNHEX_LITERAL)].map((match) => decodeHex(match[1]));
+}
+
+/** The SQL text with every unhex('<hex>') literal replaced by its decoded value
+ * in quotes: what the warehouse really compares against. */
+export function decodeUnhexLiterals(sql: string): string {
+  return String(sql ?? "").replace(UNHEX_LITERAL, (_literal, hex: string) => `'${decodeHex(hex)}'`);
+}
+
+/** Scans recorded warehouse statements — decoded text and bound parameters —
+ * e.g. "funnel B never reaches the warehouse for buyer-{A}". */
+export function scanStatementsForLeaks(
+  statements: ReadonlyArray<{ query: string; params?: Record<string, unknown> }>,
+  options: LeakScanOptions = {},
+): string[] {
+  return scanForLeaks(statements.map((statement) => ({ query: decodeUnhexLiterals(statement.query), params: statement.params ?? {} })), { sql: false, ...options });
 }
 
 /** Reads a Response (without consuming the caller's copy) and scans its body

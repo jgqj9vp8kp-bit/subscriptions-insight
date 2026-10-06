@@ -33,8 +33,14 @@
 //                      never name it; its policy entry denies everyone but the
 //                      scheduler, which the gate authorizes by `cron.actions`.
 //
-// No action is scopeReady (Milestone A): funnel-restricted members get 403 on
-// every action. Pure module (no Deno, no remote imports): vitest imports it.
+// Funnel-restricted members (access Phase 2, spec §4): report / list / charts /
+// filters / summary / status are scopeReady with scopeSnapshot "campaign" — the
+// gate admits them only on a fresh, validated snapshot whose fact_campaign_scope
+// is built (409 scope_snapshot_not_ready otherwise). Their reads see V1 rows of
+// the member's visible campaigns at campaign / adset / ad level (the account and
+// day levels are 403 scope_not_supported), and status gets the narrower
+// projectFbSyncStateForRestricted. Every other action stays 403 for them.
+// Pure module (no Deno, no remote imports): vitest imports it.
 
 import type { FunctionPolicy, NormalizeActionInput } from "../gate.ts";
 import type { AccessContext } from "../accessContext.ts";
@@ -158,12 +164,12 @@ export const CLICKHOUSE_FACEBOOK_POLICY: FunctionPolicy<ClickHouseFacebookAction
   methods: ["POST"],
   normalizeAction: normalizeClickHouseFacebookAction,
   actions: {
-    report: { anyOf: FB_PAGE },
-    list: { anyOf: FB_PAGE },
-    charts: { anyOf: FB_PAGE },
-    filters: { anyOf: FB_PAGE },
-    summary: { anyOf: FB_PAGE },
-    status: { anyOf: ["facebook_analytics.view", "cohorts.view"] },
+    report: { anyOf: FB_PAGE, scopeReady: true, scopeSnapshot: "campaign" },
+    list: { anyOf: FB_PAGE, scopeReady: true, scopeSnapshot: "campaign" },
+    charts: { anyOf: FB_PAGE, scopeReady: true, scopeSnapshot: "campaign" },
+    filters: { anyOf: FB_PAGE, scopeReady: true, scopeSnapshot: "campaign" },
+    summary: { anyOf: FB_PAGE, scopeReady: true, scopeSnapshot: "campaign" },
+    status: { anyOf: ["facebook_analytics.view", "cohorts.view"], scopeReady: true, scopeSnapshot: "campaign" },
     // A flag variant must never be weaker than the read it runs: the V2 preview
     // serves the same report/list/summary, so it needs the page permission too.
     v2_preview: { allOf: [...FB_PAGE, ...DIAGNOSTICS] },
@@ -247,6 +253,40 @@ const VIEWER_SYNC_DIAGNOSTICS_FIELDS = [
   "error_message_safe",
 ] as const;
 
+/** Funnel-restricted members (spec §4 status row): lifecycle and the cursor only
+ * (the browser's version hash reads cursor + finished_at). Also dropped: the
+ * tenant-wide row counters (rows_*, batches_processed, source_total,
+ * clickhouse_total) — warehouse size is not the member's data. */
+const RESTRICTED_SYNC_STATE_FIELDS = [
+  "sync_name",
+  "status",
+  "current_stage",
+  "stopped_reason",
+  "last_run_mode",
+  "cursor_transaction_id",
+  "cursor_updated_at",
+  "started_at",
+  "finished_at",
+  "duration_ms",
+  "updated_at",
+] as const;
+
+/** sync_state.diagnostics fields kept for restricted members: the sync window
+ * and freshness, without the API volume / row counters. */
+const RESTRICTED_SYNC_DIAGNOSTICS_FIELDS = [
+  "mode",
+  "date_from",
+  "date_to",
+  "levels",
+  "fb_stats_to",
+  "api_last_import_at",
+  "warehouse_version",
+  "strategy",
+  "validation_status",
+  "error_code",
+  "error_message_safe",
+] as const;
+
 function pick(source: Record<string, unknown>, fields: readonly string[]): Record<string, unknown> {
   const projected: Record<string, unknown> = {};
   for (const field of fields) {
@@ -255,16 +295,29 @@ function pick(source: Record<string, unknown>, fields: readonly string[]): Recor
   return projected;
 }
 
-export function projectFbSyncStateForViewer(state: Record<string, unknown> | null | undefined): Record<string, unknown> | null {
+function projectSyncState(
+  state: Record<string, unknown> | null | undefined,
+  stateFields: readonly string[],
+  diagnosticsFields: readonly string[],
+): Record<string, unknown> | null {
   if (!state || typeof state !== "object") return null;
-  const projected = pick(state, VIEWER_SYNC_STATE_FIELDS);
+  const projected = pick(state, stateFields);
   if (Object.prototype.hasOwnProperty.call(state, "diagnostics")) {
     const diagnostics = state.diagnostics;
     projected.diagnostics = diagnostics && typeof diagnostics === "object" && !Array.isArray(diagnostics)
-      ? pick(diagnostics as Record<string, unknown>, VIEWER_SYNC_DIAGNOSTICS_FIELDS)
+      ? pick(diagnostics as Record<string, unknown>, diagnosticsFields)
       : null;
   }
   return projected;
+}
+
+export function projectFbSyncStateForViewer(state: Record<string, unknown> | null | undefined): Record<string, unknown> | null {
+  return projectSyncState(state, VIEWER_SYNC_STATE_FIELDS, VIEWER_SYNC_DIAGNOSTICS_FIELDS);
+}
+
+/** The status state a funnel-restricted member gets (whatever else they hold). */
+export function projectFbSyncStateForRestricted(state: Record<string, unknown> | null | undefined): Record<string, unknown> | null {
+  return projectSyncState(state, RESTRICTED_SYNC_STATE_FIELDS, RESTRICTED_SYNC_DIAGNOSTICS_FIELDS);
 }
 
 // ---- errors ----------------------------------------------------------------------

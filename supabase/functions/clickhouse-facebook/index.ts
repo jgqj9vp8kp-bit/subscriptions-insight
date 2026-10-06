@@ -23,10 +23,18 @@
 // cron tick behind FB_CRON_SECRET. Everything runs for the workspace tenant
 // (ctx.tenantKey), never for the caller. Only the write actions may create
 // fact_facebook_stats; reads no longer run DDL.
+//
+// Funnel-restricted members (access Phase 2) reach report / list / charts /
+// filters / summary / status only. Every runner gets the request's `scope`
+// (ALL_SCOPE_SQL for everyone else, so their SQL is unchanged); the account and
+// day levels are refused (403 scope_not_supported) before any SQL, and status
+// returns the restricted projection of the sync state. Scope refusals thrown
+// by the runners are rethrown to the gate, which maps them (403 / 409).
 
 import { jsonResponse, serveWithAccess, type AccessContext } from "../_shared/clickhouse/http.ts";
 import { ensureFactFacebookStatsSchema } from "../_shared/clickhouse/schema.ts";
 import { ScopeViolation } from "../_shared/clickhouse/scopedClient.ts";
+import { assertFbLevelInScope, ScopeForbiddenError, ScopeSnapshotNotReadyError } from "../_shared/clickhouse/scopeSql.ts";
 import type { ClickHouseClientLike, SupabaseAuthClient } from "../_shared/clickhouse/types.ts";
 import {
   CLICKHOUSE_FACEBOOK_POLICY,
@@ -37,6 +45,7 @@ import {
   fbResponseAction,
   fbStatusDetailVisible,
   fbV2PreviewRead,
+  projectFbSyncStateForRestricted,
   projectFbSyncStateForViewer,
 } from "../_shared/access/policies/clickhouse-facebook.ts";
 import {
@@ -149,7 +158,7 @@ async function runCronDaily(ctx: AccessContext, pg: SupabaseAuthClient, ch: Clic
   }
 }
 
-serveWithAccess(CLICKHOUSE_FACEBOOK_POLICY, async ({ ctx, action, body, pg, clickhouse }) => {
+serveWithAccess(CLICKHOUSE_FACEBOOK_POLICY, async ({ ctx, action, body, pg, clickhouse, scope }) => {
   if (action === "cron_daily") return await runCronDaily(ctx, pg, clickhouse());
 
   // Responses echo the body's own action name, as they always have.
@@ -349,30 +358,44 @@ serveWithAccess(CLICKHOUSE_FACEBOOK_POLICY, async ({ ctx, action, body, pg, clic
 
     if (action === "status") {
       const request = body as FbReadRequest;
+      const level = normalizeFbLevel(request.level);
+      // Restricted: account / day → 403 before any SQL.
+      if (ctx.restricted) assertFbLevelInScope(scope, level);
       const [state, diagnostics] = await Promise.all([
-        getFbSyncState(pg, authUserId).catch(() => null),
+        getFbSyncState(pg, authUserId).catch((error) => {
+          if (error instanceof ScopeViolation) throw error;
+          return null;
+        }),
         withTimeout(
           buildFbDiagnostics({
             clickhouse: ch,
             supabase: pg,
             authUserId,
-            level: normalizeFbLevel(request.level),
+            level,
             filters: normalizeFbFilters(request),
+            scope,
           }),
           READ_TIMEOUT_MS,
           "Facebook status",
         ),
       ]);
-      // Tenant-wide spend totals of the stored sync state are diagnostics.
-      return { ok: true, action: responseAction, state: fbStatusDetailVisible(ctx) ? state : projectFbSyncStateForViewer(state), diagnostics };
+      // Tenant-wide spend totals of the stored sync state are diagnostics; a
+      // restricted member also loses the tenant-wide row counters.
+      const visibleState = ctx.restricted
+        ? projectFbSyncStateForRestricted(state)
+        : fbStatusDetailVisible(ctx) ? state : projectFbSyncStateForViewer(state);
+      return { ok: true, action: responseAction, state: visibleState, diagnostics };
     }
 
     // report / list / summary, or one of them on the V2 read path (v2_preview).
     const read = action === "v2_preview" ? fbV2PreviewRead(body) : action;
+    // Restricted: account / day → 403 before any SQL (filters always reads the
+    // campaign level, so it takes no level).
+    if (ctx.restricted && read !== "filters") assertFbLevelInScope(scope, normalizeFbLevel((body as FbReadRequest).level));
 
     if (read === "report") {
       const result = await withTimeout(
-        runFbReport({ clickhouse: ch, supabase: pg, authUserId, request: body as FbReadRequest }),
+        runFbReport({ clickhouse: ch, supabase: pg, authUserId, request: body as FbReadRequest, scope }),
         READ_TIMEOUT_MS,
         "Facebook report",
       );
@@ -380,20 +403,20 @@ serveWithAccess(CLICKHOUSE_FACEBOOK_POLICY, async ({ ctx, action, body, pg, clic
     }
 
     if (read === "list") {
-      const result = await withTimeout(runFbList(ch, authUserId, body as FbReadRequest), READ_TIMEOUT_MS, "Facebook list");
+      const result = await withTimeout(runFbList(ch, authUserId, body as FbReadRequest, scope), READ_TIMEOUT_MS, "Facebook list");
       return { ok: true, action: responseAction, ...result };
     }
     if (read === "charts") {
-      const charts = await withTimeout(runFbCharts(ch, authUserId, body as FbReadRequest), READ_TIMEOUT_MS, "Facebook charts");
+      const charts = await withTimeout(runFbCharts(ch, authUserId, body as FbReadRequest, scope), READ_TIMEOUT_MS, "Facebook charts");
       return { ok: true, action: responseAction, charts };
     }
     if (read === "filters") {
-      const options = await withTimeout(runFbFilterOptions(ch, authUserId, body as FbReadRequest), READ_TIMEOUT_MS, "Facebook filters");
+      const options = await withTimeout(runFbFilterOptions(ch, authUserId, body as FbReadRequest, scope), READ_TIMEOUT_MS, "Facebook filters");
       return { ok: true, action: responseAction, filter_options: options };
     }
     if (read === "summary") {
       const result = await withTimeout(
-        runFbReport({ clickhouse: ch, supabase: pg, authUserId, request: body as FbReadRequest }),
+        runFbReport({ clickhouse: ch, supabase: pg, authUserId, request: body as FbReadRequest, scope }),
         READ_TIMEOUT_MS,
         "Facebook summary",
       );
@@ -403,7 +426,8 @@ serveWithAccess(CLICKHOUSE_FACEBOOK_POLICY, async ({ ctx, action, body, pg, clic
     // Unreachable: the policy maps every action above.
     throw new FbActionError(400, { ok: false, error: `Unsupported action: ${responseAction}` });
   } catch (error) {
-    if (error instanceof ScopeViolation || error instanceof FbActionError) throw error;
+    // Scope refusals keep their own type: the gate maps them to 403 / 409.
+    if (error instanceof ScopeViolation || error instanceof FbActionError || error instanceof ScopeForbiddenError || error instanceof ScopeSnapshotNotReadyError) throw error;
     const mapped = fbWarehouseErrorResponse(error, responseAction);
     throw new FbActionError(mapped.status, mapped.body);
   }

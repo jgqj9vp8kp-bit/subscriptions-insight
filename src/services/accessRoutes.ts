@@ -9,6 +9,10 @@
 //   * /users needs users.pii.view until the server-side redaction ships;
 //   * /transactions opens for any of its tabs (the list tab itself is raw-only;
 //     the page coerces tabs).
+// Phase 2: a funnel-restricted member (funnel scope other than "all") opens
+// only the rules marked restrictedReady — exactly RESTRICTED_READY_ROUTES, the
+// pages whose every Edge action is scopeReady. Every rule states the flag, so a
+// new page is closed to restricted members until someone decides otherwise.
 // Order matters: firstAllowedRoute() walks this list in sidebar order.
 
 import type { AccessContextValue } from "@/contexts/accessContext";
@@ -21,6 +25,9 @@ export interface RouteAccessRule {
   allOf?: string[];
   /** Data owner only. */
   rawOnly?: boolean;
+  /** Open to a funnel-restricted member. True exactly for RESTRICTED_READY_ROUTES
+   * (supabase/functions/_shared/access/scopeReadiness.ts). */
+  restrictedReady: boolean;
 }
 
 /** A guard requirement (route rule or RequirePermission props). Absent fields
@@ -29,28 +36,36 @@ export interface AccessRequirement {
   anyOf?: readonly string[];
   allOf?: readonly string[];
   rawOnly?: boolean;
+  /** false ⇒ denied to a funnel-restricted member. */
+  restrictedReady?: boolean;
 }
 
+/** Why a requirement is denied: the role lacks a key (or access is not
+ * resolved), the page is data-owner only, or the member's funnel-restricted
+ * access does not include the page. */
+export type AccessDenialReason = "permission" | "raw" | "scope";
+
 /** The part of the access value the checks need (a full AccessContextValue fits). */
-export type AccessSubject = Pick<AccessContextValue, "status" | "legacy" | "rawAccess" | "can" | "canAny">;
+export type AccessSubject = Pick<AccessContextValue, "status" | "legacy" | "rawAccess" | "restricted" | "can" | "canAny">;
 
 export const ROUTE_ACCESS: readonly RouteAccessRule[] = Object.freeze<RouteAccessRule[]>([
-  { path: "/", anyOf: ["dashboard.view"] },
-  { path: "/transactions", anyOf: ["transactions.view", "payment_pass.view", "payment_pass.banks.view"] },
-  { path: "/users", anyOf: ["users.view"], allOf: ["users.view", "users.pii.view"] },
-  { path: "/leads", anyOf: ["leads.view"], rawOnly: true },
-  { path: "/cohorts", anyOf: ["cohorts.view"] },
-  { path: "/funnels", anyOf: ["funnels.view"] },
-  { path: "/reports", anyOf: ["reports.view"] },
-  { path: "/fb-analytics", anyOf: ["facebook_analytics.view"] },
-  { path: "/integrations", anyOf: ["admin.integrations.view"] },
-  { path: "/support", anyOf: ["support.view"] },
-  { path: "/forecasting", anyOf: ["forecasting.view"] },
-  { path: "/subscriptions", anyOf: ["subscriptions.view"], rawOnly: true },
-  { path: "/import", anyOf: ["admin.data.import"], rawOnly: true },
-  { path: "/admin/members", anyOf: ["admin.users.view"] },
-  { path: "/admin/roles", anyOf: ["admin.roles.view"] },
-  { path: "/admin/audit", anyOf: ["admin.audit.view"] },
+  { path: "/", anyOf: ["dashboard.view"], restrictedReady: true },
+  { path: "/transactions", anyOf: ["transactions.view", "payment_pass.view", "payment_pass.banks.view"], restrictedReady: false },
+  { path: "/users", anyOf: ["users.view"], allOf: ["users.view", "users.pii.view"], restrictedReady: false },
+  { path: "/leads", anyOf: ["leads.view"], rawOnly: true, restrictedReady: false },
+  { path: "/cohorts", anyOf: ["cohorts.view"], restrictedReady: true },
+  { path: "/funnels", anyOf: ["funnels.view"], restrictedReady: true },
+  { path: "/reports", anyOf: ["reports.view"], restrictedReady: false },
+  { path: "/fb-analytics", anyOf: ["facebook_analytics.view"], restrictedReady: true },
+  { path: "/integrations", anyOf: ["admin.integrations.view"], restrictedReady: false },
+  { path: "/support", anyOf: ["support.view"], restrictedReady: false },
+  { path: "/forecasting", anyOf: ["forecasting.view"], restrictedReady: false },
+  { path: "/subscriptions", anyOf: ["subscriptions.view"], rawOnly: true, restrictedReady: false },
+  { path: "/import", anyOf: ["admin.data.import"], rawOnly: true, restrictedReady: false },
+  { path: "/admin/members", anyOf: ["admin.users.view"], restrictedReady: false },
+  { path: "/admin/roles", anyOf: ["admin.roles.view"], restrictedReady: false },
+  { path: "/admin/audit", anyOf: ["admin.audit.view"], restrictedReady: false },
+  { path: "/admin/funnels", anyOf: ["admin.users.view", "funnels.manage"], restrictedReady: false },
 ]);
 
 /** Lower-cased pathname without query, hash or trailing slash ("/" stays "/"). */
@@ -76,16 +91,25 @@ export function findRouteAccess(path: string): RouteAccessRule | null {
   return best;
 }
 
-/** Evaluates one requirement. Legacy ⇒ allowed (today's behaviour); any status
- * other than "ok" ⇒ denied (loading, signed out, no membership, disabled, error). */
+/** Why one requirement is denied, or null when it passes. Legacy ⇒ null
+ * (today's behaviour); any status other than "ok" ⇒ "permission" (loading,
+ * signed out, no membership, disabled, error). The role is checked first, so
+ * "scope" means the role grants the page but the funnel-restricted access
+ * does not include it. */
+export function accessRuleDenial(rule: AccessRequirement, access: AccessSubject | null | undefined): AccessDenialReason | null {
+  if (!access) return "permission";
+  if (access.legacy) return null;
+  if (access.status !== "ok") return "permission";
+  if (rule.allOf && !rule.allOf.every((key) => access.can(key))) return "permission";
+  if (rule.anyOf && !access.canAny(rule.anyOf)) return "permission";
+  if (rule.rawOnly && !access.rawAccess) return "raw";
+  if (access.restricted && rule.restrictedReady === false) return "scope";
+  return null;
+}
+
+/** Evaluates one requirement (see accessRuleDenial). */
 export function checkAccessRule(rule: AccessRequirement, access: AccessSubject | null | undefined): boolean {
-  if (!access) return false;
-  if (access.legacy) return true;
-  if (access.status !== "ok") return false;
-  if (rule.rawOnly && !access.rawAccess) return false;
-  if (rule.allOf && !rule.allOf.every((key) => access.can(key))) return false;
-  if (rule.anyOf && !access.canAny(rule.anyOf)) return false;
-  return true;
+  return accessRuleDenial(rule, access) === null;
 }
 
 /** Whether `path` may be opened. A path without a rule is denied unless legacy

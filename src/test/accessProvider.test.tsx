@@ -22,7 +22,7 @@ vi.mock("@/components/AppLayout", async () => {
 import "@/hooks/usePersistedPageState";
 import { AccessProvider } from "@/components/AccessProvider";
 import { RequirePermission } from "@/components/RequirePermission";
-import { NoAccess } from "@/components/NoAccess";
+import { NoAccess, RESTRICTED_SCOPE_DENIAL_COPY, RESTRICTED_SCOPE_DENIAL_TITLE } from "@/components/NoAccess";
 import { useAccess } from "@/hooks/useAccess";
 import { AccessContext, buildAccessValue, type AccessContextValue } from "@/contexts/accessContext";
 import { notePrincipal, registerPurgeHandler, type PurgeReason } from "@/services/sessionPurge";
@@ -180,8 +180,43 @@ describe("buildAccessValue (effective permissions)", () => {
       expect(v.rawAccess, status).toBe(false);
       expect(v.partition, status).toBe("");
       expect(v.permissions.size, status).toBe(0);
+      expect(v.restricted, status).toBe(false);
+      expect(v.funnelScope, status).toBeNull();
     }
     expect(buildAccessValue({ status: "loading", access: null, userId: "u" }).loading).toBe(true);
+  });
+
+  it("restricted = an ok membership whose funnel scope is not all; funnelScope copies the server scope", () => {
+    const all = value(access({ permissions: ["cohorts.view"], mode: "all" }));
+    expect(all.restricted).toBe(false);
+    expect(all.funnelScope).toEqual({ mode: "all", funnelIds: [], paths: [] });
+
+    const row = access({ permissions: ["cohorts.view"], mode: "selected" });
+    row.funnel_scope = { mode: "selected", funnel_ids: ["funnel-a", "funnel-b"], paths: ["palm-reading", "soulmate-sketch"] };
+    const selected = value(row);
+    expect(selected.restricted).toBe(true);
+    expect(selected.funnelScope).toEqual({ mode: "selected", funnelIds: ["funnel-a", "funnel-b"], paths: ["palm-reading", "soulmate-sketch"] });
+    // A copy: mutating the context value never edits the resolved row.
+    selected.funnelScope?.paths.push("past-life");
+    expect(row.funnel_scope.paths).toEqual(["palm-reading", "soulmate-sketch"]);
+
+    const none = value(access({ permissions: ["cohorts.view"], mode: "none" }));
+    expect(none.restricted).toBe(true);
+    expect(none.funnelScope).toEqual({ mode: "none", funnelIds: [], paths: [] });
+  });
+
+  it("fails closed: an ok row without a funnel scope is restricted; legacy never is", () => {
+    const row = access({ permissions: ["cohorts.view"] });
+    row.funnel_scope = null;
+    const v = value(row);
+    expect(v.restricted).toBe(true);
+    expect(v.funnelScope).toBeNull();
+
+    const legacy = buildAccessValue({ status: "legacy", access: null, userId: "user-a" });
+    expect(legacy.restricted).toBe(false);
+    expect(legacy.funnelScope).toBeNull();
+    // The owner resolves with scope all.
+    expect(value(access({ isOwner: true, raw: true })).restricted).toBe(false);
   });
 });
 
@@ -204,6 +239,17 @@ describe("AccessProvider", () => {
     expect(latest?.can("users.view")).toBe(false);
     expect(latest?.rawAccess).toBe(false);
     expect(client.rpc).toHaveBeenCalledWith("my_access");
+  });
+
+  it("publishes restricted and the funnel scope of a selected-funnels member", async () => {
+    const { client } = fakeClient(ok(okRow({
+      partition: "p-buyer",
+      funnel_scope: { mode: "selected", funnel_ids: ["funnel-a"], paths: ["soulmate-sketch"] },
+    })));
+    render(tree(client));
+    await waitFor(() => expect(latest?.partition).toBe("p-buyer"));
+    expect(latest?.restricted).toBe(true);
+    expect(latest?.funnelScope).toEqual({ mode: "selected", funnelIds: ["funnel-a"], paths: ["soulmate-sketch"] });
   });
 
   it("maps a missing RPC to legacy (everything allowed, as today)", async () => {
@@ -495,6 +541,52 @@ describe("RequirePermission", () => {
     render(withValue(buildAccessValue({ status: "loading", access: null, userId: "user-a" }), <RequirePermission anyOf={["cohorts.view"]}>x</RequirePermission>));
     expect(screen.getByText(/checking access/i)).toBeInTheDocument();
   });
+
+  describe("funnel-restricted member (Phase 2)", () => {
+    const restrictedViewer = buildAccessValue({
+      status: "ok",
+      access: { ...viewerRow, role: { ...viewerRow.role!, permissions: ["dashboard.view", "cohorts.view", "reports.view"] }, funnel_scope: { mode: "selected", funnel_ids: ["funnel-a"], paths: ["soulmate-sketch"] } },
+      userId: "user-a",
+    });
+
+    it("a page the role grants but restricted access does not include renders the scope copy", async () => {
+      render(withValue(restrictedViewer, <RequirePermission route="/reports">reports page</RequirePermission>));
+      expect(screen.queryByText("reports page")).toBeNull();
+      const panel = await screen.findByTestId("no-access");
+      expect(panel).toHaveAttribute("data-reason", "scope");
+      expect(screen.getByText(RESTRICTED_SCOPE_DENIAL_COPY)).toBeInTheDocument();
+      expect(RESTRICTED_SCOPE_DENIAL_COPY).toBe(
+        "Not available with funnel-restricted access. Available: Dashboard (Revenue Intelligence), Cohorts, Funnels, FB-Analytics.",
+      );
+      expect(screen.getByRole("link", { name: /available page/i })).toHaveAttribute("href", "/");
+    });
+
+    it("a page the role lacks keeps the role copy; restricted-ready pages render", async () => {
+      const { unmount } = render(withValue(restrictedViewer, <RequirePermission route="/support">support page</RequirePermission>));
+      expect(await screen.findByTestId("no-access")).toHaveAttribute("data-reason", "permission");
+      expect(screen.queryByText(RESTRICTED_SCOPE_DENIAL_COPY)).toBeNull();
+      unmount();
+      render(withValue(restrictedViewer, <RequirePermission route="/cohorts">cohorts page</RequirePermission>));
+      expect(screen.getByText("cohorts page")).toBeInTheDocument();
+    });
+
+    it("explicit requirements are not scope-checked, and the fallback still wins", () => {
+      const { rerender } = render(withValue(restrictedViewer, <RequirePermission anyOf={["reports.view"]}>section</RequirePermission>));
+      expect(screen.getByText("section")).toBeInTheDocument();
+      rerender(withValue(restrictedViewer, <RequirePermission route="/reports" fallback={<span>hidden</span>}>section</RequirePermission>));
+      expect(screen.getByText("hidden")).toBeInTheDocument();
+    });
+
+    it("the same role with scope all opens the page", () => {
+      const allScope = buildAccessValue({
+        status: "ok",
+        access: { ...viewerRow, role: { ...viewerRow.role!, permissions: ["dashboard.view", "cohorts.view", "reports.view"] } },
+        userId: "user-a",
+      });
+      render(withValue(allScope, <RequirePermission route="/reports">reports page</RequirePermission>));
+      expect(screen.getByText("reports page")).toBeInTheDocument();
+    });
+  });
 });
 
 describe("NoAccess full-page variants", () => {
@@ -523,5 +615,22 @@ describe("NoAccess full-page variants", () => {
       expect(container.textContent?.toLowerCase()).not.toContain("unavailable");
       unmount();
     }
+    for (const reason of ["permission", "raw", "scope"] as const) {
+      const { container, unmount } = render(<NoAccess reason={reason} />);
+      expect(container.textContent?.toLowerCase(), reason).not.toContain("unavailable");
+      unmount();
+    }
+  });
+
+  it("inline reason scope names the available pages; other reasons keep the role copy", () => {
+    const { unmount } = render(<NoAccess reason="scope" />);
+    expect(screen.getByTestId("no-access")).toHaveAttribute("data-reason", "scope");
+    expect(screen.getByText(RESTRICTED_SCOPE_DENIAL_TITLE)).toBeInTheDocument();
+    expect(screen.getByText(RESTRICTED_SCOPE_DENIAL_COPY)).toBeInTheDocument();
+    unmount();
+    render(<NoAccess />);
+    expect(screen.getByTestId("no-access")).toHaveAttribute("data-reason", "permission");
+    expect(screen.getByText("No access to this page")).toBeInTheDocument();
+    expect(screen.queryByText(RESTRICTED_SCOPE_DENIAL_COPY)).toBeNull();
   });
 });

@@ -12,6 +12,11 @@
 //     fbCohortUserCostArchitecture.test.ts — call it with an explicit fake
 //     `config`, so no Deno secret is read);
 //   * clickHouseEnv / isClickHouseConfigured — config probes, no secret exposed.
+//
+// Reads may carry `settings` (a fixed allowlist, sent as plain URL params),
+// `query_id` and an abort `signal`: the ScopedReader sets them on funnel-
+// restricted reads only (access Phase 2, M14). Without them a request is
+// byte-identical to before.
 
 import type { ClickHouseClientLike, ClickHouseEnv, ClickHouseResultSet } from "./types.ts";
 
@@ -61,6 +66,33 @@ function queryParams(params: Record<string, unknown> | undefined): URLSearchPara
   return search;
 }
 
+/** Server settings a caller may pass as URL params (no `param_` prefix) — only the
+ * restricted-read capacity limits the ScopedReader sets (spec §3.3 M14). Anything
+ * else is refused rather than forwarded. */
+const ALLOWED_QUERY_SETTINGS: ReadonlySet<string> = new Set([
+  "max_execution_time",
+  "timeout_overflow_mode",
+  "max_memory_usage",
+  "readonly",
+  "cancel_http_readonly_queries_on_client_close",
+]);
+
+function settingParams(settings: Record<string, string | number> | undefined): Array<[string, string]> {
+  const out: Array<[string, string]> = [];
+  for (const [name, value] of Object.entries(settings ?? {})) {
+    if (!ALLOWED_QUERY_SETTINGS.has(name)) throw new Error(`ClickHouse setting "${name}" is not allowed.`);
+    if (value == null) continue;
+    out.push([name, String(value)]);
+  }
+  return out;
+}
+
+interface RequestOptions {
+  settings?: Record<string, string | number>;
+  queryId?: string;
+  signal?: AbortSignal;
+}
+
 // ---- transient-failure handling -------------------------------------------------
 //
 // ClickHouse Cloud idles a service and resets connections while it wakes, so a
@@ -78,8 +110,21 @@ const READ_RETRY_ATTEMPTS = 3;
 const RETRY_BASE_DELAY_MS = 400;
 /** Statuses worth retrying: gateway/availability, never 4xx (auth, bad SQL). */
 const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
+/** ClickHouse exception codes that are deterministic for the same query (a limit
+ * or a cancellation, usually a 500): retrying only multiplies the load —
+ * TIMEOUT_EXCEEDED 159, MEMORY_LIMIT_EXCEEDED 241, TOO_MANY_ROWS 158,
+ * TOO_MANY_ROWS_OR_BYTES 396, QUERY_WAS_CANCELLED 394. Applied to restricted
+ * reads only (the ones carrying settings: they hit their OWN fixed limits). A
+ * read without settings — the owner's, the cron's — keeps the Phase-1 retry:
+ * a total-memory 241 under a concurrent rebuild is transient for it. */
+const NON_RETRYABLE_EXCEPTION_CODES = new Set(["159", "241", "158", "396", "394"]);
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function isAbortError(error: unknown, signal?: AbortSignal): boolean {
+  if (signal?.aborted) return true;
+  return typeof error === "object" && error !== null && (error as { name?: unknown }).name === "AbortError";
+}
 
 /** HTTP-level failure — carries the status so the retry decision stays explicit. */
 class ClickHouseHttpError extends Error {
@@ -119,12 +164,17 @@ class FetchClickHouseClient implements ClickHouseClientLike {
     this.database = input.database;
   }
 
-  /** `attempts` > 1 only for reads — see the note above on write safety. */
-  private async request(query: string, params?: Record<string, unknown>, attempts = 1): Promise<string> {
+  /** `attempts` > 1 only for reads — see the note above on write safety.
+   * `options` carries the restricted-read settings / query_id / abort signal;
+   * without it the request is exactly the pre-Phase-2 one. */
+  private async request(query: string, params?: Record<string, unknown>, attempts = 1, options: RequestOptions = {}): Promise<string> {
     const url = new URL("/", this.endpoint);
     url.searchParams.set("database", this.database);
     const parameterSearch = queryParams(params);
     parameterSearch.forEach((value, key) => url.searchParams.set(key, value));
+    for (const [name, value] of settingParams(options.settings)) url.searchParams.set(name, value);
+    if (options.queryId) url.searchParams.set("query_id", options.queryId);
+    const signal = options.signal;
 
     let lastError: unknown;
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
@@ -137,28 +187,50 @@ class FetchClickHouseClient implements ClickHouseClientLike {
             "Content-Type": "text/plain; charset=utf-8",
           },
           body: query,
+          ...(signal ? { signal } : {}),
         });
         const text = await response.text();
         if (response.ok) return text;
         lastError = new ClickHouseHttpError(response.status, text);
-        retryable = RETRYABLE_STATUS.has(response.status);
+        const exceptionCode = options.settings ? response.headers?.get?.("X-ClickHouse-Exception-Code")?.trim() ?? "" : "";
+        retryable = RETRYABLE_STATUS.has(response.status) && !NON_RETRYABLE_EXCEPTION_CODES.has(exceptionCode);
       } catch (error) {
-        // Never reached the server (DNS/TLS/connection reset) — always worth a retry.
-        lastError = new Error(`ClickHouse unreachable: ${describeTransport(error)}`);
-        retryable = true;
+        if (isAbortError(error, signal)) {
+          // The reader was closed (request finished or abandoned): never retried.
+          const aborted = new Error("ClickHouse request aborted.");
+          aborted.name = "AbortError";
+          lastError = aborted;
+          retryable = false;
+        } else {
+          // Never reached the server (DNS/TLS/connection reset) — always worth a retry.
+          lastError = new Error(`ClickHouse unreachable: ${describeTransport(error)}`);
+          retryable = true;
+        }
       }
-      if (!retryable || attempt === attempts) break;
+      if (!retryable || attempt === attempts || signal?.aborted) break;
       await sleep(RETRY_BASE_DELAY_MS * attempt);
     }
     const failure = lastError instanceof Error ? lastError : new Error(String(lastError));
-    if (attempts > 1) failure.message = `${failure.message} (after ${attempts} attempts)`;
+    if (attempts > 1 && failure.name !== "AbortError") failure.message = `${failure.message} (after ${attempts} attempts)`;
     throw failure;
   }
 
-  async query(input: { query: string; query_params?: Record<string, unknown>; format?: string }): Promise<ClickHouseResultSet> {
+  async query(input: {
+    query: string;
+    query_params?: Record<string, unknown>;
+    format?: string;
+    settings?: Record<string, string | number>;
+    query_id?: string;
+    signal?: AbortSignal;
+  }): Promise<ClickHouseResultSet> {
     const query = appendFormat(input.query, input.format);
-    // Reads are pure: retrying is always safe and covers the idle-wake reset.
-    const text = await this.request(query, input.query_params, READ_RETRY_ATTEMPTS);
+    // Reads are pure: retrying is safe and covers the idle-wake reset (except
+    // deterministic limit / cancellation failures and aborts, see request()).
+    const text = await this.request(query, input.query_params, READ_RETRY_ATTEMPTS, {
+      settings: input.settings,
+      queryId: input.query_id,
+      signal: input.signal,
+    });
     return new FetchClickHouseResultSet(text, input.format);
   }
 

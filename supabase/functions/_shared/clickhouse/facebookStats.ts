@@ -22,9 +22,25 @@
 //   { fbStatsTo, lastImportAt }, notes[], rows[] }. currency is response-level.
 // - Stats restate retroactively (today/yesterday keep updating), so incremental
 //   sync re-pulls a trailing window and relies on ReplacingMergeTree(row_version).
+//
+// Read actions take a trailing `scope` (access Phase 2, spec §4): every FROM of
+// fact_facebook_stats / analytics_transactions goes through scopeSql.ts fbFrom /
+// txFrom. ALL scope renders exactly today's text (V2 compat views included); a
+// funnel-restricted scope reads V1 rows of the member's visible campaigns
+// (fact_campaign_scope `resolved` ∩ their paths) at campaign / adset / ad level
+// only, and the blended transaction metrics count only the member's users.
 
 import type { ClickHouseClientLike, SupabaseLikeClient } from "./types.ts";
-import { ANALYTICS_TRANSACTIONS_TABLE, FACT_FACEBOOK_STATS_TABLE, ensureFactFacebookStatsSchema } from "./schema.ts";
+import { FACT_FACEBOOK_STATS_TABLE, ensureFactFacebookStatsSchema } from "./schema.ts";
+import {
+  ALL_SCOPE_SQL,
+  ScopeForbiddenError,
+  ScopeSnapshotNotReadyError,
+  assertFbLevelInScope,
+  fbFrom,
+  txFrom,
+  type ScopeSql,
+} from "./scopeSql.ts";
 import {
   computeFbBatchChecksum,
   computeFbBatchDq,
@@ -1002,10 +1018,22 @@ const LEVEL_KEYS: Record<FbLevel, string[]> = {
 
 const SORTABLE = new Set(["spend", "impressions", "clicks", "outbound_clicks", "fb_purchases", "cpp", "cpc", "cpm", "ctr", "outbound_ctr", "last_date"]);
 
+/** Restricted reads: refuse an unsupported level (403) or a snapshot without a
+ * built campaign scope (409) BEFORE a runner starts any query — a refusal in
+ * the middle of a fan-out would leave sibling queries running. No-op for scope
+ * all. */
+function preflightFbScope(scope: ScopeSql, level: FbLevel): void {
+  assertFbLevelInScope(scope, level);
+  if (scope.restricted && !scope.snapshot?.campaignScopeReady) {
+    throw new ScopeSnapshotNotReadyError(scope.snapshot ? "campaign_scope_missing" : "snapshot_missing");
+  }
+}
+
 // Per-campaign Subengine aggregate over the SAME date window as the FB scan
 // (transaction_date vs stat_date), joined by campaign_id. Simple warehouse flags
 // only (is_trial / is_success / amounts) — no cohort formulas are reproduced here.
-function txByCampaignCTE(filters: FbReadFilters, params: Record<string, unknown>): string {
+// Restricted: the member's users' transactions only (txFrom).
+function txByCampaignCTE(filters: FbReadFilters, params: Record<string, unknown>, scope: ScopeSql = ALL_SCOPE_SQL): string {
   let where = `auth_user_id = {auth_user_id:String} AND campaign_id != ''`;
   if (filters.date_from) { params.tx_date_from = filters.date_from; where += ` AND transaction_date >= {tx_date_from:String}`; }
   if (filters.date_to) { params.tx_date_to = filters.date_to; where += ` AND transaction_date <= {tx_date_to:String}`; }
@@ -1017,7 +1045,7 @@ function txByCampaignCTE(filters: FbReadFilters, params: Record<string, unknown>
       anyHeavyIf(campaign_path, campaign_path != '') tx_campaign_path,
       sumIf(gross_amount_usd, is_success = 1) tx_gross,
       sum(refund_amount_usd) tx_refunds
-    FROM ${ANALYTICS_TRANSACTIONS_TABLE} FINAL
+    FROM ${txFrom(scope)}
     WHERE ${where}
     GROUP BY campaign_id`;
 }
@@ -1039,8 +1067,15 @@ function blendedFromRow(r: Record<string, unknown>, spend: number): FbBlendedMet
   };
 }
 
-export async function runFbList(client: ClickHouseClientLike, authUserId: string, req: FbReadRequest): Promise<{ rows: FbListRow[]; level: FbLevel }> {
+export async function runFbList(
+  client: ClickHouseClientLike,
+  authUserId: string,
+  req: FbReadRequest,
+  scope: ScopeSql = ALL_SCOPE_SQL,
+): Promise<{ rows: FbListRow[]; level: FbLevel }> {
   const level = normalizeFbLevel(req.level);
+  // Restricted: account / day → 403 before any SQL (no-op for scope all).
+  preflightFbScope(scope, level);
   const v2Reads = req.v2_preview === true || fbV2ReadsEnabled();
   const filters = normalizeFbFilters(req);
   const params: Record<string, unknown> = { auth_user_id: authUserId };
@@ -1054,7 +1089,7 @@ export async function runFbList(client: ClickHouseClientLike, authUserId: string
   const where = fbScopeWhere({ level, filters, params, prefix });
   const groupBy = keys.map((k) => `${prefix}${k}`).join(", ");
   const selectKeys = keys.map((k) => `${prefix}${k} AS ${k}`).join(", ");
-  const blendJoin = blend ? `LEFT JOIN (${txByCampaignCTE(filters, params)}) AS tx ON tx.campaign_id = fb.campaign_id` : "";
+  const blendJoin = blend ? `LEFT JOIN (${txByCampaignCTE(filters, params, scope)}) AS tx ON tx.campaign_id = fb.campaign_id` : "";
   const blendCols = blend
     ? `, any(tx.trial_users) trial_users, any(tx.first_sub_users) first_sub_users, any(tx.refund_users) refund_users, any(tx.tx_campaign_path) tx_campaign_path, any(tx.tx_gross) tx_gross, any(tx.tx_refunds) tx_refunds`
     : "";
@@ -1069,7 +1104,7 @@ export async function runFbList(client: ClickHouseClientLike, authUserId: string
       toString(max(stat_date)) last_date,
       uniqExact(stat_date) days,
       ${METRIC_SUMS}${blendCols}
-    FROM ${fbReadFrom(level, "fb", v2Reads)}
+    FROM ${fbFrom(scope, level, "fb", fbReadFrom(level, "fb", v2Reads))}
     ${blendJoin}
     WHERE ${where}
     GROUP BY ${groupBy}
@@ -1111,7 +1146,15 @@ export async function runFbList(client: ClickHouseClientLike, authUserId: string
 
 export interface FbChartPoint extends FbMetricTotals { date: string; }
 
-export async function runFbCharts(client: ClickHouseClientLike, authUserId: string, req: FbReadRequest): Promise<FbChartPoint[]> {
+export async function runFbCharts(
+  client: ClickHouseClientLike,
+  authUserId: string,
+  req: FbReadRequest,
+  scope: ScopeSql = ALL_SCOPE_SQL,
+): Promise<FbChartPoint[]> {
+  // Restricted: the REQUESTED level decides (account / day → 403), even when a
+  // filter would read the campaign level below.
+  preflightFbScope(scope, normalizeFbLevel(req.level, "campaign"));
   // Daily series aggregate the CAMPAIGN level (finest level that is complete and
   // compact); the API's own `day` level carries no filterable dimensions.
   const level = req.filters?.buyer?.length || req.filters?.ad_account_id?.length || req.filters?.campaign_id?.length
@@ -1122,7 +1165,7 @@ export async function runFbCharts(client: ClickHouseClientLike, authUserId: stri
   const where = fbScopeWhere({ level, filters, params });
   const sql = `
     SELECT toString(stat_date) date, ${METRIC_SUMS}
-    FROM ${fbReadFrom(level)}
+    FROM ${fbFrom(scope, level, undefined, fbReadFrom(level))}
     WHERE ${where}
     GROUP BY stat_date
     ORDER BY stat_date
@@ -1139,7 +1182,12 @@ export interface FbFilterOptions {
   date_max: string | null;
 }
 
-export async function runFbFilterOptions(client: ClickHouseClientLike, authUserId: string, req: FbReadRequest): Promise<FbFilterOptions> {
+export async function runFbFilterOptions(
+  client: ClickHouseClientLike,
+  authUserId: string,
+  req: FbReadRequest,
+  scope: ScopeSql = ALL_SCOPE_SQL,
+): Promise<FbFilterOptions> {
   const filters = normalizeFbFilters(req);
   const params: Record<string, unknown> = { auth_user_id: authUserId };
   // Options come from the campaign level (has every dimension); each dimension's
@@ -1157,11 +1205,15 @@ export async function runFbFilterOptions(client: ClickHouseClientLike, authUserI
   const buyerQ = base("buyer");
   const acctQ = base("acct");
   const campQ = base("camp");
+  // Restricted: options and the date range cover the visible campaigns only.
+  preflightFbScope(scope, "campaign");
+  const campaignFrom = fbFrom(scope, "campaign", undefined, fbReadFrom("campaign"));
+  const rangeFrom = fbFrom(scope, "campaign", undefined, `${FB} FINAL`);
   const [buyers, accounts, campaigns, range] = await Promise.all([
-    jsonRows<Record<string, unknown>>(client, `SELECT buyer value, sum(spend) spend, count() rows FROM ${fbReadFrom("campaign")} WHERE ${buyerQ.where} AND buyer != '' GROUP BY buyer ORDER BY spend DESC FORMAT JSONEachRow`, buyerQ.params),
-    jsonRows<Record<string, unknown>>(client, `SELECT ad_account_id value, argMax(ad_account_name, stat_date) label, sum(spend) spend, count() rows FROM ${fbReadFrom("campaign")} WHERE ${acctQ.where} AND ad_account_id != '' GROUP BY ad_account_id ORDER BY spend DESC FORMAT JSONEachRow`, acctQ.params),
-    jsonRows<Record<string, unknown>>(client, `SELECT campaign_id value, argMax(campaign_name, stat_date) label, sum(spend) spend, count() rows FROM ${fbReadFrom("campaign")} WHERE ${campQ.where} AND campaign_id != '' GROUP BY campaign_id ORDER BY spend DESC FORMAT JSONEachRow`, campQ.params),
-    jsonRows<Record<string, unknown>>(client, `SELECT toString(min(stat_date)) date_min, toString(max(stat_date)) date_max FROM ${FB} FINAL WHERE auth_user_id = {auth_user_id:String}`, { auth_user_id: authUserId }),
+    jsonRows<Record<string, unknown>>(client, `SELECT buyer value, sum(spend) spend, count() rows FROM ${campaignFrom} WHERE ${buyerQ.where} AND buyer != '' GROUP BY buyer ORDER BY spend DESC FORMAT JSONEachRow`, buyerQ.params),
+    jsonRows<Record<string, unknown>>(client, `SELECT ad_account_id value, argMax(ad_account_name, stat_date) label, sum(spend) spend, count() rows FROM ${campaignFrom} WHERE ${acctQ.where} AND ad_account_id != '' GROUP BY ad_account_id ORDER BY spend DESC FORMAT JSONEachRow`, acctQ.params),
+    jsonRows<Record<string, unknown>>(client, `SELECT campaign_id value, argMax(campaign_name, stat_date) label, sum(spend) spend, count() rows FROM ${campaignFrom} WHERE ${campQ.where} AND campaign_id != '' GROUP BY campaign_id ORDER BY spend DESC FORMAT JSONEachRow`, campQ.params),
+    jsonRows<Record<string, unknown>>(client, `SELECT toString(min(stat_date)) date_min, toString(max(stat_date)) date_max FROM ${rangeFrom} WHERE auth_user_id = {auth_user_id:String}`, { auth_user_id: authUserId }),
   ]);
   return {
     buyers: buyers.map((r) => ({ value: s(r.value), spend: round2(n(r.spend)), rows: n(r.rows) })),
@@ -1217,6 +1269,8 @@ export function fbWarehouseVersionFromState(state: Record<string, unknown> | nul
   return `fbwh_${(h >>> 0).toString(36)}`;
 }
 
+/** Restricted: warehouse_rows, the date range, report_complete and the version
+ * hash are computed over the member's visible rows, never the tenant's. */
 export async function buildFbDiagnostics(input: {
   clickhouse: ClickHouseClientLike;
   supabase: SupabaseLikeClient;
@@ -1224,17 +1278,25 @@ export async function buildFbDiagnostics(input: {
   level: FbLevel;
   filters: FbReadFilters;
   today?: string;
+  scope?: ScopeSql;
 }): Promise<FbDiagnostics> {
+  const scope = input.scope ?? ALL_SCOPE_SQL;
+  preflightFbScope(scope, input.level);
   const params: Record<string, unknown> = { auth_user_id: input.authUserId };
   const where = fbScopeWhere({ level: input.level, filters: input.filters, params });
+  const totalsFrom = fbFrom(scope, "campaign", undefined, `${FB} FINAL`);
+  const scopedFrom = fbFrom(scope, input.level, undefined, `${FB} FINAL`);
   const [state, totals, scoped] = await Promise.all([
-    getFbSyncState(input.supabase, input.authUserId).catch(() => null),
+    getFbSyncState(input.supabase, input.authUserId).catch((error) => {
+      if (error instanceof ScopeViolation) throw error;
+      return null;
+    }),
     jsonRows<Record<string, unknown>>(
       input.clickhouse,
-      `SELECT count() c, toString(min(stat_date)) date_min, toString(max(stat_date)) date_max FROM ${FB} FINAL WHERE auth_user_id = {auth_user_id:String}`,
+      `SELECT count() c, toString(min(stat_date)) date_min, toString(max(stat_date)) date_max FROM ${totalsFrom} WHERE auth_user_id = {auth_user_id:String}`,
       { auth_user_id: input.authUserId },
     ),
-    jsonRows<Record<string, unknown>>(input.clickhouse, `SELECT count() c FROM ${FB} FINAL WHERE ${where}`, params),
+    jsonRows<Record<string, unknown>>(input.clickhouse, `SELECT count() c FROM ${scopedFrom} WHERE ${where}`, params),
   ]);
   const warehouseRows = n(totals[0]?.c);
   const diagnostics = isRecord(state?.diagnostics) ? (state?.diagnostics as Record<string, unknown>) : {};
@@ -1291,10 +1353,13 @@ export interface FbReportResponse {
 // Mapping coverage + blended totals over the report window, joined by
 // campaign_id. Blended totals count ONLY campaigns present in the FB scope, so
 // ROAS/CAC never mix in revenue from campaigns the FB report cannot see.
+// Restricted (R-13): both sides are scoped, so the block holds the member's own
+// campaigns and users only.
 async function runFbMappingSummary(
   client: ClickHouseClientLike,
   authUserId: string,
   filters: FbReadFilters,
+  scope: ScopeSql = ALL_SCOPE_SQL,
 ): Promise<{ mapping: FbCampaignMappingDiagnostics; blended: FbBlendedMetrics }> {
   const params: Record<string, unknown> = { auth_user_id: authUserId };
   const fbWhere = fbScopeWhere({ level: "campaign", filters, params });
@@ -1302,17 +1367,17 @@ async function runFbMappingSummary(
   if (filters.date_from) { params.tx_date_from = filters.date_from; txWhere += ` AND transaction_date >= {tx_date_from:String}`; }
   if (filters.date_to) { params.tx_date_to = filters.date_to; txWhere += ` AND transaction_date <= {tx_date_to:String}`; }
   const sql = `WITH
-    fbc AS (SELECT DISTINCT campaign_id FROM ${FB} FINAL WHERE ${fbWhere} AND campaign_id != ''),
-    txc AS (SELECT DISTINCT campaign_id FROM ${ANALYTICS_TRANSACTIONS_TABLE} FINAL WHERE ${txWhere})
+    fbc AS (SELECT DISTINCT campaign_id FROM ${fbFrom(scope, "campaign", undefined, `${FB} FINAL`)} WHERE ${fbWhere} AND campaign_id != ''),
+    txc AS (SELECT DISTINCT campaign_id FROM ${txFrom(scope)} WHERE ${txWhere})
   SELECT
     (SELECT count() FROM fbc) fb_campaigns,
     (SELECT count() FROM txc) tx_campaigns,
     (SELECT count() FROM fbc WHERE campaign_id IN (SELECT campaign_id FROM txc)) matched_campaigns,
-    (SELECT uniqExactIf(user_id, is_trial = 1 AND is_success = 1) FROM ${ANALYTICS_TRANSACTIONS_TABLE} FINAL
+    (SELECT uniqExactIf(user_id, is_trial = 1 AND is_success = 1) FROM ${txFrom(scope)}
       WHERE ${txWhere} AND campaign_id IN (SELECT campaign_id FROM fbc)) trial_users,
-    (SELECT sumIf(gross_amount_usd, is_success = 1) FROM ${ANALYTICS_TRANSACTIONS_TABLE} FINAL
+    (SELECT sumIf(gross_amount_usd, is_success = 1) FROM ${txFrom(scope)}
       WHERE ${txWhere} AND campaign_id IN (SELECT campaign_id FROM fbc)) tx_gross,
-    (SELECT sum(refund_amount_usd) FROM ${ANALYTICS_TRANSACTIONS_TABLE} FINAL
+    (SELECT sum(refund_amount_usd) FROM ${txFrom(scope)}
       WHERE ${txWhere} AND campaign_id IN (SELECT campaign_id FROM fbc)) tx_refunds
   FORMAT JSONEachRow`;
   const [row] = await jsonRows<Record<string, unknown>>(client, sql, params);
@@ -1337,27 +1402,33 @@ export async function runFbReport(input: {
   supabase: SupabaseLikeClient;
   authUserId: string;
   request: FbReadRequest;
+  scope?: ScopeSql;
 }): Promise<FbReportResponse> {
   const started = Date.now();
+  const scope = input.scope ?? ALL_SCOPE_SQL;
   const level = normalizeFbLevel(input.request.level);
+  // Before the fan-out below: a refused level or a missing campaign scope must
+  // not start any query.
+  preflightFbScope(scope, level);
   const filters = normalizeFbFilters(input.request);
   const params: Record<string, unknown> = { auth_user_id: input.authUserId };
   const where = fbScopeWhere({ level: "campaign", filters, params });
+  const summaryFrom = fbFrom(scope, "campaign", undefined, `${FB} FINAL`);
   const [list, charts, options, summaryRows, diagnostics, mappingSummary] = await Promise.all([
-    runFbList(input.clickhouse, input.authUserId, input.request),
-    runFbCharts(input.clickhouse, input.authUserId, input.request),
-    runFbFilterOptions(input.clickhouse, input.authUserId, input.request),
+    runFbList(input.clickhouse, input.authUserId, input.request, scope),
+    runFbCharts(input.clickhouse, input.authUserId, input.request, scope),
+    runFbFilterOptions(input.clickhouse, input.authUserId, input.request, scope),
     jsonRows<Record<string, unknown>>(
       input.clickhouse,
       `SELECT ${METRIC_SUMS}, uniqExact(ad_account_id) accounts, uniqExact(campaign_id) campaigns, uniqExact(stat_date) active_days
-       FROM ${FB} FINAL WHERE ${where} FORMAT JSONEachRow`,
+       FROM ${summaryFrom} WHERE ${where} FORMAT JSONEachRow`,
       params,
     ),
-    buildFbDiagnostics({ clickhouse: input.clickhouse, supabase: input.supabase, authUserId: input.authUserId, level, filters }),
+    buildFbDiagnostics({ clickhouse: input.clickhouse, supabase: input.supabase, authUserId: input.authUserId, level, filters, scope }),
     // Best-effort (the report renders without the mapping block) — except a
-    // ScopeViolation, which must fail the request.
-    runFbMappingSummary(input.clickhouse, input.authUserId, filters).catch((error) => {
-      if (error instanceof ScopeViolation) throw error;
+    // ScopeViolation or a scope refusal, which must fail the request.
+    runFbMappingSummary(input.clickhouse, input.authUserId, filters, scope).catch((error) => {
+      if (error instanceof ScopeViolation || error instanceof ScopeForbiddenError || error instanceof ScopeSnapshotNotReadyError) throw error;
       return null;
     }),
   ]);

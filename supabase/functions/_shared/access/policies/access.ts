@@ -4,15 +4,18 @@
 // Admin → Access pages on every call, so a missing or unknown action is a 400
 // (rule R3: no default).
 //
-// Every action is workspace administration and needs an admin.* permission.
-// Every admin.* key is requiresFullScope, so a funnel-restricted member never
-// holds one (effectivePermissions drops it) and the gate refuses the request
-// before the handler runs. No action is scopeReady and none is open to "any
-// member": a caller's OWN access comes from public.my_access() through
+// Every action is workspace administration and needs an admin.* permission or,
+// for the funnel-path registry (access Phase 2, spec §6 contract 8),
+// funnels.manage. Every admin.* key and funnels.manage is requiresFullScope, so
+// a funnel-restricted member never holds one (effectivePermissions drops it)
+// and the gate refuses the request before the handler runs; the two path
+// writes are also fullScopeOnly. No action is scopeReady and none is open to
+// "any member": a caller's OWN access comes from public.my_access() through
 // PostgREST, not from here.
 //
-// The handler reads the member / role / scope / audit tables with the
-// service-role client (it bypasses RLS), so this table IS the read
+// The handler reads the member / role / scope / audit tables, the funnel
+// registry (funnel_paths of every status) and the cohort snapshot state with
+// the service-role client (it bypasses RLS), so this table IS the read
 // authorization. The mutation RPCs re-check permission and anti-escalation
 // inside their own transaction under the workspace lock (defence in depth).
 //
@@ -34,7 +37,10 @@ export type AccessAdminAction =
   | "roles.delete"
   | "roles.seed_templates"
   | "audit.list"
-  | "funnels.list";
+  | "funnels.list"
+  | "paths.coverage"
+  | "paths.attach"
+  | "paths.set_status";
 
 export const ACCESS_ADMIN_ACTIONS: readonly AccessAdminAction[] = Object.freeze([
   "catalog",
@@ -50,6 +56,9 @@ export const ACCESS_ADMIN_ACTIONS: readonly AccessAdminAction[] = Object.freeze(
   "roles.seed_templates",
   "audit.list",
   "funnels.list",
+  "paths.coverage",
+  "paths.attach",
+  "paths.set_status",
 ]);
 
 /** Canonical action from the body `action` (exact, case-sensitive). */
@@ -89,5 +98,13 @@ export const ACCESS_POLICY: FunctionPolicy<AccessAdminAction> = {
 
     // /admin/audit.
     "audit.list": { anyOf: ["admin.audit.view"] },
+
+    // /admin/funnels (Funnel coverage). The coverage read runs one all-scope
+    // ClickHouse statement over the active cohort snapshot; the path writes go
+    // through access_attach_funnel_path / access_set_funnel_path_status, which
+    // re-check funnels.manage in SQL and audit registry.path_*.
+    "paths.coverage": { anyOf: ["admin.users.view", "funnels.manage"] },
+    "paths.attach": { allOf: ["funnels.manage"], fullScopeOnly: true, write: true },
+    "paths.set_status": { allOf: ["funnels.manage"], fullScopeOnly: true, write: true },
   },
 };

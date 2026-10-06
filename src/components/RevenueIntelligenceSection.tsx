@@ -10,6 +10,12 @@
 // keepPreviousData keeps the previous bundle on screen while a new request is
 // in flight, so control-derived presentation would caption stale numbers
 // wrongly (e.g. a filtered bundle's spend=0 shown as a real project-wide $0).
+//
+// Funnel-restricted members (access Phase 2): the server reads only the
+// customers acquired through their funnels with filtersActive forced, so the
+// same "filters active" presentation applies (spend / profit / unattributed
+// shown as "—"); the funnel options are their funnels' paths only, and saved
+// values outside them are named and can be cleared (the server ignores them).
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { Area, AreaChart, Bar, CartesianGrid, ComposedChart, Line, XAxis, YAxis } from "recharts";
@@ -43,6 +49,8 @@ import { canAccessRoute } from "@/services/accessRoutes";
 import { useWarehouseVersion } from "@/hooks/useAnalyticsCache";
 import { useRevenueBundle, useRevenueDayBreakdown } from "@/hooks/useRevenueIntelligence";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
+import { ScopeDataPending, SCOPE_SNAPSHOT_NOT_READY } from "@/components/access/ScopeDataPending";
+import { funnelScopeFilterPaths } from "@/services/funnels";
 import { formatCell, supportTableToCsv } from "@/services/supportExport";
 import type { RevenueBucket, RevenueBucketRow, RevenueIntelligenceRequest } from "@/services/revenueIntelligence";
 
@@ -231,7 +239,16 @@ export function RevenueIntelligenceSection(): JSX.Element {
     return () => clearInterval(id);
   }, []);
 
-  const filtersActive = ui.funnels.length > 0 || ui.plans.length > 0;
+  // A restricted member's bundle always comes back filters_active (the server
+  // forces it), so the controls must agree or the "lags" flag never clears.
+  const restricted = access.restricted;
+  const filtersActive = ui.funnels.length > 0 || ui.plans.length > 0 || restricted;
+  const scopePaths = useMemo(() => funnelScopeFilterPaths(access.funnelScope), [access.funnelScope]);
+  const excludedHint = restricted ? "not in your funnel view" : "excluded by filters";
+  const outOfScopeFunnels = useMemo(
+    () => (restricted ? ui.funnels.filter((path) => !scopePaths.has(path)) : []),
+    [restricted, ui.funnels, scopePaths],
+  );
   const request = useMemo<RevenueIntelligenceRequest>(() => ({
     action: "bundle",
     bucket: ui.bucket,
@@ -240,7 +257,7 @@ export function RevenueIntelligenceSection(): JSX.Element {
     filters: { campaign_path: ui.funnels, price_plan: ui.plans },
   }), [ui.bucket, ui.range, ui.funnels, ui.plans, today]);
 
-  const { bundle, error, isInitialLoading, isRefreshing } = useRevenueBundle({
+  const { bundle, error, errorCode, isInitialLoading, isRefreshing } = useRevenueBundle({
     request,
     userScopeHash,
     warehouseVersion,
@@ -331,7 +348,12 @@ export function RevenueIntelligenceSection(): JSX.Element {
       return { ...prev, funnelDict, planDict };
     });
   }, [bundle, setUi]);
-  const funnelOptions = useMemo(() => [...new Set([...ui.funnelDict, ...ui.funnels])].sort(), [ui.funnelDict, ui.funnels]);
+  // A restricted member is offered their funnels' paths only (the persisted
+  // dictionary may hold paths from before their access was narrowed).
+  const funnelOptions = useMemo(
+    () => [...new Set([...ui.funnelDict, ...ui.funnels])].filter((path) => !restricted || scopePaths.has(path)).sort(),
+    [ui.funnelDict, ui.funnels, restricted, scopePaths],
+  );
   const planOptions = useMemo(
     () => [...new Set([...ui.planDict, ...ui.plans])].sort((a, b) => (parseFloat(a.replace("$", "")) || 0) - (parseFloat(b.replace("$", "")) || 0)),
     [ui.planDict, ui.plans],
@@ -343,7 +365,8 @@ export function RevenueIntelligenceSection(): JSX.Element {
         <div>
           <h2 className="text-base font-semibold text-foreground">Revenue Intelligence</h2>
           <p className="text-xs text-muted-foreground">
-            When did the money arrive, and which cohorts produced it · project-wide · same cohort identity as the Cohorts page
+            When did the money arrive, and which cohorts produced it · {restricted ? "your funnels" : "project-wide"} · same
+            cohort identity as the Cohorts page
           </p>
         </div>
         <div className="ml-auto flex flex-wrap items-center gap-2">
@@ -376,7 +399,8 @@ export function RevenueIntelligenceSection(): JSX.Element {
         </div>
       </div>
 
-      {error === "cohort_snapshot_not_ready" && (
+      {error === "cohort_snapshot_not_ready" && errorCode === SCOPE_SNAPSHOT_NOT_READY && <ScopeDataPending />}
+      {error === "cohort_snapshot_not_ready" && errorCode !== SCOPE_SNAPSHOT_NOT_READY && (
         <Card className="p-4 text-sm text-muted-foreground shadow-card">
           Revenue Intelligence needs the cohort snapshot.{" "}
           {canOpenCohorts ? (
@@ -402,7 +426,24 @@ export function RevenueIntelligenceSection(): JSX.Element {
 
       {bundle?.ok && totals && (
         <>
-          {displayFiltersActive && (
+          {displayFiltersActive && restricted && (
+            <Card className="border-warning/40 p-3 text-xs text-muted-foreground shadow-card" data-testid="revenue-restricted-note">
+              Funnel-restricted view — revenue of the customers acquired through your funnels, every later payment
+              included. Facebook spend, profit and the Unattributed stream are not part of this view.
+              {outOfScopeFunnels.length > 0 && (
+                <span className="mt-1 block text-warning" data-testid="revenue-out-of-scope-funnels">
+                  {outOfScopeFunnels.length === 1
+                    ? "1 saved funnel filter is outside your funnels and was ignored."
+                    : `${outOfScopeFunnels.length} saved funnel filters are outside your funnels and were ignored.`}{" "}
+                  <Button type="button" variant="link" size="sm" className="h-auto p-0 text-xs"
+                    onClick={() => setUi((prev) => ({ ...prev, funnels: prev.funnels.filter((path) => scopePaths.has(path)) }))}>
+                    Clear
+                  </Button>
+                </span>
+              )}
+            </Card>
+          )}
+          {displayFiltersActive && !restricted && (
             <Card className="border-warning/40 p-3 text-xs text-muted-foreground shadow-card">
               Cohort filters active — showing attributed revenue of matching users only. Facebook spend, profit and the
               Unattributed stream have no user grain, so they are excluded from this slice (not silently kept project-wide).
@@ -418,16 +459,16 @@ export function RevenueIntelligenceSection(): JSX.Element {
             <KpiCard label={`Existing Cohort Revenue (${basisKey})`} value={usd(kExisting)} hint={pct(kExisting, kBasisTotal)}
               icon={<Users className="h-4 w-4" />} accent="accent" />
             <KpiCard label="Spend (Facebook)" value={displayFiltersActive ? "—" : usd(totals.spend)}
-              hint={displayFiltersActive ? "excluded by filters" : undefined}
+              hint={displayFiltersActive ? excludedHint : undefined}
               icon={<Megaphone className="h-4 w-4" />} accent="warning" />
             <KpiCard label="Profit (Net − Spend)" value={displayFiltersActive ? "—" : usd(totals.profit)}
-              hint={displayFiltersActive ? "excluded by filters" : undefined}
+              hint={displayFiltersActive ? excludedHint : undefined}
               icon={totals.profit < 0 && !displayFiltersActive ? <TrendingDown className="h-4 w-4" /> : <TrendingUp className="h-4 w-4" />}
               accent={!displayFiltersActive && totals.profit < 0 ? "warning" : "success"} />
             <KpiCard
               label="Unattributed"
               value={displayFiltersActive ? "—" : usd(kUnatt, 2)}
-              hint={displayFiltersActive ? "excluded by filters" : pct(kUnatt, kBasisTotal)}
+              hint={displayFiltersActive ? excludedHint : pct(kUnatt, kBasisTotal)}
               icon={<HelpCircle className="h-4 w-4" />} accent="warning"
               tooltip="Payments whose user has no row in the active cohort snapshot — shown explicitly, never merged into Existing."
             />
@@ -440,7 +481,7 @@ export function RevenueIntelligenceSection(): JSX.Element {
                   {basisKey === "gross" ? "Gross" : "Net"} revenue by {displayBucket} · New vs Existing
                 </div>
                 <div className="text-xs text-muted-foreground">
-                  {displayFiltersActive ? "spend hidden under filters" : "line = Facebook spend"}
+                  {displayFiltersActive ? (restricted ? "spend not in your funnel view" : "spend hidden under filters") : "line = Facebook spend"}
                   {displayBucket === "day" ? " · click a bar to inspect the day" : ""}
                 </div>
               </div>
@@ -675,10 +716,13 @@ export function RevenueIntelligenceSection(): JSX.Element {
                 </TableBody>
               </Table>
             </div>
-            <p className="mt-2 text-xs text-muted-foreground">
-              Attribution coverage {bundle.diagnostics.attributed_pct}% · unattributed revenue is listed explicitly, never merged ·
-              New/Existing here follow the selected {displayBucket} grain, same as the KPI cards.
-            </p>
+            {/* Attribution coverage is a project-wide figure: not shown in a funnel-restricted view. */}
+            {!restricted && (
+              <p className="mt-2 text-xs text-muted-foreground">
+                Attribution coverage {bundle.diagnostics.attributed_pct}% · unattributed revenue is listed explicitly, never merged ·
+                New/Existing here follow the selected {displayBucket} grain, same as the KPI cards.
+              </p>
+            )}
           </Card>
         </>
       )}

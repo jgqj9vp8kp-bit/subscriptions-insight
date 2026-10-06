@@ -12,7 +12,7 @@ import { Label } from "@/components/ui/label";
 import { useToast } from "@/hooks/use-toast";
 import { FunnelScopePicker } from "@/components/admin/FunnelScopePicker";
 import { RoleSelect } from "@/components/admin/RoleSelect";
-import { useAccessAdminMutation } from "@/components/admin/useAccessAdmin";
+import { useAccessAdminMutation, usePathCoverage } from "@/components/admin/useAccessAdmin";
 import { defaultRoleId, isPrivilegedRole, type AdminActor } from "@/components/admin/accessAdminModel";
 import {
   addAccessMember,
@@ -56,6 +56,8 @@ export function AddMemberDialog({ open, onOpenChange, roles, funnels, funnelsLoa
 
   const role = useMemo(() => roles.find((entry) => entry.id === roleId), [roles, roleId]);
   const requireAll = isPrivilegedRole(role);
+  // The impact preview of the scope picker (selected funnels only).
+  const coverage = usePathCoverage(open && !requireAll && scope.mode === "selected");
   const trimmedEmail = email.trim();
   const emailValid = EMAIL_RE.test(trimmedEmail);
   const canSubmit = emailValid && Boolean(role) && !submitting;
@@ -146,6 +148,9 @@ export function AddMemberDialog({ open, onOpenChange, roles, funnels, funnelsLoa
               funnels={funnels}
               loading={funnelsLoading}
               requireAll={requireAll}
+              coverage={coverage.data}
+              coverageLoading={coverage.isLoading}
+              coverageError={coverage.error}
             />
           </div>
           {/* Lets Enter submit from the text inputs. */}

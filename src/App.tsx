@@ -41,6 +41,7 @@ const SupportPage = lazy(() => import("./pages/Support.tsx"));
 const AdminMembersPage = lazy(() => import("./pages/admin/AdminMembers.tsx"));
 const AdminRolesPage = lazy(() => import("./pages/admin/AdminRoles.tsx"));
 const AdminAuditPage = lazy(() => import("./pages/admin/AdminAudit.tsx"));
+const AdminFunnelCoveragePage = lazy(() => import("./pages/admin/AdminFunnelCoverage.tsx"));
 
 // Cache defaults for the Cohorts read path (and any future warehouse query):
 // stale-while-revalidate with a 5-min freshness window, 60-min retention so the
@@ -120,6 +121,7 @@ const App = () => (
                     <Route path="/admin/members" element={<RequirePermission route="/admin/members"><AdminMembersPage /></RequirePermission>} />
                     <Route path="/admin/roles" element={<RequirePermission route="/admin/roles"><AdminRolesPage /></RequirePermission>} />
                     <Route path="/admin/audit" element={<RequirePermission route="/admin/audit"><AdminAuditPage /></RequirePermission>} />
+                    <Route path="/admin/funnels" element={<RequirePermission route="/admin/funnels"><AdminFunnelCoveragePage /></RequirePermission>} />
                   </Route>
                   {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
                   <Route path="*" element={<NotFound />} />

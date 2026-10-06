@@ -15,6 +15,7 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { createScopedReader } from "./scopedClient.ts";
+import { getCohortSnapshotState } from "./cohortSnapshotState.ts";
 import type { SupabaseAuthClient } from "./types.ts";
 import { buildCorsHeaders } from "../access/cors.ts";
 import { BUILD_ID } from "../access/buildId.ts";
@@ -37,6 +38,7 @@ export type {
   AccessHandler,
   ActionPolicy,
   FunctionPolicy,
+  ScopeSql,
   ServeWithAccessOptions,
 } from "../access/gate.ts";
 export type { AccessContext } from "../access/accessContext.ts";
@@ -114,6 +116,8 @@ function liveAccessDeps(): AccessGateDeps {
       client ? callRpc(client, "access_write_audit", auditRpcParams(entry)) : missing(),
     recordDenial: (entry: GateDenialEntry) =>
       client ? callRpc(client, "access_record_denial", denialRpcParams(entry)) : missing(),
+    // Phase 2 freshness gate: read only for funnel-restricted scopeSnapshot actions.
+    loadCohortSnapshotState: (tenantKey) => (client ? getCohortSnapshotState(client, tenantKey) : missing()),
   };
 }
 

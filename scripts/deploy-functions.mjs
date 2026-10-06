@@ -7,7 +7,9 @@
 //   1. PRE-CHECK  public.workspace_data_key() must return the workspace data key
 //      (migrations 202610050001 + 202610050002 applied AND bootstrap_workspace()
 //      run). Without it every new function answers 503 (calls, crons, the Export
-//      API), so the script refuses to deploy anything.
+//      API), so the script refuses to deploy anything. public.funnel_paths must
+//      exist too (migration 202610060001, access Phase 2): the access function's
+//      member and funnel lists embed it.
 //   2. STAMP      a fresh BUILD_ID into supabase/functions/_shared/access/buildId.ts
 //      (git sha + UTC time), restored to the committed content afterwards.
 //   3. DEPLOY     every folder under supabase/functions that has an index.ts.
@@ -110,9 +112,23 @@ export function checkDataKeyResponse(status, bodyText) {
   return { ok: true, dataKey: value };
 }
 
+const FUNNEL_PATHS_MISSING =
+  "public.funnel_paths does not exist: apply 202610060001_access_phase2_scope.sql first (the access function's member and funnel lists embed it)";
+
+/** PostgREST answer of GET funnel_paths?select=id&limit=1 (service role) →
+ * ok when the table exists. */
+export function checkFunnelPathsResponse(status, bodyText) {
+  if (status >= 200 && status < 300) return { ok: true };
+  if (status === 404 || /PGRST205|does not exist|Could not find the table/i.test(String(bodyText ?? ""))) {
+    return { ok: false, reason: FUNNEL_PATHS_MISSING };
+  }
+  return { ok: false, reason: `funnel_paths check failed with HTTP ${status}: ${String(bodyText).slice(0, 200)}` };
+}
+
 /** Pre-check through the Supabase CLI login instead of the service-role key:
  * `supabase db query --linked -o json -f scripts/sql/workspace_data_key.sql`
- * prints {"rows":[{"data_key": …}], …}. Same verdicts as checkDataKeyResponse. */
+ * prints {"rows":[{"data_key": …, "funnel_paths": true}], …}. Same verdicts as
+ * checkDataKeyResponse + checkFunnelPathsResponse. */
 export function checkCliDataKeyOutput(code, stdout, stderr) {
   const out = String(stdout ?? "");
   const err = String(stderr ?? "");
@@ -130,9 +146,12 @@ export function checkCliDataKeyOutput(code, stdout, stderr) {
   } catch {
     return { ok: false, reason: "supabase db query returned a non-JSON body" };
   }
-  const value = Array.isArray(parsed?.rows) && parsed.rows.length ? parsed.rows[0]?.data_key ?? null : null;
+  const row = Array.isArray(parsed?.rows) && parsed.rows.length ? parsed.rows[0] : null;
+  const value = row?.data_key ?? null;
   if (value === null) return { ok: false, reason: "the workspace is not bootstrapped: run select public.bootstrap_workspace('<data owner uuid>', 'SubEngine'); first" };
   if (typeof value !== "string" || !UUID_RE.test(value)) return { ok: false, reason: "workspace_data_key() returned something that is not a uuid" };
+  // A JSON boolean from the Management API; tolerate a text rendering of it.
+  if (![true, "t", "true"].includes(row?.funnel_paths)) return { ok: false, reason: FUNNEL_PATHS_MISSING };
   return { ok: true, dataKey: value };
 }
 
@@ -206,6 +225,14 @@ export async function runDeploy(argv, deps) {
         body: "{}",
       });
       check = checkDataKeyResponse(response.status, await response.text());
+      if (check.ok) {
+        const paths = await deps.fetch(`${baseUrl}/rest/v1/funnel_paths?select=id&limit=1`, {
+          method: "GET",
+          headers: { apikey: serviceKey, Authorization: `Bearer ${serviceKey}` },
+        });
+        const schema = checkFunnelPathsResponse(paths.status, await paths.text());
+        if (!schema.ok) check = schema;
+      }
     } catch (error) {
       check = { ok: false, reason: `could not reach PostgREST: ${error.message}` };
     }
@@ -216,10 +243,12 @@ export async function runDeploy(argv, deps) {
   }
   if (!check.ok) {
     log(`REFUSED: ${check.reason}`);
-    log("Nothing was deployed. Functions deployed before migration 0002 + bootstrap answer 503 to every call, cron and Export API key.");
+    log(check.reason === FUNNEL_PATHS_MISSING
+      ? "Nothing was deployed. Functions deployed before migration 202610060001 break Admin -> Members and Funnel coverage."
+      : "Nothing was deployed. Functions deployed before migration 0002 + bootstrap answer 503 to every call, cron and Export API key.");
     return 1;
   }
-  log(`pre-check ok: the workspace is bootstrapped (data key ${check.dataKey.slice(0, 8)}…)`);
+  log(`pre-check ok: the workspace is bootstrapped (data key ${check.dataKey.slice(0, 8)}…) and public.funnel_paths exists`);
 
   const repo = deps.listRepoFunctions(deps.root);
   const listDeployed = () => {

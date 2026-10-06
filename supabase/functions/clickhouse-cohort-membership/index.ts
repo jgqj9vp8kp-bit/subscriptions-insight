@@ -6,10 +6,14 @@
 //
 // Access (policies/clickhouse-cohort-membership.ts): status for cohorts viewers
 // (detail fields only for the data owner and warehouse operators); rebuild,
-// forced rebuild and validate need admin.warehouse.manage.
+// forced rebuild and validate need admin.warehouse.manage; cron_tick is the
+// freshness cron (x-cron-secret) that keeps the snapshot current for
+// funnel-restricted reads — an unforced rebuild in "tick" mode whose body is
+// only { ok, action, tick_status, campaign_scope }.
 
 import { serveWithAccess } from "../_shared/clickhouse/http.ts";
 import {
+  CohortRebuildBusyError,
   getCohortSnapshotState,
   rebuildCohortMembership,
   validateCohortMembership,
@@ -36,6 +40,25 @@ function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
 serveWithAccess(CLICKHOUSE_COHORT_MEMBERSHIP_POLICY, async ({ ctx, action, pg, clickhouse }) => {
   const responseAction = legacyMembershipAction(action);
   try {
+    if (action === "cron_tick") {
+      try {
+        const result = await withTimeout(
+          rebuildCohortMembership({
+            authUserId: ctx.tenantKey,
+            supabase: pg,
+            clickhouse: clickhouse(),
+            force: false,
+            mode: "tick",
+          }),
+          QUERY_TIMEOUT_MS,
+        );
+        return { ok: true, action: "cron_tick", tick_status: result.tick_status, campaign_scope: result.campaign_scope };
+      } catch (error) {
+        // Another build holds the lease: that build keeps the snapshot current.
+        if (error instanceof CohortRebuildBusyError) return { ok: true, action: "cron_tick", tick_status: "in_progress" };
+        throw error;
+      }
+    }
     if (action === "rebuild" || action === "rebuild_force") {
       const result = await withTimeout(
         rebuildCohortMembership({

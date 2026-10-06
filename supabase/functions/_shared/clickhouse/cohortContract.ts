@@ -320,6 +320,15 @@ export interface CohortDiagnostics {
   support_requests?: number | null;
   support_unique_emails?: number | null;
   support_matched_cohort_users?: number | null;
+  /** Access Phase 2: true on a funnel-restricted member's response — the
+   * tenant-wide counts above are zeroed / nulled, not measured. */
+  counts_redacted?: boolean;
+}
+
+/** Access Phase 2: carried only by a funnel-restricted member's cohorts and
+ * revenue responses (owner and all-scope bodies are unchanged). */
+export interface RestrictedAccessMeta {
+  access: { scope: "restricted"; dropped_filter_values: number };
 }
 
 // Dataset-level FX health for the Cohorts FX panel — mirrors the client
@@ -366,6 +375,7 @@ export interface CohortResponse {
   /** Feature-flagged Campaign/reporting-date allocation diagnostics page. */
   fb_allocation_diagnostics?: import("./fbAllocationDiagnostics.ts").FbAllocationDiagnosticsPage;
   diagnostics: CohortDiagnostics;
+  meta?: RestrictedAccessMeta;
   error?: string;
 }
 
@@ -395,5 +405,6 @@ export interface CohortDetailsResponse {
   token_pack_breakdown: Array<{ product_id: string; product: string; price: number; purchases: number; buyers: number; gross_revenue: number; revenue_share: number }>;
   ltv_1m: { trial_users: number; net_revenue_1m: number; ltv_1m_per_user: number; age_days: number; matured: boolean; available_days: number };
   fx: { missing_transactions: number; missing_amount: number };
+  meta?: RestrictedAccessMeta;
   error?: string;
 }

@@ -8,10 +8,26 @@
 // whose authoritative Campaign ID matches. Cohort rows and totals are calculated
 // only from those users: allocated Spend = Campaign CPP * authoritative users.
 // Cohort membership and first-touch attribution never change here.
+//
+// Funnel-restricted members (access Phase 2, spec §4 "Cohorts FB columns"): the
+// user groups and the uniqueness check read the member's users (cohortsFrom),
+// the Campaign metrics read only their visible campaigns (fbFrom: resolved in
+// fact_campaign_scope and in their paths). A user whose campaign is not visible
+// (shared with other funnels, or too thin to resolve) is never allocated: the
+// row reports campaign_not_visible. The source classification (raw payloads)
+// is skipped, and without a built campaign scope no FB query runs at all.
 
 import type { ClickHouseClientLike, SupabaseLikeClient } from "./types.ts";
 import { ScopeViolation } from "./scopedClient.ts";
 import { ANALYTICS_TRANSACTIONS_TABLE, FACT_FACEBOOK_STATS_TABLE, FACT_USER_COHORTS_TABLE } from "./schema.ts";
+import {
+  ALL_SCOPE_SQL,
+  ScopeSnapshotNotReadyError,
+  campaignScopeVisibleFrom,
+  cohortsFrom,
+  fbFrom,
+  type ScopeSql,
+} from "./scopeSql.ts";
 import { getFbSyncState, fbWarehouseVersionFromState } from "./facebookStats.ts";
 import type { CohortFilters } from "./cohortContract.ts";
 import {
@@ -60,7 +76,9 @@ export type FbMatchStatus =
   | "timezone_unverified"
   | "overallocated"
   | "mixed_currency"
-  | "invalid_campaign_metric";
+  | "invalid_campaign_metric"
+  /** Funnel-restricted only: the users' campaign is not visible to the member. */
+  | "campaign_not_visible";
 export type FbAllocationStatus =
   | "fully_allocated"
   | "underallocated"
@@ -70,7 +88,9 @@ export type FbAllocationStatus =
   | "campaign_unmatched"
   | "timezone_unverified"
   | "invalid_timezone"
-  | "invalid_metrics";
+  | "invalid_metrics"
+  /** Funnel-restricted only: the campaign is hidden from the member (never allocated). */
+  | "campaign_hidden";
 export type FbTimezoneSource = "payload" | "account_config" | "default_config" | "unverified";
 
 export interface FbAdditive {
@@ -578,6 +598,7 @@ export function fbAuthoritativeUserGroupsSql(input: {
   dateTo: string | null;
   visibleRows: FbVisibleCohortRow[];
   params: Record<string, unknown>;
+  scope?: ScopeSql;
 }): string {
   const where = authoritativeScopeWhere({ ...input, prefix: "fbgroup" });
   const campaign = authoritativeCampaignExpr();
@@ -586,7 +607,7 @@ export function fbAuthoritativeUserGroupsSql(input: {
     campaign_path,
     ${campaign} campaign_id,
     count() authoritative_user_count
-  FROM ${FC} AS fc FINAL
+  FROM ${cohortsFrom(input.scope ?? ALL_SCOPE_SQL, "fc")}
   WHERE ${where}
   GROUP BY cohort_date, funnel, campaign_path, campaign_id
   FORMAT JSONEachRow`;
@@ -610,6 +631,8 @@ export function fbCampaignMetricsSql(input: {
   dateFrom: string | null;
   dateTo: string | null;
   params: Record<string, unknown>;
+  /** Restricted: the member's visible campaigns only (V1, campaign level). */
+  scope?: ScopeSql;
 }): string {
   const campaignIds = input.campaignIds == null
     ? null
@@ -650,17 +673,18 @@ export function fbCampaignMetricsSql(input: {
     sum(f.reach) reach,
     sum(f.purchase_value) purchase_value,
     countIf(NOT isFinite(f.spend) OR f.spend < 0) invalid_metric_rows
-  FROM ${FB} AS f FINAL
+  FROM ${fbFrom(input.scope ?? ALL_SCOPE_SQL, "campaign", "f", `${FB} AS f FINAL`)}
   WHERE ${where}
   GROUP BY campaign_id
   FORMAT JSONEachRow`;
 }
 
-export function fbSnapshotUniquenessSql(): string {
+/** Restricted: uniqueness of the member's users in the active snapshot. */
+export function fbSnapshotUniquenessSql(scope: ScopeSql = ALL_SCOPE_SQL): string {
   return `SELECT count() snapshot_rows,
     uniqExact(canonical_user_id) snapshot_unique_users,
     count() - uniqExact(canonical_user_id) snapshot_duplicate_users
-  FROM ${FC} FINAL
+  FROM ${cohortsFrom(scope)}
   WHERE auth_user_id = {auth_user_id:String}
     AND warehouse_version = {warehouse_version:String}
     AND classification_version = {classification_version:String}
@@ -679,14 +703,22 @@ export function assertFbSnapshotUnique(row: Record<string, unknown> | null | und
   return result;
 }
 
-export function fbSourceStatsSql(): string {
+/** Restricted: counts and freshness over the member's visible campaigns. */
+export function fbSourceStatsSql(scope: ScopeSql = ALL_SCOPE_SQL): string {
   return `SELECT count() raw_rows,
     uniqExact(stat_date, campaign_id) campaign_day_rows,
     toString(max(stat_date)) last_stat_date
-  FROM ${FB} FINAL
+  FROM ${fbFrom(scope, "campaign", undefined, `${FB} FINAL`)}
   WHERE auth_user_id = {auth_user_id:String} AND level = 'campaign'
     AND trim(BOTH ' ' FROM campaign_id) != ''
   FORMAT JSONEachRow`;
+}
+
+/** Restricted only: the campaign ids visible to the member (resolved in
+ * fact_campaign_scope and in their paths). The user groups' other ids are
+ * hidden — never allocated, reported as campaign_not_visible. */
+export function fbVisibleCampaignIdsSql(scope: ScopeSql): string {
+  return `SELECT campaign_id FROM ${campaignScopeVisibleFrom(scope)} FORMAT JSONEachRow`;
 }
 
 function jsonSignal(column: string, ...path: string[]): string {
@@ -989,11 +1021,16 @@ export interface FbUserCostAssembly {
     | "fb_validation_rows" | "fb_allocation_diagnostics_enabled">;
 }
 
+/** `hiddenCampaignIds` (funnel-restricted reads; empty for everyone else):
+ * campaigns the member may not see. Their metric rows are ignored and their
+ * users are never allocated (allocation_status campaign_hidden, row status
+ * campaign_not_visible). */
 export function assembleFbUserCosts(
   inputUsers: FbAuthoritativeUserRow[],
   metricRows: FbCampaignMetricRow[],
   visibleKeys: Set<string>,
   timezoneConfig: FbMetaTimezoneConfig,
+  hiddenCampaignIds: ReadonlySet<string> = new Set(),
 ): FbUserCostAssembly {
   const users: FbAuthoritativeUserRow[] = [];
   const seenUsers = new Set<string>();
@@ -1011,7 +1048,10 @@ export function assembleFbUserCosts(
     return Number.isFinite(count) && count > 0 ? Math.trunc(count) : 0;
   };
 
-  const { metrics, timezoneByCampaign } = campaignMetricMap(metricRows, timezoneConfig);
+  const visibleMetricRows = hiddenCampaignIds.size
+    ? metricRows.filter((row) => !hiddenCampaignIds.has(normalizeAuthoritativeCampaignId(row.campaign_id)))
+    : metricRows;
+  const { metrics, timezoneByCampaign } = campaignMetricMap(visibleMetricRows, timezoneConfig);
   const preliminary = users.map((user) => {
     const campaignId = normalizeAuthoritativeCampaignId(user.campaign_id);
     const timezoneResolution = campaignId
@@ -1071,7 +1111,8 @@ export function assembleFbUserCosts(
     const affected = affectedByKey.get(key);
     const matchedUsers = matchedUsersByKey.get(key) ?? 0;
     let allocationStatus: FbAllocationStatus;
-    if (!metric) allocationStatus = "campaign_unmatched";
+    if (hiddenCampaignIds.has(key)) allocationStatus = "campaign_hidden";
+    else if (!metric) allocationStatus = "campaign_unmatched";
     else if (!metric.valid || metric.invalid_metrics) allocationStatus = "invalid_metrics";
     else if (metric.fb_purchases <= 0) allocationStatus = "no_fb_purchases";
     else if (matchedUsers > metric.fb_purchases) allocationStatus = "overallocated";
@@ -1185,6 +1226,7 @@ export function assembleFbUserCosts(
     if (acc.currencies.size > 1) return "mixed_currency";
     if (acc.matched === acc.users && acc.users > 0) return "matched";
     if (acc.matched > 0) return "partial_coverage";
+    if (acc.statuses.has("campaign_hidden")) return "campaign_not_visible";
     if (acc.statuses.has("no_fb_purchases")) return "no_fb_purchases";
     if (acc.statuses.has("campaign_unmatched")) return "no_fb_campaign";
     return "missing_cohort_campaign_id";
@@ -1333,7 +1375,16 @@ export async function computeFbCohortStats(input: {
   timezoneConfig?: FbMetaTimezoneConfig;
   allocationDiagnosticsEnabled?: boolean;
   allocationDiagnosticsRequest?: FbAllocationDiagnosticsRequest | null;
+  /** ALL_SCOPE_SQL unless the caller is funnel-restricted (see the header). */
+  scope?: ScopeSql;
 }): Promise<FbCohortStatsBundle> {
+  const scope = input.scope ?? ALL_SCOPE_SQL;
+  const restricted = scope.restricted;
+  // No campaign scope for the active snapshot yet: the FB columns degrade to
+  // "unavailable" without a single FB query (the Cohorts rows still render).
+  if (restricted && !scope.snapshot?.campaignScopeReady) {
+    return unavailableFbCohortStats(new ScopeSnapshotNotReadyError("campaign_scope_missing"), false);
+  }
   const params: Record<string, unknown> = {
     auth_user_id: input.authUserId,
     warehouse_version: input.active.warehouse_version,
@@ -1345,6 +1396,7 @@ export async function computeFbCohortStats(input: {
     dateTo: input.dateTo,
     visibleRows: input.visibleRows,
     params,
+    scope,
   });
   const metricParams: Record<string, unknown> = { auth_user_id: input.authUserId };
   const metricSql = fbCampaignMetricsSql({
@@ -1352,31 +1404,40 @@ export async function computeFbCohortStats(input: {
     dateFrom: input.dateFrom,
     dateTo: input.dateTo,
     params: metricParams,
+    scope,
   });
-  const sourceScopedSql = fbSourceScopedDiagnosticsSql({
+  // Diagnostics-only source classification reads raw transaction payloads: never
+  // for a restricted member (its counts stay 0).
+  const sourceScopedSql = restricted ? null : fbSourceScopedDiagnosticsSql({
     filters: input.filters,
     dateFrom: input.dateFrom,
     dateTo: input.dateTo,
     visibleRows: input.visibleRows,
     params,
   });
-  const [groupRs, snapshotRs, metricRs, sourceRs, sourceScopedRs, syncState] = await Promise.all([
+  // Every statement is built before the first one starts (a scope refusal must
+  // not leave sibling queries running).
+  const snapshotSql = fbSnapshotUniquenessSql(scope);
+  const sourceSql = fbSourceStatsSql(scope);
+  const visibleSql = restricted ? fbVisibleCampaignIdsSql(scope) : null;
+  const [groupRs, snapshotRs, metricRs, sourceRs, sourceScopedRs, syncState, visibleRs] = await Promise.all([
     input.clickhouse.query({ query: groupSql, query_params: params, format: "JSONEachRow" }),
-    input.clickhouse.query({ query: fbSnapshotUniquenessSql(), query_params: params, format: "JSONEachRow" }),
+    input.clickhouse.query({ query: snapshotSql, query_params: params, format: "JSONEachRow" }),
     input.clickhouse.query({ query: metricSql, query_params: metricParams, format: "JSONEachRow" }),
-    input.clickhouse.query({ query: fbSourceStatsSql(), query_params: { auth_user_id: input.authUserId }, format: "JSONEachRow" }),
-    input.clickhouse.query({ query: sourceScopedSql, query_params: params, format: "JSONEachRow" }),
+    input.clickhouse.query({ query: sourceSql, query_params: { auth_user_id: input.authUserId }, format: "JSONEachRow" }),
+    sourceScopedSql === null ? null : input.clickhouse.query({ query: sourceScopedSql, query_params: params, format: "JSONEachRow" }),
     getFbSyncState(input.supabase, input.authUserId).catch((error) => {
       if (error instanceof ScopeViolation) throw error;
       return null;
     }),
+    visibleSql === null ? null : input.clickhouse.query({ query: visibleSql, query_params: { auth_user_id: input.authUserId }, format: "JSONEachRow" }),
   ]);
   const snapshotRow = ((await snapshotRs.json()) as Array<Record<string, unknown>>)[0] ?? {};
   const snapshot = assertFbSnapshotUnique(snapshotRow);
   const groupRows = (await groupRs.json()) as Array<Record<string, unknown>>;
   const metricRows = (await metricRs.json()) as FbCampaignMetricRow[];
   const source = ((await sourceRs.json()) as Array<Record<string, unknown>>)[0] ?? {};
-  const sourceScoped = ((await sourceScopedRs.json()) as Array<Record<string, unknown>>)[0] ?? {};
+  const sourceScoped = sourceScopedRs ? ((await sourceScopedRs.json()) as Array<Record<string, unknown>>)[0] ?? {} : {};
   const timezoneConfig = input.timezoneConfig ?? runtimeTimezoneConfig();
   const userGroups = groupRows.map((row, index): FbAuthoritativeUserRow => ({
     canonical_user_id: `aggregate:${index}:${s(row.campaign_id)}`,
@@ -1387,7 +1448,15 @@ export async function computeFbCohortStats(input: {
     campaign_id: s(row.campaign_id),
     authoritative_user_count: n(row.authoritative_user_count),
   }));
-  const assembly = assembleFbUserCosts(userGroups, metricRows, input.visibleKeys, timezoneConfig);
+  const hiddenCampaignIds = new Set<string>();
+  if (visibleRs) {
+    const visible = new Set(((await visibleRs.json()) as Array<Record<string, unknown>>).map((row) => normalizeAuthoritativeCampaignId(row.campaign_id)));
+    for (const group of userGroups) {
+      const campaignId = normalizeAuthoritativeCampaignId(group.campaign_id);
+      if (campaignId && !visible.has(campaignId)) hiddenCampaignIds.add(campaignId);
+    }
+  }
+  const assembly = assembleFbUserCosts(userGroups, metricRows, input.visibleKeys, timezoneConfig, hiddenCampaignIds);
   const sourceCounts: FbSourceCounts = {
     all: n(sourceScoped.all_cohorts_users),
     facebook: n(sourceScoped.facebook_qualified_users),
@@ -1415,7 +1484,10 @@ export async function computeFbCohortStats(input: {
   else if (sourceRows === 0) dataStatus = "empty_source";
   else if (lastStatDate && lastStatDate >= yesterday && lastStatDate !== "1970-01-01") dataStatus = "ready";
   else dataStatus = "stale";
-  const allocationDiagnostics = input.allocationDiagnosticsEnabled
+  // Per-campaign allocation diagnostics are admin-only (never for a restricted
+  // member, whatever the caller passes).
+  const allocationDiagnosticsEnabled = Boolean(input.allocationDiagnosticsEnabled) && !restricted;
+  const allocationDiagnostics = allocationDiagnosticsEnabled
     ? buildFbAllocationDiagnostics(assembly.validation, input.allocationDiagnosticsRequest)
     : null;
   return {
@@ -1452,7 +1524,7 @@ export async function computeFbCohortStats(input: {
       fb_snapshot_duplicate_users: snapshot.duplicateUsers,
       fb_snapshot_unique: snapshot.rows === snapshot.uniqueUsers && snapshot.duplicateUsers === 0,
       fb_validation_rows: assembly.validation.length,
-      fb_allocation_diagnostics_enabled: Boolean(input.allocationDiagnosticsEnabled),
+      fb_allocation_diagnostics_enabled: allocationDiagnosticsEnabled,
     },
   };
 }

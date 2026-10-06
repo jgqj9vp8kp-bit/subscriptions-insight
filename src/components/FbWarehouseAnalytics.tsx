@@ -2,6 +2,11 @@
 // KPI cards, chart, table, filter options, diagnostics — arrives pre-computed
 // from the clickhouse-facebook Edge Function as ONE atomic report bundle.
 // The browser performs no analytics and never sees the Capsuled token.
+//
+// Funnel-restricted members (access Phase 2): the server serves the campaign,
+// ad set and ad levels only (account → 403 scope_not_supported), over the
+// campaigns whose trial users all belong to their funnels. The Accounts tab is
+// hidden, a persisted "account" level is read as "campaign", and AI stays off.
 
 import { Fragment, useMemo, useState } from "react";
 import { Area, AreaChart, CartesianGrid, XAxis, YAxis } from "recharts";
@@ -29,6 +34,7 @@ import { formatUpdatedAgo } from "@/services/analyticsProgress";
 import { useFbReportQuery, useFbWarehouseStatus, useInvalidateFbWarehouse } from "@/hooks/useFbWarehouse";
 import { runFbReconSnapshot, runFbSync, type FbLevel, type FbListRow, type FbReportQuery } from "@/services/fbWarehouse";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
+import { ScopeDataPending, SCOPE_SNAPSHOT_NOT_READY } from "@/components/access/ScopeDataPending";
 
 const LEVEL_TABS: Array<{ value: FbLevel; label: string }> = [
   { value: "account", label: "Accounts" },
@@ -121,30 +127,41 @@ export function FbWarehouseAnalytics(): JSX.Element {
   // Sync writes the warehouse (clickhouse-facebook sync): admin.sync.run. UX
   // only — the Edge gate is authoritative.
   const canSync = access.can("admin.sync.run");
+  const restricted = access.restricted;
+  // AI features (and their pass-rate call) need ai.use, like the drawer, and
+  // stay hidden from funnel-restricted members until they are scoped.
+  const canUseAi = access.can("ai.use") && !restricted;
   const [ui, setUi] = usePersistedPageState("ui_state_fb_warehouse", DEFAULT_UI_STATE);
   const [syncRunning, setSyncRunning] = useState<null | "incremental" | "full">(null);
   const invalidateFbWarehouse = useInvalidateFbWarehouse();
 
   const { status, version, ready } = useFbWarehouseStatus(Boolean(user));
 
+  // The account level is not served to a restricted member: a persisted
+  // "account" is read as "campaign" BEFORE the query is built (never a 403).
+  const level: FbLevel = restricted && ui.level === "account" ? "campaign" : ui.level;
+  const levelTabs = useMemo(() => (restricted ? LEVEL_TABS.filter((tab) => tab.value !== "account") : LEVEL_TABS), [restricted]);
+
   const query: FbReportQuery = useMemo(
     () => ({
-      level: ui.level,
+      level,
       date_from: ui.range === "all" ? null : daysAgo(Number(ui.range) - 1),
       date_to: ui.range === "all" ? null : utcToday(),
       buyer: ui.buyer !== "all" ? [ui.buyer] : [],
       ad_account_id: ui.account !== "all" ? [ui.account] : [],
       campaign_id: [],
     }),
-    [ui.level, ui.range, ui.buyer, ui.account],
+    [level, ui.range, ui.buyer, ui.account],
   );
 
-  const { report, error, isBackgroundRefreshing, isInitialLoading, progressPercent, dataUpdatedAt } = useFbReportQuery({
+  const { report, error, errorCode, isBackgroundRefreshing, isInitialLoading, progressPercent, dataUpdatedAt } = useFbReportQuery({
     query,
     userScopeHash,
     warehouseVersion: version,
     enabled: Boolean(user) && ready,
   });
+  // 409 while a restricted member's campaign scope is being prepared (polled).
+  const scopePending = errorCode === SCOPE_SNAPSHOT_NOT_READY;
 
   const runSync = async (mode: "incremental" | "full") => {
     if (syncRunning) return;
@@ -174,8 +191,8 @@ export function FbWarehouseAnalytics(): JSX.Element {
   };
 
   const columns = useMemo(
-    () => FB_COLUMNS.filter((col) => !col.blended || ui.level === "campaign"),
-    [ui.level],
+    () => FB_COLUMNS.filter((col) => !col.blended || level === "campaign"),
+    [level],
   );
 
   const rows = useMemo(() => {
@@ -211,10 +228,10 @@ export function FbWarehouseAnalytics(): JSX.Element {
   // (transactions carry no adset/ad ids).
   const { version: aiWarehouseVersion } = useWarehouseVersion(Boolean(user));
   const aiRows = useMemo(
-    () => (ui.level === "campaign"
+    () => (level === "campaign"
       ? (report?.rows ?? []).map(aiCampaignRowFromWarehouse).filter((row): row is NonNullable<typeof row> => row !== null)
       : []),
-    [report, ui.level],
+    [report, level],
   );
   const aiContextKey = useMemo(
     () => stableJson({ surface: "fb-warehouse", range: ui.range, buyer: ui.buyer, account: ui.account }),
@@ -222,8 +239,7 @@ export function FbWarehouseAnalytics(): JSX.Element {
   );
   const aiCampaigns = useAiCampaignSignals({
     rows: aiRows,
-    // AI features (and their pass-rate call) need ai.use, like the drawer.
-    enabled: access.can("ai.use") && ui.level === "campaign" && aiRows.length > 0,
+    enabled: canUseAi && level === "campaign" && aiRows.length > 0,
     dateFrom: query.date_from ?? null,
     dateTo: query.date_to ?? null,
     userScopeHash,
@@ -231,7 +247,7 @@ export function FbWarehouseAnalytics(): JSX.Element {
     contextKey: aiContextKey,
   });
   const [aiExpandedKey, setAiExpandedKey] = useState<string | null>(null);
-  const showAiColumn = ui.level === "campaign";
+  const showAiColumn = level === "campaign" && !restricted;
 
   const d = report?.diagnostics;
   const summary = report?.summary;
@@ -280,9 +296,10 @@ export function FbWarehouseAnalytics(): JSX.Element {
             <Progress value={progressPercent} className="h-1.5 w-24" />
           </span>
         )}
-        {error && report != null && <span className="text-warning">refresh failed · showing cached data</span>}
-        {error && report == null && <span className="text-destructive">ClickHouse error: {error}</span>}
+        {error && report != null && !scopePending && <span className="text-warning">refresh failed · showing cached data</span>}
+        {error && report == null && !scopePending && <span className="text-destructive">ClickHouse error: {error}</span>}
       </div>
+      {scopePending && <ScopeDataPending />}
 
       {/* Controls */}
       <Card className="p-4 shadow-card">
@@ -384,9 +401,9 @@ export function FbWarehouseAnalytics(): JSX.Element {
       {/* Level tabs + entity table — rows aggregated server-side */}
       <Card className="p-4 shadow-card">
         <div className="mb-3 flex flex-wrap items-center gap-3">
-          <Tabs value={ui.level} onValueChange={(value) => setUi((p) => ({ ...p, level: value as FbLevel }))}>
+          <Tabs value={level} onValueChange={(value) => setUi((p) => ({ ...p, level: value as FbLevel }))}>
             <TabsList>
-              {LEVEL_TABS.map((t) => (
+              {levelTabs.map((t) => (
                 <TabsTrigger key={t.value} value={t.value}>{t.label}</TabsTrigger>
               ))}
             </TabsList>
@@ -403,7 +420,7 @@ export function FbWarehouseAnalytics(): JSX.Element {
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead className="min-w-64">{LEVEL_TABS.find((t) => t.value === ui.level)?.label ?? "Entity"}</TableHead>
+                <TableHead className="min-w-64">{LEVEL_TABS.find((t) => t.value === level)?.label ?? "Entity"}</TableHead>
                 {columns.map((col) => (
                   <TableHead
                     key={col.key}
@@ -419,7 +436,7 @@ export function FbWarehouseAnalytics(): JSX.Element {
             </TableHeader>
             <TableBody>
               {rows.map((row) => {
-                const label = entityLabel(row, ui.level);
+                const label = entityLabel(row, level);
                 const aiRec = showAiColumn ? aiCampaigns.byCampaign.get(row.campaign_id) ?? null : null;
                 const aiExpanded = aiRec != null && aiExpandedKey === row.key;
                 return (
@@ -454,12 +471,14 @@ export function FbWarehouseAnalytics(): JSX.Element {
                   </Fragment>
                 );
               })}
-              {!rows.length && !isInitialLoading && (
+              {!rows.length && !isInitialLoading && !scopePending && (
                 <TableRow>
                   <TableCell colSpan={columns.length + (showAiColumn ? 2 : 1)} className="py-8 text-center text-muted-foreground">
-                    {status?.state
-                      ? canSync ? "No rows in this scope. Try a wider date range or run a sync." : "No rows in this scope. Try a wider date range."
-                      : canSync ? "Warehouse is empty — run Full sync to load Capsuled history." : "Warehouse is empty — ask a workspace admin to run a sync."}
+                    {restricted
+                      ? "No campaigns of your funnels in this range. Try a wider date range — campaigns shared with other funnels are hidden."
+                      : status?.state
+                        ? canSync ? "No rows in this scope. Try a wider date range or run a sync." : "No rows in this scope. Try a wider date range."
+                        : canSync ? "Warehouse is empty — run Full sync to load Capsuled history." : "Warehouse is empty — ask a workspace admin to run a sync."}
                   </TableCell>
                 </TableRow>
               )}

@@ -1,0 +1,521 @@
+{
+  "format": "owner-rebuild-golden/v1",
+  "base_commit": "4b4057e",
+  "now": "2026-10-06T00:00:00.000Z",
+  "tenant": "owner-golden-tenant-0001",
+  "scenarios": {
+    "full/previous=old": {
+      "outcome": "resolved",
+      "rpc": [
+        "claim_clickhouse_cohort_snapshot_build",
+        "complete_clickhouse_cohort_snapshot_build"
+      ],
+      "statements": [
+        {
+          "kind": "command",
+          "query": "q_39f810c2e6113b18",
+          "query_params": {}
+        },
+        {
+          "kind": "query",
+          "query": "q_9f792cef4d61fdde",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001"
+          },
+          "format": "JSONEachRow"
+        },
+        {
+          "kind": "command",
+          "query": "q_5a388b628ea2d11a",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "classification_version": "cohort_classifier_v3_platform",
+            "generated_at": "2026-10-06T00:00:00.000Z",
+            "warehouse_version": "wh_golden"
+          }
+        },
+        {
+          "kind": "query",
+          "query": "q_f881c3736422331d",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "classification_version": "cohort_classifier_v3_platform",
+            "warehouse_version": "wh_golden"
+          },
+          "format": "JSONEachRow"
+        },
+        {
+          "kind": "query",
+          "query": "q_f873b4a31a248be3",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "classification_version": "cohort_classifier_v3_platform",
+            "warehouse_version": "wh_golden"
+          },
+          "format": "JSONEachRow"
+        },
+        {
+          "kind": "query",
+          "query": "q_52c073ea78606ae6",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "new_cls": "cohort_classifier_v3_platform",
+            "new_wh": "wh_golden",
+            "old_cls": "cohort_classifier_v2_authoritative_fields",
+            "old_wh": "wh_old"
+          },
+          "format": "JSONEachRow"
+        },
+        {
+          "kind": "query",
+          "query": "q_53eb38da9ef89f10",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "new_cls": "cohort_classifier_v3_platform",
+            "new_wh": "wh_golden",
+            "old_cls": "cohort_classifier_v2_authoritative_fields",
+            "old_wh": "wh_old"
+          },
+          "format": "JSONEachRow"
+        },
+        {
+          "kind": "query",
+          "query": "q_ed0352ffcb8bc60b",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "new_cls": "cohort_classifier_v3_platform",
+            "new_wh": "wh_golden",
+            "old_cls": "cohort_classifier_v2_authoritative_fields",
+            "old_wh": "wh_old"
+          },
+          "format": "JSONEachRow"
+        },
+        {
+          "kind": "query",
+          "query": "q_e045f3e55acdbddf",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "classification_version": "cohort_classifier_v3_platform",
+            "warehouse_version": "wh_golden"
+          },
+          "format": "JSONEachRow"
+        }
+      ]
+    },
+    "full/first_build": {
+      "outcome": "resolved",
+      "rpc": [
+        "claim_clickhouse_cohort_snapshot_build",
+        "complete_clickhouse_cohort_snapshot_build"
+      ],
+      "statements": [
+        {
+          "kind": "command",
+          "query": "q_39f810c2e6113b18",
+          "query_params": {}
+        },
+        {
+          "kind": "query",
+          "query": "q_9f792cef4d61fdde",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001"
+          },
+          "format": "JSONEachRow"
+        },
+        {
+          "kind": "command",
+          "query": "q_5a388b628ea2d11a",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "classification_version": "cohort_classifier_v3_platform",
+            "generated_at": "2026-10-06T00:00:00.000Z",
+            "warehouse_version": "wh_golden"
+          }
+        },
+        {
+          "kind": "query",
+          "query": "q_f881c3736422331d",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "classification_version": "cohort_classifier_v3_platform",
+            "warehouse_version": "wh_golden"
+          },
+          "format": "JSONEachRow"
+        },
+        {
+          "kind": "query",
+          "query": "q_f873b4a31a248be3",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "classification_version": "cohort_classifier_v3_platform",
+            "warehouse_version": "wh_golden"
+          },
+          "format": "JSONEachRow"
+        },
+        {
+          "kind": "query",
+          "query": "q_f881c3736422331d",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "classification_version": "cohort_classifier_v3_platform",
+            "warehouse_version": "wh_golden"
+          },
+          "format": "JSONEachRow"
+        },
+        {
+          "kind": "query",
+          "query": "q_e045f3e55acdbddf",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "classification_version": "cohort_classifier_v3_platform",
+            "warehouse_version": "wh_golden"
+          },
+          "format": "JSONEachRow"
+        }
+      ]
+    },
+    "full/validation_fail": {
+      "outcome": "rejected:Error",
+      "rpc": [
+        "claim_clickhouse_cohort_snapshot_build",
+        "fail_clickhouse_cohort_snapshot_build"
+      ],
+      "statements": [
+        {
+          "kind": "command",
+          "query": "q_39f810c2e6113b18",
+          "query_params": {}
+        },
+        {
+          "kind": "query",
+          "query": "q_9f792cef4d61fdde",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001"
+          },
+          "format": "JSONEachRow"
+        },
+        {
+          "kind": "command",
+          "query": "q_5a388b628ea2d11a",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "classification_version": "cohort_classifier_v3_platform",
+            "generated_at": "2026-10-06T00:00:00.000Z",
+            "warehouse_version": "wh_golden"
+          }
+        },
+        {
+          "kind": "query",
+          "query": "q_f881c3736422331d",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "classification_version": "cohort_classifier_v3_platform",
+            "warehouse_version": "wh_golden"
+          },
+          "format": "JSONEachRow"
+        },
+        {
+          "kind": "query",
+          "query": "q_f873b4a31a248be3",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "classification_version": "cohort_classifier_v3_platform",
+            "warehouse_version": "wh_golden"
+          },
+          "format": "JSONEachRow"
+        },
+        {
+          "kind": "query",
+          "query": "q_52c073ea78606ae6",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "new_cls": "cohort_classifier_v3_platform",
+            "new_wh": "wh_golden",
+            "old_cls": "cohort_classifier_v3_platform",
+            "old_wh": "wh_old"
+          },
+          "format": "JSONEachRow"
+        },
+        {
+          "kind": "query",
+          "query": "q_53eb38da9ef89f10",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "new_cls": "cohort_classifier_v3_platform",
+            "new_wh": "wh_golden",
+            "old_cls": "cohort_classifier_v3_platform",
+            "old_wh": "wh_old"
+          },
+          "format": "JSONEachRow"
+        },
+        {
+          "kind": "query",
+          "query": "q_ed0352ffcb8bc60b",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "new_cls": "cohort_classifier_v3_platform",
+            "new_wh": "wh_golden",
+            "old_cls": "cohort_classifier_v3_platform",
+            "old_wh": "wh_old"
+          },
+          "format": "JSONEachRow"
+        },
+        {
+          "kind": "query",
+          "query": "q_e045f3e55acdbddf",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "classification_version": "cohort_classifier_v3_platform",
+            "warehouse_version": "wh_golden"
+          },
+          "format": "JSONEachRow"
+        }
+      ]
+    },
+    "current/campaign_scope_recorded": {
+      "outcome": "resolved",
+      "rpc": [],
+      "statements": [
+        {
+          "kind": "command",
+          "query": "q_39f810c2e6113b18",
+          "query_params": {}
+        },
+        {
+          "kind": "query",
+          "query": "q_9f792cef4d61fdde",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001"
+          },
+          "format": "JSONEachRow"
+        }
+      ]
+    },
+    "current/pre_phase2_state": {
+      "outcome": "resolved",
+      "rpc": [],
+      "statements": [
+        {
+          "kind": "command",
+          "query": "q_39f810c2e6113b18",
+          "query_params": {}
+        },
+        {
+          "kind": "query",
+          "query": "q_9f792cef4d61fdde",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001"
+          },
+          "format": "JSONEachRow"
+        }
+      ]
+    },
+    "force/current": {
+      "outcome": "resolved",
+      "rpc": [
+        "claim_clickhouse_cohort_snapshot_build",
+        "complete_clickhouse_cohort_snapshot_build"
+      ],
+      "statements": [
+        {
+          "kind": "command",
+          "query": "q_39f810c2e6113b18",
+          "query_params": {}
+        },
+        {
+          "kind": "query",
+          "query": "q_9f792cef4d61fdde",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001"
+          },
+          "format": "JSONEachRow"
+        },
+        {
+          "kind": "command",
+          "query": "q_5a388b628ea2d11a",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "classification_version": "cohort_classifier_v3_platform",
+            "generated_at": "2026-10-06T00:00:00.000Z",
+            "warehouse_version": "wh_golden"
+          }
+        },
+        {
+          "kind": "query",
+          "query": "q_f881c3736422331d",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "classification_version": "cohort_classifier_v3_platform",
+            "warehouse_version": "wh_golden"
+          },
+          "format": "JSONEachRow"
+        },
+        {
+          "kind": "query",
+          "query": "q_f873b4a31a248be3",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "classification_version": "cohort_classifier_v3_platform",
+            "warehouse_version": "wh_golden"
+          },
+          "format": "JSONEachRow"
+        },
+        {
+          "kind": "query",
+          "query": "q_52c073ea78606ae6",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "new_cls": "cohort_classifier_v3_platform",
+            "new_wh": "wh_golden",
+            "old_cls": "cohort_classifier_v3_platform",
+            "old_wh": "wh_golden"
+          },
+          "format": "JSONEachRow"
+        },
+        {
+          "kind": "query",
+          "query": "q_53eb38da9ef89f10",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "new_cls": "cohort_classifier_v3_platform",
+            "new_wh": "wh_golden",
+            "old_cls": "cohort_classifier_v3_platform",
+            "old_wh": "wh_golden"
+          },
+          "format": "JSONEachRow"
+        },
+        {
+          "kind": "query",
+          "query": "q_ed0352ffcb8bc60b",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "new_cls": "cohort_classifier_v3_platform",
+            "new_wh": "wh_golden",
+            "old_cls": "cohort_classifier_v3_platform",
+            "old_wh": "wh_golden"
+          },
+          "format": "JSONEachRow"
+        },
+        {
+          "kind": "query",
+          "query": "q_e045f3e55acdbddf",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "classification_version": "cohort_classifier_v3_platform",
+            "warehouse_version": "wh_golden"
+          },
+          "format": "JSONEachRow"
+        }
+      ]
+    },
+    "full/after_failed_build": {
+      "outcome": "resolved",
+      "rpc": [
+        "claim_clickhouse_cohort_snapshot_build",
+        "complete_clickhouse_cohort_snapshot_build"
+      ],
+      "statements": [
+        {
+          "kind": "command",
+          "query": "q_39f810c2e6113b18",
+          "query_params": {}
+        },
+        {
+          "kind": "query",
+          "query": "q_9f792cef4d61fdde",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001"
+          },
+          "format": "JSONEachRow"
+        },
+        {
+          "kind": "command",
+          "query": "q_5a388b628ea2d11a",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "classification_version": "cohort_classifier_v3_platform",
+            "generated_at": "2026-10-06T00:00:00.000Z",
+            "warehouse_version": "wh_golden"
+          }
+        },
+        {
+          "kind": "query",
+          "query": "q_f881c3736422331d",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "classification_version": "cohort_classifier_v3_platform",
+            "warehouse_version": "wh_golden"
+          },
+          "format": "JSONEachRow"
+        },
+        {
+          "kind": "query",
+          "query": "q_f873b4a31a248be3",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "classification_version": "cohort_classifier_v3_platform",
+            "warehouse_version": "wh_golden"
+          },
+          "format": "JSONEachRow"
+        },
+        {
+          "kind": "query",
+          "query": "q_52c073ea78606ae6",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "new_cls": "cohort_classifier_v3_platform",
+            "new_wh": "wh_golden",
+            "old_cls": "cohort_classifier_v3_platform",
+            "old_wh": "wh_old"
+          },
+          "format": "JSONEachRow"
+        },
+        {
+          "kind": "query",
+          "query": "q_53eb38da9ef89f10",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "new_cls": "cohort_classifier_v3_platform",
+            "new_wh": "wh_golden",
+            "old_cls": "cohort_classifier_v3_platform",
+            "old_wh": "wh_old"
+          },
+          "format": "JSONEachRow"
+        },
+        {
+          "kind": "query",
+          "query": "q_ed0352ffcb8bc60b",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "new_cls": "cohort_classifier_v3_platform",
+            "new_wh": "wh_golden",
+            "old_cls": "cohort_classifier_v3_platform",
+            "old_wh": "wh_old"
+          },
+          "format": "JSONEachRow"
+        },
+        {
+          "kind": "query",
+          "query": "q_e045f3e55acdbddf",
+          "query_params": {
+            "auth_user_id": "owner-golden-tenant-0001",
+            "classification_version": "cohort_classifier_v3_platform",
+            "warehouse_version": "wh_golden"
+          },
+          "format": "JSONEachRow"
+        }
+      ]
+    }
+  },
+  "sql": {
+    "q_39f810c2e6113b18": "\nCREATE TABLE IF NOT EXISTS fact_user_cohorts\n(\n    auth_user_id String,\n    canonical_user_id String,\n    cohort_date Date,\n    trial_event_time DateTime64(3, 'UTC'),\n    trial_transaction_id String,\n    normalized_email String,\n    funnel LowCardinality(String),\n    campaign_path String,\n    campaign_id String,\n    traffic_source LowCardinality(String),\n    media_buyer LowCardinality(String),\n    country LowCardinality(String),\n    card_type LowCardinality(String),\n    currency LowCardinality(String),\n    price_plan String,\n    trial_amount_usd Decimal(20, 6),\n    source_updated_at DateTime64(3, 'UTC'),\n    warehouse_version String,\n    classification_version String,\n    generated_at DateTime64(3, 'UTC'),\n    row_version UInt64,\n    platform LowCardinality(String) DEFAULT ''\n)\nENGINE = ReplacingMergeTree(row_version)\nPARTITION BY toYYYYMM(cohort_date)\nORDER BY\n(\n    auth_user_id,\n    warehouse_version,\n    classification_version,\n    cohort_date,\n    funnel,\n    campaign_path,\n    campaign_id,\n    canonical_user_id\n)\n",
+    "q_52c073ea78606ae6": "SELECT count() AS c FROM fact_user_cohorts FINAL\n       WHERE auth_user_id = {auth_user_id:String}\n         AND warehouse_version = {new_wh:String}\n         AND classification_version = {new_cls:String}\n         AND canonical_user_id NOT IN (\n           SELECT canonical_user_id FROM fact_user_cohorts FINAL\n           WHERE auth_user_id = {auth_user_id:String}\n             AND warehouse_version = {old_wh:String}\n             AND classification_version = {old_cls:String}\n         )",
+    "q_53eb38da9ef89f10": "SELECT count() AS c FROM fact_user_cohorts FINAL\n       WHERE auth_user_id = {auth_user_id:String}\n         AND warehouse_version = {old_wh:String}\n         AND classification_version = {old_cls:String}\n         AND canonical_user_id NOT IN (\n           SELECT canonical_user_id FROM fact_user_cohorts FINAL\n           WHERE auth_user_id = {auth_user_id:String}\n             AND warehouse_version = {new_wh:String}\n             AND classification_version = {new_cls:String}\n         )",
+    "q_5a388b628ea2d11a": "\nINSERT INTO fact_user_cohorts\nWITH\n\nbase AS (\n  SELECT a.user_id uid, a.transaction_id tid, a.event_time et, toUnixTimestamp64Milli(a.event_time) ets,\n    a.normalized_email normalized_email, ifNull(a.source_updated_at, a.clickhouse_synced_at) source_updated_at,\n    a.funnel funnel, a.campaign_path campaign_path,\n    a.campaign_id campaign_id,\n    ifNull(nullIf(JSONExtractString(a.normalized_payload, 'traffic_source'), ''), 'unknown') traffic_source,\n    a.country_code country_code, a.card_type card_type, a.platform platform, a.media_buyer media_buyer,\n    multiIf(a.transaction_type = 'trial', 0, a.transaction_type = 'upsell', 1, a.transaction_type = 'first_subscription', 2,\n      a.transaction_type IN ('renewal_2','renewal_3','renewal'), 3, 4) tprio,\n    a.status status, a.is_success is_success, a.transaction_type ttype,\n    positionCaseInsensitive(a.billing_reason, 'upsell') > 0 upmark,\n    ((a.currency = 'USD' AND (abs(toFloat64(a.original_amount) - 4.99) < 0.005 OR abs(toFloat64(a.original_amount) - 9.99) < 0.005 OR abs(toFloat64(a.original_amount) - 24.99) < 0.005))\n      OR (a.currency = 'EUR' AND abs(toFloat64(a.original_amount) - 4.99) < 0.005)\n      OR (a.currency = 'COP' AND abs(toFloat64(a.original_amount) - 17199) < 0.005)) tokenAmt,\n    abs(toFloat64(a.original_amount) - 14.98) < 0.01 commonUp,\n    multiIf(a.status = 'failed', 'failed_payment', a.status = 'refunded', 'refund', a.status = 'chargeback', 'chargeback', '') statusType,\n    a.gross_amount_usd g, floor(a.net_amount_usd * 100 + 0.5) / 100 nn, floor(a.refund_amount_usd * 100 + 0.5) / 100 rr,\n    a.currency cur, toFloat64(a.original_amount) amt, a.product_id pid, a.product_name pname\n  FROM analytics_transactions AS a FINAL \n  WHERE a.auth_user_id = {auth_user_id:String}\n),\nelig AS (SELECT *, (statusType = '' AND NOT upmark AND NOT tokenAmt) lifeelig FROM base),\ntr AS (\n  SELECT uid, argMin(ets, (ets, tprio, tid)) trial_ts, min((ets, tprio, tid)) trial_key,\n    argMin(toString(toDate(et)), (ets, tprio, tid)) c_date,\n    argMin(funnel, (ets, tprio, tid)) c_funnel,\n    argMin(if(campaign_path = '', 'unknown', campaign_path), (ets, tprio, tid)) c_camp,\n    argMin(if(campaign_id = '', 'unknown', campaign_id), (ets, tprio, tid)) c_campaign_id,\n    argMin(if(traffic_source = '', 'unknown', traffic_source), (ets, tprio, tid)) c_traffic_source\n  FROM elig WHERE lifeelig GROUP BY uid\n),\nuserdim AS (\n  SELECT uid,\n    argMin(country_code, (multiIf(country_code = '', 2, is_success = 1, 0, 1), ets, tid)) u_country,\n    argMin(if(card_type = '', 'unknown', card_type), (multiIf(card_type = '', 2, is_success = 1, 0, 1), ets, tid)) u_card_type,\n    argMin(if(platform = '', 'unknown', platform), (multiIf(platform = '', 2, is_success = 1, 0, 1), ets, tid)) u_platform,\n    argMin(if(media_buyer = '', 'Unknown', media_buyer), (ets, tid)) u_media_buyer,\n    argMin(normalized_email, (multiIf(normalized_email = '', 2, is_success = 1, 0, 1), ets, tid)) u_normalized_email,\n    max(source_updated_at) u_source_updated_at\n  FROM base GROUP BY uid\n),\ncl AS (\n  SELECT e.uid uid, e.tid tid, e.et et, e.ets ets,\n    e.normalized_email normalized_email, e.source_updated_at source_updated_at,\n    e.funnel funnel, e.campaign_path campaign_path, e.campaign_id campaign_id, e.traffic_source traffic_source,\n    e.country_code country_code, e.card_type card_type, e.media_buyer media_buyer,\n    e.tprio tprio, e.status status, e.is_success is_success, e.upmark upmark, e.tokenAmt tokenAmt,\n    e.commonUp commonUp, e.statusType statusType, e.g g, e.nn nn, e.rr rr,\n    e.cur cur, e.amt amt, e.pid pid, e.pname pname, e.lifeelig lifeelig,\n    tr.trial_ts trial_ts, tr.trial_key trial_key, tr.c_date c_date, tr.c_funnel c_funnel, tr.c_camp c_camp,\n\t    tr.c_campaign_id c_campaign_id, tr.c_traffic_source c_traffic_source,\n\t    userdim.u_country u_country, userdim.u_card_type u_card_type, userdim.u_platform u_platform, userdim.u_media_buyer u_media_buyer,\n\t    userdim.u_normalized_email u_normalized_email, userdim.u_source_updated_at u_source_updated_at\n  FROM elig e INNER JOIN tr USING(uid)\n  INNER JOIN userdim USING(uid)\n  WHERE floor((e.ets - tr.trial_ts) / 86400000) >= 0\n),\npretyped AS (\n  SELECT *, floor((ets - trial_ts) / 86400000) d,\n    multiIf(statusType != '', statusType, upmark, 'upsell', (NOT upmark) AND tokenAmt, 'token_purchase',\n      lifeelig AND (ets, tprio, tid) = trial_key, 'trial',\n      lifeelig AND (ets - trial_ts) <= 3600000 AND commonUp, 'upsell',\n      lifeelig AND (ets - trial_ts) <= 172800000, 'token_purchase',\n      lifeelig, 'lifecycle', 'upsell') pretype\n  FROM cl\n),\nlifeidx AS (SELECT uid, tid, row_number() OVER (PARTITION BY uid ORDER BY ets, tprio, tid) lvl FROM pretyped WHERE pretype = 'lifecycle' AND is_success = 1),\nupsidx AS (SELECT uid, tid, row_number() OVER (PARTITION BY uid ORDER BY ets, tprio, tid) slot FROM pretyped WHERE pretype = 'upsell' AND is_success = 1),\nfin AS (\n  SELECT p.uid uid, p.tid tid, p.et et, p.ets ets, p.tprio tprio, p.trial_ts trial_ts,\n    p.is_success is_success, p.g g, p.nn nn, p.rr rr, p.d d, p.statusType statusType, p.tokenAmt tokenAmt,\n    p.cur cur, p.amt amt, p.pid pid, p.pname pname,\n    p.c_date c_date, p.c_funnel c_funnel, p.c_camp c_camp,\n    p.c_campaign_id c_campaign_id, p.c_traffic_source c_traffic_source,\n    p.u_country u_country, p.u_card_type u_card_type, p.u_platform u_platform, p.u_media_buyer u_media_buyer,\n    p.u_normalized_email u_normalized_email, p.u_source_updated_at u_source_updated_at,\n    ifNull(li.lvl, 0) lvl, ifNull(ui.slot, 0) slot,\n    multiIf(p.pretype != 'lifecycle', p.pretype, li.lvl = 1, 'first_subscription', li.lvl = 2, 'renewal_2', li.lvl = 3, 'renewal_3', 'renewal') lt\n  FROM pretyped p LEFT JOIN lifeidx li USING(uid, tid) LEFT JOIN upsidx ui USING(uid, tid)\n)\n, membership AS (\n  SELECT\n    uid canonical_user_id,\n    c_date cohort_date,\n    argMin(et, (ets, tprio, tid)) trial_event_time,\n    argMin(tid, (ets, tprio, tid)) trial_transaction_id,\n    u_normalized_email normalized_email,\n    c_funnel funnel,\n    c_camp campaign_path,\n    c_campaign_id campaign_id,\n    c_traffic_source traffic_source,\n    u_media_buyer media_buyer,\n    u_country country,\n    u_card_type card_type,\n    u_platform platform,\n    argMin(cur, (ets, tprio, tid)) currency,\n    argMin(g, (ets, tprio, tid)) trial_amount_usd,\n    max(u_source_updated_at) source_updated_at,\n    countIf(is_success = 1 AND lt NOT IN ('upsell','token_purchase')) plan_candidates,\n    argMinIf(round(g, 2), (ets, tprio, tid), is_success = 1 AND lt NOT IN ('upsell','token_purchase')) plan_price\n  FROM fin\n  GROUP BY uid, c_date, u_normalized_email, c_funnel, c_camp,\n    c_campaign_id, c_traffic_source, u_media_buyer, u_country, u_card_type, u_platform\n)\nSELECT\n  {auth_user_id:String} auth_user_id,\n  canonical_user_id,\n  toDate(cohort_date) cohort_date,\n  trial_event_time,\n  trial_transaction_id,\n  normalized_email,\n  funnel,\n  campaign_path,\n  campaign_id,\n  traffic_source,\n  media_buyer,\n  country,\n  card_type,\n  currency,\n  if(plan_candidates = 0, 'Unknown', concat('$', toString(plan_price))) price_plan,\n  trial_amount_usd,\n  source_updated_at,\n  {warehouse_version:String} warehouse_version,\n  {classification_version:String} classification_version,\n  parseDateTime64BestEffort({generated_at:String}, 3, 'UTC') generated_at,\n  toUInt64(toUnixTimestamp64Milli(parseDateTime64BestEffort({generated_at:String}, 3, 'UTC'))) row_version,\n  platform\nFROM membership",
+    "q_9f792cef4d61fdde": "\n      SELECT\n        count() AS transaction_count,\n        uniqExact(user_id) AS unique_users,\n        toString(max(row_version)) AS max_row_version,\n        toString(max(ifNull(source_updated_at, clickhouse_synced_at))) AS max_source_updated_at,\n        lower(hex(cityHash64(\n          toString(count()),\n          toString(uniqExact(user_id)),\n          toString(max(row_version)),\n          toString(max(ifNull(source_updated_at, clickhouse_synced_at)))\n        ))) AS warehouse_hash\n      FROM analytics_transactions FINAL\n      WHERE auth_user_id = {auth_user_id:String}\n    ",
+    "q_e045f3e55acdbddf": "WITH\n\nbase AS (\n  SELECT a.user_id uid, a.transaction_id tid, a.event_time et, toUnixTimestamp64Milli(a.event_time) ets,\n    a.normalized_email normalized_email, ifNull(a.source_updated_at, a.clickhouse_synced_at) source_updated_at,\n    a.funnel funnel, a.campaign_path campaign_path,\n    a.campaign_id campaign_id,\n    ifNull(nullIf(JSONExtractString(a.normalized_payload, 'traffic_source'), ''), 'unknown') traffic_source,\n    a.country_code country_code, a.card_type card_type, a.platform platform, a.media_buyer media_buyer,\n    multiIf(a.transaction_type = 'trial', 0, a.transaction_type = 'upsell', 1, a.transaction_type = 'first_subscription', 2,\n      a.transaction_type IN ('renewal_2','renewal_3','renewal'), 3, 4) tprio,\n    a.status status, a.is_success is_success, a.transaction_type ttype,\n    positionCaseInsensitive(a.billing_reason, 'upsell') > 0 upmark,\n    ((a.currency = 'USD' AND (abs(toFloat64(a.original_amount) - 4.99) < 0.005 OR abs(toFloat64(a.original_amount) - 9.99) < 0.005 OR abs(toFloat64(a.original_amount) - 24.99) < 0.005))\n      OR (a.currency = 'EUR' AND abs(toFloat64(a.original_amount) - 4.99) < 0.005)\n      OR (a.currency = 'COP' AND abs(toFloat64(a.original_amount) - 17199) < 0.005)) tokenAmt,\n    abs(toFloat64(a.original_amount) - 14.98) < 0.01 commonUp,\n    multiIf(a.status = 'failed', 'failed_payment', a.status = 'refunded', 'refund', a.status = 'chargeback', 'chargeback', '') statusType,\n    a.gross_amount_usd g, floor(a.net_amount_usd * 100 + 0.5) / 100 nn, floor(a.refund_amount_usd * 100 + 0.5) / 100 rr,\n    a.currency cur, toFloat64(a.original_amount) amt, a.product_id pid, a.product_name pname\n  FROM analytics_transactions AS a FINAL \n  WHERE a.auth_user_id = {auth_user_id:String}\n),\nelig AS (SELECT *, (statusType = '' AND NOT upmark AND NOT tokenAmt) lifeelig FROM base),\ntr AS (\n  SELECT uid, argMin(ets, (ets, tprio, tid)) trial_ts, min((ets, tprio, tid)) trial_key,\n    argMin(toString(toDate(et)), (ets, tprio, tid)) c_date,\n    argMin(funnel, (ets, tprio, tid)) c_funnel,\n    argMin(if(campaign_path = '', 'unknown', campaign_path), (ets, tprio, tid)) c_camp,\n    argMin(if(campaign_id = '', 'unknown', campaign_id), (ets, tprio, tid)) c_campaign_id,\n    argMin(if(traffic_source = '', 'unknown', traffic_source), (ets, tprio, tid)) c_traffic_source\n  FROM elig WHERE lifeelig GROUP BY uid\n),\nuserdim AS (\n  SELECT uid,\n    argMin(country_code, (multiIf(country_code = '', 2, is_success = 1, 0, 1), ets, tid)) u_country,\n    argMin(if(card_type = '', 'unknown', card_type), (multiIf(card_type = '', 2, is_success = 1, 0, 1), ets, tid)) u_card_type,\n    argMin(if(platform = '', 'unknown', platform), (multiIf(platform = '', 2, is_success = 1, 0, 1), ets, tid)) u_platform,\n    argMin(if(media_buyer = '', 'Unknown', media_buyer), (ets, tid)) u_media_buyer,\n    argMin(normalized_email, (multiIf(normalized_email = '', 2, is_success = 1, 0, 1), ets, tid)) u_normalized_email,\n    max(source_updated_at) u_source_updated_at\n  FROM base GROUP BY uid\n),\ncl AS (\n  SELECT e.uid uid, e.tid tid, e.et et, e.ets ets,\n    e.normalized_email normalized_email, e.source_updated_at source_updated_at,\n    e.funnel funnel, e.campaign_path campaign_path, e.campaign_id campaign_id, e.traffic_source traffic_source,\n    e.country_code country_code, e.card_type card_type, e.media_buyer media_buyer,\n    e.tprio tprio, e.status status, e.is_success is_success, e.upmark upmark, e.tokenAmt tokenAmt,\n    e.commonUp commonUp, e.statusType statusType, e.g g, e.nn nn, e.rr rr,\n    e.cur cur, e.amt amt, e.pid pid, e.pname pname, e.lifeelig lifeelig,\n    tr.trial_ts trial_ts, tr.trial_key trial_key, tr.c_date c_date, tr.c_funnel c_funnel, tr.c_camp c_camp,\n\t    tr.c_campaign_id c_campaign_id, tr.c_traffic_source c_traffic_source,\n\t    userdim.u_country u_country, userdim.u_card_type u_card_type, userdim.u_platform u_platform, userdim.u_media_buyer u_media_buyer,\n\t    userdim.u_normalized_email u_normalized_email, userdim.u_source_updated_at u_source_updated_at\n  FROM elig e INNER JOIN tr USING(uid)\n  INNER JOIN userdim USING(uid)\n  WHERE floor((e.ets - tr.trial_ts) / 86400000) >= 0\n),\npretyped AS (\n  SELECT *, floor((ets - trial_ts) / 86400000) d,\n    multiIf(statusType != '', statusType, upmark, 'upsell', (NOT upmark) AND tokenAmt, 'token_purchase',\n      lifeelig AND (ets, tprio, tid) = trial_key, 'trial',\n      lifeelig AND (ets - trial_ts) <= 3600000 AND commonUp, 'upsell',\n      lifeelig AND (ets - trial_ts) <= 172800000, 'token_purchase',\n      lifeelig, 'lifecycle', 'upsell') pretype\n  FROM cl\n),\nlifeidx AS (SELECT uid, tid, row_number() OVER (PARTITION BY uid ORDER BY ets, tprio, tid) lvl FROM pretyped WHERE pretype = 'lifecycle' AND is_success = 1),\nupsidx AS (SELECT uid, tid, row_number() OVER (PARTITION BY uid ORDER BY ets, tprio, tid) slot FROM pretyped WHERE pretype = 'upsell' AND is_success = 1),\nfin AS (\n  SELECT p.uid uid, p.tid tid, p.et et, p.ets ets, p.tprio tprio, p.trial_ts trial_ts,\n    p.is_success is_success, p.g g, p.nn nn, p.rr rr, p.d d, p.statusType statusType, p.tokenAmt tokenAmt,\n    p.cur cur, p.amt amt, p.pid pid, p.pname pname,\n    p.c_date c_date, p.c_funnel c_funnel, p.c_camp c_camp,\n    p.c_campaign_id c_campaign_id, p.c_traffic_source c_traffic_source,\n    p.u_country u_country, p.u_card_type u_card_type, p.u_platform u_platform, p.u_media_buyer u_media_buyer,\n    p.u_normalized_email u_normalized_email, p.u_source_updated_at u_source_updated_at,\n    ifNull(li.lvl, 0) lvl, ifNull(ui.slot, 0) slot,\n    multiIf(p.pretype != 'lifecycle', p.pretype, li.lvl = 1, 'first_subscription', li.lvl = 2, 'renewal_2', li.lvl = 3, 'renewal_3', 'renewal') lt\n  FROM pretyped p LEFT JOIN lifeidx li USING(uid, tid) LEFT JOIN upsidx ui USING(uid, tid)\n)\n, dynamic AS (\n  SELECT\n    uid canonical_user_id,\n    c_date cohort_date,\n    argMin(et, (ets, tprio, tid)) trial_event_time,\n    argMin(tid, (ets, tprio, tid)) trial_transaction_id,\n    c_funnel funnel,\n    c_camp campaign_path,\n    c_campaign_id campaign_id,\n    c_traffic_source traffic_source,\n    u_media_buyer media_buyer,\n    u_country country,\n    u_card_type card_type,\n    u_platform platform,\n    argMin(cur, (ets, tprio, tid)) currency,\n    if(\n      countIf(is_success = 1 AND lt NOT IN ('upsell','token_purchase')) = 0,\n      'Unknown',\n      concat('$', toString(argMinIf(round(g, 2), (ets, tprio, tid), is_success = 1 AND lt NOT IN ('upsell','token_purchase'))))\n    ) price_plan\n  FROM fin\n  GROUP BY uid, c_date, c_funnel, c_camp, c_campaign_id, c_traffic_source,\n    u_media_buyer, u_country, u_card_type, u_platform\n),\nmaterialized AS (\n  SELECT canonical_user_id, toString(cohort_date) cohort_date, trial_event_time, trial_transaction_id,\n    funnel, campaign_path, campaign_id, traffic_source, media_buyer, country, card_type, platform, currency, price_plan\n  FROM fact_user_cohorts FINAL\n  WHERE auth_user_id = {auth_user_id:String}\n    AND warehouse_version = {warehouse_version:String}\n    AND classification_version = {classification_version:String}\n),\njoined AS (\n  SELECT d.*, m.canonical_user_id materialized_user_id,\n    m.cohort_date m_cohort_date, m.trial_event_time m_trial_event_time, m.trial_transaction_id m_trial_transaction_id,\n    m.funnel m_funnel, m.campaign_path m_campaign_path, m.campaign_id m_campaign_id, m.traffic_source m_traffic_source,\n    m.media_buyer m_media_buyer, m.country m_country, m.card_type m_card_type, m.platform m_platform, m.currency m_currency, m.price_plan m_price_plan\n  FROM dynamic d LEFT JOIN materialized m USING(canonical_user_id)\n)\nSELECT\n  (SELECT count() FROM dynamic) dynamic_users,\n  (SELECT count() FROM materialized) materialized_users,\n  (SELECT count() - uniqExact(canonical_user_id) FROM materialized) duplicate_users,\n  countIf(materialized_user_id = '') missing_users,\n  (SELECT count() FROM materialized WHERE canonical_user_id NOT IN (SELECT canonical_user_id FROM dynamic)) extra_users,\n  countIf(toString(cohort_date) != m_cohort_date) cohort_date_mismatches,\n  countIf(trial_event_time != m_trial_event_time) trial_event_time_mismatches,\n  countIf(trial_transaction_id != m_trial_transaction_id) trial_transaction_id_mismatches,\n  countIf(funnel != m_funnel) funnel_mismatches,\n  countIf(campaign_path != m_campaign_path) campaign_path_mismatches,\n  countIf(campaign_id != m_campaign_id) campaign_id_mismatches,\n  countIf(traffic_source != m_traffic_source) traffic_source_mismatches,\n  countIf(media_buyer != m_media_buyer) media_buyer_mismatches,\n  countIf(country != m_country) country_mismatches,\n  countIf(card_type != m_card_type) card_type_mismatches,\n  countIf(platform != m_platform) platform_mismatches,\n  countIf(currency != m_currency) currency_mismatches,\n  countIf(price_plan != m_price_plan) price_plan_mismatches\nFROM joined\nFORMAT JSONEachRow",
+    "q_ed0352ffcb8bc60b": "SELECT\n         count() AS common_users,\n         countIf(\n           old.cohort_date = neu.cohort_date\n           AND old.trial_event_time = neu.trial_event_time\n           AND old.trial_transaction_id = neu.trial_transaction_id\n           AND old.funnel = neu.funnel\n           AND old.campaign_path = neu.campaign_path\n           AND old.campaign_id = neu.campaign_id\n           AND old.traffic_source = neu.traffic_source\n           AND old.media_buyer = neu.media_buyer\n           AND old.country = neu.country\n           AND old.card_type = neu.card_type\n           AND old.platform = neu.platform\n           AND old.currency = neu.currency\n           AND old.price_plan = neu.price_plan\n         ) AS unchanged_users\n       FROM fact_user_cohorts AS neu FINAL\n       INNER JOIN fact_user_cohorts AS old FINAL\n         ON old.auth_user_id = neu.auth_user_id\n        AND old.canonical_user_id = neu.canonical_user_id\n       WHERE neu.auth_user_id = {auth_user_id:String}\n         AND neu.warehouse_version = {new_wh:String}\n         AND neu.classification_version = {new_cls:String}\n         AND old.warehouse_version = {old_wh:String}\n         AND old.classification_version = {old_cls:String}",
+    "q_f873b4a31a248be3": "SELECT count() - uniqExact(canonical_user_id) AS c FROM fact_user_cohorts FINAL\n     WHERE auth_user_id = {auth_user_id:String}\n       AND warehouse_version = {warehouse_version:String}\n       AND classification_version = {classification_version:String}",
+    "q_f881c3736422331d": "SELECT count() AS c FROM fact_user_cohorts FINAL\n     WHERE auth_user_id = {auth_user_id:String}\n       AND warehouse_version = {warehouse_version:String}\n       AND classification_version = {classification_version:String}"
+  }
+}

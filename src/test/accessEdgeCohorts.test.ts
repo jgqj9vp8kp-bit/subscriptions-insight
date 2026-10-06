@@ -1,5 +1,7 @@
 // Access control for clickhouse-cohorts, clickhouse-cohort-membership and
-// clickhouse-summary (plan §7, §13, §19, §27; Milestone A).
+// clickhouse-summary (plan §7, §13, §19, §27; Milestone A; Phase 2 spec §4:
+// the scopeReady allowlist, the freshness gate, the cron tick). The restricted
+// runners themselves are covered by cohortsScopedReads.test.ts.
 //
 // The index.ts files import esm.sh (via http.ts) and cannot be loaded here, so
 // the coverage is layered like the rest of the access suite:
@@ -27,6 +29,8 @@ import {
 } from "../../supabase/functions/_shared/access/accessContext.ts";
 import { isKnownPermission } from "../../supabase/functions/_shared/access/permissions.ts";
 import { createScopedReader, ScopeViolation } from "../../supabase/functions/_shared/clickhouse/scopedClient.ts";
+import type { ScopeSql } from "../../supabase/functions/_shared/clickhouse/scopeSql.ts";
+import { CAMPAIGN_SCOPE_VERSION, type CohortSnapshotState } from "../../supabase/functions/_shared/clickhouse/cohortSnapshotState.ts";
 import {
   CLICKHOUSE_COHORTS_POLICY,
   COHORT_LIST_VIEW_PERMISSIONS,
@@ -145,7 +149,42 @@ function contextFor(name: PersonaName): AccessContext {
   return buildAccessContext(row, { kind: "user", userId: persona.userId, email: "member@example.com" }, "req-test");
 }
 
-function gateDeps(name: PersonaName): AccessGateDeps {
+const NOW = new Date("2026-10-06T12:00:00.000Z");
+const CRON_SECRET = "cron-secret-value";
+const PASS = { status: "PASS", duplicate_users: 0 };
+
+/** A fresh, validated cohort snapshot (the Phase 2 freshness gate admits it). */
+function readySnapshotState(overrides: Partial<CohortSnapshotState> = {}): CohortSnapshotState {
+  return {
+    auth_user_id: DATA_KEY,
+    snapshot_name: "fact_user_cohorts",
+    status: "completed",
+    active_warehouse_version: "wh_live",
+    active_classification_version: COHORT_CLASSIFICATION_VERSION,
+    active_generated_at: "2026-10-06T09:00:00.000Z",
+    building_warehouse_version: null,
+    building_classification_version: null,
+    started_at: null,
+    finished_at: "2026-10-06T09:00:00.000Z",
+    duration_ms: 1,
+    users_classified: 5,
+    rows_inserted: 5,
+    duplicate_users: 0,
+    removed_or_invalidated: 0,
+    source_transactions: 50,
+    source_unique_users: 5,
+    last_error: null,
+    diagnostics: { validation: PASS },
+    active_validation: PASS,
+    active_validated_at: "2026-10-06T09:00:00.000Z",
+    active_campaign_scope_version: CAMPAIGN_SCOPE_VERSION,
+    fresh_verified_at: "2026-10-06T11:52:00.000Z",
+    stale_since: null,
+    ...overrides,
+  };
+}
+
+function gateDeps(name: PersonaName, snapshotState: CohortSnapshotState | null = readySnapshotState()): AccessGateDeps {
   const persona = PERSONAS[name];
   const raw: ClickHouseClientLike = {
     query: async () => ({ json: async () => [] }),
@@ -158,10 +197,12 @@ function gateDeps(name: PersonaName): AccessGateDeps {
     getUser: async () => ({ data: { user: { id: persona.userId, email: "member@example.com" } }, error: null }),
     loadAccess: async () => ({ data: accessRow(persona), error: null }),
     workspaceDataKey: async () => ({ data: DATA_KEY, error: null }),
-    readEnv: () => undefined,
+    readEnv: (envName) => (envName === "FB_CRON_SECRET" ? CRON_SECRET : undefined),
     createClickHouse: (ctx) => createScopedReader(ctx, raw),
     newRequestId: () => "req-test",
     log: () => undefined,
+    loadCohortSnapshotState: vi.fn(async () => snapshotState),
+    now: () => NOW,
   };
 }
 
@@ -170,10 +211,13 @@ async function call<A extends string>(
   persona: PersonaName,
   body: unknown,
   method = "POST",
-): Promise<{ status: number; body: Record<string, unknown>; action: string | null }> {
+  snapshotState?: CohortSnapshotState | null,
+): Promise<{ status: number; body: Record<string, unknown>; action: string | null; scope: ScopeSql | null }> {
   let seen: string | null = null;
+  let scope: ScopeSql | null = null;
   const handler = async (request: AccessRequest<A>) => {
     seen = request.action;
+    scope = request.scope;
     return { ok: true, action: request.action };
   };
   const req = new Request(`https://edge.test/functions/v1/${policy.fn}`, {
@@ -181,26 +225,46 @@ async function call<A extends string>(
     headers: { Authorization: "Bearer good-token", "Content-Type": "application/json" },
     body: method === "GET" ? undefined : JSON.stringify(body),
   });
-  const response = await handleWithAccess(req, policy, handler, gateDeps(persona));
-  return { status: response.status, body: (await response.json()) as Record<string, unknown>, action: seen };
+  const response = await handleWithAccess(req, policy, handler, gateDeps(persona, snapshotState));
+  return { status: response.status, body: (await response.json()) as Record<string, unknown>, action: seen, scope };
 }
 
 // ---- policies ------------------------------------------------------------------------
 
 const POLICIES = [CLICKHOUSE_COHORTS_POLICY, CLICKHOUSE_COHORT_MEMBERSHIP_POLICY, CLICKHOUSE_SUMMARY_POLICY] as Array<FunctionPolicy<string>>;
 
+/** Phase 2 (spec §6 contract 2): the scopeReady actions of these three functions
+ * and the snapshot each needs (null = scopeReady without a snapshot). */
+const SCOPE_READY: Record<string, Record<string, "cohort" | "campaign" | null>> = {
+  "clickhouse-cohorts": { list: "cohort", details: "cohort", options: "cohort" },
+  "clickhouse-cohort-membership": {},
+  "clickhouse-summary": { summary: null },
+};
+
 describe("policy tables", () => {
   it.each(POLICIES.map((policy) => [policy.fn, policy] as const))("%s is a valid, closed policy", (_fn, policy) => {
     expect(() => assertValidPolicy(policy)).not.toThrow();
+    const ready: Record<string, "cohort" | "campaign" | null> = {};
     for (const [action, rule] of Object.entries(policy.actions)) {
-      // Milestone A: nothing is scope-ready, so restricted contexts are refused.
-      expect(rule.scopeReady, `${policy.fn}.${action}`).toBeFalsy();
+      if (rule.scopeReady) ready[action] = rule.scopeSnapshot ?? null;
       // No action is open to "any active member".
-      const keys = [...(rule.anyOf ?? []), ...(rule.allOf ?? [])];
+      const keys = [...(rule.anyOf ?? []), ...(rule.allOf ?? []), ...(rule.restrictedAnyOf ?? [])];
       expect(keys.length || rule.rawOnly || rule.ownerOnly, `${policy.fn}.${action}`).toBeTruthy();
       for (const key of keys) expect(isKnownPermission(key), key).toBe(true);
     }
-    expect(policy.cron).toBeUndefined();
+    // Exactly the allowlist — list_fb_allocation_diagnostics and every
+    // membership action (cron_tick included) are never scopeReady.
+    expect(ready).toEqual(SCOPE_READY[policy.fn]);
+    if (policy.fn === "clickhouse-cohort-membership") {
+      expect(policy.cron).toEqual({ header: "x-cron-secret", secretEnv: "FB_CRON_SECRET", actions: ["cron_tick"] });
+    } else {
+      expect(policy.cron).toBeUndefined();
+    }
+  });
+
+  it("restricted members need cohorts.view itself for list; cron_tick is the scheduler's only", () => {
+    expect(CLICKHOUSE_COHORTS_POLICY.actions.list.restrictedAnyOf).toEqual(["cohorts.view"]);
+    expect(CLICKHOUSE_COHORT_MEMBERSHIP_POLICY.actions.cron_tick).toEqual({ ownerOnly: true, rawOnly: true, allOf: ["admin.warehouse.manage"], write: true });
   });
 
   it("list is open to exactly the pages that render cohort rows (agrees with ROUTE_ACCESS)", () => {
@@ -244,9 +308,20 @@ describe("canonical action normalizers", () => {
     expect(normalizeClickHouseCohortMembershipAction(input({ action: "rebuild", force: false }))).toBe("rebuild");
     expect(normalizeClickHouseCohortMembershipAction(input({ action: "rebuild", force: true }))).toBe("rebuild_force");
     expect(normalizeClickHouseCohortMembershipAction(input({ action: "rebuild", force: "yes" }))).toBe("rebuild_force");
-    for (const body of [{}, { action: "rebuild_force" }, { action: "drop" }, { force: true }]) {
+    for (const body of [{}, { action: "rebuild_force" }, { action: "drop" }, { force: true }, { action: "cron_tick" }]) {
       expect(() => normalizeClickHouseCohortMembershipAction(input(body))).toThrow(ActionNormalizeError);
     }
+  });
+
+  it("clickhouse-cohort-membership: the cron branch runs the tick and nothing else", () => {
+    const cron = (body: Record<string, unknown>) => ({ ...input(body), cron: true });
+    expect(normalizeClickHouseCohortMembershipAction(cron({}))).toBe("cron_tick");
+    expect(normalizeClickHouseCohortMembershipAction(cron({ action: null }))).toBe("cron_tick");
+    expect(normalizeClickHouseCohortMembershipAction(cron({ action: "cron_tick", auth_user_id: DATA_KEY }))).toBe("cron_tick");
+    for (const body of [{ action: "rebuild" }, { action: "rebuild", force: true }, { action: "status" }, { action: "validate" }, { action: "tick" }]) {
+      expect(() => normalizeClickHouseCohortMembershipAction(cron(body))).toThrow(ActionNormalizeError);
+    }
+    expect(legacyMembershipAction("cron_tick")).toBe("cron_tick");
   });
 
   it("clickhouse-summary: the frontend's empty body maps explicitly to summary", () => {
@@ -272,8 +347,8 @@ const MATRIX: Array<{ policy: FunctionPolicy<string>; label: string; body: Recor
     expect: {
       owner: OK("list"), viewer: OK("list"), reportsOnly: OK("list"), forecastOnly: OK("list"),
       dashboardOnly: DENY(ACCESS_ERROR.PERMISSION_DENIED), warehouseAdmin: DENY(ACCESS_ERROR.PERMISSION_DENIED),
-      restrictedViewer: DENY(ACCESS_ERROR.SCOPE_NOT_SUPPORTED), noScopeViewer: DENY(ACCESS_ERROR.SCOPE_NOT_SUPPORTED),
-      restrictedAdmin: DENY(ACCESS_ERROR.SCOPE_NOT_SUPPORTED),
+      // Phase 2: scopeReady behind the freshness gate (a ready snapshot here).
+      restrictedViewer: OK("list"), noScopeViewer: OK("list"), restrictedAdmin: OK("list"),
     },
   },
   {
@@ -294,7 +369,7 @@ const MATRIX: Array<{ policy: FunctionPolicy<string>; label: string; body: Recor
     expect: {
       owner: OK("details"), viewer: OK("details"),
       reportsOnly: DENY(ACCESS_ERROR.PERMISSION_DENIED), forecastOnly: DENY(ACCESS_ERROR.PERMISSION_DENIED),
-      restrictedViewer: DENY(ACCESS_ERROR.SCOPE_NOT_SUPPORTED), noScopeViewer: DENY(ACCESS_ERROR.SCOPE_NOT_SUPPORTED),
+      restrictedViewer: OK("details"), noScopeViewer: OK("details"),
     },
   },
   {
@@ -303,7 +378,7 @@ const MATRIX: Array<{ policy: FunctionPolicy<string>; label: string; body: Recor
     body: { action: "filter_options" },
     expect: {
       owner: OK("options"), viewer: OK("options"), forecastOnly: DENY(ACCESS_ERROR.PERMISSION_DENIED),
-      restrictedViewer: DENY(ACCESS_ERROR.SCOPE_NOT_SUPPORTED),
+      restrictedViewer: OK("options"),
     },
   },
   {
@@ -354,8 +429,8 @@ const MATRIX: Array<{ policy: FunctionPolicy<string>; label: string; body: Recor
       owner: OK("summary"), viewer: OK("summary"), dashboardOnly: OK("summary"), diagnosticsAdmin: OK("summary"),
       reportsOnly: DENY(ACCESS_ERROR.PERMISSION_DENIED), forecastOnly: DENY(ACCESS_ERROR.PERMISSION_DENIED),
       warehouseAdmin: DENY(ACCESS_ERROR.PERMISSION_DENIED),
-      restrictedViewer: DENY(ACCESS_ERROR.SCOPE_NOT_SUPPORTED), noScopeViewer: DENY(ACCESS_ERROR.SCOPE_NOT_SUPPORTED),
-      restrictedAdmin: DENY(ACCESS_ERROR.SCOPE_NOT_SUPPORTED),
+      // Phase 2: scopeReady without a snapshot (the member view makes no ClickHouse call).
+      restrictedViewer: OK("summary"), noScopeViewer: OK("summary"), restrictedAdmin: OK("summary"),
     },
   },
 ];
@@ -375,19 +450,20 @@ describe("gate matrix (real handleWithAccess, fake dependencies)", () => {
     }
   });
 
-  it("every action of the three functions is refused (403) for every restricted context", async () => {
+  const COHORTS = CLICKHOUSE_COHORTS_POLICY as FunctionPolicy<string>;
+  const MEMBERSHIP = CLICKHOUSE_COHORT_MEMBERSHIP_POLICY as FunctionPolicy<string>;
+  const SUMMARY = CLICKHOUSE_SUMMARY_POLICY as FunctionPolicy<string>;
+  const RESTRICTED_PERSONAS = ["restrictedViewer", "noScopeViewer", "restrictedAdmin"] as const;
+
+  it("restricted contexts: every non-scopeReady action is refused (403) before the handler", async () => {
     const bodies: Array<[FunctionPolicy<string>, Record<string, unknown>]> = [
-      [CLICKHOUSE_COHORTS_POLICY as FunctionPolicy<string>, { action: "list" }],
-      [CLICKHOUSE_COHORTS_POLICY as FunctionPolicy<string>, { action: "list", fb_allocation_diagnostics: {} }],
-      [CLICKHOUSE_COHORTS_POLICY as FunctionPolicy<string>, { action: "details" }],
-      [CLICKHOUSE_COHORTS_POLICY as FunctionPolicy<string>, { action: "options" }],
-      [CLICKHOUSE_COHORT_MEMBERSHIP_POLICY as FunctionPolicy<string>, { action: "status" }],
-      [CLICKHOUSE_COHORT_MEMBERSHIP_POLICY as FunctionPolicy<string>, { action: "rebuild" }],
-      [CLICKHOUSE_COHORT_MEMBERSHIP_POLICY as FunctionPolicy<string>, { action: "rebuild", force: true }],
-      [CLICKHOUSE_COHORT_MEMBERSHIP_POLICY as FunctionPolicy<string>, { action: "validate" }],
-      [CLICKHOUSE_SUMMARY_POLICY as FunctionPolicy<string>, {}],
+      [COHORTS, { action: "list", fb_allocation_diagnostics: {} }],
+      [MEMBERSHIP, { action: "status" }],
+      [MEMBERSHIP, { action: "rebuild" }],
+      [MEMBERSHIP, { action: "rebuild", force: true }],
+      [MEMBERSHIP, { action: "validate" }],
     ];
-    for (const persona of ["restrictedViewer", "noScopeViewer", "restrictedAdmin"] as const) {
+    for (const persona of RESTRICTED_PERSONAS) {
       for (const [policy, body] of bodies) {
         const result = await call(policy, persona, body);
         expect(result.status, `${policy.fn} ${JSON.stringify(body)} as ${persona}`).toBe(403);
@@ -395,6 +471,40 @@ describe("gate matrix (real handleWithAccess, fake dependencies)", () => {
         expect(result.action).toBeNull();
       }
     }
+  });
+
+  it("restricted contexts: the scopeReady actions reach the handler with a restricted scope (snapshot only where required)", async () => {
+    const bodies: Array<[FunctionPolicy<string>, Record<string, unknown>, string, boolean]> = [
+      [COHORTS, { action: "list" }, "list", true],
+      [COHORTS, { action: "details", cohort_key: { cohort_date: "2026-07-01", funnel: "f", campaign_path: "soulmate" } }, "details", true],
+      [COHORTS, { action: "options" }, "options", true],
+      [SUMMARY, {}, "summary", false],
+    ];
+    for (const persona of RESTRICTED_PERSONAS) {
+      for (const [policy, body, action, needsSnapshot] of bodies) {
+        const result = await call(policy, persona, body);
+        expect(result.status, `${policy.fn} ${JSON.stringify(body)} as ${persona}`).toBe(200);
+        expect(result.action).toBe(action);
+        expect(result.scope?.restricted).toBe(true);
+        expect(Boolean(result.scope?.snapshot), `${policy.fn}.${action}`).toBe(needsSnapshot);
+      }
+    }
+    // Scope all keeps ALL_SCOPE_SQL.
+    expect((await call(COHORTS, "viewer", { action: "list" })).scope?.restricted).toBe(false);
+  });
+
+  it("restricted contexts without a fresh, validated snapshot: 409 on the cohorts reads; the probe still answers", async () => {
+    for (const state of [null, readySnapshotState({ fresh_verified_at: "2026-10-06T05:00:00.000Z" }), readySnapshotState({ active_validation: { status: "FAIL" } })]) {
+      for (const body of [{ action: "list" }, { action: "details" }, { action: "options" }]) {
+        const result = await call(COHORTS, "restrictedViewer", body, "POST", state);
+        expect(result.status, JSON.stringify(body)).toBe(409);
+        expect(result.body.error_code).toBe(ACCESS_ERROR.SCOPE_SNAPSHOT_NOT_READY);
+        expect(result.action).toBeNull();
+      }
+      expect((await call(SUMMARY, "restrictedViewer", {}, "POST", state)).status).toBe(200);
+    }
+    // Scope all never consults the snapshot state.
+    expect((await call(COHORTS, "viewer", { action: "list" }, "POST", null)).status).toBe(200);
   });
 
   it("rejects missing / unknown actions with 400 before resolving access", async () => {
@@ -415,6 +525,54 @@ describe("gate matrix (real handleWithAccess, fake dependencies)", () => {
     expect((await call(CLICKHOUSE_SUMMARY_POLICY as FunctionPolicy<string>, "viewer", null, "GET")).status).toBe(200);
     expect((await call(CLICKHOUSE_COHORT_MEMBERSHIP_POLICY as FunctionPolicy<string>, "viewer", null, "GET")).status).toBe(405);
     expect((await call(CLICKHOUSE_COHORTS_POLICY as FunctionPolicy<string>, "viewer", null, "GET")).status).toBe(405);
+  });
+});
+
+describe("clickhouse-cohort-membership cron_tick (the freshness cron)", () => {
+  const MEMBERSHIP = CLICKHOUSE_COHORT_MEMBERSHIP_POLICY as FunctionPolicy<string>;
+  const cronCall = async (headers: Record<string, string>, body: unknown) => {
+    let seen: { action: string; actor: string; restricted: boolean; tenant: string } | null = null;
+    const handler = async (request: AccessRequest<string>) => {
+      seen = { action: request.action, actor: request.ctx.actor.kind, restricted: request.scope.restricted, tenant: request.ctx.tenantKey };
+      return { ok: true };
+    };
+    const req = new Request("https://edge.test/functions/v1/clickhouse-cohort-membership", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...headers },
+      body: JSON.stringify(body),
+    });
+    const response = await handleWithAccess(req, MEMBERSHIP, handler, gateDeps("owner"));
+    return { status: response.status, body: (await response.json()) as Record<string, unknown>, seen };
+  };
+
+  it("the secret-authenticated tick reaches cron_tick for the workspace tenant, with the all scope", async () => {
+    for (const body of [{}, { action: "cron_tick" }, { auth_user_id: DATA_KEY, action: "cron_tick" }]) {
+      const result = await cronCall({ "x-cron-secret": CRON_SECRET }, body);
+      expect(result.status, JSON.stringify(body)).toBe(200);
+      expect(result.seen).toEqual({ action: "cron_tick", actor: "cron", restricted: false, tenant: DATA_KEY });
+    }
+  });
+
+  it("a wrong secret is 401; the cron can name nothing else; a user can never name cron_tick", async () => {
+    expect((await cronCall({ "x-cron-secret": "wrong" }, {})).status).toBe(401);
+    expect((await cronCall({ "x-cron-secret": CRON_SECRET }, { auth_user_id: EMPLOYEE })).status).toBe(400);
+    for (const body of [{ action: "rebuild", force: true }, { action: "validate" }, { action: "status" }]) {
+      const other = await cronCall({ "x-cron-secret": CRON_SECRET }, body);
+      expect(other.status, JSON.stringify(body)).toBe(400);
+      expect(other.seen).toBeNull();
+    }
+    for (const persona of ["owner", "warehouseAdmin"] as const) {
+      const user = await call(MEMBERSHIP, persona, { action: "cron_tick" });
+      expect(user.status).toBe(400);
+      expect(user.body.error_code).toBe(ACCESS_ERROR.UNKNOWN_ACTION);
+    }
+  });
+
+  it("index.ts: an unforced tick-mode rebuild whose body is only the tick outcome; a held lease is in_progress", () => {
+    const source = readFileSync("supabase/functions/clickhouse-cohort-membership/index.ts", "utf8");
+    expect(source).toMatch(/if \(action === "cron_tick"\) \{[\s\S]*?rebuildCohortMembership\(\{[\s\S]*?force: false,\s*mode: "tick",[\s\S]*?\}\)/);
+    expect(source).toContain('return { ok: true, action: "cron_tick", tick_status: result.tick_status, campaign_scope: result.campaign_scope };');
+    expect(source).toContain('if (error instanceof CohortRebuildBusyError) return { ok: true, action: "cron_tick", tick_status: "in_progress" };');
   });
 });
 

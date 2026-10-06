@@ -35,6 +35,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { KpiCard } from "@/components/KpiCard";
 import { RevenueIntelligenceSection } from "@/components/RevenueIntelligenceSection";
+import { FunnelScopeBanner } from "@/components/access/FunnelScopeBanner";
 import {
   Select,
   SelectContent,
@@ -353,12 +354,20 @@ export default function Dashboard() {
 }
 
 function ServerDashboard() {
+  const access = useAccess();
   return (
     <AppLayout title="Dashboard" description="Cohort-based business overview">
-      <Card className="mb-4 p-3 text-xs text-muted-foreground shadow-card" data-testid="dashboard-server-only-note">
-        The cohort KPIs and charts of this page are computed from the full transaction warehouse and are available to the
-        data owner only. Revenue Intelligence below is computed on the server.
-      </Card>
+      {/* A funnel-restricted member sees which funnels the section covers instead. */}
+      {access.restricted ? (
+        <div className="mb-4">
+          <FunnelScopeBanner surface="dashboard" />
+        </div>
+      ) : (
+        <Card className="mb-4 p-3 text-xs text-muted-foreground shadow-card" data-testid="dashboard-server-only-note">
+          The cohort KPIs and charts of this page are computed from the full transaction warehouse and are available to the
+          data owner only. Revenue Intelligence below is computed on the server.
+        </Card>
+      )}
       <RevenueIntelligenceSection />
     </AppLayout>
   );

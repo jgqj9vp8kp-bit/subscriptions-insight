@@ -25,11 +25,19 @@
 //   4. resolve_access(user) → 503 on any fault or a missing workspace (R2),
 //      403 no_membership / membership_disabled (R1).
 //   5. authorizeAction: permissions, rawOnly, ownerOnly, fullScopeOnly, and
-//      restricted ∧ ¬scopeReady → 403 scope_not_supported (R6).
-//   6. handler. Thrown errors are mapped (onError) or 502; for anyone but the
-//      data owner (and the cron, which holds the secret and whose body only
-//      lands in net._http_response) the body is replaced by a generic
-//      { error_code, request_id } so warehouse messages never reach employees.
+//      restricted ∧ ¬scopeReady → 403 scope_not_supported (R6); restricted ∧
+//      restrictedAnyOf unmet → 403 scope_not_supported.
+//   5b. Scope handle (Phase 2, spec §3.5): scope all (and cron) → ALL_SCOPE_SQL
+//      with no I/O. Restricted on a scopeSnapshot action → the cohort snapshot
+//      state is loaded (a fault → 503) and must be fresh and validated, else
+//      409 scope_snapshot_not_ready; restricted otherwise → a restricted handle
+//      without a snapshot. The handler gets it as `scope`.
+//   6. handler. ScopeForbiddenError → 403 with its code, ScopeSnapshotNotReadyError
+//      → 409 (before onError, never sanitized further). Other thrown errors are
+//      mapped (onError) or 502; for anyone but the data owner (and the cron,
+//      which holds the secret and whose body only lands in net._http_response)
+//      the body is replaced by a generic { error_code, request_id } so warehouse
+//      messages never reach employees.
 //   7. Any recorded scope violation → 500 scope_violation, whatever the handler
 //      returned or swallowed (R7).
 // Audit (§24, best effort, never changes a response): a 403 for an
@@ -55,8 +63,20 @@ import {
 import { timingSafeEqual } from "./timingSafe.ts";
 import { BUILD_ID } from "./buildId.ts";
 import { buildCorsHeaders, EXPOSED_RESPONSE_HEADERS } from "./cors.ts";
+import {
+  ALL_SCOPE_SQL,
+  createRestrictedScopeSql,
+  ScopeForbiddenError,
+  ScopeSnapshotNotReadyError,
+  type ScopeSql,
+} from "../clickhouse/scopeSql.ts";
+import {
+  restrictedSnapshotReadiness,
+  SCOPE_SNAPSHOT_MAX_STALENESS_HOURS_DEFAULT,
+  type CohortSnapshotState,
+} from "../clickhouse/cohortSnapshotState.ts";
 
-export type { AccessContext, ActionPolicy };
+export type { AccessContext, ActionPolicy, ScopeSql };
 export { ActionNormalizeError };
 
 export interface NormalizeActionInput {
@@ -89,6 +109,8 @@ export interface AccessRequest<A extends string> {
   pg: SupabaseAuthClient;
   /** Lazily created ScopedReader bound to ctx. */
   clickhouse(): ClickHouseClientLike;
+  /** Scope-SQL handle for this request: ALL_SCOPE_SQL unless ctx.restricted. */
+  scope: ScopeSql;
 }
 
 export type AccessHandler<A extends string> = (request: AccessRequest<A>) => Promise<Response | unknown>;
@@ -149,6 +171,11 @@ export interface AccessGateDeps {
   writeAudit?(entry: GateAuditEntry): Promise<unknown>;
   /** public.access_record_denial (best effort; omitted ⇒ not counted). */
   recordDenial?(entry: GateDenialEntry): Promise<unknown>;
+  /** public.clickhouse_cohort_snapshot_state of the tenant (restricted
+   * scopeSnapshot actions only; omitted ⇒ those requests are 503). */
+  loadCohortSnapshotState?(tenantKey: string): Promise<CohortSnapshotState | null>;
+  /** Clock of the freshness check (tests); default new Date(). */
+  now?(): Date;
 }
 
 /** The §24 event a write action is audited under: warehouse administration
@@ -237,6 +264,20 @@ export function assertValidPolicy<A extends string>(policy: FunctionPolicy<A>): 
   const actions = Object.keys(policy.actions ?? {});
   if (!actions.length) throw new Error(`${policy.fn}: at least one action policy is required.`);
   if (policy.methods && !policy.methods.length) throw new Error(`${policy.fn}: methods must not be empty.`);
+  for (const action of actions) {
+    const entry = (policy.actions as Record<string, ActionPolicy>)[action];
+    if (entry?.scopeSnapshot !== undefined) {
+      if (entry.scopeSnapshot !== "cohort" && entry.scopeSnapshot !== "campaign") {
+        throw new Error(`${policy.fn}: action "${action}" has an unknown scopeSnapshot.`);
+      }
+      if (entry.scopeReady !== true) throw new Error(`${policy.fn}: action "${action}" sets scopeSnapshot without scopeReady.`);
+    }
+    if (entry?.restrictedAnyOf !== undefined) {
+      if (!Array.isArray(entry.restrictedAnyOf) || entry.restrictedAnyOf.some((key) => typeof key !== "string" || !key)) {
+        throw new Error(`${policy.fn}: action "${action}" has a malformed restrictedAnyOf.`);
+      }
+    }
+  }
   if (policy.cron) {
     if (!policy.cron.header?.trim() || !policy.cron.secretEnv?.trim()) throw new Error(`${policy.fn}: cron.header and cron.secretEnv are required.`);
     for (const action of policy.cron.actions ?? []) {
@@ -362,12 +403,45 @@ export async function handleWithAccess<A extends string>(
     }
   };
 
+  /** Step 5b: the request's ScopeSql handle, or the denial that replaces the
+   * handler (503 when the snapshot state cannot be read, 409 when it is not
+   * fresh / validated). Scope all and cron never do I/O here. */
+  const scopeFor = async (ctx: AccessContext, action: A): Promise<{ scope: ScopeSql } | { denial: Response }> => {
+    if (!ctx.restricted || ctx.actor.kind === "cron") return { scope: ALL_SCOPE_SQL };
+    const needs = policy.actions[action]?.scopeSnapshot;
+    if (!needs) return { scope: createRestrictedScopeSql(ctx, null) };
+    const details = { user_id: ctx.actor.userId, member_id: ctx.actor.memberId, action, restricted: true };
+    if (!deps.loadCohortSnapshotState) {
+      return { denial: await deny(accessDenial(503, ACCESS_ERROR.ACCESS_SERVICE_ERROR), { ...details, reason: "snapshot state loader missing" }) };
+    }
+    let state: CohortSnapshotState | null;
+    try {
+      const loaded = await deps.loadCohortSnapshotState(ctx.tenantKey);
+      if (isRecord(loaded) && "error" in loaded && loaded.error) throw new Error(errorMessage(loaded.error));
+      state = (loaded ?? null) as CohortSnapshotState | null;
+    } catch (error) {
+      return { denial: await deny(accessDenial(503, ACCESS_ERROR.ACCESS_SERVICE_ERROR), { ...details, reason: `snapshot state: ${errorMessage(error)}` }) };
+    }
+    const hours = Number(deps.readEnv("SCOPE_SNAPSHOT_MAX_STALENESS_HOURS") ?? SCOPE_SNAPSHOT_MAX_STALENESS_HOURS_DEFAULT);
+    const maxStalenessMs = (Number.isFinite(hours) && hours > 0 ? hours : SCOPE_SNAPSHOT_MAX_STALENESS_HOURS_DEFAULT) * 3_600_000;
+    const readiness = restrictedSnapshotReadiness(state, { now: deps.now?.() ?? new Date(), maxStalenessMs, needsCampaignScope: needs === "campaign" });
+    // `=== false` narrows under the app tsconfig too (no strictNullChecks).
+    if (readiness.ok === false) {
+      // The reason is logged, never returned (it would describe the warehouse).
+      return { denial: await deny(accessDenial(409, ACCESS_ERROR.SCOPE_SNAPSHOT_NOT_READY), { ...details, reason: readiness.reason }) };
+    }
+    return { scope: createRestrictedScopeSql(ctx, readiness.snapshot) };
+  };
+
   const run = async (ctx: AccessContext, action: A, body: Record<string, unknown>): Promise<Response> => {
+    const scoped = await scopeFor(ctx, action);
+    if ("denial" in scoped) return scoped.denial;
+    const scope = scoped.scope;
     let reader: ClickHouseClientLike | null = null;
     const clickhouse = () => (reader ??= deps.createClickHouse(ctx));
     let response: Response;
     try {
-      const result = await handler({ ctx, action, body, url, req, pg: deps.pg as SupabaseAuthClient, clickhouse });
+      const result = await handler({ ctx, action, body, url, req, pg: deps.pg as SupabaseAuthClient, clickhouse, scope });
       response = result instanceof Response ? withGateHeaders(result, requestId, methods) : respond(result ?? null, 200);
     } catch (error) {
       // A ScopeViolation is recorded by the reader before it throws; record it
@@ -413,6 +487,16 @@ export async function handleWithAccess<A extends string>(
   };
 
   const handlerErrorResponse = (error: unknown, ctx: AccessContext, action: A): Response => {
+    // Scope refusals raised by the scopeSql.ts helpers inside the handler: fixed
+    // coded bodies, mapped before onError and exempt from the generic rewrite.
+    if (error instanceof ScopeForbiddenError) {
+      log("warn", "access_denied", { fn: policy.fn, request_id: requestId, status: 403, error_code: error.code, user_id: ctx.actor.userId, action, restricted: ctx.restricted });
+      return respond({ ok: false, error_code: error.code, error: ACCESS_ERROR_MESSAGES[error.code], request_id: requestId }, 403);
+    }
+    if (error instanceof ScopeSnapshotNotReadyError) {
+      log("warn", "access_denied", { fn: policy.fn, request_id: requestId, status: 409, error_code: ACCESS_ERROR.SCOPE_SNAPSHOT_NOT_READY, user_id: ctx.actor.userId, action, reason: error.reason });
+      return respond({ ok: false, error_code: ACCESS_ERROR.SCOPE_SNAPSHOT_NOT_READY, error: ACCESS_ERROR_MESSAGES.scope_snapshot_not_ready, request_id: requestId }, 409);
+    }
     let status = 502;
     let body: Record<string, unknown> = { ok: false, source: "clickhouse", error: errorMessage(error), request_id: requestId };
     let mapped: { status: number; body: Record<string, unknown> } | null = null;

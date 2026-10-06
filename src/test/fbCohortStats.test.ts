@@ -142,3 +142,42 @@ describe("FB Cohorts user-first smoke contract", () => {
     expect(() => assembleFbUserCosts([user("u1"), user("u1")], [metric()], new Set([KEY]), { defaultTimezone: "UTC" })).toThrow(/duplicate authoritative user/);
   });
 });
+
+// Access Phase 2: campaigns hidden from a funnel-restricted member.
+describe("hidden campaigns (funnel-restricted Cohorts FB columns)", () => {
+  const HIDDEN = "120249115818080099";
+  const KEY_B = fbCohortRowKey(DATE, "soulmate", "path-b");
+
+  it("never allocates a hidden campaign, even when its metrics are present", () => {
+    const users = [user("u1", { campaign_id: HIDDEN }), user("u2", { campaign_id: HIDDEN })];
+    const result = assembleFbUserCosts(users, [metric({ campaign_id: HIDDEN, spend: 987654.32 })], new Set([KEY]), { defaultTimezone: "UTC" }, new Set([HIDDEN]));
+    expect(result.perRow[KEY]).toMatchObject({ fb_spend: null, fb_purchases: null, fb_cpp: null, fb_matched_users: 0, fb_unmatched_users: 2, fb_match_status: "campaign_not_visible" });
+    expect(result.assignments.every((row) => row.allocation_status === "campaign_hidden" && row.fb_user_cpp === null && row.fb_campaign_cpp === null)).toBe(true);
+    expect(result.validation).toEqual([expect.objectContaining({ campaign_id: HIDDEN, allocation_status: "campaign_hidden", fb_spend: 0, fb_purchases: 0, allocated_spend: 0, unallocated_spend: 0 })]);
+    expect(result.totals).toMatchObject({ fb_spend: null, fb_purchases: null, fb_matched_users: 0, fb_unmatched_users: 2 });
+    expect(JSON.stringify(result)).not.toContain("987654");
+  });
+
+  it("a row with visible and hidden users is partial; a row with hidden users only is campaign_not_visible", () => {
+    const users = [
+      user("u1"),
+      user("u2"),
+      user("u3", { campaign_id: HIDDEN }),
+      user("u4", { campaign_id: HIDDEN, campaign_path: "path-b" }),
+    ];
+    const result = assembleFbUserCosts(users, [metric()], new Set([KEY, KEY_B]), { defaultTimezone: "UTC" }, new Set([HIDDEN]));
+    expect(result.perRow[KEY]).toMatchObject({ fb_match_status: "partial_coverage", fb_spend: 100, fb_matched_users: 2, fb_unmatched_users: 1 });
+    expect(result.perRow[KEY_B]).toMatchObject({ fb_match_status: "campaign_not_visible", fb_spend: null });
+    expect(result.totals).toMatchObject({ fb_spend: 100, fb_matched_users: 2, fb_unmatched_users: 2 });
+  });
+
+  it("an empty hidden set changes nothing (everyone but restricted members)", () => {
+    const users = [user("u1"), user("u2"), user("u3", { campaign_id: HIDDEN })];
+    const metrics = [metric(), metric({ campaign_id: HIDDEN, spend: 30, purchases: 1 })];
+    const visible = new Set([KEY]);
+    expect(assembleFbUserCosts(users, metrics, visible, { defaultTimezone: "UTC" }, new Set())).toEqual(assembleFbUserCosts(users, metrics, visible, { defaultTimezone: "UTC" }));
+    const plain = assembleFbUserCosts(users, metrics, visible, { defaultTimezone: "UTC" });
+    expect(plain.perRow[KEY]).toMatchObject({ fb_match_status: "matched", fb_spend: 130 });
+    expect(plain.assignments.some((row) => row.allocation_status === "campaign_hidden")).toBe(false);
+  });
+});

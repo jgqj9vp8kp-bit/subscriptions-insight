@@ -2,7 +2,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { MutationObserver, QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { ComponentType, ReactNode } from "react";
+import { useEffect, type ComponentType, type ReactNode } from "react";
 
 // Shared, hoisted state the module mocks below read at render time.
 const shell = vi.hoisted(() => ({
@@ -80,6 +80,10 @@ vi.mock("@/pages/Leads.tsx", shell.stubPage("leads page"));
 vi.mock("@/pages/admin/AdminMembers.tsx", shell.stubPage("admin members page"));
 vi.mock("@/pages/admin/AdminRoles.tsx", shell.stubPage("admin roles page"));
 vi.mock("@/pages/admin/AdminAudit.tsx", shell.stubPage("admin audit page"));
+vi.mock("@/pages/admin/AdminFunnelCoverage.tsx", shell.stubPage("admin funnel coverage page"));
+vi.mock("@/pages/Reports.tsx", shell.stubPage("reports page"));
+vi.mock("@/pages/Funnels.tsx", shell.stubPage("funnels page"));
+vi.mock("@/pages/FBAnalytics.tsx", shell.stubPage("fb analytics page"));
 
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -94,6 +98,9 @@ import type { MyAccess } from "@/services/accessClient";
 import * as clickhouse from "@/services/clickhouse";
 import { registeredPurgeHandlers, runPurge } from "@/services/sessionPurge";
 import { useDataStore } from "@/store/dataStore";
+import { RESTRICTED_SCOPE_DENIAL_COPY } from "@/components/NoAccess";
+import { FunnelPathChips } from "@/components/access/FunnelPathChips";
+import { ACCESS_ERROR_MESSAGES } from "../../supabase/functions/_shared/access/errors";
 
 const USER: AuthUser = { id: "user-a", email: "a@example.com", provider: "supabase" };
 
@@ -112,7 +119,10 @@ function authFor(user: AuthUser | null, overrides: Partial<AuthContextValue> = {
   };
 }
 
-function okRow(input: { permissions?: string[]; isOwner?: boolean; raw?: boolean; partition?: string }): MyAccess {
+type ScopeMode = "all" | "selected" | "none";
+
+function okRow(input: { permissions?: string[]; isOwner?: boolean; raw?: boolean; partition?: string; mode?: ScopeMode }): MyAccess {
+  const mode = input.mode ?? "all";
   return {
     status: "ok",
     workspace_id: "ws-1",
@@ -123,7 +133,7 @@ function okRow(input: { permissions?: string[]; isOwner?: boolean; raw?: boolean
     is_data_owner: input.raw === true,
     raw_access: input.raw === true,
     role: { id: "role-1", key: "custom", name: "Custom", is_owner: input.isOwner === true, permissions: input.permissions ?? [] },
-    funnel_scope: { mode: "all", funnel_ids: [], paths: [] },
+    funnel_scope: mode === "selected" ? { mode, funnel_ids: ["funnel-a"], paths: ["soulmate-sketch"] } : { mode, funnel_ids: [], paths: [] },
     access_version: "1",
     partition: input.partition ?? "p-member",
   };
@@ -131,13 +141,16 @@ function okRow(input: { permissions?: string[]; isOwner?: boolean; raw?: boolean
 
 const refreshSpy = vi.fn(async () => {});
 
-function member(permissions: string[], extra: { raw?: boolean; partition?: string } = {}): AccessContextValue {
+function member(permissions: string[], extra: { raw?: boolean; partition?: string; mode?: ScopeMode } = {}): AccessContextValue {
   return buildAccessValue({ status: "ok", access: okRow({ permissions, ...extra }), userId: USER.id, refresh: refreshSpy });
 }
 
 const OWNER = () => buildAccessValue({ status: "ok", access: okRow({ isOwner: true, raw: true, partition: "p-owner" }), userId: USER.id, refresh: refreshSpy });
 const LEGACY = () => buildAccessValue({ status: "legacy", access: null, userId: USER.id, refresh: refreshSpy });
 const VIEWER = () => member(["dashboard.view", "cohorts.view", "funnels.view", "reports.view"]);
+// Phase 2: the Media Buyer template restricted to funnel A.
+const MEDIA_BUYER_KEYS = ["dashboard.view", "cohorts.view", "funnels.view", "facebook_analytics.view", "ai.use"];
+const BUYER_A = (partition = "p-buyer-a") => member(MEDIA_BUYER_KEYS, { mode: "selected", partition });
 const status = (value: AccessStatus) => buildAccessValue({ status: value, access: null, userId: USER.id, refresh: refreshSpy });
 
 // Read by the mocked providers in the App-level tests.
@@ -256,6 +269,51 @@ describe("ProtectedRoute", () => {
     expect(screen.getByTestId("location")).toHaveTextContent("/cohorts");
   });
 
+  describe("outlet key (Phase 2)", () => {
+    let mounts = 0;
+    function Counted() {
+      useEffect(() => {
+        mounts += 1;
+      }, []);
+      return <div>counted outlet</div>;
+    }
+    function tree(access: AccessContextValue) {
+      return (
+        <MemoryRouter initialEntries={["/cohorts"]}>
+          <AuthContext.Provider value={authFor(USER)}>
+            <AccessContext.Provider value={access}>
+              <Routes>
+                <Route element={<ProtectedRoute />}>
+                  <Route path="/cohorts" element={<Counted />} />
+                </Route>
+              </Routes>
+            </AccessContext.Provider>
+          </AuthContext.Provider>
+        </MemoryRouter>
+      );
+    }
+
+    beforeEach(() => {
+      mounts = 0;
+    });
+
+    it("remounts a restricted member's page when the access partition changes", () => {
+      const view = render(tree(BUYER_A("p-buyer-1")));
+      expect(screen.getByText("counted outlet")).toBeInTheDocument();
+      view.rerender(tree(BUYER_A("p-buyer-1")));
+      expect(mounts).toBe(1);
+      view.rerender(tree(BUYER_A("p-buyer-2")));
+      expect(mounts).toBe(2);
+    });
+
+    it("never remounts the page of an unrestricted member on a partition change", () => {
+      const view = render(tree(member(["cohorts.view"], { partition: "p-1" })));
+      view.rerender(tree(member(["cohorts.view"], { partition: "p-2" })));
+      expect(mounts).toBe(1);
+      expect(screen.getByText("counted outlet")).toBeInTheDocument();
+    });
+  });
+
   it("mounts SavedDataAutoLoader only with raw access (owner and legacy, never an employee)", () => {
     const { unmount } = renderAt("/", authFor(USER), OWNER());
     expect(screen.getByTestId("saved-data-auto-loader")).toBeInTheDocument();
@@ -296,8 +354,33 @@ describe("AppSidebar", () => {
 
   it("owner sees every page plus the Administration group", () => {
     renderSidebar(OWNER());
-    expect(linkNames()).toEqual([...ALL_PAGES, "Members", "Roles", "Audit log"]);
+    expect(linkNames()).toEqual([...ALL_PAGES, "Members", "Roles", "Audit log", "Funnel coverage"]);
     expect(screen.getByText("Administration")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Funnel coverage" })).toHaveAttribute("href", "/admin/funnels");
+  });
+
+  it("funnels.manage alone (scope all) opens the Administration group with Funnel coverage only", () => {
+    renderSidebar(member(["funnels.view", "funnels.manage"]));
+    expect(screen.getByText("Administration")).toBeInTheDocument();
+    expect(linkNames()).toEqual(["Funnels", "Funnel coverage"]);
+  });
+
+  it("a restricted media buyer sees exactly the four media-buyer pages and no Administration", () => {
+    renderSidebar(BUYER_A());
+    expect(linkNames()).toEqual(["Dashboard", "Cohorts", "Funnels", "FB-Analytics"]);
+    expect(screen.queryByText("Administration")).toBeNull();
+  });
+
+  it("a restricted member never sees a page outside the ready set, whatever the role grants", () => {
+    renderSidebar(member(
+      ["dashboard.view", "cohorts.view", "reports.view", "support.view", "forecasting.view", "transactions.view", "users.view", "users.pii.view", "funnels.manage", "admin.users.view"],
+      { mode: "selected" },
+    ));
+    expect(linkNames()).toEqual(["Dashboard", "Cohorts"]);
+    expect(screen.queryByText("Administration")).toBeNull();
+    cleanup();
+    renderSidebar(member(["reports.view", "support.view"], { mode: "none" }));
+    expect(linkNames()).toEqual([]);
   });
 
   it("legacy keeps today's sidebar: every page, no Administration group", () => {
@@ -320,7 +403,8 @@ describe("AppSidebar", () => {
   it("shows only the admin pages the member may open", () => {
     renderSidebar(member(["admin.users.view", "dashboard.view"]));
     expect(screen.getByText("Administration")).toBeInTheDocument();
-    expect(linkNames()).toEqual(["Dashboard", "Members"]);
+    // Funnel coverage opens with admin.users.view (read-only) or funnels.manage.
+    expect(linkNames()).toEqual(["Dashboard", "Members", "Funnel coverage"]);
     cleanup();
     renderSidebar(member(["admin.audit.view"]));
     expect(linkNames()).toEqual(["Audit log"]);
@@ -332,11 +416,29 @@ describe("AppSidebar", () => {
     expect(screen.queryByText("Workspace")).toBeNull();
   });
 
-  it("prefetches Cohorts on hover keyed by the access partition", () => {
-    renderSidebar(member(["cohorts.view"], { partition: "p-buyer" }));
+  it("prefetches Cohorts on hover keyed by the access partition (data owner)", () => {
+    renderSidebar(OWNER());
     fireEvent.mouseEnter(screen.getByRole("link", { name: "Cohorts" }));
     expect(shell.prefetchCohortsNav).toHaveBeenCalledTimes(1);
-    expect(shell.prefetchCohortsNav).toHaveBeenCalledWith(expect.any(QueryClient), "p-buyer", expect.any(Number));
+    expect(shell.prefetchCohortsNav).toHaveBeenCalledWith(expect.any(QueryClient), "p-owner", expect.any(Number));
+  });
+
+  it("prefetches Cohorts for a scope-all member too, keyed by their partition (pre-Phase-2 behaviour)", () => {
+    renderSidebar(member(["cohorts.view"], { partition: "p-viewer" }));
+    fireEvent.mouseEnter(screen.getByRole("link", { name: "Cohorts" }));
+    expect(shell.prefetchCohortsNav).toHaveBeenCalledTimes(1);
+    expect(shell.prefetchCohortsNav).toHaveBeenCalledWith(expect.any(QueryClient), "p-viewer", expect.any(Number));
+  });
+
+  it("never prefetches Cohorts for a funnel-restricted member (selected or none)", () => {
+    for (const access of [BUYER_A(), member(["cohorts.view"], { mode: "none", partition: "p-none" })]) {
+      expect(access.restricted).toBe(true);
+      renderSidebar(access);
+      fireEvent.mouseEnter(screen.getByRole("link", { name: "Cohorts" }));
+      fireEvent.focus(screen.getByRole("link", { name: "Cohorts" }));
+      cleanup();
+    }
+    expect(shell.prefetchCohortsNav).not.toHaveBeenCalled();
   });
 
   it("legacy prefetch uses the legacy partition", () => {
@@ -394,6 +496,15 @@ describe("AppLayout", () => {
     renderLayout(member(["dashboard.view", "ai.use"]));
     expect(screen.getByTestId("ai-drawer")).toBeInTheDocument();
     expect(screen.queryByText(/sample data mode/i)).toBeNull();
+  });
+
+  it("hides AI from a funnel-restricted member even with ai.use (Phase 2.4)", () => {
+    const buyer = BUYER_A();
+    expect(buyer.can("ai.use")).toBe(true);
+    renderLayout(buyer);
+    expect(screen.queryByRole("button", { name: /^ai$/i })).toBeNull();
+    expect(screen.queryByTestId("ai-drawer")).toBeNull();
+    expect(screen.getByText("content")).toBeInTheDocument();
   });
 });
 
@@ -468,7 +579,7 @@ describe("AccessErrorBridge", () => {
   });
 
   it("covers every 403 access code of the contract", async () => {
-    for (const code of ["no_membership", "membership_disabled", "permission_denied", "scope_not_supported", "raw_access_required"]) {
+    for (const code of ["no_membership", "membership_disabled", "permission_denied", "scope_not_supported", "raw_access_required", "funnel_out_of_scope"]) {
       const { client, refresh } = renderBridge();
       await failQuery(client, edgeError(403, code));
       await waitFor(() => expect(refresh, code).toHaveBeenCalledTimes(1));
@@ -491,6 +602,23 @@ describe("AccessErrorBridge", () => {
     const observer = new MutationObserver(client, { mutationFn: async () => { throw edgeError(403, "raw_access_required"); } });
     await observer.mutate().catch(() => undefined);
     await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+  });
+
+  it("refreshes access on 403 funnel_out_of_scope (the funnel scope probably changed), never signs out", async () => {
+    const { client, signOut, refresh } = renderBridge();
+    await failQuery(client, edgeError(403, "funnel_out_of_scope"));
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+    expect(signOut).not.toHaveBeenCalled();
+  });
+
+  it("does nothing for 409 scope_snapshot_not_ready (the page polls; never a sign-out or refresh)", async () => {
+    const { client, signOut, refresh } = renderBridge();
+    for (let i = 0; i < 3; i += 1) await failQuery(client, edgeError(409, "scope_snapshot_not_ready"));
+    const observer = new MutationObserver(client, { mutationFn: async () => { throw edgeError(409, "scope_snapshot_not_ready"); } });
+    await observer.mutate().catch(() => undefined);
+    await settle();
+    expect(signOut).not.toHaveBeenCalled();
+    expect(refresh).not.toHaveBeenCalled();
   });
 
   it("does nothing for 503 auth/access service errors (never signs out)", async () => {
@@ -530,6 +658,65 @@ describe("AccessErrorBridge", () => {
   });
 });
 
+describe("FunnelPathChips", () => {
+  const PATHS = [
+    { path: "soulmate-sketch-v2", status: "proposed" },
+    { path: "soulmate-sketch", status: "retired" },
+    { path: "soulmate-1-tariff-month-veb", status: "active" },
+    { path: "soulmate-old", status: "revoked" },
+    { path: "soulmate-a", status: "active" },
+  ] as const;
+  const chips = () => screen.queryAllByTestId("funnel-path-chip").map((chip) => [chip.getAttribute("data-status"), chip.textContent]);
+
+  it("shows the granting paths by default: active first, retired with a muted (old) badge", () => {
+    render(<FunnelPathChips paths={PATHS} />);
+    expect(chips()).toEqual([
+      ["active", "soulmate-1-tariff-month-veb"],
+      ["active", "soulmate-a"],
+      ["retired", "soulmate-sketch(old)"],
+    ]);
+  });
+
+  it("showInactive adds proposed and revoked rows after them", () => {
+    render(<FunnelPathChips paths={PATHS} showInactive />);
+    expect(chips().map(([status]) => status)).toEqual(["active", "active", "retired", "proposed", "revoked"]);
+    expect(screen.getByText("(proposed)")).toBeInTheDocument();
+    expect(screen.getByText("(revoked)")).toBeInTheDocument();
+  });
+
+  it("renders a dash when nothing grants access", () => {
+    render(<FunnelPathChips paths={[{ path: "x-y", status: "proposed" }]} />);
+    expect(chips()).toEqual([]);
+    expect(screen.getByText("—")).toBeInTheDocument();
+  });
+});
+
+describe("typed Edge errors: Phase-2 scope codes", () => {
+  const PHASE2 = [
+    { status: 409, code: "scope_snapshot_not_ready" },
+    { status: 403, code: "funnel_out_of_scope" },
+  ] as const;
+
+  it("are access errors, so they are never retried and never fall back", () => {
+    for (const { status, code } of PHASE2) {
+      const error = new clickhouse.ClickHouseRequestError(`ClickHouse Edge Function failed: ${ACCESS_ERROR_MESSAGES[code]}`, { status, errorCode: code, requestId: "req-1" });
+      expect(clickhouse.isAccessError(error), code).toBe(true);
+      expect(clickhouse.isAccessErrorCode(code), code).toBe(true);
+      expect(clickhouse.isAccessServiceError(error), code).toBe(false);
+    }
+  });
+
+  it("never open the ClickHouse breaker, even with a transport-shaped message", () => {
+    for (const { status, code } of PHASE2) {
+      for (const message of [ACCESS_ERROR_MESSAGES[code], "upstream connect error: connection reset (timeout)"]) {
+        expect(clickhouse.shouldOpenClickHouseCircuit({ status, errorCode: code, message }), `${code}: ${message}`).toBe(false);
+      }
+      // The gate's own copy for these codes is not breaker-shaped either.
+      expect(clickhouse.isWarehouseDownError(ACCESS_ERROR_MESSAGES[code]), code).toBe(false);
+    }
+  });
+});
+
 describe("App.tsx routes (static)", () => {
   it("every protected route is wrapped in RequirePermission with its own path, admin routes included", () => {
     const source = readFileSync(resolve(process.cwd(), "src/App.tsx"), "utf8");
@@ -542,10 +729,10 @@ describe("App.tsx routes (static)", () => {
     for (const [, path, element] of routes) {
       expect(element, path).toMatch(new RegExp(`^<RequirePermission route="${path.replace(/[/-]/g, "\\$&")}">`));
     }
-    for (const path of ["/admin/members", "/admin/roles", "/admin/audit"]) {
+    for (const path of ["/admin/members", "/admin/roles", "/admin/audit", "/admin/funnels"]) {
       expect(routes.map((match) => match[1])).toContain(path);
     }
-    for (const page of ["AdminMembers", "AdminRoles", "AdminAudit"]) {
+    for (const page of ["AdminMembers", "AdminRoles", "AdminAudit", "AdminFunnelCoverage"]) {
       expect(source).toContain(`import("./pages/admin/${page}.tsx")`);
     }
   });
@@ -561,9 +748,14 @@ describe("App.tsx routes (static)", () => {
 
 // The admin pages are created in parallel by the admin UI track; Vite cannot
 // transform App.tsx (it resolves every lazy import) until they exist.
-const ADMIN_PAGES_PRESENT = ["AdminMembers", "AdminRoles", "AdminAudit"].every((page) =>
-  existsSync(resolve(process.cwd(), `src/pages/admin/${page}.tsx`)),
-);
+const ADMIN_PAGES_PRESENT = [
+  ...new Set([
+    "AdminMembers",
+    "AdminRoles",
+    "AdminAudit",
+    ...[...readFileSync(resolve(process.cwd(), "src/App.tsx"), "utf8").matchAll(/import\("\.\/pages\/admin\/(\w+)\.tsx"\)/g)].map((match) => match[1]),
+  ]),
+].every((page) => existsSync(resolve(process.cwd(), `src/pages/admin/${page}.tsx`)));
 
 describe.runIf(ADMIN_PAGES_PRESENT)("App", () => {
   let App: ComponentType;
@@ -645,6 +837,34 @@ describe.runIf(ADMIN_PAGES_PRESENT)("App", () => {
     renderApp("/admin/audit");
     expect(await screen.findByTestId("no-access")).toBeInTheDocument();
     expect(screen.queryByText(/admin audit page/)).toBeNull();
+  });
+
+  it("a restricted media buyer opens the four media-buyer pages; other granted pages show the scope copy", async () => {
+    accessValue = member([...MEDIA_BUYER_KEYS, "reports.view"], { mode: "selected", partition: "p-buyer-a" });
+    renderApp("/fb-analytics");
+    expect(await screen.findByText("fb analytics page")).toBeInTheDocument();
+    expect(screen.queryByTestId("saved-data-auto-loader")).toBeNull();
+    cleanup();
+
+    renderApp("/reports");
+    // The denial renders inside the (lazy) app shell: wait for the sidebar.
+    expect(await screen.findByRole("link", { name: "FB-Analytics" })).toBeInTheDocument();
+    const panel = screen.getByTestId("no-access");
+    expect(panel).toHaveAttribute("data-reason", "scope");
+    expect(within(panel).getByText(RESTRICTED_SCOPE_DENIAL_COPY)).toBeInTheDocument();
+    expect(screen.queryByText("reports page")).toBeNull();
+    const nav = screen.getAllByRole("link").map((link) => link.textContent).filter((name) => name !== "Go to an available page");
+    expect(nav).toEqual(["Dashboard", "Cohorts", "Funnels", "FB-Analytics"]);
+    cleanup();
+
+    renderApp("/admin/funnels");
+    expect(await screen.findByTestId("no-access")).toBeInTheDocument();
+    expect(screen.queryByText(/admin funnel coverage page/)).toBeNull();
+  });
+
+  it("owner opens the funnel coverage admin page", async () => {
+    renderApp("/admin/funnels");
+    expect(await screen.findByText(/admin funnel coverage page/)).toBeInTheDocument();
   });
 
   it("no membership replaces the whole app with the full-page NoAccess", async () => {

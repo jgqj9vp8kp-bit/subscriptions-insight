@@ -78,6 +78,10 @@ describe("funnels service", () => {
           created_at: "2026-07-01T00:00:00Z",
           updated_at: "2026-07-02T00:00:00Z",
           funnel_tags: [{ tags: { id: "t1", name: "Live", created_by: "user-1", created_at: "2026-06-01T00:00:00Z" } }],
+          funnel_paths: [
+            { id: 7, path_canonical: "soulmate-sketch", status: "active" },
+            { id: 8, path_canonical: "x", status: "bogus" },
+          ],
         },
         {
           id: "f2",
@@ -105,13 +109,17 @@ describe("funnels service", () => {
       "trial_price,trial_currency,trial_duration_days,subscription_price,subscription_currency," +
       "billing_period,upsells,default_language,default_currency,geo_localization,destination," +
       "product,traffic_sources,passport_notes," +
-      "funnel_tags(tags(id,name,created_by,created_at))",
+      "funnel_tags(tags(id,name,created_by,created_at)),funnel_paths(id,path_canonical,status)",
     );
     expect(builder.order).toHaveBeenCalledWith("created_at", { ascending: false });
     expect(result).toHaveLength(2);
     expect(result[0].tags).toEqual([{ id: "t1", name: "Live", created_by: "user-1", created_at: "2026-06-01T00:00:00Z" }]);
     expect(result[0]).not.toHaveProperty("funnel_tags");
     expect(result[1].tags).toEqual([]);
+    // funnel_paths (access Phase 2): ids as strings, unknown statuses dropped.
+    expect(result[0].paths).toEqual([{ id: "7", path: "soulmate-sketch", status: "active" }]);
+    expect(result[0]).not.toHaveProperty("funnel_paths");
+    expect(result[1].paths).toEqual([]);
   });
 
   it("listFunnels: surfaces the Supabase error with a descriptive prefix", async () => {
@@ -147,6 +155,14 @@ describe("funnels service", () => {
     await expect(createFunnel({ funnel_path: "soulmate-sketch", display_name: "x" })).rejects.toThrow(
       'A funnel with path "soulmate-sketch" already exists.',
     );
+  });
+
+  it("createFunnel: the registry triggers' P0001 invalid / conflict errors lose their code prefix", async () => {
+    fromMock.mockReturnValueOnce(fakeBuilder({ data: null, error: { code: "P0001", message: "invalid: funnel_path has no canonical campaign_path form" } }));
+    fromMock.mockReturnValueOnce(fakeBuilder({ data: null, error: { code: "P0001", message: "conflict: path past-life already belongs to another funnel" } }));
+    const { createFunnel } = await importFunnels();
+    await expect(createFunnel({ funnel_path: "тест", display_name: "x" })).rejects.toThrow("Funnel_path has no canonical campaign_path form.");
+    await expect(createFunnel({ funnel_path: "past-life", display_name: "x" })).rejects.toThrow("Path past-life already belongs to another funnel.");
   });
 
   it("updateFunnelDisplayName: does not touch funnel_path — only display_name is in the update payload", async () => {
@@ -331,8 +347,10 @@ describe("FunnelFox import", () => {
       error: null,
     });
     const createdTagBuilder = fakeBuilder({ data: { id: "t-web", name: "WEB", created_by: null, created_at: "t" }, error: null });
-    // listTags (x2: before-count + ensureTags), createTag("WEB"), insert funnels
+    // granted funnel_paths (pre-filter), listTags (x2: before-count + ensureTags),
+    // createTag("WEB"), insert funnels
     fromMock
+      .mockReturnValueOnce(fakeBuilder({ data: [], error: null }))
       .mockReturnValueOnce(tagsBuilder)
       .mockReturnValueOnce(tagsBuilder)
       .mockReturnValueOnce(createdTagBuilder)
@@ -344,6 +362,7 @@ describe("FunnelFox import", () => {
     // traffic, which the recompute (button/cron) determines afterwards.
     const result = await importFunnelFoxFunnels([funnelFoxFunnel({ status: "published" })]);
 
+    expect(fromMock.mock.calls[0][0]).toBe("funnel_paths");
     expect(insertBuilder.insert).toHaveBeenCalledWith([
       {
         funnel_path: "soulmate-sketch-en",

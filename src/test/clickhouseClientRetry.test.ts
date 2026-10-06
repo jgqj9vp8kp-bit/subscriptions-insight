@@ -19,8 +19,8 @@ function okResponse(body: string) {
   return { ok: true, status: 200, text: () => Promise.resolve(body) } as unknown as Response;
 }
 
-function httpResponse(status: number, body = "boom") {
-  return { ok: false, status, text: () => Promise.resolve(body) } as unknown as Response;
+function httpResponse(status: number, body = "boom", headers?: Record<string, string>) {
+  return { ok: false, status, text: () => Promise.resolve(body), ...(headers ? { headers: new Headers(headers) } : {}) } as unknown as Response;
 }
 
 const reset = () => new TypeError(
@@ -120,5 +120,87 @@ describe("writes are never retried (duplicate-row safety)", () => {
   it("an empty insert never touches the network", async () => {
     await run(client().insert({ table: "t", values: [] }));
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+// ---- access Phase 2: restricted-read settings, query_id, abort (spec §3.4) ---------------
+
+describe("restricted-read transport options", () => {
+  const RESTRICTED = {
+    max_execution_time: 20,
+    timeout_overflow_mode: "throw",
+    max_memory_usage: 4e9,
+    readonly: 2,
+    cancel_http_readonly_queries_on_client_close: 1,
+  };
+
+  it("a plain read sends exactly the Phase-1 request (database + param_* only, no signal)", async () => {
+    fetchMock.mockResolvedValue(okResponse(""));
+    await run(client().query({ query: "SELECT {a:String}", query_params: { a: "x", auth_user_id: "t" }, format: "JSONEachRow" }));
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect([...new URL(url).searchParams.keys()].sort()).toEqual(["database", "param_a", "param_auth_user_id"]);
+    expect(Object.keys(init).sort()).toEqual(["body", "headers", "method"]);
+  });
+
+  it("sends settings as plain URL params, the query_id, and passes the abort signal to fetch", async () => {
+    fetchMock.mockResolvedValue(okResponse(""));
+    const controller = new AbortController();
+    await run(client().query({ query: "SELECT 1", query_params: { p: "v" }, settings: RESTRICTED, query_id: "sub_req_1", signal: controller.signal }));
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const search = new URL(url).searchParams;
+    expect(Object.fromEntries(search.entries())).toEqual({
+      database: "default",
+      param_p: "v",
+      max_execution_time: "20",
+      timeout_overflow_mode: "throw",
+      max_memory_usage: "4000000000",
+      readonly: "2",
+      cancel_http_readonly_queries_on_client_close: "1",
+      query_id: "sub_req_1",
+    });
+    expect(init.signal).toBe(controller.signal);
+  });
+
+  it("refuses a setting outside the allowlist instead of forwarding it", async () => {
+    fetchMock.mockResolvedValue(okResponse(""));
+    await expect(run(client().query({ query: "SELECT 1", settings: { max_threads: 64 } }))).rejects.toThrow(/not allowed/);
+    await expect(run(client().query({ query: "SELECT 1", settings: { param_auth_user_id: "x" } }))).rejects.toThrow(/not allowed/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["159", "241", "158", "396", "394"])("does not retry a restricted read's 500 carrying exception code %s", async (code) => {
+    fetchMock.mockResolvedValue(httpResponse(500, "Code: limit", { "X-ClickHouse-Exception-Code": code }));
+    await expect(run(client().query({ query: "SELECT 1", settings: RESTRICTED }))).rejects.toThrow(/HTTP 500/);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  // Owner-regression review: the no-retry rule is for the restricted reads'
+  // own fixed limits. An owner / cron read (no settings) keeps the Phase-1
+  // retry — a total-memory 241 under a concurrent rebuild is transient for it.
+  it.each(["159", "241", "158", "396", "394"])("still retries an owner read (no settings) whose 500 carries exception code %s", async (code) => {
+    fetchMock
+      .mockResolvedValueOnce(httpResponse(500, "Code: limit", { "X-ClickHouse-Exception-Code": code }))
+      .mockResolvedValueOnce(httpResponse(500, "Code: limit", { "X-ClickHouse-Exception-Code": code }))
+      .mockResolvedValueOnce(okResponse("{}"));
+    await run(client().query({ query: "SELECT 1" }));
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("still retries a 500 with any other (or no) exception code", async () => {
+    fetchMock.mockResolvedValueOnce(httpResponse(500, "x", { "X-ClickHouse-Exception-Code": "210" })).mockResolvedValueOnce(okResponse("{}"));
+    await run(client().query({ query: "SELECT 1" }));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("never retries an aborted read", async () => {
+    const controller = new AbortController();
+    fetchMock.mockImplementation(async () => {
+      controller.abort();
+      throw Object.assign(new Error("The operation was aborted."), { name: "AbortError" });
+    });
+    const error = await runExpectingError(client().query({ query: "SELECT 1", signal: controller.signal }));
+    expect(error.name).toBe("AbortError");
+    expect(error.message).toBe("ClickHouse request aborted.");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });

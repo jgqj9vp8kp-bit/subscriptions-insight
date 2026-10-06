@@ -5,7 +5,8 @@
 
 import { useEffect, useMemo } from "react";
 import { keepPreviousData, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
-import { getClickHouseSummary } from "@/services/clickhouse";
+import { ClickHouseRequestError, getClickHouseSummary } from "@/services/clickhouse";
+import { SCOPE_PENDING_POLL_MS, SCOPE_SNAPSHOT_NOT_READY } from "@/components/access/ScopeDataPending";
 import { loadCohortsFromClickHouse, cohortFilterReproductionStatus, type CohortsSourceResult } from "@/services/cohortsDataSource";
 import { cohortsListKey, normalizeCohortRequest, warehouseVersionFromSummary } from "@/services/cohortsCache";
 import { warehouseVersionKey } from "@/services/analyticsCache";
@@ -40,6 +41,11 @@ function activeFilterFlags(request: CohortRequest) {
 export interface CohortsStatus {
   loading: boolean;
   error: string | null;
+  /** The gate's error_code of a failed request (ClickHouseRequestError), e.g.
+   * scope_snapshot_not_ready (409, polled) or scope_not_supported (403). */
+  errorCode: string | null;
+  /** HTTP status of a failed request (ClickHouseRequestError). */
+  errorStatus: number | null;
   durationMs: number | null;
   subStatus: string | null;
   applicable: boolean;
@@ -106,11 +112,18 @@ export function useCohortsListQuery(params: {
     retry: transientRetry,
     refetchOnWindowFocus: false,
     refetchOnReconnect: true,
+    // A funnel-restricted member's scoped snapshot is being prepared (409):
+    // ask again every minute until it is ready.
+    refetchInterval: (current) =>
+      current.state.error instanceof ClickHouseRequestError && current.state.error.errorCode === SCOPE_SNAPSHOT_NOT_READY
+        ? SCOPE_PENDING_POLL_MS
+        : false,
   });
 
   const data = (query.data as CohortsSourceResult | undefined) ?? null;
   const hasData = data != null;
   const errorMessage = query.isError ? (query.error instanceof Error ? query.error.message : "ClickHouse cohorts request failed") : null;
+  const typedError = query.isError && query.error instanceof ClickHouseRequestError ? query.error : null;
   const normalizedRequest = useMemo(() => normalizeCohortRequest(request), [request]);
   const activeFilters = useMemo(() => {
     const filters = normalizedRequest;
@@ -172,6 +185,8 @@ export function useCohortsListQuery(params: {
     chStatus: {
       loading: query.isFetching && enabled,
       error: errorMessage,
+      errorCode: typedError?.errorCode ?? null,
+      errorStatus: typedError?.status ?? null,
       durationMs: data?.durationMs ?? null,
       subStatus: data?.subscriptionDataStatus ?? null,
       applicable,

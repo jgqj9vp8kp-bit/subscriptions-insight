@@ -8,6 +8,7 @@
 // effective permissions come from effectivePermissions() in the shared catalog
 // (owner ⇒ every enforced key; planned keys never; requiresFullScope keys only
 // with funnel scope "all"), and every non-ok, non-legacy state grants nothing.
+// `restricted` mirrors the gate's ctx.restricted (funnel scope is not "all").
 
 import { createContext } from "react";
 import type { MyAccess, MyAccessStatus } from "@/services/accessClient";
@@ -17,6 +18,12 @@ import { effectivePermissions } from "../../supabase/functions/_shared/access/pe
  * for the current user in flight) and "signed_out" (no auth user). Neither
  * grants anything. */
 export type AccessStatus = MyAccessStatus | "loading" | "signed_out";
+
+export type AccessFunnelScope = {
+  mode: "all" | "selected" | "none";
+  funnelIds: string[];
+  paths: string[];
+};
 
 export type AccessContextValue = {
   /** True until the first resolution for the current user (or while auth loads). */
@@ -31,6 +38,15 @@ export type AccessContextValue = {
    * "legacy:" + user id; "" whenever no data may be loaded (loading, signed
    * out, no membership, disabled, error). */
   partition: string;
+  /** Funnel-restricted member: a resolved membership whose funnel scope is not
+   * "all" (Phase 2). Such a member may open only the RESTRICTED_READY_ROUTES
+   * pages, and the AI features stay hidden. Legacy and every non-ok status ⇒
+   * false (they are gated by status instead). */
+  restricted: boolean;
+  /** The member's funnel scope as the server resolved it (paths = active and
+   * retired canonical campaign paths of the selected funnels; display and
+   * client-side option filtering only). null unless status is "ok". */
+  funnelScope: AccessFunnelScope | null;
   /** Effective permissions (legacy ⇒ every enforced key). */
   permissions: Set<string>;
   /** Legacy ⇒ true for any key; otherwise only effective keys of an ok status. */
@@ -97,6 +113,18 @@ export function buildAccessValue(input: {
     permissions = new Set<string>();
   }
 
+  // Fail closed: a resolved membership is restricted unless the server says
+  // "all" (a missing scope row means "none", plan §9). Legacy is the owner.
+  const restricted = status === "ok" && access?.funnel_scope?.mode !== "all";
+  const scopeRow = status === "ok" ? access?.funnel_scope ?? null : null;
+  const funnelScope: AccessFunnelScope | null = scopeRow
+    ? {
+      mode: scopeRow.mode === "all" || scopeRow.mode === "selected" ? scopeRow.mode : "none",
+      funnelIds: Array.isArray(scopeRow.funnel_ids) ? [...scopeRow.funnel_ids] : [],
+      paths: Array.isArray(scopeRow.paths) ? [...scopeRow.paths] : [],
+    }
+    : null;
+
   const granted = status === "ok" && permissions.size > 0;
   const can = (key: string) => legacy || (granted && permissions.has(key));
   const canAny = (keys: readonly string[]) => Array.isArray(keys) && keys.some((key) => can(key));
@@ -108,6 +136,8 @@ export function buildAccessValue(input: {
     legacy,
     rawAccess,
     partition,
+    restricted,
+    funnelScope,
     permissions,
     can,
     canAny,

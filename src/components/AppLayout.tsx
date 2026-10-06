@@ -31,8 +31,9 @@ export function AppLayout({ title, description, actions, children }: AppLayoutPr
   // auto-loader for rawAccess only) and only they can import, so for anyone
   // else "mock" says nothing about the numbers on screen.
   const isSampleData = access.rawAccess && shouldShowSampleDataBanner(dataStoreSource, location.pathname);
-  // UX gate; ai-analytics itself requires ai.use. Legacy ⇒ true (today).
-  const canUseAi = access.can("ai.use");
+  // UX gate; ai-analytics itself requires ai.use. Legacy ⇒ true (today). AI is
+  // hidden from funnel-restricted members until it is scoped (Phase 2.4).
+  const canUseAi = access.can("ai.use") && !access.restricted;
 
   useEffect(() => {
     document.title = title ? `${title} • Subengine` : "Subengine";

@@ -9,6 +9,7 @@ import {
   BUILD_ID_FILE,
   checkCliDataKeyOutput,
   checkDataKeyResponse,
+  checkFunnelPathsResponse,
   DATA_KEY_CHECK_SQL_FILE,
   diffFunctionSets,
   generateBuildId,
@@ -56,7 +57,7 @@ describe("pure helpers", () => {
   });
 
   it("reads the CLI pre-check output (rows JSON, stderr noise, failures)", () => {
-    const ok = JSON.stringify({ boundary: "b", rows: [{ data_key: DATA_KEY }], warning: "w" });
+    const ok = JSON.stringify({ boundary: "b", rows: [{ data_key: DATA_KEY, funnel_paths: true }], warning: "w" });
     expect(checkCliDataKeyOutput(0, ok, "Initialising login role...")).toEqual({ ok: true, dataKey: DATA_KEY });
     expect(checkCliDataKeyOutput(0, `Initialising login role...\n${ok}`, "")).toEqual({ ok: true, dataKey: DATA_KEY });
     expect(checkCliDataKeyOutput(0, JSON.stringify({ rows: [{ data_key: null }] }), "").reason).toMatch(/not bootstrapped/);
@@ -65,7 +66,21 @@ describe("pure helpers", () => {
     expect(checkCliDataKeyOutput(0, "not json", "").ok).toBe(false);
     expect(checkCliDataKeyOutput(1, "", "ERROR: function public.workspace_data_key() does not exist").reason).toMatch(/apply 202610050001 and 202610050002/);
     expect(checkCliDataKeyOutput(1, "", "Access token not provided").reason).toMatch(/supabase db query failed/);
-    expect(readFileSync(resolve(ROOT, DATA_KEY_CHECK_SQL_FILE), "utf8")).toMatch(/select public\.workspace_data_key\(\)::text as data_key;/);
+    // Access Phase 2: the functions embed funnel_paths, so 202610060001 comes first.
+    for (const funnelPaths of [false, null, undefined]) {
+      expect(checkCliDataKeyOutput(0, JSON.stringify({ rows: [{ data_key: DATA_KEY, funnel_paths: funnelPaths }] }), "").reason).toMatch(/apply 202610060001_access_phase2_scope\.sql first/);
+    }
+    const sql = readFileSync(resolve(ROOT, DATA_KEY_CHECK_SQL_FILE), "utf8");
+    expect(sql).toMatch(/select public\.workspace_data_key\(\)::text as data_key,/);
+    expect(sql).toMatch(/to_regclass\('public\.funnel_paths'\) is not null as funnel_paths;/);
+  });
+
+  it("reads the PostgREST funnel_paths probe (service-key pre-check)", () => {
+    expect(checkFunnelPathsResponse(200, "[]")).toEqual({ ok: true });
+    expect(checkFunnelPathsResponse(206, "[]")).toEqual({ ok: true });
+    expect(checkFunnelPathsResponse(404, '{"code":"PGRST205","message":"Could not find the table \'public.funnel_paths\' in the schema cache"}').reason).toMatch(/apply 202610060001/);
+    expect(checkFunnelPathsResponse(400, '{"code":"42P01","message":"relation \\"public.funnel_paths\\" does not exist"}').reason).toMatch(/apply 202610060001/);
+    expect(checkFunnelPathsResponse(500, "boom").reason).toMatch(/funnel_paths check failed with HTTP 500/);
   });
 
   it("runs the pinned CLI through npx when no supabase binary is installed", () => {
@@ -122,7 +137,10 @@ function harness(options: {
   /** CLI pre-check (no service key): the data key the query returns, or a failure. */
   cliDataKey?: string | null;
   cliFailure?: { code: number; stderr: string };
+  /** Migration 202610060001 applied (public.funnel_paths exists); default true. */
+  funnelPaths?: boolean;
 } = {}) {
+  const funnelPaths = options.funnelPaths ?? true;
   const files = new Map<string, string>([[resolve(ROOT, BUILD_ID_FILE), BUILD_ID_SOURCE]]);
   const lines: string[] = [];
   let deployed = [...(options.deployed ?? [...REPO, "funnelfox-endpoint-probe"])];
@@ -132,7 +150,7 @@ function harness(options: {
     if (args[0] === "db" && args[1] === "query") {
       if (options.cliFailure) return { code: options.cliFailure.code, stdout: "", stderr: options.cliFailure.stderr };
       const value = options.cliDataKey === undefined ? DATA_KEY : options.cliDataKey;
-      return { code: 0, stdout: JSON.stringify({ boundary: "b", rows: [{ data_key: value }], warning: "untrusted" }), stderr: "Initialising login role...\n" };
+      return { code: 0, stdout: JSON.stringify({ boundary: "b", rows: [{ data_key: value, funnel_paths: funnelPaths }], warning: "untrusted" }), stderr: "Initialising login role...\n" };
     }
     const [, sub, fn] = args;
     if (sub === "list") return { code: 0, stdout: JSON.stringify(deployed.map((slug) => ({ slug }))), stderr: "" };
@@ -152,6 +170,12 @@ function harness(options: {
     if (url.endsWith("/rest/v1/rpc/workspace_data_key")) {
       const value = options.dataKey === undefined ? DATA_KEY : options.dataKey;
       return new Response(JSON.stringify(value), { status: options.dataKeyStatus ?? 200 });
+    }
+    if (url.endsWith("/rest/v1/funnel_paths?select=id&limit=1")) {
+      expect(init.method).toBe("GET");
+      return funnelPaths
+        ? new Response("[]", { status: 200 })
+        : new Response(JSON.stringify({ code: "PGRST205", message: "Could not find the table 'public.funnel_paths' in the schema cache" }), { status: 404 });
     }
     expect(init.method).toBe("OPTIONS");
     const fn = url.split("/functions/v1/")[1];
@@ -192,6 +216,19 @@ describe("runDeploy", () => {
       expect(h.deletes()).toEqual([]);
       expect(h.lines.join("\n")).toMatch(/REFUSED/);
       expect(h.fetchFn.mock.calls.filter(([url]) => String(url).includes("/rest/v1/"))).toEqual([]);
+    }
+  });
+
+  it("refuses to deploy before migration 202610060001 (the access function embeds funnel_paths), both pre-check routes", async () => {
+    for (const env of [{ SUPABASE_SERVICE_ROLE_KEY: "service-key" }, {}]) {
+      const h = harness({ funnelPaths: false });
+      expect(await runDeploy(["--project-ref", "ref"], { ...h.deps, env })).toBe(1);
+      expect(h.deploys()).toEqual([]);
+      expect(h.deletes()).toEqual([]);
+      expect(h.lines.join("\n")).toMatch(/REFUSED: public\.funnel_paths does not exist: apply 202610060001_access_phase2_scope\.sql first/);
+      // --verify-only is gated the same way.
+      const verify = harness({ funnelPaths: false });
+      expect(await runDeploy(["--project-ref", "ref", "--verify-only"], { ...verify.deps, env })).toBe(1);
     }
   });
 

@@ -56,17 +56,26 @@ import { isAccessError } from "@/services/clickhouse";
 import {
   AccessAdminRequestError,
   describeAccessAdminError,
+  fetchMemberEffectiveAccess,
+  listAccessFunnels,
   listAccessMembers,
   listAccessAudit,
   updateAccessRole,
+  type AdminFunnelPath,
   type AdminMember,
   type AdminRole,
+  type EffectiveAccess,
+  type FunnelCoverage,
 } from "@/services/accessAdminClient";
 import {
   actorFromAccess,
+  auditEventLabel,
+  canonicalCampaignPath,
+  computeScopeImpact,
   defaultRoleId,
   describeAuditChanges,
   formatLastActive,
+  formatPct,
   funnelScopeLabel,
   grantableSubset,
   memberEditBlockReason,
@@ -75,10 +84,13 @@ import {
   roleAssignBlockReason,
   roleDeleteBlockReason,
   roleEditBlockReason,
+  scopeImpactSummary,
+  scopeWithoutData,
   togglePermission,
   type AdminActor,
   type AuditLookups,
 } from "@/components/admin/accessAdminModel";
+import { EffectiveAccessPanel } from "@/components/admin/EffectiveAccessPanel";
 import { FunnelScopePicker } from "@/components/admin/FunnelScopePicker";
 import AdminMembersPage from "@/pages/admin/AdminMembers";
 import AdminRolesPage from "@/pages/admin/AdminRoles";
@@ -152,17 +164,93 @@ function memberRow(overrides: Partial<AdminMember> & Pick<AdminMember, "id" | "u
   };
 }
 
+function funnelPath(id: string, funnelId: string, path: string, status: AdminFunnelPath["status"], source: AdminFunnelPath["source"] = "registry_seed"): AdminFunnelPath {
+  const granted = status === "active" || status === "retired";
+  return {
+    id,
+    funnel_id: funnelId,
+    path,
+    status,
+    source,
+    funnelfox_funnel_id: null,
+    note: "",
+    confirmed_at: granted ? "2026-10-06T00:00:00Z" : null,
+    retired_at: status === "retired" ? "2026-09-01T00:00:00Z" : null,
+    revoked_at: null,
+  };
+}
+
 const FUNNELS = [
-  { id: "f-1", funnel_path: "/soulmate-sketch", display_name: "Soulmate Sketch", is_active: true, tags: ["soulmate"] },
-  { id: "f-2", funnel_path: "/past-life", display_name: "Past Life", is_active: true, tags: ["esoteric", "past-life"] },
-  { id: "f-3", funnel_path: "/palm-reading", display_name: "Palm Reading", is_active: true, tags: ["esoteric"] },
-  { id: "f-4", funnel_path: "/old-quiz", display_name: "Old Quiz", is_active: false, tags: [] },
+  {
+    id: "f-1",
+    funnel_path: "/soulmate-sketch",
+    display_name: "Soulmate Sketch",
+    is_active: true,
+    tags: ["soulmate"],
+    paths: [funnelPath("1", "f-1", "soulmate-sketch", "active"), funnelPath("2", "f-1", "soulmate-1-tariff-month-veb", "proposed", "funnelfox_alias_seed")],
+  },
+  {
+    id: "f-2",
+    funnel_path: "/past-life",
+    display_name: "Past Life",
+    is_active: true,
+    tags: ["esoteric", "past-life"],
+    paths: [funnelPath("3", "f-2", "past-life", "active"), funnelPath("4", "f-2", "past-life-old", "retired")],
+  },
+  { id: "f-3", funnel_path: "/palm-reading", display_name: "Palm Reading", is_active: true, tags: ["esoteric"], paths: [funnelPath("5", "f-3", "palm-reading", "active")] },
+  { id: "f-4", funnel_path: "/old-quiz", display_name: "Old Quiz", is_active: false, tags: [], paths: [] },
 ];
+
+/** paths.coverage of the fixture registry: 1,000 real users, 90% on granted paths. */
+function coverageFixture(): FunnelCoverage {
+  const row = (path: string, users: number, net: number, extra: Partial<FunnelCoverage["paths"][number]>): FunnelCoverage["paths"][number] => ({
+    path,
+    users,
+    synthetic_users: 0,
+    net_revenue: net,
+    first_cohort_date: "2026-01-01",
+    last_cohort_date: "2026-10-01",
+    state: "unregistered",
+    funnel_id: null,
+    path_id: null,
+    path_status: null,
+    proposals: [],
+    users_since_retired: null,
+    ...extra,
+  });
+  return {
+    ok: true,
+    snapshot: { status: "current", warehouse_version: "wh-1", generated_at: "2026-10-06T00:00:00Z" },
+    totals: { users: 1000, synthetic_users: 20, registered_users: 900, registered_pct: 90, net_revenue: 50000, registered_net_revenue: 45000 },
+    paths: [
+      row("soulmate-sketch", 500, 25000, { state: "granted", funnel_id: "f-1", path_id: "1", path_status: "active", synthetic_users: 20 }),
+      row("past-life", 300, 15000, { state: "granted", funnel_id: "f-2", path_id: "3", path_status: "active" }),
+      row("past-life-old", 100, 5000, { state: "granted", funnel_id: "f-2", path_id: "4", path_status: "retired", users_since_retired: 7 }),
+      row("soulmate-1-tariff-month-veb", 60, 3000, { state: "proposed", path_status: "proposed", proposals: [{ path_id: "2", funnel_id: "f-1" }] }),
+      row("new-quiz", 30, 1500, {}),
+      row("unknown", 10, 500, { state: "unscopable" }),
+    ],
+    reuse_alerts: [{ path: "past-life-old", funnel_id: "f-2", path_id: "4", retired_at: "2026-09-01T00:00:00Z", users_since_retired: 7 }],
+    funnels: [
+      { funnel_id: "f-1", users: 500, net_revenue: 25000, granted_paths: 1 },
+      { funnel_id: "f-2", users: 400, net_revenue: 20000, granted_paths: 2 },
+      { funnel_id: "f-3", users: 0, net_revenue: 0, granted_paths: 1 },
+      { funnel_id: "f-4", users: 0, net_revenue: 0, granted_paths: 0 },
+    ],
+    registry_without_data: ["f-3", "f-4"],
+  };
+}
+
+function grantedPathsOf(funnelIds: readonly string[]): string[] {
+  return [...new Set(FUNNELS.filter((f) => funnelIds.includes(f.id)).flatMap((f) => f.paths.filter((p) => p.status === "active" || p.status === "retired").map((p) => p.path)))].sort();
+}
 
 interface FakeState {
   members: AdminMember[];
   roles: AdminRole[];
   audit: Json[];
+  /** null ⇒ paths.coverage answers 409 (no validated snapshot). */
+  coverage: FunnelCoverage | null;
 }
 
 let state: FakeState;
@@ -197,6 +285,7 @@ function freshState(): FakeState {
       memberRow({ id: "m-lena", user_id: "u-lena", email: "lena@example.com", status: "disabled", funnel_scope: { mode: "none", funnel_ids: [] } }),
     ],
     audit: [],
+    coverage: coverageFixture(),
   };
 }
 
@@ -211,6 +300,8 @@ function defaultHandler(action: string, body: Record<string, unknown>): { status
       return ok({ roles: state.roles });
     case "funnels.list":
       return ok({ funnels: FUNNELS });
+    case "paths.coverage":
+      return state.coverage ? ok({ ...state.coverage }) : { status: 409, body: { ok: false, error_code: "conflict", error: "The cohort snapshot is not ready." } };
     case "members.effective": {
       const member = state.members.find((entry) => entry.id === body.member_id);
       if (!member) return { status: 404, body: { ok: false, error_code: "not_found", error: "member not found" } };
@@ -225,7 +316,11 @@ function defaultHandler(action: string, body: Record<string, unknown>): { status
           role: member.role,
           permissions,
           raw_access: member.is_data_owner && active,
-          funnel_scope: { ...member.funnel_scope, names: member.funnel_scope.funnel_ids.map((id) => FUNNELS.find((f) => f.id === id)?.display_name ?? id) },
+          funnel_scope: {
+            ...member.funnel_scope,
+            names: member.funnel_scope.funnel_ids.map((id) => FUNNELS.find((f) => f.id === id)?.display_name ?? id),
+            paths: grantedPathsOf(member.funnel_scope.funnel_ids),
+          },
         },
       });
     }
@@ -362,6 +457,44 @@ describe("accessAdminClient", () => {
     expect(error.status).toBe(0);
     expect(isAccessError(error)).toBe(false);
   });
+
+  it("parses funnel_paths rows of funnels.list and drops rows with an unknown status", async () => {
+    backend.handler = () => ({
+      body: {
+        ok: true,
+        funnels: [
+          {
+            id: "f-9",
+            funnel_path: "/x",
+            display_name: "X",
+            is_active: true,
+            tags: [],
+            paths: [
+              { id: 7, path: "x", status: "active", source: "registry_seed", note: null },
+              { id: "8", path_canonical: "x-old", status: "retired", source: "registry", retired_at: "2026-09-01T00:00:00Z" },
+              { id: "9", path: "x-new", status: "granted", source: "registry" },
+            ],
+          },
+          { id: "f-10", funnel_path: "/y", display_name: "Y", is_active: false, tags: [] },
+        ],
+      },
+    });
+    const funnels = await listAccessFunnels();
+    expect(funnels[0].paths).toEqual([
+      { id: "7", funnel_id: "f-9", path: "x", status: "active", source: "registry_seed", funnelfox_funnel_id: null, note: "", confirmed_at: null, retired_at: null, revoked_at: null },
+      { id: "8", funnel_id: "f-9", path: "x-old", status: "retired", source: "registry", funnelfox_funnel_id: null, note: "", confirmed_at: null, retired_at: "2026-09-01T00:00:00Z", revoked_at: null },
+    ]);
+    expect(funnels[1].paths).toEqual([]);
+  });
+
+  it("reads the effective funnel_scope.paths (selected scopes only)", async () => {
+    const effective = await fetchMemberEffectiveAccess("m-ivan");
+    expect(effective.funnel_scope.paths).toEqual(["palm-reading", "past-life", "past-life-old", "soulmate-sketch"]);
+    backend.handler = () => ({
+      body: { ok: true, effective: { status: "active", role: {}, permissions: [], raw_access: false, funnel_scope: { mode: "all", funnel_ids: [], paths: ["x"] } } },
+    });
+    expect((await fetchMemberEffectiveAccess("m-x")).funnel_scope).toEqual({ mode: "all", funnel_ids: [], names: [], paths: [] });
+  });
 });
 
 // ---- view model ------------------------------------------------------------------------------
@@ -434,18 +567,89 @@ describe("accessAdminModel", () => {
   });
 
   it("previews pages with the same route rules as the member's own app", () => {
-    const viewer = previewPages({ status: "active", permissions: VIEWER_KEYS, raw_access: false });
+    const ALL_SCOPE = { mode: "all" } as const;
+    const viewer = previewPages({ status: "active", permissions: VIEWER_KEYS, raw_access: false, funnel_scope: ALL_SCOPE });
     expect(viewer.filter((page) => page.allowed).map((page) => page.path)).toEqual(["/", "/cohorts", "/funnels", "/reports"]);
     expect(viewer).toHaveLength(ROUTE_ACCESS.length);
+    expect(viewer.find((page) => page.path === "/support")?.denial).toBe("permission");
 
     // /users needs users.pii.view in Phase 1; raw-only pages need the data owner.
-    const users = previewPages({ status: "active", permissions: ["users.view", "leads.view"], raw_access: false });
+    const users = previewPages({ status: "active", permissions: ["users.view", "leads.view"], raw_access: false, funnel_scope: ALL_SCOPE });
     expect(users.find((page) => page.path === "/users")?.allowed).toBe(false);
-    expect(users.find((page) => page.path === "/leads")?.allowed).toBe(false);
-    const owner = previewPages({ status: "active", permissions: [...ENFORCED_PERMISSION_KEYS], raw_access: true });
-    expect(owner.every((page) => page.allowed)).toBe(true);
+    expect(users.find((page) => page.path === "/leads")).toMatchObject({ allowed: false, denial: "raw" });
+    const owner = previewPages({ status: "active", permissions: [...ENFORCED_PERMISSION_KEYS], raw_access: true, funnel_scope: ALL_SCOPE });
+    expect(owner.every((page) => page.allowed && page.denial === null)).toBe(true);
+    expect(owner.find((page) => page.path === "/admin/funnels")).toMatchObject({ title: "Funnel coverage", group: "admin" });
 
-    expect(previewPages({ status: "disabled", permissions: VIEWER_KEYS, raw_access: false }).some((page) => page.allowed)).toBe(false);
+    expect(previewPages({ status: "disabled", permissions: VIEWER_KEYS, raw_access: false, funnel_scope: ALL_SCOPE }).some((page) => page.allowed)).toBe(false);
+  });
+
+  it("a funnel-restricted member opens only the media-buyer pages; the rest is hidden by scope", () => {
+    const buyer = previewPages({ status: "active", permissions: VIEWER_KEYS, raw_access: false, funnel_scope: { mode: "selected" } });
+    expect(buyer.filter((page) => page.allowed).map((page) => page.path)).toEqual(["/", "/cohorts", "/funnels"]);
+    // The role grants Reports, the restricted scope does not.
+    expect(buyer.find((page) => page.path === "/reports")?.denial).toBe("scope");
+    // Pages the role never granted stay a permission denial.
+    expect(buyer.find((page) => page.path === "/support")?.denial).toBe("permission");
+    const none = previewPages({ status: "active", permissions: [...VIEWER_KEYS, "facebook_analytics.view"], raw_access: false, funnel_scope: { mode: "none" } });
+    expect(none.filter((page) => page.allowed).map((page) => page.path)).toEqual(["/", "/cohorts", "/funnels", "/fb-analytics"]);
+  });
+
+  it("computes the scope impact preview from the registry and the snapshot coverage", () => {
+    const impact = computeScopeImpact({ mode: "selected", funnel_ids: ["F-1", "f-2", "f-3"] }, FUNNELS, coverageFixture());
+    expect(impact).toMatchObject({
+      funnels: 3,
+      paths: 4,
+      retiredPaths: 1,
+      users: 900,
+      usersPct: "90%",
+      netRevenue: 45000,
+      netPct: "90%",
+      funnelsWithoutData: [{ id: "f-3", label: "Palm Reading" }],
+      unregisteredPaths: 3,
+      unregisteredUsersPct: "10%",
+    });
+    expect(scopeImpactSummary(impact)).toBe("3 funnels · 4 paths (1 retired) · 900 users (90%) · $45,000 net (90%)");
+
+    // Without coverage only the registry part is known; proposed rows never count.
+    const registryOnly = computeScopeImpact({ mode: "selected", funnel_ids: ["f-1"] }, FUNNELS, undefined);
+    expect(scopeImpactSummary(registryOnly)).toBe("1 funnel · 1 path");
+    expect(registryOnly.users).toBeNull();
+    // An id the registry does not know counts as a funnel without data.
+    expect(computeScopeImpact({ mode: "selected", funnel_ids: ["f-gone"] }, FUNNELS, coverageFixture()).funnelsWithoutData).toEqual([
+      { id: "f-gone", label: "Unknown funnel fgone" },
+    ]);
+    expect(computeScopeImpact({ mode: "all", funnel_ids: [] }, FUNNELS, coverageFixture())).toMatchObject({ funnels: 0, paths: 0, users: 0 });
+  });
+
+  it("flags selected scopes without data and formats shares without ever rounding up to 100%", () => {
+    expect(scopeWithoutData({ mode: "selected", funnel_ids: ["f-3", "f-4"] }, coverageFixture())).toBe(true);
+    expect(scopeWithoutData({ mode: "selected", funnel_ids: ["f-3", "f-1"] }, coverageFixture())).toBe(false);
+    expect(scopeWithoutData({ mode: "none", funnel_ids: [] }, coverageFixture())).toBe(false);
+    expect(scopeWithoutData({ mode: "selected", funnel_ids: ["f-3"] }, undefined)).toBe(false);
+    expect(formatPct(9999, 10000)).toBe("99.9%");
+    expect(formatPct(1, 100000)).toBe("<0.1%");
+    expect(formatPct(0, 100)).toBe("0%");
+    expect(formatPct(5, 0)).toBe("—");
+  });
+
+  it("mirrors the SQL canonicalizer for the funnel's own path", () => {
+    expect(canonicalCampaignPath("/Soulmate-Sketch")).toBe("soulmate-sketch");
+    expect(canonicalCampaignPath("https://example.com/Past_Life/?utm=1#x")).toBe("past-life");
+    expect(canonicalCampaignPath(" /a--b/ ")).toBe("a-b");
+    expect(canonicalCampaignPath("unknown")).toBeNull();
+    expect(canonicalCampaignPath("тест")).toBeNull();
+    expect(canonicalCampaignPath("")).toBeNull();
+  });
+
+  it("labels the Phase 2 registry audit events", () => {
+    expect(auditEventLabel("registry.path_attached")).toBe("Funnel path attached");
+    expect(auditEventLabel("registry.path_revoked")).toBe("Funnel path revoked");
+    expect(auditEventLabel("registry.paths_seeded")).toBe("Funnel paths seeded");
+    expect(describeAuditChanges({ event: "registry.path_repathed", before: { path: "old-quiz" }, after: { path: "new-quiz" }, context: {} }, {
+      funnelLabel: (id) => id,
+      roleLabel: (id) => id ?? "",
+    })).toEqual(["Path: old-quiz → new-quiz"]);
   });
 
   it("renders audit before/after snapshots as readable change lines", () => {
@@ -521,8 +725,44 @@ describe("FunnelScopePicker", () => {
     expect(screen.getByTestId("scope-selection-count")).toHaveTextContent("1 of 4 funnels selected · 1 path");
     fireEvent.click(screen.getByRole("button", { name: /^esoteric/ }));
     expect(onChange).toHaveBeenLastCalledWith({ mode: "selected", funnel_ids: ["f-1", "f-2", "f-3"] });
-    // The Milestone A notice: restricted scopes are not live yet.
-    expect(screen.getByRole("status")).toHaveTextContent(/not live yet/);
+    // Phase 2: restricted scopes are live on the media-buyer pages.
+    expect(screen.getByTestId("scope-restricted-notice")).toHaveTextContent(
+      "Restricted members can open: Dashboard (Revenue Intelligence), Cohorts, Funnels, FB-Analytics",
+    );
+    expect(screen.queryByText(/not live yet/)).not.toBeInTheDocument();
+  });
+
+  it("counts granted paths (active and retired) and shows them as chips", () => {
+    render(<FunnelScopePicker value={{ mode: "selected", funnel_ids: ["f-1", "f-2"] }} onChange={vi.fn()} funnels={FUNNELS} />);
+    // f-1: soulmate-sketch (its proposal grants nothing); f-2: past-life + past-life-old.
+    expect(screen.getByTestId("scope-selection-count")).toHaveTextContent("2 of 4 funnels selected · 3 paths");
+    const pastLife = screen.getByTestId("scope-funnel-f-2");
+    const chips = within(pastLife).getAllByTestId("funnel-path-chip");
+    expect(chips.map((chip) => [chip.getAttribute("data-status"), chip.textContent])).toEqual([
+      ["active", "past-life"],
+      ["retired", "past-life-old(old)"],
+    ]);
+    expect(within(screen.getByTestId("scope-funnel-f-1")).queryByText("soulmate-1-tariff-month-veb")).not.toBeInTheDocument();
+    expect(within(screen.getByTestId("scope-funnel-f-4")).getByText("no granted path")).toBeInTheDocument();
+  });
+
+  it("previews the impact of the selection from the snapshot coverage", () => {
+    const { rerender } = render(
+      <FunnelScopePicker value={{ mode: "selected", funnel_ids: ["f-1", "f-2", "f-3"] }} onChange={vi.fn()} funnels={FUNNELS} coverage={coverageFixture()} />,
+    );
+    expect(screen.getByTestId("scope-impact-summary")).toHaveTextContent("3 funnels · 4 paths (1 retired) · 900 users (90%) · $45,000 net (90%)");
+    expect(screen.getByTestId("scope-impact-no-data")).toHaveTextContent("No users in the current snapshot: Palm Reading");
+    expect(screen.getByTestId("scope-impact-unregistered")).toHaveTextContent("3 unregistered paths (10% of users) are invisible to this member.");
+    expect(within(screen.getByTestId("scope-funnel-f-1")).getByText("500 users")).toBeInTheDocument();
+    expect(within(screen.getByTestId("scope-funnel-f-3")).getByText("no data")).toBeInTheDocument();
+
+    rerender(<FunnelScopePicker value={{ mode: "selected", funnel_ids: ["f-1"] }} onChange={vi.fn()} funnels={FUNNELS} coverageLoading />);
+    expect(screen.getByTestId("scope-impact-summary")).toHaveTextContent("1 funnel · 1 path");
+    expect(screen.getByText("Measuring coverage…")).toBeInTheDocument();
+
+    rerender(<FunnelScopePicker value={{ mode: "all", funnel_ids: [] }} onChange={vi.fn()} funnels={FUNNELS} coverage={coverageFixture()} />);
+    expect(screen.queryByTestId("scope-impact")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("scope-restricted-notice")).not.toBeInTheDocument();
   });
 
   it("toggles funnels from the searchable list and keeps the selection when switching modes", () => {
@@ -541,6 +781,44 @@ describe("FunnelScopePicker", () => {
     expect(screen.getByRole("radio", { name: "Selected funnels" })).toBeDisabled();
     expect(screen.getByRole("radio", { name: "No data access" })).toBeDisabled();
     expect(screen.getByText(/must have All funnels/)).toBeInTheDocument();
+  });
+});
+
+// ---- effective access panel --------------------------------------------------------------------
+
+describe("EffectiveAccessPanel", () => {
+  function effectiveRow(overrides: Partial<EffectiveAccess>): EffectiveAccess {
+    return {
+      status: "active",
+      role: { id: "r-viewer", key: "viewer", name: "Viewer", is_owner: false },
+      permissions: VIEWER_KEYS,
+      raw_access: false,
+      funnel_scope: { mode: "all", funnel_ids: [], names: [], paths: [] },
+      ...overrides,
+    };
+  }
+
+  it("lists the granted paths and the pages hidden only by funnel-restricted access", () => {
+    render(
+      <EffectiveAccessPanel
+        effective={effectiveRow({ funnel_scope: { mode: "selected", funnel_ids: ["f-2"], names: ["Past Life"], paths: ["past-life", "past-life-old"] } })}
+      />,
+    );
+    expect(screen.getByTestId("effective-pages")).toHaveTextContent(`Pages 3/${ROUTE_ACCESS.length}`);
+    expect(screen.getByTestId("effective-paths")).toHaveTextContent("Paths: past-life, past-life-old");
+    expect(screen.getByText("Hidden by funnel-restricted access")).toBeInTheDocument();
+    expect(screen.getByTestId("effective-scope-hidden")).toHaveTextContent(/^Reports$/);
+    // The Milestone A warning is gone.
+    expect(screen.queryByText(/not live yet/)).not.toBeInTheDocument();
+  });
+
+  it("says when the selected funnels grant no path; an all-scope member has no scope-hidden pages", () => {
+    const { rerender } = render(<EffectiveAccessPanel effective={effectiveRow({ funnel_scope: { mode: "selected", funnel_ids: ["f-4"], names: ["Old Quiz"], paths: [] } })} />);
+    expect(screen.getByTestId("effective-paths")).toHaveTextContent(/none granted/);
+    rerender(<EffectiveAccessPanel effective={effectiveRow({})} />);
+    expect(screen.getByTestId("effective-pages")).toHaveTextContent(`Pages 4/${ROUTE_ACCESS.length}`);
+    expect(screen.queryByTestId("effective-scope-hidden")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("effective-paths")).not.toBeInTheDocument();
   });
 });
 
@@ -586,6 +864,9 @@ describe("AdminMembersPage", () => {
     expect(within(sheet).getByTestId("effective-funnels")).toHaveTextContent(`Funnels 3/${FUNNELS.length}`);
     expect(within(sheet).getByTestId("capability-export")).toHaveTextContent("Export off");
     expect(within(within(sheet).getByTestId("sidebar-preview")).getByText("Cohorts")).toBeInTheDocument();
+    expect(within(sheet).getByTestId("effective-paths")).toHaveTextContent("Paths: palm-reading, past-life, past-life-old, soulmate-sketch");
+    // The picker previews the selected scope against the shared coverage query.
+    expect(await within(sheet).findByTestId("scope-impact-summary")).toHaveTextContent("3 funnels · 4 paths (1 retired) · 900 users (90%)");
 
     const save = within(sheet).getByRole("button", { name: "Save changes" });
     expect(save).toBeDisabled();
@@ -595,6 +876,61 @@ describe("AdminMembersPage", () => {
     await waitFor(() => expect(callsFor("members.set_scope")).toHaveLength(1));
     expect(callsFor("members.set_scope")[0].body).toEqual({ action: "members.set_scope", member_id: "m-ivan", mode: "all", funnel_ids: [] });
     expect(callsFor("members.update")).toHaveLength(0);
+    // The save refreshes the admin queries but not the (ClickHouse) coverage.
+    await waitFor(() => expect(callsFor("members.list").length).toBeGreaterThan(1));
+    expect(callsFor("paths.coverage")).toHaveLength(1);
+  });
+
+  it("says that narrowing an All-funnels member leaves what they saved readable (Phase 4 gap, security review)", async () => {
+    state.members.push(memberRow({ id: "m-anna", user_id: "u-anna", email: "anna@example.com", display_name: "Anna" }));
+    renderWithAccess(<AdminMembersPage />);
+    fireEvent.click(await screen.findByTestId("member-row-m-anna"));
+    const sheet = await screen.findByTestId("member-sheet");
+    const notice = () => within(sheet).queryByTestId("scope-narrowing-saved-objects");
+    expect(notice()).not.toBeInTheDocument();
+    fireEvent.click(within(sheet).getByRole("radio", { name: "Selected funnels" }));
+    expect(notice()).toHaveTextContent("Reports, forecasts and AI history this member saved while on All funnels stay readable to them after this change.");
+    fireEvent.click(within(sheet).getByRole("radio", { name: "No data access" }));
+    expect(notice()).toBeInTheDocument();
+    fireEvent.click(within(sheet).getByRole("radio", { name: "All funnels" }));
+    expect(notice()).not.toBeInTheDocument();
+    cleanup();
+    // A member who is already restricted saved nothing tenant-wide since: no notice.
+    renderWithAccess(<AdminMembersPage />);
+    fireEvent.click(await screen.findByTestId("member-row-m-ivan"));
+    expect(within(await screen.findByTestId("member-sheet")).queryByTestId("scope-narrowing-saved-objects")).not.toBeInTheDocument();
+  });
+
+  it("warns about restricted members without data and about users no funnel holds", async () => {
+    state.members.push(
+      memberRow({ id: "m-olya", user_id: "u-olya", email: "olya@example.com", display_name: "Olya", funnel_scope: { mode: "selected", funnel_ids: ["f-3", "f-4"] } }),
+    );
+    renderWithAccess(<AdminMembersPage />);
+    expect(await screen.findByTestId("member-no-data-m-olya")).toBeInTheDocument();
+    expect(screen.queryByTestId("member-no-data-m-ivan")).not.toBeInTheDocument();
+    const banner = screen.getByTestId("coverage-gap-notice");
+    expect(banner).toHaveTextContent("10% of users (3 campaign paths) belong to no funnel: members with selected funnels never see them.");
+    expect(within(banner).getByRole("link", { name: "Review funnel coverage" })).toHaveAttribute("href", "/admin/funnels");
+    expect(callsFor("paths.coverage")).toHaveLength(1);
+  });
+
+  it("reads coverage only while an active member is funnel-restricted; a 409 just hides the warnings", async () => {
+    state.members = state.members.filter((member) => member.id !== "m-ivan");
+    renderWithAccess(<AdminMembersPage />);
+    await screen.findByTestId("member-row-m-dmitry");
+    await waitFor(() => expect(callsFor("roles.list")).toHaveLength(1));
+    expect(callsFor("paths.coverage")).toHaveLength(0);
+    expect(screen.queryByTestId("coverage-gap-notice")).not.toBeInTheDocument();
+    cleanup();
+
+    state = freshState();
+    state.coverage = null;
+    backend.calls = [];
+    renderWithAccess(<AdminMembersPage />);
+    await screen.findByTestId("member-row-m-ivan");
+    await waitFor(() => expect(callsFor("paths.coverage")).toHaveLength(1));
+    expect(screen.queryByTestId("coverage-gap-notice")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("member-no-data-m-ivan")).not.toBeInTheDocument();
   });
 
   it("adds an existing account with the default role and All funnels", async () => {

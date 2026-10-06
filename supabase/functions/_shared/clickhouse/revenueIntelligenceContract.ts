@@ -157,7 +157,15 @@ export interface RevenueIntelligenceBundle {
   by_plan: RevenueSliceRow[];
   by_age: RevenueAgeRow[];
   diagnostics: RevenueDiagnostics;
+  /** Access Phase 2: only on a funnel-restricted member's response. */
+  meta?: RevenueRestrictedMeta;
   error?: string;
+}
+
+/** Access Phase 2: carried only by a funnel-restricted member's bundle /
+ * day breakdown (same shape as the cohorts RestrictedAccessMeta). */
+export interface RevenueRestrictedMeta {
+  access: { scope: "restricted"; dropped_filter_values: number };
 }
 
 export interface RevenueDayCohortRow {
@@ -179,6 +187,7 @@ export interface RevenueDayBreakdown {
   gross: number;
   by_cohort: RevenueDayCohortRow[];
   by_funnel: RevenueSliceRow[];
+  meta?: RevenueRestrictedMeta;
   error?: string;
 }
 

@@ -3,7 +3,9 @@
 // Two shapes:
 //   * variant "inline" (default) — a Card rendered inside AppLayout when the
 //     member lacks the permission for one page; the sidebar stays, and a link
-//     points to the first page they may open.
+//     points to the first page they may open. reason "scope" (the role grants
+//     the page, funnel-restricted access does not include it) names the pages
+//     that are available instead of blaming the role.
 //   * full-page variants "no_membership" | "disabled" | "error" — rendered by
 //     ProtectedRoute instead of the app shell when there is no usable
 //     membership (or access could not be resolved), styled like the Login page,
@@ -19,12 +21,21 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { AuthContext } from "@/contexts/authContext";
 import { useOptionalAccess } from "@/hooks/useAccess";
-import { firstAllowedRoute, normalizeRoutePath } from "@/services/accessRoutes";
+import { firstAllowedRoute, normalizeRoutePath, type AccessDenialReason } from "@/services/accessRoutes";
 
 export type NoAccessVariant = "inline" | "no_membership" | "disabled" | "error";
 
+/** Inline copy for a page outside funnel-restricted access (Phase 2: the
+ * RESTRICTED_READY_ROUTES pages). */
+export const RESTRICTED_SCOPE_DENIAL_TITLE = "Funnel-restricted access";
+export const RESTRICTED_SCOPE_DENIAL_COPY =
+  "Not available with funnel-restricted access. Available: Dashboard (Revenue Intelligence), Cohorts, Funnels, FB-Analytics.";
+
 export interface NoAccessProps {
   variant?: NoAccessVariant;
+  /** Why the inline panel is shown (default "permission"). Only "scope" has
+   * its own copy; "raw" keeps the role copy, as before. */
+  reason?: AccessDenialReason;
   title?: string;
   description?: ReactNode;
   /** Defaults to the access refresh (full-page variants only). */
@@ -60,19 +71,21 @@ const COPY: Record<NoAccessVariant, { icon: LucideIcon; title: string; descripti
   },
 };
 
-export function NoAccess({ variant = "inline", title, description, onRetry, onSignOut }: NoAccessProps) {
+export function NoAccess({ variant = "inline", reason = "permission", title, description, onRetry, onSignOut }: NoAccessProps) {
   if (variant === "inline") {
-    return <NoAccessPanel title={title} description={description} />;
+    return <NoAccessPanel reason={reason} title={title} description={description} />;
   }
   return <NoAccessPage variant={variant} title={title} description={description} onRetry={onRetry} onSignOut={onSignOut} />;
 }
 
-function NoAccessPanel({ title, description }: { title?: string; description?: ReactNode }) {
+function NoAccessPanel({ reason, title, description }: { reason: AccessDenialReason; title?: string; description?: ReactNode }) {
   const inRouter = useInRouterContext();
-  const copy = COPY.inline;
+  const copy = reason === "scope"
+    ? { ...COPY.inline, title: RESTRICTED_SCOPE_DENIAL_TITLE, description: RESTRICTED_SCOPE_DENIAL_COPY }
+    : COPY.inline;
   const Icon = copy.icon;
   return (
-    <Card className="mx-auto mt-6 max-w-xl p-5 shadow-card" role="status" data-testid="no-access">
+    <Card className="mx-auto mt-6 max-w-xl p-5 shadow-card" role="status" data-testid="no-access" data-reason={reason}>
       <div className="flex items-start gap-3">
         <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-muted">
           <Icon className="h-4 w-4 text-muted-foreground" />

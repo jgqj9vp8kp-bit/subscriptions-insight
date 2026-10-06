@@ -12,7 +12,10 @@
 // Real code under test: the gate, every policy, the ScopedReader, the access
 // admin handler (createAccessAdminHandler) over the REAL SQL mutation RPCs in
 // PGlite, the reports-generate and Export API handlers, the service-role read
-// helpers (against strictFakeSupabase), and the migrations' RLS.
+// helpers (against strictFakeSupabase), and the migrations' RLS. Access Phase 2
+// (H1 / H2 / H4 for the cohorts, revenue and FB surfaces) also runs the REAL
+// runners through router replicas against the fixture warehouse of
+// accessFixtures §6; the users / payments / support parts stay it.todo.
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -22,6 +25,7 @@ import { ACCESS_ERROR, ACCESS_ERROR_MESSAGES } from "../../supabase/functions/_s
 import { authorizeAction, type ActionPolicy } from "../../supabase/functions/_shared/access/accessContext.ts";
 import { ENFORCED_PERMISSION_KEYS, closeUnderRequires, isPrivilegedPermission } from "../../supabase/functions/_shared/access/permissions.ts";
 import { ScopeViolation, createScopedReader } from "../../supabase/functions/_shared/clickhouse/scopedClient.ts";
+import { OUT_OF_SCOPE_SENTINEL } from "../../supabase/functions/_shared/clickhouse/scopeSql.ts";
 import { ACCESS_POLICY } from "../../supabase/functions/_shared/access/policies/access.ts";
 import { REPORTS_GENERATE_POLICY } from "../../supabase/functions/_shared/access/policies/reports-generate.ts";
 import { fbStatusDetailVisible, projectFbSyncStateForViewer } from "../../supabase/functions/_shared/access/policies/clickhouse-facebook.ts";
@@ -34,7 +38,11 @@ import {
 } from "../../supabase/functions/_shared/access/policies/clickhouse-health.ts";
 import { capsuledRawPayloadsVisible, stripCapsuledSyncRawPayloads } from "../../supabase/functions/_shared/access/policies/capsuled-facebook-sync.ts";
 import { summaryKpisVisible } from "../../supabase/functions/_shared/access/policies/clickhouse-summary.ts";
-import { canServeFbAllocationDiagnostics, cohortIdentitiesVisible } from "../../supabase/functions/_shared/access/policies/clickhouse-cohorts.ts";
+import {
+  canServeFbAllocationDiagnostics,
+  cohortIdentitiesVisible,
+  restrictCohortRequest,
+} from "../../supabase/functions/_shared/access/policies/clickhouse-cohorts.ts";
 import { paymentPassFullBundleAllowed } from "../../supabase/functions/_shared/access/policies/clickhouse-payment-analytics.ts";
 import { accessAdminOnError, createAccessAdminHandler } from "../../supabase/functions/_shared/access/adminApi.ts";
 import { createReportsGenerateHandler, REPORT_NOT_FOUND } from "../../supabase/functions/reports-generate/handler.ts";
@@ -59,13 +67,18 @@ import {
   FUNNELS,
   GATED_POLICIES,
   PERSONAS,
+  SCOPE_CUSTOMERS,
+  SCOPE_DAYS,
+  SCOPE_READY_REQUESTS,
   TAMPERED_TENANT_FIELDS,
   TEMPLATE_PERMISSIONS,
+  TENANT_COUNT_SENTINEL,
   TENANT_ROW_TABLES,
   UPDATE_MEMBER_SQL,
   USER_IDS,
   accessRow,
   apiKeyFixture,
+  boundList,
   callGate,
   contextFor,
   createLockedWorkspace,
@@ -80,11 +93,15 @@ import {
   policyFor,
   probeHandler,
   readResult,
+  readThroughRouter,
+  scopedUserPathsOf,
   svc,
   userToken,
+  visibleCampaignPathsOf,
   withGrant,
   type ActionCase,
   type Persona,
+  type RouterRead,
   type SeededWorkspace,
 } from "./support/accessFixtures";
 import { TENANT_PROBE_SQL, createRecordingClickHouse } from "./support/recordingClickHouse";
@@ -137,7 +154,7 @@ afterAll(async () => {
 // Horizontal
 // =========================================================================================
 
-describe("H1 / H2 — crafted filters and options never reach a restricted member's data (Milestone A: 403)", () => {
+describe("H1 / H2 — crafted filters and options never reach a restricted member's data (403, or a scope the body cannot widen)", () => {
   const FILTER_READS = CASES.filter((entry) =>
     [
       "clickhouse-cohorts.list", "clickhouse-cohorts.options", "clickhouse-users.list", "clickhouse-users.options",
@@ -154,11 +171,40 @@ describe("H1 / H2 — crafted filters and options never reach a restricted membe
     { scope: "all", funnel_scope: { mode: "all" }, restricted: false },
   ];
 
+  const READY_FILTER_READS = FILTER_READS.filter((entry) => entry.rule.scopeReady === true);
+  const REFUSED_FILTER_READS = FILTER_READS.filter((entry) => entry.rule.scopeReady !== true);
+
   it("has the filter-taking reads (sanity)", () => {
     expect(FILTER_READS).toHaveLength(12);
+    // Phase 2: cohorts list/options, FB report/filters and RI bundle/day are scopeReady.
+    expect(READY_FILTER_READS).toHaveLength(6);
   });
 
-  it.each(FILTER_READS.map((entry) => [`${entry.fn}.${entry.action}`, entry] as const))("%s: every crafted body is refused for buyer-{A}", async (_label, entry) => {
+  it.each(READY_FILTER_READS.map((entry) => [`${entry.fn}.${entry.action}`, entry] as const))("%s (scopeReady): every crafted body reaches the handler bound to paths(A) only", async (_label, entry) => {
+    const persona = withGrant(PERSONAS.buyerA, ENFORCED_PERMISSION_KEYS, { name: "buyer-{A}" });
+    for (const crafted of CRAFTED) {
+      const body = { ...entry.request.body, ...crafted };
+      expect(normalizedAction(entry.policy, { ...entry.request, body })).toBe(entry.action);
+      const { deps, clickhouse } = fakeGate({ persona });
+      const seen: Array<{ restricted: boolean; scopeRestricted: boolean; scopePaths: readonly string[] | null; ctxPaths: readonly string[] | null }> = [];
+      const handler = async (request: AccessRequest<string>) => {
+        const funnel = request.ctx.scope.funnel;
+        seen.push({
+          restricted: request.ctx.restricted,
+          scopeRestricted: request.scope.restricted,
+          scopePaths: request.scope.paths,
+          ctxPaths: funnel.mode === "selected" ? funnel.paths : null,
+        });
+        return { ok: true };
+      };
+      const result = await callGate(entry.policy, handler as never, requestFor(entry, body).req, deps);
+      expect(result.status, JSON.stringify(crafted)).toBe(200);
+      expect(seen).toEqual([{ restricted: true, scopeRestricted: true, scopePaths: [FUNNELS.A.path], ctxPaths: [FUNNELS.A.path] }]);
+      expect(clickhouse.statements).toEqual([]);
+    }
+  });
+
+  it.each(REFUSED_FILTER_READS.map((entry) => [`${entry.fn}.${entry.action}`, entry] as const))("%s: every crafted body is refused for buyer-{A}", async (_label, entry) => {
     const persona = withGrant(PERSONAS.buyerA, ENFORCED_PERMISSION_KEYS, { name: "buyer-{A}" });
     for (const crafted of CRAFTED) {
       const body = { ...entry.request.body, ...crafted };
@@ -171,8 +217,103 @@ describe("H1 / H2 — crafted filters and options never reach a restricted membe
     }
   });
 
-  it.todo("Phase 2: H1 — for buyer-{A}, include filters are intersected with paths(A) (B dropped, meta.access.dropped_filter_values counts it), an all-out include list is FALSE (zero rows), and exclude lists are applied as sent");
-  it.todo("Phase 2: H2 — every options producer (cohorts, users, payments, banks, support, FB) computes options over scopedBase ∩ userFilters, so funnel B and 'unknown' never appear for buyer-{A}, whatever the self-excluded dimension is");
+  // Semantic part: through the router replicas, the REAL runners and the fixture
+  // warehouse of accessFixtures §6 (answers each statement by the scope it carries).
+  const A = FUNNELS.A.path;
+  const B = FUNNELS.B.path;
+  const C = FUNNELS.C.path;
+  const [DAY_1, DAY_2] = SCOPE_DAYS;
+  const pathsOfRows = (result: RouterRead, key: "rows" | "by_funnel") =>
+    [...new Set(((result.json?.[key] ?? []) as Array<Record<string, unknown>>).map((row) => String(row.campaign_path ?? row.key)))].sort();
+  const droppedOf = (result: RouterRead) => (result.json?.meta as { access: { dropped_filter_values: number } }).access.dropped_filter_values;
+
+  it.each([
+    ["clickhouse-cohorts", "list", "rows"],
+    ["clickhouse-revenue", "bundle", "by_funnel"],
+  ] as const)("Phase 2: H1 — %s.%s: include lists are intersected with paths(A) (B dropped and counted), an all-out list matches nothing, exclude lists apply as sent", async (fn, action, rowsKey) => {
+    const cases: Array<{ filters: Record<string, string[]>; paths: string[]; dropped: number; include?: string[]; exclude?: string[] }> = [
+      { filters: { campaign_path: [A, B] }, paths: [A], dropped: 1, include: [A] },
+      { filters: { campaign_path: [B] }, paths: [], dropped: 1, include: [OUT_OF_SCOPE_SENTINEL] },
+      { filters: { campaign_path: [B, C, "unknown"] }, paths: [], dropped: 3, include: [OUT_OF_SCOPE_SENTINEL] },
+      ...(fn === "clickhouse-cohorts"
+        ? [
+          { filters: { campaign_path_exclude: [A] }, paths: [], dropped: 0, exclude: [A] },
+          { filters: { campaign_path_exclude: [B] }, paths: [A], dropped: 0, exclude: [B] },
+          { filters: { campaign_path: [A], campaign_path_exclude: [A] }, paths: [], dropped: 0, include: [A], exclude: [A] },
+        ]
+        // Revenue Intelligence has no exclude list (spec §4): the key is ignored, never a widening.
+        : [{ filters: { campaign_path: [A], campaign_path_exclude: [A] }, paths: [A], dropped: 0, include: [A] }]),
+    ];
+    for (const entry of cases) {
+      const label = JSON.stringify(entry.filters);
+      const result = await readThroughRouter(PERSONAS.buyerA, fn, { action, date_from: DAY_1, date_to: DAY_2, filters: entry.filters });
+      expect(result.status, `${label}: ${result.text.slice(0, 200)}`).toBe(200);
+      expect(pathsOfRows(result, rowsKey), label).toEqual(entry.paths);
+      expect(droppedOf(result), label).toBe(entry.dropped);
+      // What reached the warehouse: the scope fragments admit A only, the include
+      // list is A or the sentinel, the exclude list is exactly what was sent.
+      for (const statement of result.clickhouse.statements) {
+        const users = scopedUserPathsOf(statement.query);
+        if (users) expect([...users], label).toEqual([A]);
+        const include = boundList(statement.params, "mcp");
+        if (include) expect(include, label).toEqual(entry.include);
+        const exclude = boundList(statement.params, "mcpx");
+        if (exclude) expect(exclude, label).toEqual(entry.exclude);
+      }
+      expect(result.clickhouse.statements.some((statement) => boundList(statement.params, entry.include ? "mcp" : "mcpx")), label).toBe(true);
+      expect(scanForLeaks(result.text, { funnelB: true }), label).toEqual([]);
+    }
+  });
+
+  it("Phase 2: H1 — FB filters (campaign / buyer / account) are ANDed with the visible campaigns: naming B's or the shared campaign returns nothing", async () => {
+    for (const [filters, campaigns] of [
+      [{ campaign_id: ["fb_a", "fb_b", "fb_mixed"] }, ["fb_a"]],
+      [{ campaign_id: ["fb_b"] }, []],
+      [{ campaign_id: ["fb_mixed"] }, []],
+      [{ buyer: ["Bob", "Mallory"] }, []],
+      [{ buyer: ["Alice"] }, ["fb_a"]],
+      [{ ad_account_id: ["act_shared"] }, ["fb_a"]],
+    ] as const) {
+      const result = await readThroughRouter(PERSONAS.buyerA, "clickhouse-facebook", { action: "report", level: "campaign", filters });
+      expect(result.status, result.text.slice(0, 200)).toBe(200);
+      expect((result.json?.rows as Array<{ campaign_id: string }>).map((row) => row.campaign_id), JSON.stringify(filters)).toEqual(campaigns);
+      for (const statement of result.clickhouse.statements) {
+        const visible = visibleCampaignPathsOf(statement.query);
+        if (visible) expect([...visible]).toEqual([A]);
+      }
+      expect(scanForLeaks(result.text, { funnelB: true }), JSON.stringify(filters)).toEqual([]);
+    }
+  });
+
+  it("Phase 2: H2 — cohorts and FB options come from the scoped base: B, 'unknown' and hidden campaigns never appear for buyer-{A}, whatever dimension is selected", async () => {
+    const own = new Set([A, "soulmate", "fb_a", "fb_mixed", "fb_thin"]);
+    const foreign = new Set(SCOPE_CUSTOMERS.flatMap((entry) => [entry.path, entry.funnel, entry.campaignId]).filter((value) => !own.has(value)));
+    const COHORT_SELECTIONS: Array<Record<string, string[]>> = [
+      {}, { campaign_path: [A] }, { campaign_path: [B] }, { funnel: ["soulmate"] }, { funnel: ["past_life"] },
+      { campaign_id: ["fb_b"] }, { media_buyer: ["utm:facebook"] }, { country: ["US"] },
+    ];
+    for (const filters of COHORT_SELECTIONS) {
+      for (const action of ["options", "list"] as const) {
+        const result = await readThroughRouter(PERSONAS.buyerA, "clickhouse-cohorts", { action, date_from: DAY_1, date_to: DAY_2, filters });
+        expect(result.status, `${action} ${JSON.stringify(filters)}`).toBe(200);
+        const values = JSON.stringify(result.json?.filter_options);
+        for (const value of foreign) expect(values, `${action} ${JSON.stringify(filters)}: ${value}`).not.toContain(`"${value}"`);
+        expect(values.toLowerCase()).not.toContain('"unknown"');
+        const options = result.clickhouse.statements.find((statement) => statement.query.includes("'price_plan' dim"))!;
+        expect([...(scopedUserPathsOf(options.query) ?? [])]).toEqual([A]);
+      }
+    }
+    for (const filters of [{}, { buyer: ["Bob"] }, { campaign_id: ["fb_b"] }, { ad_account_id: ["act_shared"] }, { buyer: ["Alice"], campaign_id: ["fb_mixed"] }]) {
+      const result = await readThroughRouter(PERSONAS.buyerA, "clickhouse-facebook", { action: "filters", filters });
+      expect(result.status).toBe(200);
+      const options = result.json?.filter_options as { buyers: Array<{ value: string }>; campaigns: Array<{ value: string }> };
+      expect(options.campaigns.every((option) => option.value === "fb_a"), JSON.stringify(filters)).toBe(true);
+      expect(options.buyers.every((option) => option.value === "Alice"), JSON.stringify(filters)).toBe(true);
+      expect(scanForLeaks(result.text, { funnelB: true, extra: ['"fb_mixed"', '"fb_thin"', "Mallory"] }), JSON.stringify(filters)).toEqual([]);
+    }
+  });
+
+  it.todo("Phase 4/5: H2 — the users, payments, banks and support options producers compute options over scopedBase ∩ userFilters (their actions are not scopeReady yet: 403 above)");
 });
 
 describe("H3 — ids of another member's or another funnel's objects", () => {
@@ -212,7 +353,6 @@ describe("H3 — ids of another member's or another funnel's objects", () => {
   it.each([
     ["clickhouse-users", { action: "details", user_id: SENTINEL_EMAILS[0] }],
     ["clickhouse-support", { action: "details", request_id: "req-of-funnel-b" }],
-    ["clickhouse-cohorts", { action: "details", cohort_key: `${FUNNELS.B.path}|2026-09-01`, funnel_key: FUNNELS.B.path }],
   ] as const)("%s drilldown by id is refused for a restricted member before any lookup (Milestone A)", async (fn, body) => {
     const { deps, clickhouse } = fakeGate({ persona: withGrant(PERSONAS.buyerA, ENFORCED_PERMISSION_KEYS) });
     const result = await callGate(policyFor(fn), probeHandler().handler, edgeRequest({ body }).req, deps);
@@ -221,7 +361,28 @@ describe("H3 — ids of another member's or another funnel's objects", () => {
     expect(clickhouse.statements).toEqual([]);
   });
 
-  it.todo("Phase 4: H3 — a buyer-{A} users.details for a customer anchored to B, support.details for a request of B and cohorts.details for a cohort_key of B all answer 404 with a body byte-identical to the 404 of an id that does not exist");
+  it.each([
+    ["cohort_key of B", { cohort_key: { cohort_date: "2026-09-01", funnel: FUNNELS.B.path, campaign_path: FUNNELS.B.path } }],
+    ["funnel_key of B", { funnel_key: { campaign_path: FUNNELS.B.path } }],
+    ["A cohort_key with a funnel_key of B", { cohort_key: { cohort_date: "2026-09-01", funnel: FUNNELS.A.path, campaign_path: FUNNELS.A.path }, funnel_key: { campaign_path: FUNNELS.B.path } }],
+    ["a string cohort_key", { cohort_key: `${FUNNELS.B.path}|2026-09-01` }],
+    ["an 'unknown' key", { funnel_key: { campaign_path: "unknown" } }],
+  ] as const)("clickhouse-cohorts details (scopeReady) with %s is 403 funnel_out_of_scope before any SQL (R11)", async (_label, keys) => {
+    const { deps, clickhouse } = fakeGate({ persona: withGrant(PERSONAS.buyerA, ENFORCED_PERMISSION_KEYS) });
+    const probe = probeHandler();
+    // The router's first step for a restricted member (FN/clickhouse-cohorts/index.ts).
+    const handler = async (request: AccessRequest<string>) => {
+      restrictCohortRequest(request.scope, request.body);
+      return (probe.handler as unknown as (input: AccessRequest<string>) => Promise<unknown>)(request);
+    };
+    const result = await callGate(policyFor("clickhouse-cohorts"), handler as never, edgeRequest({ body: { action: "details", ...keys } }).req, deps);
+    expect(result.status).toBe(403);
+    expect(result.json).toMatchObject({ ok: false, error_code: ACCESS_ERROR.FUNNEL_OUT_OF_SCOPE, error: ACCESS_ERROR_MESSAGES.funnel_out_of_scope });
+    expect(probe.spy).not.toHaveBeenCalled();
+    expect(clickhouse.statements).toEqual([]);
+  });
+
+  it.todo("Phase 4/5: H3 — a buyer-{A} users.details for a customer anchored to B and support.details for a request of B answer 404 with a body byte-identical to the 404 of an id that does not exist (cohorts keys are 403 funnel_out_of_scope by R11, above; users / support are not scopeReady yet)");
 });
 
 describe("H4 — side channels in the member views", () => {
@@ -288,7 +449,56 @@ describe("H4 — side channels in the member views", () => {
     expect(scanForLeaks(stripCapsuledSyncRawPayloads(result))).toEqual([]);
   });
 
-  it.todo("Phase 2: H4 — under buyer-{A} the side-channel projector drops fx_diagnostics, scanDiagnostics, snapshotDiagnostics.source_transactions, fb_unallocated_spend, support denominators and spend-ledger residual buckets: scanForLeaks(body, { funnelB: true }) is empty for every scopeReady action");
+  // Phase 2: the fixture warehouse answers every UNSCOPED statement (and the stored
+  // sync / snapshot states) with tenant-wide sentinels — TENANT_COUNT_SENTINEL,
+  // the spend sentinel, raw error text, sentinel e-mails — so a restricted body
+  // that echoed a tenant-wide value would carry one.
+  const A_EMAILS = SCOPE_CUSTOMERS.filter((entry) => entry.path === FUNNELS.A.path).map((entry) => entry.email);
+
+  it.each(Object.entries(SCOPE_READY_REQUESTS))("Phase 2: H4 — %s for buyer-{A}: no tenant-wide counter, spend, error text, raw e-mail, data key or funnel B in the body", async (key, body) => {
+    const fn = key.slice(0, key.lastIndexOf("."));
+    const result = await readThroughRouter(PERSONAS.buyerA, fn, body);
+    expect(result.status, result.text.slice(0, 300)).toBe(200);
+    expect(scanForLeaks(result.text, { funnelB: true, extra: [DATA_KEY, ...A_EMAILS, String(TENANT_COUNT_SENTINEL)] })).toEqual([]);
+    expect(result.pg.violations).toEqual([]);
+    // The stored state is read once, by the gate; no runner re-reads it for a restricted member.
+    expect(result.pg.callsTo("clickhouse_cohort_snapshot_state")).toEqual(fn === "clickhouse-summary" ? [expect.anything()] : []);
+  });
+
+  it("Phase 2: H4 — cohorts: diagnostics redacted (counts_redacted), FX recomputed over the member's users, no allocation page; Revenue: no unattributed / spend stream", async () => {
+    const list = await readThroughRouter(PERSONAS.buyerA, "clickhouse-cohorts", SCOPE_READY_REQUESTS["clickhouse-cohorts.list"]);
+    expect(list.status).toBe(200);
+    expect(list.json?.diagnostics).toMatchObject({
+      counts_redacted: true, transactions_scanned: 0, users_scanned: 0, source_transactions: null, cohort_users: null,
+      current_warehouse_version: null, current_warehouse_transactions: null, support_requests: null, support_unique_emails: null,
+    });
+    const nonSyntheticA = SCOPE_CUSTOMERS.filter((entry) => entry.path === FUNNELS.A.path && !entry.id.startsWith("unknown_user_"));
+    expect((list.json?.fx_diagnostics as { transactions_total: number }).transactions_total).toBe(nonSyntheticA.length);
+    expect(list.json).not.toHaveProperty("fb_allocation_diagnostics");
+    // ...and the page that would carry it stays refused at the gate.
+    const page = await readThroughRouter(PERSONAS.buyerA, "clickhouse-cohorts", { action: "list", fb_allocation_diagnostics: { enabled: true } });
+    expect(page.status).toBe(403);
+    expect(page.json?.error_code).toBe(ACCESS_ERROR.SCOPE_NOT_SUPPORTED);
+    expect(page.clickhouse.statements).toEqual([]);
+
+    for (const body of [SCOPE_READY_REQUESTS["clickhouse-revenue.bundle"], SCOPE_READY_REQUESTS["clickhouse-revenue.day_breakdown"]]) {
+      const revenue = await readThroughRouter(PERSONAS.buyerA, "clickhouse-revenue", body);
+      expect(revenue.status).toBe(200);
+      expect(revenue.clickhouse.statements.length).toBeGreaterThan(0);
+      for (const statement of revenue.clickhouse.statements) expect(statement.query).not.toMatch(/snapshot_users AS|fact_facebook_stats/);
+    }
+  });
+
+  it("Phase 2: H4 — positive control: the owner's views of the same fixture DO carry the tenant sentinels (the scans above are not vacuous)", async () => {
+    const owner = await readThroughRouter(PERSONAS.owner, "clickhouse-cohorts", { action: "list", date_from: SCOPE_DAYS[0], date_to: SCOPE_DAYS[1] });
+    expect(owner.status).toBe(200);
+    expect(scanForLeaks(owner.text, { funnelB: true, extra: [String(TENANT_COUNT_SENTINEL)] }).length).toBeGreaterThan(0);
+    const fb = await readThroughRouter(PERSONAS.owner, "clickhouse-facebook", { action: "status", level: "campaign" });
+    expect(fb.status).toBe(200);
+    expect(scanForLeaks(fb.text, { extra: [String(TENANT_COUNT_SENTINEL)] }).length).toBeGreaterThan(0);
+  });
+
+  it.todo("Phase 4/5: H4 — support funnel denominators (SH/support.ts) and the spend-ledger residual buckets (SH/projectSpendLedger.ts) are dropped for buyer-{A}; those actions are not scopeReady yet (403)");
 });
 
 describe("H5 — PostgREST and service-role reads never cross the data key", () => {
@@ -364,7 +574,47 @@ describe("H5 — PostgREST and service-role reads never cross the data key", () 
     await expect(activeSubscriptionsByEmail(pg as never, FOREIGN_TENANT)).rejects.toBeInstanceOf(StrictSupabaseViolation);
   });
 
-  it.todo("Phase 2: H5 — registry reads go through app.can_see_funnel: buyer-{A} selects only funnel A from funnels / funnel_tags / funnel_paths, and tags only through visible funnels (today every active member reads the whole registry)");
+  it("Phase 2: H5 — registry RLS: buyer-{A} selects only funnel A from funnels / funnel_tags / funnel_paths (granted paths only), and tags only through visible funnels", async () => {
+    const h = await cloneLocked();
+    const TAGS = { a: "7a7a7a7a-0000-4000-8000-00000000000a", b: "7a7a7a7a-0000-4000-8000-00000000000b", orphan: "7a7a7a7a-0000-4000-8000-00000000000c" };
+    // Planted as postgres (the registry rows an all-scope manager would have made).
+    await h.db.query("insert into public.tags (id, name) values ($1, 'Tag A'), ($2, 'Tag B'), ($3, 'Tag orphan')", [TAGS.a, TAGS.b, TAGS.orphan]);
+    await h.db.query("insert into public.funnel_tags (funnel_id, tag_id) values ($1, $2), ($3, $4)", [FUNNELS.A.id, TAGS.a, FUNNELS.B.id, TAGS.b]);
+    await h.db.query("insert into public.funnel_paths (funnel_id, path_canonical, status, source) values ($1, 'soulmate-proposal', 'proposed', 'admin_alias')", [FUNNELS.A.id]);
+
+    const read = (user: string) =>
+      h.asUser(user, async (tx) => ({
+        funnels: (await tx.query<{ id: string }>("select id::text from public.funnels")).rows.map((row) => row.id).sort(),
+        funnelTags: (await tx.query<{ funnel_id: string }>("select funnel_id::text from public.funnel_tags")).rows.map((row) => row.funnel_id).sort(),
+        tags: (await tx.query<{ name: string }>("select name from public.tags")).rows.map((row) => row.name).sort(),
+        paths: (await tx.query<{ path: string; status: string }>("select path_canonical as path, status from public.funnel_paths")).rows
+          .map((row) => `${row.path}:${row.status}`).sort(),
+      }));
+
+    expect(await read(USER_IDS.buyerA)).toEqual({
+      funnels: [FUNNELS.A.id],
+      funnelTags: [FUNNELS.A.id],
+      tags: ["Tag A"],
+      paths: [`${FUNNELS.A.path}:active`],
+    });
+    expect(await read(USER_IDS.buyerAB)).toEqual({
+      funnels: [FUNNELS.A.id, FUNNELS.B.id],
+      funnelTags: [FUNNELS.A.id, FUNNELS.B.id],
+      tags: ["Tag A", "Tag B"],
+      paths: [`${FUNNELS.B.path}:active`, `${FUNNELS.A.path}:active`].sort(),
+    });
+    // Scope all reads the whole registry, proposals included.
+    expect(await read(USER_IDS.viewer)).toEqual({
+      funnels: [FUNNELS.A.id, FUNNELS.B.id, FUNNELS.C.id],
+      funnelTags: [FUNNELS.A.id, FUNNELS.B.id],
+      tags: ["Tag A", "Tag B", "Tag orphan"],
+      paths: [`${FUNNELS.A.path}:active`, `${FUNNELS.B.path}:active`, `${FUNNELS.C.path}:active`, "soulmate-proposal:proposed"].sort(),
+    });
+    for (const user of [USER_IDS.emptyGrant, USER_IDS.noRule, USER_IDS.disabled, USER_IDS.nonMember]) {
+      expect(await read(user), user).toEqual({ funnels: [], funnelTags: [], tags: [], paths: [] });
+    }
+    await expect(h.asAnon((tx) => tx.query("select 1 from public.funnel_paths"))).rejects.toThrow(/permission denied/);
+  });
 });
 
 describe("H6 — sync and write actions", () => {
@@ -739,6 +989,7 @@ describe("V5 — registry re-pathing", () => {
 
 describe("V6 — the cron tenant comes from the workspace, never from the body", () => {
   const CRON_REQUESTS: Record<string, Record<string, Record<string, unknown>>> = {
+    "clickhouse-cohort-membership": { cron_tick: { action: "cron_tick" } },
     "clickhouse-facebook": { cron_daily: {} },
     "funnelfox-subscriptions-sync": { sync: { full_reset: false }, sync_full_reset: { full_reset: true } },
     "sync-support-mail": {
@@ -750,6 +1001,7 @@ describe("V6 — the cron tenant comes from the workspace, never from the body",
     "classify-support-requests": { continue: { action: "continue" } },
   };
   const NOT_FOR_CRON: Record<string, Record<string, unknown>> = {
+    "clickhouse-cohort-membership": { action: "rebuild", force: true },
     "clickhouse-facebook": { action: "report" },
     "funnelfox-subscriptions-sync": { dry_run: true },
     "sync-support-mail": { internal: true, action: "reset_cursor" },
@@ -880,7 +1132,29 @@ describe("V8 — writes under a restricted scope", () => {
     expect(ctx.violations).toHaveLength(3);
   });
 
-  it.todo("Phase 2: V8 — adminWriter(ctx) exists and is the only writer: it requires cron or full scope with admin.sync.run / admin.warehouse.manage, and scratchFromScopedSelect(ctx, prefix, select) is the only way a restricted request creates a scratch table");
+  it("Phase 2: a scopeReady handler's command() / insert() under a restricted scope is restricted_write → 500, nothing sent", async () => {
+    const entry = CASES.find((candidate) => candidate.fn === "clickhouse-cohorts" && candidate.action === "list")!;
+    const writes: Array<(request: AccessRequest<string>) => Promise<unknown>> = [
+      (request) => request.clickhouse().command({ query: "CREATE TABLE IF NOT EXISTS scratch_buyer (x UInt8) ENGINE = Memory" }),
+      (request) => request.clickhouse().insert({ table: "scratch_buyer", values: [{ auth_user_id: request.ctx.tenantKey }] }),
+    ];
+    for (const write of writes) {
+      const { deps, clickhouse } = fakeGate({ persona: withGrant(PERSONAS.buyerA, ENFORCED_PERMISSION_KEYS) });
+      let violations: readonly string[] = [];
+      const handler = async (request: AccessRequest<string>) => {
+        await write(request).catch(() => null);
+        violations = [...request.ctx.violations];
+        return { ok: true };
+      };
+      const result = await callGate(entry.policy, handler as never, requestFor(entry).req, deps);
+      expect(result.status).toBe(500);
+      expect(result.json?.error_code).toBe(ACCESS_ERROR.SCOPE_VIOLATION);
+      expect(violations.map((code) => code.split(":")[0])).toEqual(["restricted_write"]);
+      expect(clickhouse.statements).toEqual([]);
+    }
+  });
+
+  it.todo("Phase 4: V8 (scratch part; the restricted_write part runs above) — adminWriter(ctx) exists and is the only writer: it requires cron or full scope with admin.sync.run / admin.warehouse.manage, and scratchFromScopedSelect(ctx, prefix, select) is the only way a restricted request creates a scratch table (Payment Pass / Banks / Users decline, not scopeReady yet)");
 });
 
 // =========================================================================================

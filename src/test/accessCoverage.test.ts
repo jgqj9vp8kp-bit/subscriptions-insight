@@ -8,8 +8,9 @@
 //     its API-key path builds the context itself) and none uses the deprecated
 //     "any signed-in user" helpers or the caller's id as the data tenant;
 //   * every permission key a policy names exists in the catalog and is enforced;
-//   * Milestone A: no action is scopeReady, so every funnel-restricted context is
-//     refused (403 scope_not_supported) everywhere;
+//   * Phase 2: exactly the 12 media-buyer actions are scopeReady, so a
+//     funnel-restricted context is refused (403 scope_not_supported) everywhere
+//     else;
 //   * no action is open to every member by accident;
 //   * the deleted funnelfox-endpoint-probe stays deleted.
 
@@ -28,6 +29,17 @@ const NOT_GATED: Record<string, string> = {
   // (resolve_access + decideApiKeyAccess) and reads through createScopedReader.
   "export-campaign-performance": "api_key",
 };
+
+/** Access Phase 2 (spec §6 contract 2): the only actions that serve a
+ * funnel-restricted context. Kept literal here so a policy edit cannot move
+ * the allowlist and its check together. */
+const SCOPE_READY_ACTIONS: readonly string[] = [
+  "clickhouse-cohorts.details", "clickhouse-cohorts.list", "clickhouse-cohorts.options",
+  "clickhouse-facebook.charts", "clickhouse-facebook.filters", "clickhouse-facebook.list", "clickhouse-facebook.report",
+  "clickhouse-facebook.status", "clickhouse-facebook.summary",
+  "clickhouse-revenue.bundle", "clickhouse-revenue.day_breakdown",
+  "clickhouse-summary.summary",
+];
 
 /** Actions reachable only through the policy's cron branch (no user permission). */
 function cronOnly(policy: FunctionPolicy<string>, action: string): boolean {
@@ -101,11 +113,21 @@ describe("Edge access coverage", () => {
     }
   });
 
-  it.each(FOLDERS)("%s: Milestone A — no action is scopeReady", (fn) => {
+  it.each(FOLDERS)("%s: Phase 2 — exactly the allowlisted actions are scopeReady", (fn) => {
     const policy = policyFor(fn) as FunctionPolicy<string>;
     for (const [action, rule] of Object.entries(policy.actions)) {
-      expect(rule.scopeReady, `${fn}.${action}`).not.toBe(true);
+      expect(rule.scopeReady === true, `${fn}.${action}`).toBe(SCOPE_READY_ACTIONS.includes(`${fn}.${action}`));
     }
+  });
+
+  it("Phase 2 — the scopeReady allowlist is exactly the 12 media-buyer actions, each in a real policy", () => {
+    const ready = FOLDERS.flatMap((fn) =>
+      Object.entries((policyFor(fn) as FunctionPolicy<string>).actions)
+        .filter(([, rule]) => rule.scopeReady === true)
+        .map(([action]) => `${fn}.${action}`),
+    );
+    expect(ready.sort()).toEqual([...SCOPE_READY_ACTIONS].sort());
+    expect(SCOPE_READY_ACTIONS).toHaveLength(12);
   });
 
   it.each(FOLDERS)("%s: no action is open to every member", (fn) => {

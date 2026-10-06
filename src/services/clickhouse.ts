@@ -260,9 +260,12 @@ async function sessionToken(): Promise<string> {
 
 /** error_code values of an access DENIAL: the request was refused because of who
  * is asking (session, membership, role, funnel scope), never because the
- * warehouse failed. "not_found" (R11: out-of-scope entity ids answer 404),
- * "scope_snapshot_not_ready" (R8, 409) and "escalation_denied" (admin API) are
- * the plan's codes beyond the gate's own list. */
+ * warehouse failed. Phase 2 adds 409 scope_snapshot_not_ready (the
+ * funnel-scoped snapshot is being prepared: the page polls, never a sign-out,
+ * never the breaker) and 403 funnel_out_of_scope (an explicit funnel key
+ * outside the member's scope, R11). "not_found" (R11: out-of-scope entity ids
+ * answer 404) and "escalation_denied" (admin API) are the plan's codes beyond
+ * the gate's own list. */
 const ACCESS_DENIAL_CODES: ReadonlySet<string> = new Set<string>([
   ACCESS_ERROR.INVALID_SESSION,
   ACCESS_ERROR.NO_MEMBERSHIP,
@@ -272,12 +275,13 @@ const ACCESS_DENIAL_CODES: ReadonlySet<string> = new Set<string>([
   ACCESS_ERROR.OWNER_REQUIRED,
   ACCESS_ERROR.FULL_SCOPE_REQUIRED,
   ACCESS_ERROR.SCOPE_NOT_SUPPORTED,
+  ACCESS_ERROR.SCOPE_SNAPSHOT_NOT_READY,
+  ACCESS_ERROR.FUNNEL_OUT_OF_SCOPE,
   ACCESS_ERROR.POLICY_MISSING,
   ACCESS_ERROR.INVALID_CRON_SECRET,
   ACCESS_ERROR.TENANT_MISMATCH,
   ACCESS_ERROR.CRON_ACTION_NOT_ALLOWED,
   "not_found",
-  "scope_snapshot_not_ready",
   "escalation_denied",
 ]);
 

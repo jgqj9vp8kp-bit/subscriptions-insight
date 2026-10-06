@@ -24,6 +24,12 @@
 //   * Disabling a member also bans the auth user (refresh tokens stop working);
 //     enabling lifts the ban. Both run only AFTER the RPC accepted the change,
 //     so the SQL anti-escalation rules decide who can be banned.
+//   * Funnel paths (access Phase 2, spec §6 contract 8): paths.attach and
+//     paths.set_status call the funnel_paths RPCs of 202610060001 (same p_actor
+//     pattern, funnels.manage re-checked in SQL, audited there). paths.coverage
+//     reads the active cohort snapshot through the request's ScopedReader in
+//     all-scope mode only (pathCoverage.ts) and answers 409 conflict while no
+//     validated snapshot exists.
 //
 // Dependency-injected (AccessAdminStore) so vitest drives it without Supabase;
 // createSupabaseAccessAdminStore adapts the live service-role client. No Deno
@@ -42,7 +48,20 @@ import {
 import { ROLE_TEMPLATES, type RoleTemplate } from "./roles.ts";
 import { canonicalFunnelIds } from "./scope.ts";
 import type { AccessAdminAction } from "./policies/access.ts";
-import type { SupabaseAuthClient } from "../clickhouse/types.ts";
+import type { ClickHouseClientLike, SupabaseAuthClient, SupabaseLikeClient } from "../clickhouse/types.ts";
+import { getCohortSnapshotState, type CohortSnapshotState } from "../clickhouse/cohortSnapshotState.ts";
+import {
+  GRANTED_PATH_STATUSES,
+  buildFunnelCoverage,
+  coverageMaxStalenessMs,
+  coverageSnapshot,
+  isScopablePath,
+  runPathCoverage,
+  type FunnelCoverage,
+  type FunnelPathStatus,
+} from "../clickhouse/pathCoverage.ts";
+
+export type { FunnelCoverage, FunnelPathStatus };
 
 /** GoTrue ban while a member is disabled (~100 years); "none" lifts it. */
 export const DISABLED_MEMBER_BAN_DURATION = "876000h";
@@ -56,6 +75,7 @@ const MAX_EMAIL_LENGTH = 320;
 const MAX_DISPLAY_NAME = 120;
 const MAX_ROLE_NAME = 80;
 const MAX_ROLE_DESCRIPTION = 500;
+const MAX_PATH_NOTE = 500;
 const ROLE_KEY_RE = /^[a-z][a-z0-9_]{1,40}$/;
 /** A full dotted event ("member.added") or a namespace ("member" ⇒ "member.*"). */
 const AUDIT_EVENT_FILTER_RE = /^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$/;
@@ -219,12 +239,40 @@ export interface ScopeValueRow {
   funnel_id: string;
 }
 
+export type FunnelPathSource = "registry_seed" | "registry" | "funnelfox_alias_seed" | "admin_alias";
+
+/** One public.funnel_paths row (SHARED CONTRACT 8). Only active and retired
+ * rows grant access; the bigint id travels as a string. */
+export interface AdminFunnelPath {
+  id: string;
+  funnel_id: string;
+  path: string;
+  status: FunnelPathStatus;
+  source: FunnelPathSource;
+  funnelfox_funnel_id: string | null;
+  note: string;
+  confirmed_at: string | null;
+  retired_at: string | null;
+  revoked_at: string | null;
+}
+
+/** paths.attach / paths.set_status → 200. */
+export type PathMutationResult = {
+  ok: true;
+  changed: boolean;
+  path: AdminFunnelPath;
+  /** Active members whose selected scope holds the path's funnel. */
+  affected_members: number;
+};
+
 export interface FunnelRow {
   id: string;
   funnel_path: string;
   display_name: string;
   is_active: boolean;
   tags: string[];
+  /** Every funnel_paths row of the funnel, any status (service-role read). */
+  paths: AdminFunnelPath[];
 }
 
 export interface AuditRow {
@@ -291,7 +339,9 @@ export interface EffectiveAccessView {
   /** Effective (§8): enforced, requires-satisfied, full-scope keys only with scope all; [] while disabled. */
   permissions: string[];
   raw_access: boolean;
-  funnel_scope: FunnelScopeView & { names: string[] };
+  /** paths: the sorted granted (active ∪ retired) paths of the selected funnels,
+   * as app.funnel_scope_paths resolves them. */
+  funnel_scope: FunnelScopeView & { names: string[]; paths: string[] };
 }
 
 export interface AuditEventView {
@@ -317,6 +367,8 @@ export interface FunnelOptionView {
   display_name: string;
   is_active: boolean;
   tags: string[];
+  /** Active, retired, proposed, then revoked; by path within a status. */
+  paths: AdminFunnelPath[];
 }
 
 // ---- store ----------------------------------------------------------------------------
@@ -349,6 +401,9 @@ export interface AccessAdminStore {
   listAuditEvents(query: AuditQuery): Promise<AuditRow[]>;
   rpc(fn: string, params: Record<string, unknown>): Promise<{ data: unknown; error: unknown }>;
   setUserBan(userId: string, banDuration: string): Promise<BanResult>;
+  /** public.clickhouse_cohort_snapshot_state of the tenant (paths.coverage only;
+   * a store without it answers that action 503). */
+  loadCohortSnapshotState?(tenantKey: string): Promise<CohortSnapshotState | null>;
 }
 
 export type AccessAdminLog = (level: "info" | "warn" | "error", event: string, details: Record<string, unknown>) => void;
@@ -414,6 +469,29 @@ export function readScopeInput(mode: unknown, funnelIds: unknown): ScopeInput {
   return { mode: normalizedMode, funnelIds: ids };
 }
 
+/** paths.attach `path`: exactly a canonical campaign path, the funnel_paths
+ * CHECK (nothing is transformed on the admin's behalf, as in SQL). */
+function readCanonicalPath(body: Record<string, unknown>): string {
+  const value = body.path;
+  const path = typeof value === "string" ? value.trim() : "";
+  if (!isScopablePath(path)) throw invalid("path must be a canonical campaign path (a-z, 0-9 and single dashes, at most 200 characters).");
+  return path;
+}
+
+/** paths.set_status `path_id`: the funnel_paths bigint id (string or number). */
+function readPathId(body: Record<string, unknown>): number {
+  const id = positiveInteger(body.path_id);
+  if (id === null) throw invalid("path_id must be a positive integer.");
+  return id;
+}
+
+function readPathStatus(body: Record<string, unknown>): "active" | "retired" | "revoked" {
+  const value = body.status;
+  const status = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (status !== "active" && status !== "retired" && status !== "revoked") throw invalid("status must be active, retired or revoked.");
+  return status;
+}
+
 /** validateRolePermissions + its normalized (catalog-ordered, requires-closed) set. */
 export function readRolePermissions(value: unknown): string[] {
   if (!Array.isArray(value)) throw invalid("permissions must be an array of permission keys.");
@@ -453,6 +531,11 @@ function readRoleKey(value: unknown, name: string): string {
 function positiveInteger(value: unknown): number | null {
   const parsed = typeof value === "number" ? value : typeof value === "string" && /^\d+$/.test(value.trim()) ? Number(value.trim()) : NaN;
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function nonNegativeInteger(value: unknown): number | null {
+  const parsed = typeof value === "number" ? value : typeof value === "string" && /^\d+$/.test(value.trim()) ? Number(value.trim()) : NaN;
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
 }
 
 export function parseAuditQuery(body: Record<string, unknown>, workspaceId: string): AuditQuery {
@@ -636,21 +719,31 @@ export function buildEffectiveAccess(input: {
       ? inCatalogOrder(effectivePermissions({ granted: role.permissions, isOwner: role.is_owner, funnelScopeAll: scope.mode === "all" }))
       : [];
   const funnelsById = new Map(input.funnels.map((funnel) => [funnel.id.toLowerCase(), funnel]));
-  const names =
-    scope.mode === "selected"
-      ? scope.funnel_ids.map((id) => {
-        const funnel = funnelsById.get(id.toLowerCase());
-        return funnel ? funnel.display_name.trim() || funnel.funnel_path : id;
-      })
-      : [];
+  const selected = scope.mode === "selected" ? scope.funnel_ids.map((id) => ({ id, funnel: funnelsById.get(id.toLowerCase()) })) : [];
+  const names = selected.map(({ id, funnel }) => (funnel ? funnel.display_name.trim() || funnel.funnel_path : id));
   return {
     status: member.status,
     role: roleRefOf(role, member.role_id),
     permissions,
     raw_access: active && member.is_data_owner && sameId(member.user_id, input.tenantKey),
-    funnel_scope: { mode: scope.mode, funnel_ids: [...scope.funnel_ids], names },
+    funnel_scope: { mode: scope.mode, funnel_ids: [...scope.funnel_ids], names, paths: grantedFunnelPaths(selected.map(({ funnel }) => funnel)) },
   };
 }
+
+const compareText = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+
+/** Sorted, distinct granted (active ∪ retired) paths of the given funnels. */
+export function grantedFunnelPaths(funnels: ReadonlyArray<Pick<FunnelRow, "paths"> | null | undefined>): string[] {
+  const paths = new Set<string>();
+  for (const funnel of funnels) {
+    for (const entry of funnel?.paths ?? []) {
+      if (GRANTED_PATH_STATUSES.has(entry.status)) paths.add(entry.path);
+    }
+  }
+  return [...paths].sort(compareText);
+}
+
+const PATH_STATUS_RANK: Readonly<Record<FunnelPathStatus, number>> = Object.freeze({ active: 0, retired: 1, proposed: 2, revoked: 3 });
 
 export function funnelOptionView(funnel: FunnelRow): FunnelOptionView {
   return {
@@ -659,6 +752,9 @@ export function funnelOptionView(funnel: FunnelRow): FunnelOptionView {
     display_name: funnel.display_name,
     is_active: funnel.is_active,
     tags: [...new Set(funnel.tags)].sort((a, b) => a.localeCompare(b)),
+    paths: [...(funnel.paths ?? [])]
+      .sort((a, b) => PATH_STATUS_RANK[a.status] - PATH_STATUS_RANK[b.status] || compareText(a.path, b.path) || Number(a.id) - Number(b.id))
+      .map((entry) => ({ ...entry })),
   };
 }
 
@@ -736,6 +832,9 @@ export interface AccessAdminRunInput {
   body: Record<string, unknown>;
   store: AccessAdminStore;
   log?: AccessAdminLog;
+  /** The request's lazily built ScopedReader (gate `clickhouse()`); only
+   * paths.coverage opens it. */
+  clickhouse?: () => ClickHouseClientLike;
 }
 
 /** The mutation actor: the signed-in caller (never the tenant key). */
@@ -1041,6 +1140,80 @@ async function listFunnelOptions({ store }: AccessAdminRunInput) {
   return { ok: true, funnels };
 }
 
+// ---- funnel paths (Phase 2) -----------------------------------------------------------
+
+/** The PathMutationResult of a path RPC ({ ok, changed, path: to_jsonb(row),
+ * affected_members }). A row this module cannot read is a service fault. */
+function pathMutationResult(fn: string, result: Record<string, unknown>): PathMutationResult {
+  const path = parseFunnelPath(result.path);
+  if (!path) throw new AccessAdminStoreError(`${fn} returned an unexpected path.`);
+  return { ok: true, changed: result.changed === true, path, affected_members: nonNegativeInteger(result.affected_members) ?? 0 };
+}
+
+async function attachFunnelPath({ ctx, body, store }: AccessAdminRunInput): Promise<PathMutationResult> {
+  const actor = actorUserId(ctx);
+  const funnelId = requireUuidField(body, "funnel_id");
+  const path = readCanonicalPath(body);
+  const note = optionalTextField(body, "note", MAX_PATH_NOTE) ?? "";
+  const result = await callRpc(store, "access_attach_funnel_path", { p_actor: actor, p_funnel_id: funnelId, p_path: path, p_note: note });
+  return pathMutationResult("access_attach_funnel_path", result);
+}
+
+async function setFunnelPathStatus({ ctx, body, store }: AccessAdminRunInput): Promise<PathMutationResult> {
+  const actor = actorUserId(ctx);
+  const pathId = readPathId(body);
+  const status = readPathStatus(body);
+  const note = optionalTextField(body, "note", MAX_PATH_NOTE) ?? "";
+  const result = await callRpc(store, "access_set_funnel_path_status", {
+    p_actor: actor,
+    p_funnel_path_id: pathId,
+    p_status: status,
+    p_note: note,
+  });
+  return pathMutationResult("access_set_funnel_path_status", result);
+}
+
+const COVERAGE_NOT_READY =
+  "The cohort snapshot is not ready: coverage is measured on the active validated snapshot. Retry after the next rebuild.";
+
+/** paths.coverage: the active snapshot's anchor paths diffed against the
+ * registry. State first (409 before any ClickHouse statement), then the
+ * registry, then one warehouse read. */
+async function pathCoverage({ ctx, store, clickhouse }: AccessAdminRunInput): Promise<FunnelCoverage> {
+  // PATH_COVERAGE_SQL names the protected tables directly: all-scope only.
+  if (ctx.restricted) throw new AccessAdminError("permission_denied", "Funnel coverage requires access to all funnels.");
+  if (!store.loadCohortSnapshotState) throw new AccessAdminStoreError("paths.coverage: the store cannot read the cohort snapshot state");
+  if (!clickhouse) throw new AccessAdminStoreError("paths.coverage: no ClickHouse reader for this request");
+
+  const state = await store.loadCohortSnapshotState(ctx.tenantKey);
+  const active = coverageSnapshot(state, { now: new Date(), maxStalenessMs: coverageMaxStalenessMs() });
+  if (!active) throw new AccessAdminError("conflict", COVERAGE_NOT_READY);
+
+  const funnels = await store.listFunnels();
+  const registry = funnels.map((funnel) => ({
+    id: funnel.id,
+    paths: (funnel.paths ?? []).map((entry) => ({
+      id: entry.id,
+      funnel_id: entry.funnel_id || funnel.id,
+      path: entry.path,
+      status: entry.status,
+      retired_at: entry.retired_at,
+    })),
+  }));
+  const retired = registry.flatMap((funnel) =>
+    funnel.paths.filter((entry) => entry.status === "retired" && entry.retired_at).map((entry) => ({ path: entry.path, since: entry.retired_at as string })));
+
+  let rows: Awaited<ReturnType<typeof runPathCoverage>>;
+  try {
+    rows = await runPathCoverage({ clickhouse: clickhouse(), authUserId: ctx.tenantKey, active: active.active, retired });
+  } catch (error) {
+    // A ScopeViolation stays one: the gate answers it 500 scope_violation.
+    if (error instanceof Error && error.name === "ScopeViolation") throw error;
+    throw new AccessAdminStoreError(`path coverage: ${errorText(error)}`);
+  }
+  return buildFunnelCoverage({ rows, funnels: registry, snapshot: active.snapshot });
+}
+
 /** Runs one authorized action. Returns the 200 body; throws AccessAdminError
  * (admin-facing refusal), AccessAdminStoreError (503) or anything else (500). */
 export async function runAccessAdminAction(input: AccessAdminRunInput): Promise<Record<string, unknown>> {
@@ -1075,6 +1248,12 @@ export async function runAccessAdminAction(input: AccessAdminRunInput): Promise<
       return listAudit(input);
     case "funnels.list":
       return listFunnelOptions(input);
+    case "paths.coverage":
+      return pathCoverage(input);
+    case "paths.attach":
+      return attachFunnelPath(input);
+    case "paths.set_status":
+      return setFunnelPathStatus(input);
     default:
       throw invalid("Unsupported action.");
   }
@@ -1130,9 +1309,9 @@ export function createAccessAdminHandler(
   const makeStore =
     options.makeStore ?? (({ pg, ctx }) => createSupabaseAccessAdminStore(pg as unknown as AccessAdminPgClient, { requestId: ctx.requestId }));
   const log = options.log ?? defaultLog;
-  return async ({ ctx, action, body, pg }) => {
+  return async ({ ctx, action, body, pg, clickhouse }) => {
     try {
-      return await runAccessAdminAction({ ctx, action, body, store: makeStore({ pg, ctx }), log });
+      return await runAccessAdminAction({ ctx, action, body, store: makeStore({ pg, ctx }), log, clickhouse });
     } catch (error) {
       if (!(error instanceof AccessAdminError)) throw error;
       log("warn", "access_admin_rejected", {
@@ -1164,6 +1343,8 @@ export interface PgQuery extends PromiseLike<PgResult> {
   order(column: string, options?: { ascending?: boolean }): PgQuery;
   limit(count: number): PgQuery;
   range?(from: number, to: number): PgQuery;
+  /** getCohortSnapshotState's single-row read (paths.coverage). */
+  maybeSingle?(): PromiseLike<PgResult>;
 }
 
 export interface PgRpcCall extends PromiseLike<PgResult> {
@@ -1188,7 +1369,8 @@ const MEMBER_COLUMNS = "id,user_id,role_id,status,is_data_owner,email_snapshot,d
 const ROLE_COLUMNS = "id,key,name,description,is_owner,is_system,template_key,permissions";
 const SCOPE_RULE_COLUMNS = "member_id,mode";
 const SCOPE_VALUE_COLUMNS = "member_id,funnel_id";
-const FUNNEL_COLUMNS = "id,funnel_path,display_name,is_active,funnel_tags(tags(name))";
+const FUNNEL_COLUMNS =
+  "id,funnel_path,display_name,is_active,funnel_tags(tags(name)),funnel_paths(id,path_canonical,status,source,funnelfox_funnel_id,note,confirmed_at,retired_at,revoked_at)";
 const AUDIT_COLUMNS = "id,occurred_at,actor_kind,actor_user_id,event,target_type,target_id,outcome,reason_code,before,after,context";
 
 async function runQuery(label: string, query: PromiseLike<PgResult>): Promise<Record<string, unknown>[]> {
@@ -1253,6 +1435,35 @@ function parseRoleRow(raw: Record<string, unknown>): RoleRow | null {
   };
 }
 
+const FUNNEL_PATH_STATUSES: readonly string[] = ["proposed", "active", "retired", "revoked"];
+const FUNNEL_PATH_SOURCES: readonly string[] = ["registry_seed", "registry", "funnelfox_alias_seed", "admin_alias"];
+
+/** A funnel_paths row: from the funnels embed (no funnel_id column there, so the
+ * parent's id) or an RPC's to_jsonb(row). A row outside the CHECK vocabulary is
+ * dropped, so an unknown status never reads as a grant. */
+export function parseFunnelPath(raw: unknown, parentFunnelId: string | null = null): AdminFunnelPath | null {
+  const row = asRecord(raw);
+  if (!row) return null;
+  const id = text(row.id);
+  const funnelId = text(row.funnel_id) ?? parentFunnelId;
+  const path = text(row.path_canonical);
+  const status = text(row.status) ?? "";
+  const source = text(row.source) ?? "";
+  if (!id || !funnelId || !path || !FUNNEL_PATH_STATUSES.includes(status) || !FUNNEL_PATH_SOURCES.includes(source)) return null;
+  return {
+    id,
+    funnel_id: funnelId,
+    path,
+    status: status as FunnelPathStatus,
+    source: source as FunnelPathSource,
+    funnelfox_funnel_id: text(row.funnelfox_funnel_id),
+    note: text(row.note) ?? "",
+    confirmed_at: text(row.confirmed_at),
+    retired_at: text(row.retired_at),
+    revoked_at: text(row.revoked_at),
+  };
+}
+
 function parseFunnelRow(raw: Record<string, unknown>): FunnelRow | null {
   const id = text(raw.id);
   if (!id) return null;
@@ -1262,12 +1473,18 @@ function parseFunnelRow(raw: Record<string, unknown>): FunnelRow | null {
     const name = isRecord(tag) ? text(tag.name)?.trim() : null;
     if (name) tags.push(name);
   }
+  const paths: AdminFunnelPath[] = [];
+  for (const entry of Array.isArray(raw.funnel_paths) ? raw.funnel_paths : []) {
+    const path = parseFunnelPath(entry, id);
+    if (path) paths.push(path);
+  }
   return {
     id,
     funnel_path: text(raw.funnel_path) ?? "",
     display_name: text(raw.display_name) ?? "",
     is_active: raw.is_active === true,
     tags,
+    paths,
   };
 }
 
@@ -1362,6 +1579,16 @@ export function createSupabaseAccessAdminStore(pg: AccessAdminPgClient, options:
         return result?.error ? { ok: false, reason: "failed" } : { ok: true };
       } catch {
         return { ok: false, reason: "failed" };
+      }
+    },
+    async loadCohortSnapshotState(tenantKey) {
+      // The gate's own reader (one definition of the row); filtered on
+      // auth_user_id = the workspace data key. Only versions and dates leave
+      // this module (paths.coverage `snapshot`).
+      try {
+        return await getCohortSnapshotState(pg as unknown as SupabaseLikeClient, tenantKey);
+      } catch (error) {
+        throw new AccessAdminStoreError(`clickhouse_cohort_snapshot_state: ${errorText(error)}`);
       }
     },
   };
