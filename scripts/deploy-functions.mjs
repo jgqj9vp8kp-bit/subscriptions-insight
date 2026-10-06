@@ -22,9 +22,13 @@
 // employee. `--dry-run` prints the plan and changes nothing.
 //
 // Usage:
-//   SUPABASE_SERVICE_ROLE_KEY=... node scripts/deploy-functions.mjs --project-ref <ref> [--dry-run | --verify-only]
-//   (SUPABASE_URL defaults to https://<ref>.supabase.co; the Supabase CLI must be
-//   logged in: `supabase login`.)
+//   npm run deploy:functions -- --project-ref <ref> [--dry-run | --verify-only]
+//   (Windows PowerShell: npm.cmd). The Supabase CLI must be logged in
+//   (`supabase login`, or `npx.cmd supabase login`); without a global `supabase`
+//   binary the script runs the pinned CLI through npx. The pre-check uses that
+//   login; set SUPABASE_SERVICE_ROLE_KEY only to pre-check through PostgREST
+//   instead (SUPABASE_URL defaults to https://<ref>.supabase.co). Functions are
+//   bundled server-side (--use-api), so Docker is not needed.
 //
 // Freeze the crons before running it and unfreeze them only after it passed
 // (README "Access control rollout").
@@ -107,6 +111,34 @@ export function checkDataKeyResponse(status, bodyText) {
   return { ok: true, dataKey: value };
 }
 
+/** Pre-check through the Supabase CLI login instead of the service-role key:
+ * `supabase db query --linked -o json -f scripts/sql/workspace_data_key.sql`
+ * prints {"rows":[{"data_key": …}], …}. Same verdicts as checkDataKeyResponse. */
+export function checkCliDataKeyOutput(code, stdout, stderr) {
+  const out = String(stdout ?? "");
+  const err = String(stderr ?? "");
+  if (code !== 0) {
+    if (/workspace_data_key/i.test(`${out}\n${err}`) && /does not exist/i.test(`${out}\n${err}`)) {
+      return { ok: false, reason: "public.workspace_data_key() does not exist: apply 202610050001 and 202610050002 first" };
+    }
+    return { ok: false, reason: `supabase db query failed: ${(err || out).trim().slice(0, 200)}` };
+  }
+  const start = out.indexOf("{");
+  const end = out.lastIndexOf("}");
+  let parsed;
+  try {
+    parsed = JSON.parse(start >= 0 && end > start ? out.slice(start, end + 1) : "null");
+  } catch {
+    return { ok: false, reason: "supabase db query returned a non-JSON body" };
+  }
+  const value = Array.isArray(parsed?.rows) && parsed.rows.length ? parsed.rows[0]?.data_key ?? null : null;
+  if (value === null) return { ok: false, reason: "the workspace is not bootstrapped: run select public.bootstrap_workspace('<data owner uuid>', 'SubEngine'); first" };
+  if (typeof value !== "string" || !UUID_RE.test(value)) return { ok: false, reason: "workspace_data_key() returned something that is not a uuid" };
+  return { ok: true, dataKey: value };
+}
+
+export const DATA_KEY_CHECK_SQL_FILE = "scripts/sql/workspace_data_key.sql";
+
 /** Every function answered with the expected build id (or, without one, all
  * with the SAME id). results: [{ fn, status, buildId }]. */
 export function verifyBuildIds(results, expected) {
@@ -162,22 +194,26 @@ export async function runDeploy(argv, deps) {
   const ref = options.projectRef;
   const baseUrl = String(deps.env.SUPABASE_URL ?? `https://${ref}.supabase.co`).replace(/\/+$/, "");
   const serviceKey = String(deps.env.SUPABASE_SERVICE_ROLE_KEY ?? "").trim();
-  if (!serviceKey) {
-    log("error: SUPABASE_SERVICE_ROLE_KEY is required for the workspace pre-check (it is never sent anywhere but the project's PostgREST)");
-    return 2;
-  }
 
-  // 1. pre-check: migrations + bootstrap before any function
+  // 1. pre-check: migrations + bootstrap before any function. With
+  // SUPABASE_SERVICE_ROLE_KEY it asks PostgREST; without it, the logged-in
+  // Supabase CLI (Management API) — so nobody has to paste the service key.
   let check;
-  try {
-    const response = await deps.fetch(`${baseUrl}/rest/v1/rpc/workspace_data_key`, {
-      method: "POST",
-      headers: { apikey: serviceKey, Authorization: `Bearer ${serviceKey}`, "Content-Type": "application/json" },
-      body: "{}",
-    });
-    check = checkDataKeyResponse(response.status, await response.text());
-  } catch (error) {
-    check = { ok: false, reason: `could not reach PostgREST: ${error.message}` };
+  if (serviceKey) {
+    try {
+      const response = await deps.fetch(`${baseUrl}/rest/v1/rpc/workspace_data_key`, {
+        method: "POST",
+        headers: { apikey: serviceKey, Authorization: `Bearer ${serviceKey}`, "Content-Type": "application/json" },
+        body: "{}",
+      });
+      check = checkDataKeyResponse(response.status, await response.text());
+    } catch (error) {
+      check = { ok: false, reason: `could not reach PostgREST: ${error.message}` };
+    }
+  } else {
+    log("pre-check through the Supabase CLI login (SUPABASE_SERVICE_ROLE_KEY is not set)");
+    const queried = deps.exec("supabase", ["db", "query", "--linked", "--project-ref", ref, "-o", "json", "-f", DATA_KEY_CHECK_SQL_FILE]);
+    check = checkCliDataKeyOutput(queried.code, queried.stdout, queried.stderr);
   }
   if (!check.ok) {
     log(`REFUSED: ${check.reason}`);
@@ -220,7 +256,8 @@ export async function runDeploy(argv, deps) {
       deps.writeFile(buildIdPath, renderBuildIdSource(original, expected));
       for (const fn of repo) {
         log(`deploy ${fn}`);
-        const result = deps.exec("supabase", ["functions", "deploy", fn, "--project-ref", ref]);
+        // --use-api: bundle server-side, so deploying needs no local Docker.
+        const result = deps.exec("supabase", ["functions", "deploy", fn, "--project-ref", ref, "--use-api"]);
         if (result.code !== 0) {
           failed.push(fn);
           log(`  FAILED: ${(result.stderr || result.stdout || "").trim().slice(0, 500)}`);
@@ -282,15 +319,32 @@ export async function runDeploy(argv, deps) {
 
 // ---- CLI ----------------------------------------------------------------------------------------
 
+/** The Supabase CLI pinned for `npx` when no `supabase` binary is on PATH. */
+export const SUPABASE_CLI_NPX_PACKAGE = "supabase@2.119.0";
+
+/** `supabase …` → the installed binary when there is one, else `npx --yes <pinned CLI> …`. */
+export function resolveCliCommand(command, args, hasSupabaseBinary) {
+  if (command !== "supabase" || hasSupabaseBinary) return { command, args };
+  return { command: "npx", args: ["--yes", SUPABASE_CLI_NPX_PACKAGE, ...args] };
+}
+
 function liveDeps(root) {
+  // `shell` on Windows so the npm-installed `.cmd` shims (supabase.cmd, npx.cmd)
+  // resolve. Every argument the script passes is a plain token (no spaces or
+  // shell metacharacters — the pre-check SQL lives in a file), so no quoting is needed.
+  const shell = process.platform === "win32";
+  let hasSupabaseBinary;
   return {
     root,
     env: process.env,
     log: (line) => console.log(line),
     now: () => new Date(),
     exec: (command, args) => {
-      // `shell` on Windows so the npm-installed `supabase.cmd` shim resolves.
-      const result = spawnSync(command, args, { cwd: root, encoding: "utf8", shell: process.platform === "win32" });
+      if (command === "supabase" && hasSupabaseBinary === undefined) {
+        hasSupabaseBinary = spawnSync("supabase", ["--version"], { cwd: root, encoding: "utf8", shell }).status === 0;
+      }
+      const resolved = resolveCliCommand(command, args, hasSupabaseBinary);
+      const result = spawnSync(resolved.command, resolved.args, { cwd: root, encoding: "utf8", shell });
       return { code: result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? String(result.error ?? "") };
     },
     fetch: (url, init) => fetch(url, init),

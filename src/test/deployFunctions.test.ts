@@ -7,7 +7,9 @@ import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
   BUILD_ID_FILE,
+  checkCliDataKeyOutput,
   checkDataKeyResponse,
+  DATA_KEY_CHECK_SQL_FILE,
   diffFunctionSets,
   generateBuildId,
   listRepoFunctions,
@@ -15,7 +17,9 @@ import {
   parseDeployedFunctions,
   readBuildId,
   renderBuildIdSource,
+  resolveCliCommand,
   runDeploy,
+  SUPABASE_CLI_NPX_PACKAGE,
   verifyBuildIds,
 } from "../../scripts/deploy-functions.mjs";
 
@@ -49,6 +53,25 @@ describe("pure helpers", () => {
     expect(stamped.replace(id, "X")).toBe(BUILD_ID_SOURCE.replace(readBuildId(BUILD_ID_SOURCE) as string, "X"));
     expect(() => renderBuildIdSource("export const OTHER = 1;", id)).toThrow(/no `export const BUILD_ID/);
     expect(() => renderBuildIdSource(BUILD_ID_SOURCE, 'x"; evil()')).toThrow(/invalid build id/);
+  });
+
+  it("reads the CLI pre-check output (rows JSON, stderr noise, failures)", () => {
+    const ok = JSON.stringify({ boundary: "b", rows: [{ data_key: DATA_KEY }], warning: "w" });
+    expect(checkCliDataKeyOutput(0, ok, "Initialising login role...")).toEqual({ ok: true, dataKey: DATA_KEY });
+    expect(checkCliDataKeyOutput(0, `Initialising login role...\n${ok}`, "")).toEqual({ ok: true, dataKey: DATA_KEY });
+    expect(checkCliDataKeyOutput(0, JSON.stringify({ rows: [{ data_key: null }] }), "").reason).toMatch(/not bootstrapped/);
+    expect(checkCliDataKeyOutput(0, JSON.stringify({ rows: [] }), "").reason).toMatch(/not bootstrapped/);
+    expect(checkCliDataKeyOutput(0, JSON.stringify({ rows: [{ data_key: "x" }] }), "").ok).toBe(false);
+    expect(checkCliDataKeyOutput(0, "not json", "").ok).toBe(false);
+    expect(checkCliDataKeyOutput(1, "", "ERROR: function public.workspace_data_key() does not exist").reason).toMatch(/apply 202610050001 and 202610050002/);
+    expect(checkCliDataKeyOutput(1, "", "Access token not provided").reason).toMatch(/supabase db query failed/);
+    expect(readFileSync(resolve(ROOT, DATA_KEY_CHECK_SQL_FILE), "utf8")).toMatch(/select public\.workspace_data_key\(\)::text as data_key;/);
+  });
+
+  it("runs the pinned CLI through npx when no supabase binary is installed", () => {
+    expect(resolveCliCommand("supabase", ["functions", "list"], true)).toEqual({ command: "supabase", args: ["functions", "list"] });
+    expect(resolveCliCommand("supabase", ["functions", "list"], false)).toEqual({ command: "npx", args: ["--yes", SUPABASE_CLI_NPX_PACKAGE, "functions", "list"] });
+    expect(resolveCliCommand("git", ["rev-parse"], false)).toEqual({ command: "git", args: ["rev-parse"] });
   });
 
   it("accepts only a uuid data key from the pre-check", () => {
@@ -96,6 +119,9 @@ function harness(options: {
   deployed?: string[];
   deployFails?: string[];
   liveBuildIds?: (fn: string, stamped: string) => string | null;
+  /** CLI pre-check (no service key): the data key the query returns, or a failure. */
+  cliDataKey?: string | null;
+  cliFailure?: { code: number; stderr: string };
 } = {}) {
   const files = new Map<string, string>([[resolve(ROOT, BUILD_ID_FILE), BUILD_ID_SOURCE]]);
   const lines: string[] = [];
@@ -103,6 +129,11 @@ function harness(options: {
   const stampedAtDeploy: string[] = [];
   const exec = vi.fn((command: string, args: string[]) => {
     if (command === "git") return { code: 0, stdout: "abc123def456\n", stderr: "" };
+    if (args[0] === "db" && args[1] === "query") {
+      if (options.cliFailure) return { code: options.cliFailure.code, stdout: "", stderr: options.cliFailure.stderr };
+      const value = options.cliDataKey === undefined ? DATA_KEY : options.cliDataKey;
+      return { code: 0, stdout: JSON.stringify({ boundary: "b", rows: [{ data_key: value }], warning: "untrusted" }), stderr: "Initialising login role...\n" };
+    }
     const [, sub, fn] = args;
     if (sub === "list") return { code: 0, stdout: JSON.stringify(deployed.map((slug) => ({ slug }))), stderr: "" };
     if (sub === "deploy") {
@@ -153,9 +184,25 @@ describe("runDeploy", () => {
       expect(h.deletes()).toEqual([]);
       expect(h.lines.join("\n")).toMatch(/REFUSED/);
     }
-    const noKey = harness();
-    expect(await runDeploy(["--project-ref", "ref"], { ...noKey.deps, env: {} })).toBe(2);
-    expect(noKey.fetchFn).not.toHaveBeenCalled();
+    // Without SUPABASE_SERVICE_ROLE_KEY the same gate runs through the CLI login.
+    for (const options of [{ cliDataKey: null }, { cliFailure: { code: 1, stderr: 'ERROR: function public.workspace_data_key() does not exist' } }]) {
+      const h = harness(options);
+      expect(await runDeploy(["--project-ref", "ref"], { ...h.deps, env: {} })).toBe(1);
+      expect(h.deploys()).toEqual([]);
+      expect(h.deletes()).toEqual([]);
+      expect(h.lines.join("\n")).toMatch(/REFUSED/);
+      expect(h.fetchFn.mock.calls.filter(([url]) => String(url).includes("/rest/v1/"))).toEqual([]);
+    }
+  });
+
+  it("pre-checks through the CLI login when no service key is set, then deploys with server-side bundling", async () => {
+    const h = harness();
+    expect(await runDeploy(["--project-ref", "ref"], { ...h.deps, env: {} })).toBe(0);
+    const query = h.exec.mock.calls.find(([, args]) => args[0] === "db");
+    expect(query?.[1]).toEqual(["db", "query", "--linked", "--project-ref", "ref", "-o", "json", "-f", DATA_KEY_CHECK_SQL_FILE]);
+    expect(h.fetchFn.mock.calls.filter(([url]) => String(url).includes("/rest/v1/"))).toEqual([]);
+    expect(h.deploys()).toEqual(REPO);
+    for (const [, args] of h.exec.mock.calls.filter(([, args]) => args[1] === "deploy")) expect(args).toContain("--use-api");
   });
 
   it("deploys every repo function with one stamped build id, deletes extras, verifies, and restores buildId.ts", async () => {

@@ -33,3 +33,6 @@ supabase/.temp/
 
 # Local payment exports (customer data) - never commit
 /payments*.csv
+
+# Production rollout SQL with account emails/uuids - never commit
+/.rollout/
