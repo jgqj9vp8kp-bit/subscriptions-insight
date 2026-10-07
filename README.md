@@ -205,13 +205,102 @@ carries an email into `public.funnelfox_leads` in the background. Details: DEVEL
    `select * from net._http_response order by created desc` for 200s.
 5. **Deploy the frontend.** The new tab needs the step-2 functions; the old tab keeps working until
    then (the server ignores its `conversion` body and fills in the missing page sizes).
+6. **Latest 1,000 leads (2026-10-07): apply `202610070001_leads_recent_candidates.sql` on its own** —
+   out of band, never `supabase db push` (that would also apply every other pending file, e.g.
+   `202610060011` if it is still pending). It needs only `202610060010` (it refuses to run before it):
+
+   ```text
+   npx supabase db query --linked -f supabase/migrations/202610070001_leads_recent_candidates.sql
+   npx supabase migration repair --status applied 202610070001
+   ```
+
+   (or paste the file into the Dashboard SQL Editor; either way it runs as one transaction). It adds
+   `leads_recent_candidates_compute` / `leads_recent_candidates` / `leads_refresh_recent_candidates`
+   (service_role only), the cache table `public.funnelfox_leads_candidates_cache` (RLS on, no
+   browser access) and the pg_cron job `funnelfox-leads-recent-cache` (every 5 minutes, pure SQL, no
+   HTTP).
+
+   Once `202610070001` is recorded, `supabase db push` refuses any still-pending `202610060011`,
+   because it sorts before the last applied version. Apply that file out of band too:
+   `npx supabase db query --linked -f supabase/migrations/202610060011_funnelfox_leads_cron.sql`,
+   then `npx supabase migration repair --status applied 202610060011` (or use the SQL Editor).
+   Never use `--include-all`.
+
+   Then warm the cache once and check it:
+
+   ```text
+   select public.leads_refresh_recent_candidates();
+   select profile_limit, computed_at, duration_ms from public.funnelfox_leads_candidates_cache;
+   select status, return_message, start_time from cron.job_run_details
+     where jobid = (select jobid from cron.job where jobname = 'funnelfox-leads-recent-cache')
+     order by start_time desc limit 5;
+   ```
+
+   Then deploy the functions and the frontend. The order does not matter: until the migration is
+   applied the functions fall back to `leads_profile_candidates` with its old 50,000 cap (slow and
+   timeout-prone, as before; the merged set is still cut to the latest 1,000), and the old frontend
+   simply shows no banner. Rollback: `select cron.unschedule('funnelfox-leads-recent-cache');`
+   stops the refresh (the Edge then computes on a cache miss, at most every 15 minutes).
+
+   **Reconcile queue (incident 2026-10-07), same file, section 6.** The export's `reconcile` stage
+   called `funnelfox_leads_reconcile` through PostgREST; its first pass over the 235k stored
+   profiles rewrites almost every row and ran into the 8 s statement timeout every minute
+   (`reconcile failed: canceling statement due to statement timeout`, `last_status = 'error'`,
+   `next_stage = 'reconcile'`). The file now also adds the `funnelfox_leads_sync_state` columns
+   `reconcile_requested_at` / `reconcile_applied_at` / `reconcile_summary` / `reconcile_failure`
+   (no browser write access), `funnelfox_leads_reconcile_request` (service_role only: stamps the
+   request, one row update), `funnelfox_leads_reconcile_pending(p_force default false)` (no API
+   role) and the pg_cron job `funnelfox-leads-reconcile` (every minute, pure SQL, no HTTP, as
+   postgres): the stage now only queues the reconcile and completes; the job runs the unchanged
+   `funnelfox_leads_reconcile` within a minute and records it. postgres is not under PostgREST's
+   8 s limit but IS under Supabase's 2-minute global `statement_timeout`, so the job's command sets
+   its own first: `set statement_timeout = '15min'; set lock_timeout = '30s'; select
+   public.funnelfox_leads_reconcile_pending()`. A run that still fails (timeout or any error) rolls
+   back, is recorded in `reconcile_failure` (`failed_at`, `duration_ms`, `sqlstate`, `error`,
+   `failures`, `retry_after`; a WARNING in the Postgres log — the cron run itself reads `succeeded`)
+   and the job waits 15 min before the next attempt, doubling per consecutive failure up to 6 h, so
+   it never restarts back to back. Deploy order does not matter either: before the SQL, the new
+   `funnelfox-leads-sync` falls back (PGRST202) to the inline reconcile, which keeps failing exactly
+   as today until the file is applied. Once both are live, the next advance tick queues the
+   reconcile (a click on **Continue Sync** does it at once) and the pipeline turns `ok`.
+
+   The first pass is the heavy one (~216k rows rewritten): within a few minutes of the first
+   request, check that it applied and how long it took. Check:
+
+   ```text
+   select reconcile_requested_at, reconcile_applied_at, reconcile_summary->>'duration_ms' as duration_ms,
+          reconcile_summary, reconcile_failure from public.funnelfox_leads_sync_state;
+   select status, return_message, start_time, end_time from cron.job_run_details
+     where jobid = (select jobid from cron.job where jobname = 'funnelfox-leads-reconcile')
+     order by start_time desc limit 5;
+   ```
+
+   `reconcile_applied_at >= reconcile_requested_at` means the last request is applied;
+   `reconcile_summary` holds its counts (`checked`, `leads`, `paid_excluded`, `active_excluded`,
+   `updated`, `duration_ms`, `applied_at`). An idle minute of the job costs one primary-key read.
+   If `reconcile_failure` is set (e.g. `canceling statement due to statement timeout` after 15 min),
+   run the pass once by hand without a timeout, from the SQL editor or better a direct connection
+   (`p_force` skips the backoff; a run already in progress answers `skipped: running`):
+
+   ```text
+   set statement_timeout = 0; select public.funnelfox_leads_reconcile_pending(true);
+   ```
+
+   If runs keep failing, freeze the job until it is understood:
+   `select cron.alter_job(jobid, active := false) from cron.job where jobname = 'funnelfox-leads-reconcile';`
+   Rollback: `select cron.unschedule('funnelfox-leads-reconcile');` (requests then simply stay
+   queued; nothing reads the five conversion columns the reconcile writes). While a request stays
+   queued for more than 15 minutes, or after a failed run, the sync card shows an amber "Conversion
+   reconcile queued since … but not applied yet" warning (the status itself stays `ok`).
 
 How the background export proceeds:
 
 - `funnelfox-leads-advance` posts every minute and runs ONE stage per call (~50 s budget):
   `profiles` (crawl the profile list newest first, store only rows with an email; checkpoint every
-  10 pages) → `sessions` (attribution for the stored profiles) → `reconcile` (one SQL call: paid /
-  active emails stop being leads). Each call resumes from the saved cursor.
+  10 pages) → `sessions` (attribution for the stored profiles) → `reconcile` (queues the conversion
+  reconcile: paid / active emails stop being leads once the pg_cron job `funnelfox-leads-reconcile`
+  applies it, within a minute; before `202610070001` it runs inline). Each call resumes from the
+  saved cursor.
 - The tick is skipped without an HTTP call while another call holds the lease (120 s), while a
   FunnelFox 429 pause runs (`stats.rate_limited_until`, Retry-After or 60 s), while the backoff after
   a FunnelFox error runs (`stats.error_backoff_until`, 60 s doubling to at most 1 h) and once every
@@ -223,13 +312,24 @@ How the background export proceeds:
   restarts; a pipeline whose last run failed is restarted.
 - Progress (read-only): `select current_stage, last_status, last_error, lease_until,
   profiles_completed, sessions_completed, reconcile_completed, stats->>'profiles_scanned_total',
-  stats->>'profiles_with_email', stats->>'rate_limited_until', stats->>'error_backoff_until' from
-  public.funnelfox_leads_sync_state;`
-- Leads tab size: the server merges at most the newest 50 000 FunnelFox profile leads in memory.
-  Past that the tab shows "Showing the newest … of … FunnelFox profile leads" — the signal that
-  profile leads must move to ClickHouse (plan §4 step 7).
+  stats->>'profiles_with_email', stats->>'rate_limited_until', stats->>'error_backoff_until',
+  reconcile_requested_at, reconcile_applied_at, reconcile_summary, reconcile_failure from
+  public.funnelfox_leads_sync_state;` (the four new `reconcile_*` columns exist once `202610070001`
+  is applied; the sync card shows "Conversion reconcile queued …" while a request waits for the job —
+  not a failure — and an amber warning once it waits past 15 minutes or its last run failed).
+- What the Leads tab shows (owner decision 2026-10-07, for speed): only the **latest 1,000 leads**
+  by lead date (about the last 3 days today). The list, search, filters, filter options and the
+  Total Leads / Leads Today / Leads Last 7 Days cards cover those 1,000; Emails Found, Converted
+  Excluded and Active Subs Excluded are whole-base counts. A banner says "Showing the latest 1,000
+  leads (since …)" and when the server last computed them (the cache is at most ~5 minutes old;
+  the Refresh button and the end of a sync rebuild the server's 60 s memo and recompute the cache
+  unless it is under a minute old). Known transient: for up to ~5 min after an import's ClickHouse
+  sync, a returning old lead can show with its new transaction date, and a just-converted recent
+  lead can stay listed, until the next `funnelfox-leads-recent-cache` tick (the cached Postgres
+  candidates are merged with the live ClickHouse rows).
 - Pause / resume: `select cron.alter_job(jobid, active := false) from cron.job where jobname like
-  'funnelfox-leads-%';` (`active := true` to resume).
+  'funnelfox-leads-%';` (`active := true` to resume; this includes `funnelfox-leads-recent-cache`
+  and `funnelfox-leads-reconcile` — freeze all four leads jobs around a deploy that touches them).
 
 Server-summary flags stay off in production until real-data parity is confirmed
 (see `.env.example`): `VITE_FB_ANALYTICS_SOURCE` and `VITE_DASHBOARD_SOURCE`
@@ -337,17 +437,19 @@ Rollback (Phase 2):
 1. Disable the restricted members first.
 2. Cron: `select cron.unschedule('cohort-membership-freshness');` (before the functions, so no tick
    reaches a build without `cron_tick`).
-3. Functions: redeploy commit `8d40168` (the last `main` before Phase 2; it carries the server-side Leads)
-   with the deploy script — restricted members get 403 everywhere again.
+3. Functions: redeploy the last `main` before Phase 2 with the deploy script (`91fea2f` as of
+   2026-10-07: server-side Leads, the latest-1,000 candidates and the queued reconcile; an older
+   build would run the reconcile inline again, which times out) — restricted members get 403
+   everywhere again.
 4. SQL: run `supabase/rollback/202610060001_rollback.sql`. `funnel_paths`, the new snapshot columns and
    `fact_campaign_scope` stay in place, unused. Leave the `schema_migrations` rows of `202610060001` /
    `202610060002` in place: `202610060001` is one-shot (plain `create table` / `create trigger` /
    `create policy`), so a later roll-forward needs a dedicated script, not a re-run of the file.
-5. Frontend: return `main` to the 8d40168 frontend (server-side Leads, no Phase 2) with
-   `git revert -m 2 ec629b5`, the commit that merged `main` into `feature/access-phase2`
-   (parent 1 = d3c4e74 Phase 2, parent 2 = 8d40168 main). Never `-m 1`: it
-   drops the Leads frontend and keeps Phase 2. The `funnel_paths` embed keeps working, the table
-   still exists.
+5. Frontend: return `main` to its pre-Phase-2 frontend with `git revert -m 2 <merge>`, where
+   `<merge>` is the newest commit that merged `main` into `feature/access-phase2`
+   (`git log --merges -1 --format=%h feature/access-phase2`; parent 1 = the Phase 2 side, parent 2 =
+   `main`). Never `-m 1`: it drops the Leads frontend and keeps Phase 2. The `funnel_paths` embed keeps
+   working, the table still exists.
 6. The ClickHouse retention deletes cannot be undone; they only remove versions older than the previous
    active snapshot.
 

@@ -342,15 +342,69 @@ Pipeline (`supabase/functions/funnelfox-leads-sync/index.ts`; pure twin
   checkpointed every 10 pages; every page has a 20 s timeout.
 - `sessions` → crawl `/sessions` and attach the earliest session's attribution
   to STORED profiles only (light columns, no `raw_session`).
-- `reconcile` → one SQL call, `public.funnelfox_leads_reconcile(p_data_key)`:
-  paid emails from `public.transactions`, active ones from
+- `reconcile` → `public.funnelfox_leads_reconcile(p_data_key)`: paid emails
+  from `public.transactions`, active ones from
   `active_funnelfox_subscription_emails` (Cohorts definition). The Edge ignores
   any `conversion` body key; the browser no longer builds one.
+- Reconcile queue (incident 2026-10-07, migration `202610070001` section 6):
+  the stage used to call `funnelfox_leads_reconcile` through PostgREST. Its
+  first pass over the export (235k rows) rewrites almost every row
+  (`has_successful_payment`, `has_active_subscription`, `is_lead`,
+  `first_trial_at`, `first_sub_at`) and hit the 8 s statement timeout of the
+  role PostgREST runs service_role calls under, every minute (sync state stuck
+  at `next_stage = 'reconcile'`, `last_status = 'error'`, ~8 s of DB time per
+  tick). Now the stage calls `funnelfox_leads_reconcile_request(p_data_key)`
+  (service_role only; stamps `funnelfox_leads_sync_state.reconcile_requested_at`,
+  one row update, answers `{queued, requested_at, last_applied_at,
+  last_summary}`), marks `reconcile_completed` and copies the last APPLIED
+  run's counts into `stats` (`reconcile_rows` / `leads_found` /
+  `converted_excluded` / `active_sub_excluded` / `reconciled_at` from
+  `checked` / `leads` / `paid_excluded` / `active_excluded` / `applied_at`;
+  without an applied run the previous values stay) plus `reconcile_queued_at`.
+  The pg_cron job `funnelfox-leads-reconcile` (every minute, as postgres, pure
+  SQL) runs `set statement_timeout = '15min'; set lock_timeout = '30s'; select
+  funnelfox_leads_reconcile_pending()` — postgres has no timeout of its own but
+  Supabase's global default caps it at 2 minutes, which the first pass (~216k
+  non-HOT row updates over 8 indexes) may not fit on a small instance; since
+  PG13 each statement of a multi-statement command arms its own timeout, so
+  the SETs apply to the SELECT. `funnelfox_leads_reconcile_pending(p_force
+  boolean default false)`: when `reconcile_requested_at` is newer than
+  `reconcile_applied_at` it takes a transaction advisory lock, runs the
+  unchanged `funnelfox_leads_reconcile(workspace_data_key())` and stores
+  `reconcile_applied_at` = the run's START time and `reconcile_summary` = the
+  counts + `duration_ms` + `applied_at` (and clears `reconcile_failure`), so a
+  request stamped during a run is picked up by the next one. The reconcile
+  call sits in a block that traps `query_canceled` (a timeout; `others` does
+  not match it) and every other error: its work rolls back, the advisory lock
+  stays, `reconcile_failure` = `{failed_at, started_at, duration_ms, sqlstate,
+  error, failures, retry_after}` plus a WARNING, and later ticks answer
+  `{skipped: 'backoff'}` until `retry_after` (15 min after the first failure,
+  doubling per consecutive failure, at most 6 h). `p_force = true` skips that
+  wait (the manual `set statement_timeout = 0; select
+  public.funnelfox_leads_reconcile_pending(true);`). Trade-off: a trapped
+  failure shows as `succeeded` in `cron.job_run_details` (the failure lives in
+  `reconcile_failure` instead — recording it needs the transaction to commit).
+  The migration drops a no-argument `funnelfox_leads_reconcile_pending()` (an
+  earlier draft) so the job's call is never ambiguous. Nothing in the app reads
+  the five conversion columns (the Leads tab computes exclusions on the fly in
+  `leads_recent_candidates_compute`), so the queue only delays those columns
+  and the card's "Leads found". The Edge falls back (PGRST202 / 404 /
+  "could not find the function", `isMissingRpcError` mirrored from
+  `_shared/clickhouse/leads.ts`) to the inline call while the migration is not
+  applied; any other request error (or `queued: false`) fails the run as
+  before. The sync card shows "Conversion reconcile queued …" (muted, not an
+  error) while a request waits, polls for up to 15 min, and prefers the row's
+  `reconcile_summary.leads` over the stats copy. `isReconcileOverdue` (queued
+  for at least `RECONCILE_QUEUE_POLL_WINDOW_MS`, i.e. where polling stops, or
+  queued with a `reconcile_failure`) turns the note into an amber warning
+  ("… but not applied yet — the pg_cron job funnelfox-leads-reconcile may not
+  be running (check cron.job_run_details)", or the failure's error and
+  `retry_after`); `last_status` and its styling stay as they are.
 - A stored profile is also never a lead when ITS OWN subscription
   (`funnelfox_subscriptions.profile_id`) shows a paying / subscribed customer
   (its email paid or active, or priced and not cancelled / still in its paid
   period) — the quiz email can differ from the checkout email. Same rule in
-  reconcile and `leads_profile_candidates`.
+  reconcile, `leads_profile_candidates` and `leads_recent_candidates_compute`.
 - Upserts are grouped by key set (supabase-js fills missing keys with NULL in a
   bulk upsert — the same incident as the subscriptions list stage above).
 - A lease (`funnelfox_leads_acquire_lease` returns a token,
@@ -379,24 +433,76 @@ Leads tab read path (`clickhouse-users` actions `leads_list` /
 `leads_overview`; `supabase/functions/_shared/clickhouse/leads.ts`, contract in
 `leadsContract.ts`, browser `runClickHouseLeads` + `src/hooks/useLeadsData.ts`):
 - Merged in Edge from (A) one ClickHouse query of warehouse lead candidates,
-  (B) the RPC `leads_profile_candidates(p_data_key, p_profile_limit)` (stored
-  profiles + subscription-only emails + KPI counts) and (C)
+  (B) the RPC `leads_recent_candidates(p_data_key, p_limit, p_max_age_seconds)`
+  (migration `202610070001`; profile leads + subscription-only emails + KPI
+  counts, served from a Postgres cache, see below) and (C)
   `activeSubscriptionsByEmail`; `mergeLeads` is pure and parity-tested against
-  `computeLeads`. Filters, the sort allowlist and pagination run in Edge over
-  the merged set, memoized per workspace for 60 s per isolate (`refresh: true`
-  bypasses it and never joins a plain load already in flight; the page sends it
-  once after a sync).
+  `computeLeads`. The merged set is then cut to the newest
+  `LEADS_RECENT_LIMIT` (1 000) leads by lead date (`keepNewestLeads`: lead_date
+  desc, undated last, ties by row key — the page's default sort). Filters,
+  search, the sort allowlist, pagination, the filter options and the lead
+  counts (Total Leads, Leads Today, Leads Last 7 Days) run in Edge over that
+  cut set, memoized per workspace for 60 s per isolate (`refresh: true`
+  bypasses the memo, never joins a plain load already in flight, and asks the
+  Postgres cache for candidates at most `LEADS_CANDIDATES_REFRESH_MAX_AGE_SECONDS`
+  (60 s) old, so it recomputes unless the cron just ran; if that inline compute
+  fails, e.g. 57014 on a cold buffer cache, it retries once with 900 s; the page
+  sends it after a sync, on Refresh and when a background pass finishes).
+- Latest 1 000 leads only (owner decision 2026-10-07, for speed; about the last
+  3 days today). `leads_profile_candidates` ranked all 216k profile leads per
+  call (5.8-12 s, over the 8 s PostgREST statement timeout of the Edge's
+  service-role calls) and still showed only the newest 50k. Emails Found /
+  Converted Excluded / Active Subs Excluded stay whole-base (the RPC's `kpis`).
+  `diagnostics.lead_set_limited` / `lead_set_oldest_date` drive the page's
+  "Showing the latest 1,000 leads (since …)" banner; `candidates_computed_at`
+  its "Updated N min ago".
+- `leads_recent_candidates_compute(p_data_key, p_limit)` returns only what an
+  exact newest-N cut needs: the newest N + 1 representative profile leads of
+  emails outside the warehouse (ties included; two newest-first streams along
+  the `created_at` / `session_created_at` indexes) plus the representative
+  profile of EVERY unpaid warehouse email whatever its age (the merge folds it
+  into the warehouse row as "both" with the earlier date, so an old profile
+  must never be missing — a "both" row competes with its merged date, never
+  its fresh warehouse date). The paid flag is two-valued
+  (`coalesce(bool_or(status = 'success'), false)`): `transactions.status` is
+  nullable, and a NULL flag would drop that email's profile. Exclusions, the
+  representative rule and the field derivations are those of
+  `leads_profile_candidates` (production parity
+  2026-10-07: 0 differences; PGlite parity + an end-to-end cut test in
+  `src/test/leadsRecentCandidatesMigration.test.ts`). PL/pgSQL with `EXECUTE …
+  USING` so the key and limit are planned as constants (the measured plan);
+  it assumes `funnelfox_leads.normalized_email` is stored as
+  `lower(btrim(email))`, which the sync guarantees.
+- Cache: `public.funnelfox_leads_candidates_cache` (one row per data key, RLS on,
+  no policies, no browser grants). pg_cron `funnelfox-leads-recent-cache`
+  (`*/5 * * * *`, pure SQL, as postgres) runs
+  `leads_refresh_recent_candidates()`; the Edge reads with max age 900 s and
+  computes inline (and stores) only on a miss — 1.1 s warm, 2.5-10 s while the
+  export churns the buffer cache. `LEADS_RECENT_LIMIT` must equal the SQL
+  default `p_limit` (1000): the cron caches that limit and a test checks it.
+  Until `202610070001` is applied the Edge falls back (PGRST202) to
+  `leads_profile_candidates(p_data_key, p_profile_limit := 50000)`
+  (`LEADS_LEGACY_PROFILE_LIMIT`, what the previous build sent; slow and
+  timeout-prone as before). Not 1 000: the old RPC ranks the profiles of unpaid
+  warehouse emails together with the profile-only ones, so a 1 000 cap would
+  drop the older profiles the "both" merge needs. `keepNewestLeads` still cuts
+  the merged set to 1 000.
+- Known transient (cached snapshot vs live warehouse): the candidates are a
+  Postgres snapshot (`computed_at`), the ClickHouse warehouse rows are read
+  live. For up to ~5 min after an import's ClickHouse sync, a returning old
+  lead can show with its new transaction date (source "warehouse": its old
+  profile was not an unpaid warehouse email's at compute time, so it is not in
+  the payload and cannot fold into "both"), and a just-converted recent lead
+  can stay listed, until the next `funnelfox-leads-recent-cache` tick (+ the
+  60 s memo). Not patched in Edge: a per-email profile lookup would need the
+  linked-profile exclusion only the SQL knows.
 - A warehouse lead that also has a profile ("both") keeps the warehouse
   attribution (campaign path, campaign id, media buyer, country); the profile
   only fills fields the warehouse lacks. Profile campaign paths are normalized
   like the warehouse import.
-- Size: the merged set lives in Edge memory. The bulk RPC carries no profile
-  `user_agent` / `origin` (`leads_list` reads them for the page's rows only),
-  and at most `LEADS_PROFILE_CANDIDATES_LIMIT` (50 000) profile leads — the
-  newest. Past that, `diagnostics.profile_candidates_truncated` is true, the tab
-  shows a notice and the Edge logs a warning: the trigger to mirror profile
-  leads into ClickHouse (plan §4 step 7). Subscription-only rows and the
-  warehouse rows are not capped.
+- Size: the bulk RPC carries no profile `user_agent` / `origin` (`leads_list`
+  reads them for the page's rows only, of the kept set). The warehouse
+  candidates (A) are still read whole from ClickHouse and cut in Edge.
 - Data-owner only for the first release: both actions are `rawOnly` +
   `users.view` + `users.pii.view` + `leads.view`, none `scopeReady`. Dropping
   `rawOnly` later (policy + `accessRoutes.ts` + `Users.tsx`) opens it to members
@@ -407,11 +513,17 @@ Leads tab read path (`clickhouse-users` actions `leads_list` /
 
 Deploy order (each step needs the previous one): migration `202610060010` →
 deploy all functions → Diagnose + one Continue → migration `202610060011` (cron)
-→ frontend. See README "FunnelFox Leads export — rollout". Since the access
-Phase 2 merge the deploy script also needs `202610060001` (`public.funnel_paths`)
-applied first, and `202610060011` goes in out of band (`db query --linked` +
+→ frontend. See README "FunnelFox Leads export — rollout". Migration
+`202610070001` (latest-1 000 candidates + cache + its cron job, and the
+reconcile queue + the `funnelfox-leads-reconcile` job) only needs
+`202610060010`; it is applied on its own (README step 6). The leads pg_cron
+jobs are `funnelfox-leads-advance`, `funnelfox-leads-refresh`,
+`funnelfox-leads-recent-cache` and `funnelfox-leads-reconcile` (freeze them
+together: `jobname like 'funnelfox-leads-%'`). Since the access Phase 2 merge
+the deploy script also needs `202610060001` (`public.funnel_paths`) applied
+first, and every leads migration goes in out of band (`db query --linked` +
 `migration repair`), never via `supabase db push` while `202610060001` /
-`202610060002` are pending.
+`202610060002` are pending (they sort before the applied `202610060010`).
 
 ## FunnelFox Backend Requirement
 

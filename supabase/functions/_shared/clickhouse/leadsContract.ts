@@ -16,6 +16,11 @@
 //   funnelfox_subscription  a FunnelFox subscription email that never reached
 //                           the warehouse (computeLeads' subscription-only leads).
 //
+// The lead set is the newest diagnostics.lead_set_limit (1,000) leads by
+// lead_date (owner decision 2026-10-07, for speed): rows, pages, search,
+// filters, filter options and the lead counts cover only those; the
+// emails_found / converted_excluded / active_subs_excluded KPIs are whole-base.
+//
 // Rows carry the customer email (the Leads tab displays it); the actions are
 // data-owner only for now (policy: rawOnly + users.view + users.pii.view +
 // leads.view). No raw payloads, SQL or credentials are ever returned.
@@ -145,15 +150,23 @@ export interface LeadsDiagnostics {
   memo: LeadsMemoState;
   /** Age of the merged lead set when this response was built. */
   dataset_age_ms: number;
-  // The three profile_candidates_* fields are always sent by this build; optional
+  // The lead_set_* / candidates_* fields are always sent by this build; optional
   // so a page served before the Edge redeploy (or a test fixture) still types.
-  /** Stored FunnelFox profile leads (paid / active / preview excluded) before the in-memory cap. */
-  profile_candidates_total?: number;
-  /** Of those, how many the merged set holds (the newest). */
-  profile_candidates_loaded?: number;
-  /** The cap cut the profile leads: older profile-only leads are missing and the
-   * counts are low — the signal to mirror profile leads into ClickHouse. */
-  profile_candidates_truncated?: boolean;
+  /** The lead set holds at most this many leads: the newest by lead date
+   * (owner decision 2026-10-07; LEADS_RECENT_LIMIT, 1,000). */
+  lead_set_limit?: number;
+  /** Older leads exist than the set holds: the list, search, filters, filter
+   * options and the lead counts (total / today / last 7 days) cover the newest
+   * lead_set_limit only. emails_found / converted_excluded /
+   * active_subs_excluded stay whole-base. */
+  lead_set_limited?: boolean;
+  /** The oldest lead_date in the set (ISO, UTC) — "since" in the page's banner. */
+  lead_set_oldest_date?: string | null;
+  /** When Postgres computed the lead candidates (ISO, UTC; the cache is refreshed
+   * every 5 minutes). Null when the server fell back to the uncached RPC. */
+  candidates_computed_at?: string | null;
+  /** The candidates came from the Postgres cache (not computed for this load). */
+  candidates_cached?: boolean;
   /** leads_list only: the page's profile user_agent / origin could not be read
    * (the rows carry what the merge had). */
   profile_details_unavailable?: boolean;
@@ -170,23 +183,23 @@ export interface LeadsListResponse {
 }
 
 export interface LeadsSummary {
-  /** Rows of the merged lead set (unfiltered). */
+  /** Rows of the lead set (unfiltered): the newest diagnostics.lead_set_limit leads at most. */
   total_leads: number;
-  /** Distinct emails over warehouse ∪ FunnelFox profiles ∪ FunnelFox subscriptions. */
+  /** Whole base: distinct emails over warehouse ∪ FunnelFox profiles ∪ FunnelFox subscriptions. */
   emails_found: number;
-  /** Distinct emails with a successful payment. */
+  /** Whole base: distinct emails with a successful payment. */
   converted_excluded: number;
-  /** Distinct emails with an active subscription that are not paid. */
+  /** Whole base: distinct emails with an active subscription that are not paid. */
   active_subs_excluded: number;
-  /** lead_date on today's UTC date. */
+  /** Leads of the set with lead_date on today's UTC date. */
   leads_today: number;
-  /** lead_date within the last 7 × 24 h. */
+  /** Leads of the set with lead_date within the last 7 × 24 h. */
   leads_last_7_days: number;
 }
 
 export interface LeadsFilterOption {
   value: string;
-  /** Leads of the merged (unfiltered) set carrying this value. */
+  /** Leads of the (unfiltered) lead set carrying this value. */
   count: number;
 }
 

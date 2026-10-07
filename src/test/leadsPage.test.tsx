@@ -39,7 +39,7 @@ vi.mock("@/hooks/useAccess", async () => {
   return { useAccess: () => owner, useOptionalAccess: () => owner, useCan: (key: string) => owner.can(key) };
 });
 
-import LeadsPage, { formatLeadDateTime } from "@/pages/Leads";
+import LeadsPage, { candidatesUpdatedText, formatLeadDateTime } from "@/pages/Leads";
 import type {
   LeadRow,
   LeadsListResponse,
@@ -205,21 +205,59 @@ describe("Leads page (server read path)", () => {
     expect(await screen.findByText(/Could not load leads: Invalid sort key/)).toBeInTheDocument();
   });
 
-  it("says so when the server merged only the newest FunnelFox profile leads (the in-memory cap)", async () => {
-    const capped = { ...DIAGNOSTICS, profile_candidates_total: 73_000, profile_candidates_loaded: 50_000, profile_candidates_truncated: true };
-    serve(() => ({ ...listResponse([leadRow()]), diagnostics: capped }), { ...overviewResponse({ total_leads: 51_000 }), diagnostics: capped });
+  it("says the list holds only the latest 1,000 leads, since when, and how fresh they are", async () => {
+    const computedAt = new Date(Date.now() - 4 * 60_000 - 5_000).toISOString();
+    const limited = {
+      ...DIAGNOSTICS, lead_set_limit: 1_000, lead_set_limited: true, lead_set_oldest_date: "2026-10-04T09:30:00.000Z",
+      candidates_computed_at: computedAt, candidates_cached: true,
+    };
+    serve(() => ({ ...listResponse([leadRow()]), diagnostics: limited }), { ...overviewResponse({ total_leads: 1_000 }), diagnostics: limited });
     renderPage();
-    const banner = await screen.findByTestId("leads-profile-cap");
+    const banner = await screen.findByTestId("leads-recent-limit");
     // Locale-proof: the grouping separator may be a (narrow) no-break space, which the matcher folds to " ".
-    const expected = `Showing the newest ${(50_000).toLocaleString()} of ${(73_000).toLocaleString()} FunnelFox profile leads`.replace(/\s/g, " ");
+    const expected = `Showing the latest ${(1_000).toLocaleString()} leads (since ${formatLeadDateTime("2026-10-04T09:30:00.000Z")}).`.replace(/\s/g, " ");
     expect(banner).toHaveTextContent(expected);
+    expect(banner).toHaveTextContent("Search, filters and the lead counts cover these leads only.");
+    expect(banner).toHaveTextContent("Updated 4 min ago.");
+    // The old profile-cap notice is gone for good.
+    expect(screen.queryByTestId("leads-profile-cap")).not.toBeInTheDocument();
   });
 
-  it("shows no cap notice while the profile leads fit", async () => {
-    serve(() => listResponse([leadRow()]), { ...overviewResponse({ total_leads: 1 }), diagnostics: { ...DIAGNOSTICS, profile_candidates_total: 10, profile_candidates_loaded: 10, profile_candidates_truncated: false } });
+  it("shows no limit notice when every lead fits (or the server predates the cut)", async () => {
+    serve(() => listResponse([leadRow()]), { ...overviewResponse({ total_leads: 1 }), diagnostics: { ...DIAGNOSTICS, lead_set_limit: 1_000, lead_set_limited: false, lead_set_oldest_date: "2026-06-10T10:00:00.000Z" } });
     renderPage();
     await screen.findByText("lead@example.com");
+    expect(screen.queryByTestId("leads-recent-limit")).not.toBeInTheDocument();
+
+    // An older server build sends the removed cap fields only: no banner either.
+    const stale = { ...DIAGNOSTICS, profile_candidates_total: 73_000, profile_candidates_loaded: 50_000, profile_candidates_truncated: true };
+    serve(() => ({ ...listResponse([leadRow()]), diagnostics: stale }), { ...overviewResponse({ total_leads: 1 }), diagnostics: stale });
+    renderPage();
+    await waitFor(() => expect(screen.getAllByText("lead@example.com")).toHaveLength(2));
+    expect(screen.queryByTestId("leads-recent-limit")).not.toBeInTheDocument();
     expect(screen.queryByTestId("leads-profile-cap")).not.toBeInTheDocument();
+  });
+
+  it("the limit notice works without the freshness stamp (the server fell back to the uncached RPC)", async () => {
+    const limited = { ...DIAGNOSTICS, lead_set_limit: 1_000, lead_set_limited: true, lead_set_oldest_date: null, candidates_computed_at: null, candidates_cached: false };
+    serve(() => ({ ...listResponse([leadRow()]), diagnostics: limited }), { ...overviewResponse({ total_leads: 1_000 }), diagnostics: limited });
+    renderPage();
+    const banner = await screen.findByTestId("leads-recent-limit");
+    expect(banner.textContent?.replace(/\s/g, " ")).toBe(
+      `Showing the latest ${(1_000).toLocaleString()} leads. Search, filters and the lead counts cover these leads only.`.replace(/\s/g, " "),
+    );
+  });
+});
+
+describe("candidatesUpdatedText", () => {
+  it("minutes since the server computed the candidates; empty when unknown", () => {
+    const now = Date.parse("2026-10-07T12:00:00.000Z");
+    expect(candidatesUpdatedText("2026-10-07T11:59:30.000Z", now)).toBe("Updated just now.");
+    expect(candidatesUpdatedText("2026-10-07T11:56:59.000Z", now)).toBe("Updated 3 min ago.");
+    // A clock a little ahead of the server's never shows a negative age.
+    expect(candidatesUpdatedText("2026-10-07T12:00:20.000Z", now)).toBe("Updated just now.");
+    expect(candidatesUpdatedText(null, now)).toBe("");
+    expect(candidatesUpdatedText("not a date", now)).toBe("");
   });
 });
 

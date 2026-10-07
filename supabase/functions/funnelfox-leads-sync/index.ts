@@ -17,9 +17,19 @@
 //                killed call loses at most that many pages.
 //   sessions   → crawl /public/v1/sessions and attach the earliest session's attribution to STORED
 //                profiles only (light columns; no raw_session).
-//   reconcile  → one SQL call, public.funnelfox_leads_reconcile(p_data_key): paid emails from
-//                public.transactions, active ones from the Cohorts RPC. Server-side only — a
-//                `conversion` key in the body (the old browser context) is ignored.
+//   reconcile  → QUEUES the conversion reconcile: public.funnelfox_leads_reconcile_request(p_data_key)
+//                stamps sync_state.reconcile_requested_at (one row update) and the stage completes;
+//                the pg_cron job funnelfox-leads-reconcile (migration 202610070001) then runs
+//                public.funnelfox_leads_reconcile as postgres within a minute (paid emails from
+//                public.transactions, active ones from the Cohorts RPC) under the job's own
+//                15 min statement_timeout and records reconcile_applied_at / reconcile_summary (a
+//                failed run: reconcile_failure, then a 15 min → 6 h backoff — never this function's
+//                concern: the stage only queues). Its first pass over the export rewrites
+//                almost every row and outlived PostgREST's 8 s statement_timeout (incident
+//                2026-10-07), so it no longer runs through PostgREST — except as the fallback while
+//                that migration is not applied (PGRST202). stats carry the last APPLIED run's counts
+//                plus reconcile_queued_at. Server-side only — a `conversion` key in the body (the old
+//                browser context) is ignored.
 //
 // Each stage persists its cursor + completion flag to public.funnelfox_leads_sync_state, so the next
 // call resumes where the last one stopped. No stage param → the next incomplete stage; with every
@@ -900,6 +910,66 @@ const LEGACY_STAT_KEYS = [
   "remaining_without_email_after_checked",
 ];
 
+// ---- Stage 3: reconcile ----------------------------------------------------------------------
+
+/** PostgREST's answer for an RPC that is not in its schema cache (the migration that adds it is not
+ * applied yet): PGRST202, HTTP 404. Mirrors isMissingRpcError in _shared/clickhouse/leads.ts (not
+ * imported: that module is the ClickHouse Leads runner, which this function never loads). */
+function isMissingRpcError(error: unknown, status?: unknown): boolean {
+  if (status === 404) return true;
+  const record = readRecord(error);
+  return record.code === "PGRST202" || /could not find the function/i.test(str(record.message));
+}
+
+function isoOrNull(value: unknown): string | null {
+  const text = str(value);
+  if (!text) return null;
+  const ms = Date.parse(text);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+
+/**
+ * Stage 3 → the stats keys it sets. Queues the reconcile (funnelfox_leads_reconcile_request: one
+ * row update stamping sync_state.reconcile_requested_at); the pg_cron job funnelfox-leads-reconcile
+ * (migration 202610070001) runs funnelfox_leads_reconcile as postgres within a minute. The counts
+ * are those of the last APPLIED run (the request answers its summary); before the first applied run
+ * there is none and the previous stats values stay. While that migration is not applied
+ * (PGRST202 / 404) the reconcile runs inline through PostgREST, exactly as before. Any other error
+ * throws (the run ends in last_status "error").
+ */
+async function runReconcileStage(db: ServiceClient, tenantKey: string): Promise<JsonRecord> {
+  const request = await db.rpc("funnelfox_leads_reconcile_request", { p_data_key: tenantKey });
+  if (request.error && isMissingRpcError(request.error, request.status)) {
+    console.warn("funnelfox-leads-sync: funnelfox_leads_reconcile_request is missing (migration 202610070001 not applied) — reconciling inline");
+    const { data, error } = await db.rpc("funnelfox_leads_reconcile", { p_data_key: tenantKey });
+    if (error) throw new Error(`reconcile failed: ${error.message}`);
+    const result = readRecord(data);
+    return {
+      reconcile_rows: numberOr(result.checked, 0),
+      leads_found: numberOr(result.leads, 0),
+      converted_excluded: numberOr(result.paid_excluded, 0),
+      active_sub_excluded: numberOr(result.active_excluded, 0),
+      reconciled_at: new Date().toISOString(),
+    };
+  }
+  if (request.error) throw new Error(`reconcile request failed: ${request.error.message}`);
+  const queued = readRecord(request.data);
+  // The run upserted the sync-state row before this stage, so "not queued" means nothing was stamped.
+  if (queued.queued !== true) throw new Error("reconcile request failed: the sync state row to queue it on is missing.");
+
+  const stats: JsonRecord = { reconcile_queued_at: isoOrNull(queued.requested_at) ?? new Date().toISOString() };
+  const last = readRecord(queued.last_summary);
+  if (Object.keys(last).length > 0) {
+    stats.reconcile_rows = numberOr(last.checked, 0);
+    stats.leads_found = numberOr(last.leads, 0);
+    stats.converted_excluded = numberOr(last.paid_excluded, 0);
+    stats.active_sub_excluded = numberOr(last.active_excluded, 0);
+    const appliedAt = isoOrNull(last.applied_at) ?? isoOrNull(queued.last_applied_at);
+    if (appliedAt) stats.reconciled_at = appliedAt;
+  }
+  return stats;
+}
+
 // ---- HTTP entry ------------------------------------------------------------------------------
 
 serveWithAccess(FUNNELFOX_LEADS_SYNC_POLICY, async ({ ctx, action, body, url, pg }) => {
@@ -1252,19 +1322,10 @@ serveWithAccess(FUNNELFOX_LEADS_SYNC_POLICY, async ({ ctx, action, body, url, pg
           sessions_without_profile_id: withoutProfileId,
         });
       } else {
-        // --- Stage 3: reconcile conversion server-side (one set-based SQL call) -----------------
-        const { data, error } = await db.rpc("funnelfox_leads_reconcile", { p_data_key: tenantKey });
-        if (error) throw new Error(`reconcile failed: ${error.message}`);
-        const result = readRecord(data);
+        // --- Stage 3: reconcile conversion server-side (queued; pg_cron applies it) --------------
+        Object.assign(runStats, await runReconcileStage(db, tenantKey));
         stoppedReason = "completed";
         completionUpdate.reconcile_completed = true;
-        Object.assign(runStats, {
-          reconcile_rows: numberOr(result.checked, 0),
-          leads_found: numberOr(result.leads, 0),
-          converted_excluded: numberOr(result.paid_excluded, 0),
-          active_sub_excluded: numberOr(result.active_excluded, 0),
-          reconciled_at: new Date().toISOString(),
-        });
       }
 
       // ---- Stored population (whole tenant) ----------------------------------------------------

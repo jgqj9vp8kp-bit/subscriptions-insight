@@ -5,9 +5,11 @@ import { shouldContinueSync } from "@/services/funnelfoxLeadsTransform";
 /**
  * Frontend bridge for the `funnelfox-leads-sync` Edge Function + its sync state.
  *
- * The Edge Function crawls FunnelFox server-side (profile list → sessions) and reconciles conversion
- * itself (SQL funnelfox_leads_reconcile over public.transactions + the active-subscription RPC), so
- * the browser sends nothing but flags and page sizes — no warehouse data, no conversion context.
+ * The Edge Function crawls FunnelFox server-side (profile list → sessions) and has conversion
+ * reconciled server-side (SQL funnelfox_leads_reconcile over public.transactions + the
+ * active-subscription RPC; the stage queues it and the pg_cron job funnelfox-leads-reconcile applies
+ * it within a minute), so the browser sends nothing but flags and page sizes — no warehouse data, no
+ * conversion context.
  * The pipeline also advances on its own: a pg_cron tick runs every minute (and a full refresh once a
  * day), so the Leads tab's Continue button only speeds things up. The lead list itself is read
  * through clickhouse-users (runClickHouseLeads / useLeadsData), never from these tables.
@@ -73,12 +75,15 @@ export interface FunnelFoxLeadsSyncSummary {
   sessions_joined?: number;
   sessions_without_profile_id?: number;
 
-  // reconcile stage
+  // reconcile stage: the stage queues the reconcile (pg_cron applies it within a minute); the counts
+  // are those of the last APPLIED run, as of the stage's call (the row's reconcile_summary is newer).
   reconcile_rows?: number;
   leads_found?: number;
   converted_excluded?: number;
   active_sub_excluded?: number;
   reconciled_at?: string;
+  /** When the reconcile stage last queued a reconcile. */
+  reconcile_queued_at?: string;
 
   // cross-cutting coverage
   profiles_total_saved?: number;
@@ -137,8 +142,39 @@ export interface FunnelFoxLeadsSyncState {
   last_sessions_cursor: string | null;
   /** A sync call holds the lease until then (cron tick or a button click). */
   lease_until?: string | null;
+  /** Migration 202610070001: the reconcile stage queues the reconcile here; pg_cron applies it. */
+  reconcile_requested_at?: string | null;
+  /** Start time of the last applied reconcile (older than reconcile_requested_at ⇒ one is queued). */
+  reconcile_applied_at?: string | null;
+  reconcile_summary?: FunnelFoxLeadsReconcileSummary | null;
+  /** The current streak of failed reconcile runs (null after a successful one); pg_cron backs off. */
+  reconcile_failure?: FunnelFoxLeadsReconcileFailure | null;
   stats: FunnelFoxLeadsSyncSummary | null;
   updated_at: string | null;
+}
+
+/** funnelfox_leads_sync_state.reconcile_summary: the counts of the last applied reconcile. */
+export interface FunnelFoxLeadsReconcileSummary {
+  checked?: number;
+  leads?: number;
+  paid_excluded?: number;
+  active_excluded?: number;
+  updated?: number;
+  duration_ms?: number;
+  applied_at?: string;
+}
+
+/** funnelfox_leads_sync_state.reconcile_failure: the last failed reconcile run (a timeout included)
+ * and when pg_cron tries again (15 min after the first failure, doubling, at most 6 h). */
+export interface FunnelFoxLeadsReconcileFailure {
+  failed_at?: string;
+  started_at?: string;
+  duration_ms?: number;
+  sqlstate?: string;
+  error?: string;
+  /** Consecutive failed runs. */
+  failures?: number;
+  retry_after?: string;
 }
 
 function ensureSupabase() {
@@ -244,11 +280,37 @@ export function futureMs(value: string | null | undefined, now: number = Date.no
   return Number.isFinite(ms) && ms > now ? ms : null;
 }
 
+/** How long after a reconcile request the card keeps polling for pg_cron to apply it (it runs every
+ * minute; a longer wait means the job is not running — the card then stops polling). */
+export const RECONCILE_QUEUE_POLL_WINDOW_MS = 15 * 60_000;
+
+/** The reconcile stage queued a reconcile that pg_cron has not applied yet (requested after the last
+ * applied run started). Not a failure: the pg_cron job funnelfox-leads-reconcile applies it within
+ * a minute. */
+export function isReconcileQueued(state: FunnelFoxLeadsSyncState | null | undefined): boolean {
+  const requested = state?.reconcile_requested_at ? Date.parse(state.reconcile_requested_at) : Number.NaN;
+  if (!Number.isFinite(requested)) return false;
+  const applied = state?.reconcile_applied_at ? Date.parse(state.reconcile_applied_at) : Number.NaN;
+  return !Number.isFinite(applied) || applied < requested;
+}
+
+/** A queued reconcile pg_cron is NOT applying "within a minute": queued for at least
+ * RECONCILE_QUEUE_POLL_WINDOW_MS (the card has stopped polling; the job is likely not running), or
+ * its last run failed (pg_cron backs off before the next one). The card then warns instead of the
+ * reassuring note. */
+export function isReconcileOverdue(state: FunnelFoxLeadsSyncState | null | undefined, now: number = Date.now()): boolean {
+  if (!isReconcileQueued(state)) return false;
+  if (state?.reconcile_failure) return true;
+  return Date.parse(state?.reconcile_requested_at as string) <= now - RECONCILE_QUEUE_POLL_WINDOW_MS;
+}
+
 /** True while the sync card should keep re-reading the state: the pipeline is partial (the cron is
- * advancing it), a call holds the lease, or a FunnelFox rate-limit pause is running. */
+ * advancing it), a call holds the lease, a FunnelFox rate-limit pause is running, or a reconcile
+ * queued in the last RECONCILE_QUEUE_POLL_WINDOW_MS waits for pg_cron. */
 export function isLeadsSyncActive(state: FunnelFoxLeadsSyncState | null | undefined, now: number = Date.now()): boolean {
   if (!state) return false;
   if (state.last_status === "partial" || state.last_status === "busy") return true;
   if (futureMs(state.lease_until ?? null, now) != null) return true;
+  if (isReconcileQueued(state) && Date.parse(state.reconcile_requested_at as string) > now - RECONCILE_QUEUE_POLL_WINDOW_MS) return true;
   return futureMs(state.stats?.rate_limited_until ?? null, now) != null;
 }
