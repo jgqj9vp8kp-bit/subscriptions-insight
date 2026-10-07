@@ -36,12 +36,57 @@ vi.mock("@/hooks/useAccess", async () => {
   return { useAccess: () => owner, useOptionalAccess: () => owner, useCan: (key: string) => owner.can(key) };
 });
 
-// The Leads tab's FunnelFox sync source stays empty here (warehouse fallback).
-vi.mock("@/services/funnelfoxLeads", () => ({
-  loadFunnelFoxLeads: vi.fn(async () => []),
-  getFunnelFoxLeadsStats: vi.fn(async () => null),
-  runFunnelFoxLeadsSync: vi.fn(async () => undefined),
-}));
+// The Leads tab's sync card stays empty here (no state row, no sync calls).
+vi.mock("@/services/funnelfoxLeads", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/services/funnelfoxLeads")>();
+  return {
+    ...actual,
+    getFunnelFoxLeadsStats: vi.fn(async () => null),
+    runFunnelFoxLeadsSync: vi.fn(async () => undefined),
+  };
+});
+
+// The Leads tab reads its rows from the server (clickhouse-users leads_list /
+// leads_overview); one warehouse lead is served here.
+const leadsMocks = vi.hoisted(() => ({ runClickHouseLeads: vi.fn() }));
+vi.mock("@/services/clickhouse", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/services/clickhouse")>();
+  return { ...actual, runClickHouseLeads: leadsMocks.runClickHouseLeads };
+});
+
+const LEADS_DIAGNOSTICS = { warehouse_leads: 1, profile_leads: 0, both_leads: 0, subscription_leads: 0, memo: "miss", dataset_age_ms: 0 };
+
+function serveLeads() {
+  leadsMocks.runClickHouseLeads.mockImplementation(async (request: { action: string }) =>
+    request.action === "leads_list"
+      ? {
+          ok: true,
+          source: "clickhouse",
+          generated_at: "2026-01-01T00:00:00.000Z",
+          query_duration_ms: 1,
+          rows: [
+            {
+              key: "w:lead", email: "lead@example.com", lead_date: "2026-01-01T10:00:00.000Z", funnel: "unknown",
+              campaign_path: "campaign-b", campaign_id: "", media_buyer: null, country: "US",
+              session_date: "2026-01-01T10:00:00.000Z", days_since_visit: 1, customer_id: "lead", user_agent: null,
+              origin: null, source: "warehouse", has_declines: true, decline_reason: null,
+            },
+          ],
+          pagination: { page: 1, page_size: 50, total_rows: 1, total_pages: 1 },
+          diagnostics: LEADS_DIAGNOSTICS,
+        }
+      : {
+          ok: true,
+          source: "clickhouse",
+          generated_at: "2026-01-01T00:00:00.000Z",
+          query_duration_ms: 1,
+          summary: { total_leads: 1, emails_found: 2, converted_excluded: 1, active_subs_excluded: 0, leads_today: 0, leads_last_7_days: 0 },
+          filter_options: { funnel: [], campaign_path: [], campaign_id: [], media_buyer: [], country: [], source: [] },
+          sync_state: { status: null, current_stage: null, last_full_sync_at: null, stats: {}, rate_limited_until: null, next_tick_hint: null, running: false },
+          diagnostics: LEADS_DIAGNOSTICS,
+        },
+  );
+}
 
 import { useTransactions } from "@/services/sheets";
 
@@ -86,6 +131,7 @@ describe("Users page", () => {
     localStorage.clear();
     vi.clearAllMocks();
     useDataStore.setState({ rawPalmerRows: [], subscriptions: [] });
+    serveLeads();
   });
 
   it("displays user country code when available", () => {
@@ -710,6 +756,8 @@ describe("Users page", () => {
 
     expect(await screen.findByText("Total Leads")).toBeInTheDocument();
     expect(await screen.findByText("lead@example.com")).toBeInTheDocument();
+    // Served by the server read path, not computed from the browser warehouse.
+    expect(leadsMocks.runClickHouseLeads).toHaveBeenCalledWith(expect.objectContaining({ action: "leads_list" }));
     expect(screen.getByRole("tab", { name: "Leads" })).toHaveAttribute("aria-selected", "true");
     expect(screen.queryByPlaceholderText("Search campaign…")).toBeNull();
 

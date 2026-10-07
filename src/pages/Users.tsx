@@ -86,7 +86,7 @@ interface CohortExplorerRow {
 }
 type UsersPageMode = "users_table" | "decline_analytics" | "leads";
 
-// The Leads tab pulls in the leads computation and FunnelFox sync code only when opened.
+// The Leads tab pulls in its server read path and the FunnelFox sync card only when opened.
 const LeadsPanel = lazy(() => import("@/pages/Leads").then((module) => ({ default: module.LeadsPanel })));
 type DeclineSortKey = "reason" | "failed_users" | "failed_transactions" | "share" | "avg_attempts" | "latest_failed_date";
 // Sort fields of the server-computed Decline Analytics country breakdown
@@ -506,9 +506,10 @@ export default function UsersPage() {
   // function (the legacy flag is ignored) and an Edge error is shown as an
   // error, never recomputed in the browser.
   const { rawAccess, partition, can } = useAccess();
-  // The Leads tab (formerly the /leads page) is computed in the browser from the
-  // raw warehouse, so it stays data-owner only; a persisted "leads" tab falls
-  // back to the users table for anyone else.
+  // The Leads tab (formerly the /leads page) is merged on the server
+  // (clickhouse-users leads_list / leads_overview, rawOnly for the first release),
+  // so it stays data-owner only; a persisted "leads" tab falls back to the users
+  // table for anyone else.
   const canSeeLeads = rawAccess && can("leads.view");
   const mode: UsersPageMode = persistedMode === "leads" && !canSeeLeads ? "users_table" : persistedMode;
   const [searchParams, setSearchParams] = useSearchParams();

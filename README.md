@@ -110,8 +110,9 @@ it idempotently creates/extends the warehouse schema (including Warehouse V2 tab
 2. **Freeze the crons**: `select cron.alter_job(jobid, active := false) from cron.job where jobname in
    ('fb-daily-warehouse-tick', 'funnelfox-subscriptions-advance', 'funnelfox-subscriptions-refresh',
    'support-mail-sync-tick', 'support-classification-tick', 'support-sent-backfill-tick',
-   'funnels-active-from-traffic', 'cohort-membership-freshness');` (the last one exists from access
-   Phase 2 on; use the same list for every later deploy, and `active := true` to unfreeze).
+   'funnels-active-from-traffic', 'funnelfox-leads-advance', 'funnelfox-leads-refresh',
+   'cohort-membership-freshness');` (the leads jobs exist from `202610060011` on, the last one from
+   access Phase 2 on; use the same list for every later deploy, and `active := true` to unfreeze).
 3. **Apply `202610050001` and `202610050002` only** — not `supabase db push`, which would also attempt
    `202610050003` (it aborts before bootstrap, and a runner that applies all pending files in one
    transaction rolls back the first two as well):
@@ -159,6 +160,76 @@ What the data owner will notice after this release (expected, not regressions):
   in-session reload refetches them.
 - A ClickHouse backfill killed mid-run holds its lease for up to 10 minutes; Continue / the
   post-import sync then report "Another backfill run holds the lease" with the time to retry.
+
+### FunnelFox Leads export — rollout (in this order)
+
+The Leads tab of /users is now merged on the server (`clickhouse-users` actions `leads_list` /
+`leads_overview`, data owner only), and `funnelfox-leads-sync` exports every FunnelFox profile that
+carries an email into `public.funnelfox_leads` in the background. Details: DEVELOPER_NOTES.md
+"FunnelFox leads export + server-side Leads tab".
+
+1. **Apply `202610060010_funnelfox_leads_export.sql` alone** — not `supabase db push`, which would
+   also apply the cron migration before the functions that serve it are deployed:
+
+   ```text
+   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -1 -f supabase/migrations/202610060010_funnelfox_leads_export.sql
+   supabase migration repair --status applied 202610060010
+   ```
+
+   It adds `preview` / `email_source` / `lease_until` / `lease_token`, the reconcile / lease /
+   candidates RPCs (service_role only) and a covering index on `public.transactions` (built in
+   place: writes to `transactions` wait a few seconds, about 40 MB). One-way: legacy
+   `funnelfox_leads` rows without a list email are deleted, the raw jsonb payloads of the rows kept
+   are cleared, and the leads sync state (cursors, stage flags, counters, stats) is reset; the crawl
+   rebuilds everything from FunnelFox.
+2. **Deploy every function** with `npm run deploy:functions` (above). Before step 1 the leads sync
+   answers 502 on every call (no lease RPC) and the Leads actions answer 502 (no candidates RPC); the
+   Users actions are unaffected.
+3. **Probe**: as the data owner open Users → Leads, click **Diagnose** (a dry run: at most 2 profile
+   pages + 1 sessions page, key names and counts only, nothing written) and check
+   `profiles.cursor_key`, `profiles.root_email` and `profiles.preview_true`; then click
+   **Continue Sync** once.
+4. **Apply `202610060011_funnelfox_leads_cron.sql` alone**, outside `supabase db push`, and record it
+   as applied:
+
+   ```text
+   npx.cmd supabase db query --linked -f supabase/migrations/202610060011_funnelfox_leads_cron.sql
+   npx.cmd supabase migration repair --status applied 202610060011
+   ```
+
+   (or paste the file into the SQL editor, then run the `migration repair` line). It refuses to run
+   before `202610060010`. Never use `supabase db push` while access Phase 2 (`202610060001` /
+   `202610060002`) is unapplied: those files sort before the applied `202610060010`, so `db push`
+   refuses, and its `--include-all` hint would apply the Phase 2 cron before the functions that
+   serve it. Applied before step 2, every tick would be a refused (401) Edge invocation. Check
+   `select * from net._http_response order by created desc` for 200s.
+5. **Deploy the frontend.** The new tab needs the step-2 functions; the old tab keeps working until
+   then (the server ignores its `conversion` body and fills in the missing page sizes).
+
+How the background export proceeds:
+
+- `funnelfox-leads-advance` posts every minute and runs ONE stage per call (~50 s budget):
+  `profiles` (crawl the profile list newest first, store only rows with an email; checkpoint every
+  10 pages) → `sessions` (attribution for the stored profiles) → `reconcile` (one SQL call: paid /
+  active emails stop being leads). Each call resumes from the saved cursor.
+- The tick is skipped without an HTTP call while another call holds the lease (120 s), while a
+  FunnelFox 429 pause runs (`stats.rate_limited_until`, Retry-After or 60 s), while the backoff after
+  a FunnelFox error runs (`stats.error_backoff_until`, 60 s doubling to at most 1 h) and once every
+  stage is complete. The Continue button only speeds things up (at most 10 calls per click) and is
+  never held back by the error backoff. A cursor FunnelFox keeps refusing is dropped after 3 errors
+  in a row (the pass restarts from the newest profile).
+- `funnelfox-leads-refresh` (06:15 UTC daily, after the 05:45 subscriptions refresh) re-crawls the
+  whole list. While a healthy pass is still unfinished it only advances it, so the backfill never
+  restarts; a pipeline whose last run failed is restarted.
+- Progress (read-only): `select current_stage, last_status, last_error, lease_until,
+  profiles_completed, sessions_completed, reconcile_completed, stats->>'profiles_scanned_total',
+  stats->>'profiles_with_email', stats->>'rate_limited_until', stats->>'error_backoff_until' from
+  public.funnelfox_leads_sync_state;`
+- Leads tab size: the server merges at most the newest 50 000 FunnelFox profile leads in memory.
+  Past that the tab shows "Showing the newest … of … FunnelFox profile leads" — the signal that
+  profile leads must move to ClickHouse (plan §4 step 7).
+- Pause / resume: `select cron.alter_job(jobid, active := false) from cron.job where jobname like
+  'funnelfox-leads-%';` (`active := true` to resume).
 
 Server-summary flags stay off in production until real-data parity is confirmed
 (see `.env.example`): `VITE_FB_ANALYTICS_SOURCE` and `VITE_DASHBOARD_SOURCE`
@@ -266,12 +337,17 @@ Rollback (Phase 2):
 1. Disable the restricted members first.
 2. Cron: `select cron.unschedule('cohort-membership-freshness');` (before the functions, so no tick
    reaches a build without `cron_tick`).
-3. Functions: redeploy commit `470a153` with the deploy script — restricted members get 403 everywhere again.
+3. Functions: redeploy commit `8d40168` (the last `main` before Phase 2; it carries the server-side Leads)
+   with the deploy script — restricted members get 403 everywhere again.
 4. SQL: run `supabase/rollback/202610060001_rollback.sql`. `funnel_paths`, the new snapshot columns and
    `fact_campaign_scope` stay in place, unused. Leave the `schema_migrations` rows of `202610060001` /
    `202610060002` in place: `202610060001` is one-shot (plain `create table` / `create trigger` /
    `create policy`), so a later roll-forward needs a dedicated script, not a re-run of the file.
-5. Frontend: revert the commit (the `funnel_paths` embed keeps working, the table still exists).
+5. Frontend: return `main` to the 8d40168 frontend (server-side Leads, no Phase 2) with
+   `git revert -m 2 <merge>`, where `<merge>` is the commit that merged `main` into
+   `feature/access-phase2` (parent 1 = d3c4e74 Phase 2, parent 2 = 8d40168 main). Never `-m 1`: it
+   drops the Leads frontend and keeps Phase 2. The `funnel_paths` embed keeps working, the table
+   still exists.
 6. The ClickHouse retention deletes cannot be undone; they only remove versions older than the previous
    active snapshot.
 

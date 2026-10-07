@@ -1,38 +1,30 @@
 import { describe, expect, it } from "vitest";
 import {
-  buildLeadUpsertRow,
-  deriveConversionState,
   emailFromListRow,
-  emailFromProfileDetail,
   joinSessionsToProfiles,
   mediaBuyerFromUtmSource,
   parseOriginUrl,
   parseProfileListRow,
   parseSessionRow,
+  profileUpsertRow,
   selectLeadsSource,
-  type LeadConversionContext,
+  sessionAttributionRow,
   type ParsedSession,
 } from "@/services/funnelfoxLeadsTransform";
-import { buildConversionContext } from "@/services/funnelfoxLeads";
-import type { Transaction } from "@/services/types";
 
-function emptyContext(overrides: Partial<LeadConversionContext> = {}): LeadConversionContext {
-  return {
-    paidEmails: new Set(),
-    activeSubEmails: new Set(),
-    trialDatesByEmail: new Map(),
-    firstSubDatesByEmail: new Map(),
-    ...overrides,
-  };
-}
+// Conversion (paid / active subscription → not a lead) is decided by the SQL function
+// public.funnelfox_leads_reconcile now, not by a browser-computed context; its tests live with
+// the migration. The sync stores only list rows that carry an email.
 
 describe("1. profile list parsing", () => {
-  it("extracts profile_id (from id), created_at, funnel_id", () => {
-    const parsed = parseProfileListRow({ id: "pro_1", created_at: "2026-06-10T00:00:00Z", funnel_id: "fn_9" });
-    expect(parsed.profile_id).toBe("pro_1");
+  it("extracts profile_id (from id, prefix stripped), created_at, funnel_id, preview", () => {
+    const parsed = parseProfileListRow({ id: "pro_1", created_at: "2026-06-10T00:00:00Z", funnel_id: "fn_9", preview: false });
+    expect(parsed.profile_id).toBe("1");
     expect(parsed.created_at).toBe("2026-06-10T00:00:00Z");
     expect(parsed.funnel_id).toBe("fn_9");
-    expect(parsed.email_from_list).toBeNull();
+    expect(parsed.preview).toBe(false);
+    expect(parsed.email).toBeNull();
+    expect(parsed.normalized_email).toBeNull();
   });
 
   it("uses a list-row email when present, and finds one inside a preview string", () => {
@@ -40,19 +32,19 @@ describe("1. profile list parsing", () => {
     expect(emailFromListRow({ preview: "Lead: jane@example.com (US)" })).toBe("jane@example.com");
     expect(emailFromListRow({ preview: { email: "x@y.com" } })).toBe("x@y.com");
     expect(emailFromListRow({ preview: "no email here" })).toBeNull();
+    // `preview` is a boolean on live rows — it never carries an email.
+    expect(emailFromListRow({ preview: true })).toBeNull();
   });
-});
 
-describe("2. profile detail email extraction", () => {
-  it("extracts email from known profile-detail paths", () => {
-    expect(emailFromProfileDetail({ data: { email: "a@b.com" } })).toBe("a@b.com");
-    expect(emailFromProfileDetail({ data: { replies: { email: "c@d.com" } } })).toBe("c@d.com");
-    expect(emailFromProfileDetail({ nothing: true })).toBeNull();
+  it("keeps the email as sent plus its normalized form", () => {
+    const parsed = parseProfileListRow({ id: "p", email: "  Jane.Doe@Example.COM " });
+    expect(parsed.email).toBe("Jane.Doe@Example.COM");
+    expect(parsed.normalized_email).toBe("jane.doe@example.com");
   });
 });
 
 describe("3. session parsing", () => {
-  it("extracts attribution fields and normalizes country", () => {
+  it("extracts attribution fields, normalizes country and the profile id", () => {
     const s = parseSessionRow({
       id: "sess_1",
       profile_id: "pro_1",
@@ -67,7 +59,7 @@ describe("3. session parsing", () => {
     });
     expect(s).toMatchObject({
       session_id: "sess_1",
-      profile_id: "pro_1",
+      profile_id: "1",
       country_code: "US",
       user_agent: "Mozilla/5.0",
       funnel_version: "v2",
@@ -81,12 +73,12 @@ describe("4. session → profile join", () => {
   it("keeps the earliest session per profile_id and drops sessions without profile_id", () => {
     const sessions: ParsedSession[] = [
       parseSessionRow({ id: "s_late", profile_id: "pro_1", created_at: "2026-06-12T00:00:00Z", origin: "late" }),
-      parseSessionRow({ id: "s_early", profile_id: "pro_1", created_at: "2026-06-10T00:00:00Z", origin: "early" }),
+      parseSessionRow({ id: "s_early", profile_id: "1", created_at: "2026-06-10T00:00:00Z", origin: "early" }),
       parseSessionRow({ id: "s_orphan", profile_id: "", created_at: "2026-06-11T00:00:00Z" }),
     ];
     const joined = joinSessionsToProfiles(sessions);
     expect(joined.size).toBe(1);
-    expect(joined.get("pro_1")?.session_id).toBe("s_early");
+    expect(joined.get("1")?.session_id).toBe("s_early");
   });
 });
 
@@ -113,59 +105,51 @@ describe("6. media buyer mapping", () => {
   });
 });
 
-describe("7-9. lead definition + conversion exclusions", () => {
-  it("is a lead when email exists and there is no payment and no active subscription", () => {
-    const state = deriveConversionState("lead@example.com", emptyContext());
-    expect(state.is_lead).toBe(true);
-    expect(state.has_successful_payment).toBe(false);
-    expect(state.has_active_subscription).toBe(false);
+describe("10. upsert rows (dedup key = profile_id)", () => {
+  it("a profile row carries only the columns the list owns — never conversion state or raw payloads", () => {
+    const profile = parseProfileListRow({ id: "pro_1", created_at: "2026-06-10T00:00:00Z", funnel_id: "fn_9", preview: true, email: "Lead@Example.com" });
+    const row = profileUpsertRow(profile, "2026-10-06T00:00:00.000Z");
+    expect(row).toEqual({
+      profile_id: "1",
+      email: "Lead@Example.com",
+      normalized_email: "lead@example.com",
+      email_source: "list",
+      detail_checked: true,
+      preview: true,
+      created_at: "2026-06-10T00:00:00Z",
+      updated_at: null,
+      synced_at: "2026-10-06T00:00:00.000Z",
+      funnel_id: "fn_9",
+    });
+    for (const key of ["is_lead", "has_successful_payment", "has_active_subscription", "raw_profile_list", "raw_profile_detail"]) {
+      expect(row).not.toHaveProperty(key);
+    }
+    // No funnel_id in the list row → the key is absent, so a stored funnel_id is never nulled.
+    expect(profileUpsertRow(parseProfileListRow({ id: "p2", email: "b@x.com" }), "t")).not.toHaveProperty("funnel_id");
   });
 
-  it("excludes a converted (paid) user", () => {
-    const state = deriveConversionState("paid@example.com", emptyContext({ paidEmails: new Set(["paid@example.com"]) }));
-    expect(state.has_successful_payment).toBe(true);
-    expect(state.is_lead).toBe(false);
-  });
-
-  it("excludes a user with an active subscription", () => {
-    const state = deriveConversionState("active@example.com", emptyContext({ activeSubEmails: new Set(["active@example.com"]) }));
-    expect(state.has_active_subscription).toBe(true);
-    expect(state.is_lead).toBe(false);
-  });
-
-  it("is not a lead without an email", () => {
-    expect(deriveConversionState(null, emptyContext()).is_lead).toBe(false);
-  });
-
-  it("carries first trial / first sub dates from context", () => {
-    const state = deriveConversionState("lead@example.com", emptyContext({
-      trialDatesByEmail: new Map([["lead@example.com", "2026-06-15T00:00:00Z"]]),
-    }));
-    expect(state.first_trial_at).toBe("2026-06-15T00:00:00Z");
-  });
-});
-
-describe("10. upsert row build (dedup key = profile_id)", () => {
-  it("builds a stable row keyed on profile_id with joined attribution + media buyer", () => {
-    const profile = parseProfileListRow({ id: "pro_1", created_at: "2026-06-10T00:00:00Z", funnel_id: "fn_9" });
+  it("a session row attaches joined attribution + media buyer to a stored profile, light columns only", () => {
     const session = parseSessionRow({
-      id: "sess_1", profile_id: "pro_1", country: "us", user_agent: "UA",
+      id: "sess_1", profile_id: "pro_1", country: "us", user_agent: "UA", funnel_id: "fn_s",
       origin: "https://lp/x?utm_source=4&utm_campaign=soulmate-reading&campaign_id=cmp1", created_at: "2026-06-10T10:00:00Z",
     });
-    const conversion = deriveConversionState("lead@example.com", emptyContext());
-    const row = buildLeadUpsertRow(profile, session, "lead@example.com", conversion);
-
-    expect(row.profile_id).toBe("pro_1"); // stable conflict key for upsert dedup
-    expect(row.normalized_email).toBe("lead@example.com");
-    expect(row.campaign_path).toBe("soulmate-reading");
-    expect(row.campaign_id).toBe("cmp1");
-    expect(row.utm_source).toBe("4");
-    expect(row.media_buyer).toBe("Ivan");
-    expect(row.country_code).toBe("US");
-    expect(row.is_lead).toBe(true);
-
-    // Re-building for the same profile yields the same conflict key (idempotent upsert).
-    expect(buildLeadUpsertRow(profile, session, "lead@example.com", conversion).profile_id).toBe(row.profile_id);
+    const row = sessionAttributionRow("1", session, { session_created_at: null, funnel_id: "fn_9" }, "t");
+    expect(row).toMatchObject({
+      profile_id: "1",
+      session_id: "sess_1",
+      campaign_path: "soulmate-reading",
+      campaign_id: "cmp1",
+      utm_source: "4",
+      media_buyer: "Ivan",
+      country_code: "US",
+      funnel_id: "fn_9", // the stored funnel wins over the session's
+    });
+    expect(row).not.toHaveProperty("raw_session");
+    expect(row).not.toHaveProperty("email");
+    // Not stored (no email) → nothing to write; an earlier stored session wins.
+    expect(sessionAttributionRow("1", session, undefined, "t")).toBeNull();
+    expect(sessionAttributionRow("1", session, { session_created_at: "2026-06-09T00:00:00Z", funnel_id: null }, "t")).toBeNull();
+    expect(sessionAttributionRow("1", session, { session_created_at: "2026-06-11T00:00:00Z", funnel_id: null }, "t")?.funnel_id).toBe("fn_s");
   });
 });
 
@@ -174,31 +158,5 @@ describe("12. Leads page source priority", () => {
     expect(selectLeadsSource([{ a: 1 }], [{ b: 2 }]).source).toBe("funnelfox");
     expect(selectLeadsSource([], [{ b: 2 }]).source).toBe("warehouse");
     expect(selectLeadsSource([], [{ b: 2 }]).warehouse).toHaveLength(1);
-  });
-});
-
-describe("buildConversionContext (client → edge payload)", () => {
-  function tx(o: Partial<Transaction>): Transaction {
-    return {
-      transaction_id: o.transaction_id ?? "t", user_id: "u", email: o.email ?? "x@y.com",
-      event_time: o.event_time ?? "2026-06-01T00:00:00Z", amount_usd: 0, gross_amount_usd: 0, refund_amount_usd: 0,
-      net_amount_usd: 0, is_refunded: false, currency: "USD", status: o.status ?? "failed",
-      transaction_type: o.transaction_type ?? "failed_payment", funnel: "unknown", campaign_path: "", product: "",
-      traffic_source: "unknown", campaign_id: "", classification_reason: "t",
-    };
-  }
-  it("collects paid emails and trial/first-sub dates from successful transactions", () => {
-    const ctx = buildConversionContext(
-      [
-        tx({ email: "paid@x.com", status: "success", transaction_type: "trial", event_time: "2026-06-02T00:00:00Z" }),
-        tx({ email: "paid@x.com", status: "success", transaction_type: "first_subscription", event_time: "2026-06-05T00:00:00Z" }),
-        tx({ email: "lead@x.com", status: "failed" }),
-      ],
-      [],
-    );
-    expect(ctx.paid_emails).toContain("paid@x.com");
-    expect(ctx.paid_emails).not.toContain("lead@x.com");
-    expect(ctx.trial_dates["paid@x.com"]).toBe("2026-06-02T00:00:00Z");
-    expect(ctx.first_sub_dates["paid@x.com"]).toBe("2026-06-05T00:00:00Z");
   });
 });

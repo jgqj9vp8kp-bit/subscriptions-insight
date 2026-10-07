@@ -8,17 +8,27 @@
 // needs users.details.view. No action is scopeReady, so funnel-restricted
 // members get 403 scope_not_supported from the gate on every action.
 //
+// Leads tab (leads plan §3, owner decision 4): leads_list / leads_overview
+// serve the server-side lead set — customer emails of people who never paid.
+// They need users.view + users.pii.view + leads.view AND raw access, so for the
+// first release only the data owner reaches them, like the /leads route guard
+// (accessRoutes.ts, rawOnly) and the browser-computed tab they replace.
+// Dropping rawOnly later opens them to members holding the three keys.
+//
 // Pure module (no Deno, no remote imports): vitest imports it directly.
 
 import type { FunctionPolicy } from "../gate.ts";
 import { ActionNormalizeError } from "../errors.ts";
 
-export type ClickHouseUsersAction = "list" | "summary" | "options" | "decline" | "details";
+export type ClickHouseUsersAction = "list" | "summary" | "options" | "decline" | "details" | "leads_list" | "leads_overview";
 
-const USERS_ACTIONS: readonly ClickHouseUsersAction[] = ["list", "summary", "options", "decline", "details"];
+const USERS_ACTIONS: readonly ClickHouseUsersAction[] = ["list", "summary", "options", "decline", "details", "leads_list", "leads_overview"];
 
 /** The Users page (list, summary, options, decline tab) — see the header. */
 const USERS_PAGE = ["users.view", "users.pii.view"];
+
+/** The Leads tab of the Users page — see the header. */
+const LEADS_TAB = [...USERS_PAGE, "leads.view"];
 
 /** Canonical action from the body. The browser always names its action
  * (src/services/usersDataSource.ts), so a missing or unknown action is a 400 —
@@ -38,5 +48,7 @@ export const CLICKHOUSE_USERS_POLICY: FunctionPolicy<ClickHouseUsersAction> = {
     options: { allOf: USERS_PAGE },
     decline: { allOf: USERS_PAGE },
     details: { allOf: [...USERS_PAGE, "users.details.view"] },
+    leads_list: { allOf: LEADS_TAB, rawOnly: true },
+    leads_overview: { allOf: LEADS_TAB, rawOnly: true },
   },
 };

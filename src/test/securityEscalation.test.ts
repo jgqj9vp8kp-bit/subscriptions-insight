@@ -992,6 +992,11 @@ describe("V6 — the cron tenant comes from the workspace, never from the body",
     "clickhouse-cohort-membership": { cron_tick: { action: "cron_tick" } },
     "clickhouse-facebook": { cron_daily: {} },
     "funnelfox-subscriptions-sync": { sync: { full_reset: false }, sync_full_reset: { full_reset: true } },
+    // The exact bodies public.invoke_funnelfox_leads_sync posts (migration 202610060011).
+    "funnelfox-leads-sync": {
+      sync: { full_reset: false, limit: 100, max_pages: 200 },
+      sync_full_reset: { full_reset: true, limit: 100, max_pages: 200 },
+    },
     "sync-support-mail": {
       sync_new: { internal: true, action: "sync_new" },
       sent_initial_sync: { internal: true, action: "sent_initial_sync" },
@@ -1004,6 +1009,7 @@ describe("V6 — the cron tenant comes from the workspace, never from the body",
     "clickhouse-cohort-membership": { action: "rebuild", force: true },
     "clickhouse-facebook": { action: "report" },
     "funnelfox-subscriptions-sync": { dry_run: true },
+    "funnelfox-leads-sync": { dry_run: true },
     "sync-support-mail": { internal: true, action: "reset_cursor" },
     "classify-support-requests": { action: "reset" },
   };

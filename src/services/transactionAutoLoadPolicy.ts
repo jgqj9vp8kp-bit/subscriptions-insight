@@ -25,9 +25,10 @@ function safeLocalStorage(): Storage | null {
 
 /**
  * On-demand hydration for views that compute from the raw warehouse on a route
- * the path policy defers (the Leads tab of /users). While at least one such view
- * is mounted, ProtectedRoute asks SavedDataAutoLoader to load transactions even
- * though the path alone would not. Releasing never unloads anything.
+ * the path policy defers. While at least one such view is mounted,
+ * ProtectedRoute asks SavedDataAutoLoader to load transactions even though the
+ * path alone would not. Releasing never unloads anything. (The Leads tab of
+ * /users used it until it moved to the server read path; no view needs it today.)
  */
 interface TransactionDemandState {
   demand: number;

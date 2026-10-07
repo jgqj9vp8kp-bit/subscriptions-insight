@@ -3,9 +3,11 @@
 --
 -- NOT a migration (it lives outside supabase/migrations, so supabase db push
 -- and the test harness never run it). Run it by hand, as postgres, AFTER
--- restricted members are disabled and the Phase-1 Edge build (470a153) is
--- redeployed, so restricted members get 403 everywhere again:
---   npx.cmd supabase db query -f supabase/rollback/202610060001_rollback.sql
+-- restricted members are disabled, the cohort-membership-freshness cron is
+-- unscheduled and the last pre-Phase-2 main Edge build (8d40168: it carries the
+-- server-side Leads and the funnelfox-leads-sync cron branch) is redeployed, so
+-- restricted members get 403 everywhere again:
+--   npx.cmd supabase db query --linked -f supabase/rollback/202610060001_rollback.sql
 -- or paste it into the SQL editor. It is one transaction.
 --
 -- What it restores:

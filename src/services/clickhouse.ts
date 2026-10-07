@@ -12,6 +12,11 @@ import type {
   UsersDetailsResponse,
 } from "../../supabase/functions/_shared/clickhouse/usersContract";
 import type {
+  LeadsListResponse,
+  LeadsOverviewResponse,
+  LeadsRequest,
+} from "../../supabase/functions/_shared/clickhouse/leadsContract";
+import type {
   SupportRequest,
   SupportResponse,
 } from "../../supabase/functions/_shared/clickhouse/supportContract";
@@ -771,6 +776,18 @@ export async function runClickHouseUserDetails(request: UsersRequest): Promise<U
 
 export async function runClickHouseUsersDecline(request: UsersRequest): Promise<UsersDeclineResponse> {
   return clickHouseRequest<UsersDeclineResponse>(CLICKHOUSE_USERS_FUNCTION, request as Record<string, unknown>, { breakerGated: true });
+}
+
+// Leads tab (same edge function, actions leads_list / leads_overview): the lead
+// set is merged server-side from the warehouse and the stored FunnelFox
+// profiles / subscriptions, so the tab never downloads the raw warehouse.
+// Data owner only for now (policy: rawOnly + users.view + users.pii.view +
+// leads.view). Same circuit breaker as the Users reads (Query A is ClickHouse).
+export function runClickHouseLeads(request: LeadsRequest & { action: "leads_list" }): Promise<LeadsListResponse>;
+export function runClickHouseLeads(request: LeadsRequest & { action: "leads_overview" }): Promise<LeadsOverviewResponse>;
+export function runClickHouseLeads(request: LeadsRequest): Promise<LeadsListResponse | LeadsOverviewResponse>;
+export async function runClickHouseLeads(request: LeadsRequest): Promise<LeadsListResponse | LeadsOverviewResponse> {
+  return clickHouseRequest<LeadsListResponse | LeadsOverviewResponse>(CLICKHOUSE_USERS_FUNCTION, request as unknown as Record<string, unknown>, { breakerGated: true });
 }
 
 // --- Payment Pass Analytics read path (clickhouse-payment-analytics) -------
