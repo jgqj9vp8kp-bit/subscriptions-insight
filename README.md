@@ -344,8 +344,8 @@ Rollback (Phase 2):
    `202610060002` in place: `202610060001` is one-shot (plain `create table` / `create trigger` /
    `create policy`), so a later roll-forward needs a dedicated script, not a re-run of the file.
 5. Frontend: return `main` to the 8d40168 frontend (server-side Leads, no Phase 2) with
-   `git revert -m 2 <merge>`, where `<merge>` is the commit that merged `main` into
-   `feature/access-phase2` (parent 1 = d3c4e74 Phase 2, parent 2 = 8d40168 main). Never `-m 1`: it
+   `git revert -m 2 ec629b5`, the commit that merged `main` into `feature/access-phase2`
+   (parent 1 = d3c4e74 Phase 2, parent 2 = 8d40168 main). Never `-m 1`: it
    drops the Leads frontend and keeps Phase 2. The `funnel_paths` embed keeps working, the table
    still exists.
 6. The ClickHouse retention deletes cannot be undone; they only remove versions older than the previous
