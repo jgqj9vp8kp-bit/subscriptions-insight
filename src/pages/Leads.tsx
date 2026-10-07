@@ -127,6 +127,15 @@ export function formatLeadDateTime(value: string | null): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
+/** "Updated N min ago." for the lead set's candidates (computed on the server,
+ * refreshed every 5 minutes); "" when the time is unknown. Pure + exported for tests. */
+export function candidatesUpdatedText(computedAt: string | null, now: number): string {
+  const ms = computedAt ? Date.parse(computedAt) : Number.NaN;
+  if (!Number.isFinite(ms) || !Number.isFinite(now)) return "";
+  const minutes = Math.max(0, Math.floor((now - ms) / 60_000));
+  return minutes < 1 ? "Updated just now." : `Updated ${minutes.toLocaleString()} min ago.`;
+}
+
 function isLeadSource(value: unknown): value is LeadSource {
   return typeof value === "string" && value in SOURCE_LABELS;
 }
@@ -305,7 +314,8 @@ export function LeadsPanel({ embedded = false }: { embedded?: boolean }) {
         setSyncing(false);
         setSyncProgress(null);
         // New profiles / reconciled conversion: refetch the list, KPIs and state
-        // (the next list / overview request also rebuilds the server's merged set).
+        // (the next list / overview request also rebuilds the server's merged set,
+        // and recomputes its Postgres candidates unless they are under a minute old).
         await invalidateLeadsQueries(queryClient);
         // This click already refreshed everything: the pass it may have completed
         // must not trigger the "background pass finished" refresh below again.
@@ -390,10 +400,14 @@ export function LeadsPanel({ embedded = false }: { embedded?: boolean }) {
   const pageSize = pagination?.page_size ?? PAGE_SIZE;
   const listError = list.error instanceof Error ? list.error.message : list.error ? "Leads request failed." : null;
   const overviewError = overview.error instanceof Error ? overview.error.message : overview.error ? "Leads overview request failed." : null;
-  // The server merges at most the newest N FunnelFox profile leads in memory; past that, say so.
+  // The server keeps only the newest N leads (by lead date); when older ones were left out, say so.
   const leadSetDiagnostics = overview.data?.diagnostics ?? list.data?.diagnostics ?? null;
-  const profileCap = leadSetDiagnostics?.profile_candidates_truncated
-    ? { loaded: leadSetDiagnostics.profile_candidates_loaded ?? 0, total: leadSetDiagnostics.profile_candidates_total ?? 0 }
+  const recentLimit = leadSetDiagnostics?.lead_set_limited
+    ? {
+        limit: leadSetDiagnostics.lead_set_limit ?? summary?.total_leads ?? 0,
+        since: formatLeadDateTime(leadSetDiagnostics.lead_set_oldest_date ?? null),
+        updated: candidatesUpdatedText(leadSetDiagnostics.candidates_computed_at ?? null, now),
+      }
     : null;
   const initialLoading = canReadLeads && list.data == null && list.isFetching;
 
@@ -631,11 +645,11 @@ export function LeadsPanel({ embedded = false }: { embedded?: boolean }) {
               </div>
             )}
 
-            {profileCap && (
-              <div data-testid="leads-profile-cap" className="mt-2 rounded-md border border-warning/40 bg-warning/10 p-2 text-xs text-foreground">
-                Showing the newest {profileCap.loaded.toLocaleString()} of {profileCap.total.toLocaleString()} FunnelFox profile leads:
-                older profile-only leads are left out and the totals are low. The lead set has outgrown the in-memory merge; profile
-                leads need to move to ClickHouse.
+            {recentLimit && (
+              <div data-testid="leads-recent-limit" className="mt-2 rounded-md border border-border bg-muted/40 p-2 text-xs text-muted-foreground">
+                Showing the latest {recentLimit.limit.toLocaleString()} leads{recentLimit.since ? ` (since ${recentLimit.since})` : ""}.
+                {" "}Search, filters and the lead counts cover these leads only.
+                {recentLimit.updated ? ` ${recentLimit.updated}` : ""}
               </div>
             )}
 

@@ -21,12 +21,19 @@ import {
   filterLeadRows,
   funnelFromProfile,
   leadsFilterOptions,
+  isMissingRpcError,
+  keepNewestLeads,
   leadsSummary,
+  LEADS_CANDIDATES_MAX_AGE_SECONDS,
+  LEADS_CANDIDATES_REFRESH_MAX_AGE_SECONDS,
+  LEADS_LEGACY_PROFILE_LIMIT,
   LEADS_MEMO_TTL_MS,
-  LEADS_PROFILE_CANDIDATES_LIMIT,
+  LEADS_RECENT_LIMIT,
+  loadLeadsDataset,
   mergeLeads,
   mergeLeadsWithProfiles,
   normalizeLeadCampaignPath,
+  oldestLeadDate,
   paginateLeadRows,
   parseLeadsProfileCandidates,
   parseWarehouseLeadRow,
@@ -259,6 +266,13 @@ function fakeWarehouse(rows: Array<Record<string, unknown>> | (() => Promise<Arr
 interface PgOptions {
   candidates?: unknown;
   candidatesError?: string;
+  /** leads_recent_candidates fails only when called with this p_max_age_seconds
+   * (e.g. a refresh's inline compute hitting the statement timeout). */
+  candidatesErrorAtMaxAge?: { maxAge: number; message: string; code?: string };
+  /** leads_recent_candidates is not deployed (PostgREST PGRST202 / 404): the old RPC answers `legacyCandidates`. */
+  recentMissing?: boolean;
+  legacyCandidates?: unknown;
+  legacyError?: string;
   active?: Record<string, string[]>;
   syncState?: Record<string, unknown> | null;
   syncStateError?: string;
@@ -269,9 +283,22 @@ interface PgOptions {
 
 function fakePg(options: PgOptions = {}) {
   const rpc = vi.fn(async (fn: string, params?: Record<string, unknown>) => {
-    if (fn === "leads_profile_candidates") {
+    if (fn === "leads_recent_candidates") {
+      if (options.recentMissing) {
+        return {
+          data: null,
+          error: { code: "PGRST202", message: "Could not find the function public.leads_recent_candidates(p_data_key, p_limit, p_max_age_seconds) in the schema cache" },
+          status: 404,
+        };
+      }
       if (options.candidatesError) return { data: null, error: { message: options.candidatesError } };
+      const failAt = options.candidatesErrorAtMaxAge;
+      if (failAt && params?.p_max_age_seconds === failAt.maxAge) return { data: null, error: { code: failAt.code, message: failAt.message } };
       return { data: options.candidates ?? { profile_leads: [], subscription_leads: [], kpis: {} }, error: null };
+    }
+    if (fn === "leads_profile_candidates" && options.recentMissing) {
+      if (options.legacyError) return { data: null, error: { message: options.legacyError } };
+      return { data: options.legacyCandidates ?? { profile_leads: [], subscription_leads: [], kpis: {} }, error: null };
     }
     if (fn === "active_funnelfox_subscription_emails") return { data: options.active ?? {}, error: null };
     return { data: null, error: { message: `unexpected rpc ${fn} ${JSON.stringify(params)}` } };
@@ -749,17 +776,35 @@ describe("mergeLeads", () => {
       expect(parsed.profile_leads[0]).toMatchObject({ profile_id: "p1", lead_date: "2026-06-01T00:00:00.000Z", campaign_path: null, country: "us", user_agent: null, origin: null });
       expect(parsed.subscription_leads).toEqual([{ email: "s@x.io", lead_date: null, funnel: "soulmate", customer_id: "c1" }]);
       expect(parsed.kpis).toEqual({ emails_found: 12, converted_excluded: 3, active_subs_excluded: 0 });
-      // An older RPC without the cap fields: the total is what came back, nothing truncated.
-      expect(parsed).toMatchObject({ profile_leads_total: 1, profile_leads_truncated: false });
+      // No limit flag, no cache fields: nothing limited, never cached.
+      expect(parsed).toMatchObject({ profile_only_limited: false, computed_at: null, cached: false });
     }
+    // leads_recent_candidates: the limit flag and the cache stamp.
+    expect(parseLeadsProfileCandidates({ ...payload, profile_only_limited: true, computed_at: "2026-10-07T10:00:00.123456+00:00", cached: true })).toMatchObject({
+      profile_only_limited: true,
+      computed_at: "2026-10-07T10:00:00.123Z",
+      cached: true,
+    });
+    // The old leads_profile_candidates (the fallback): its truncation flag is the limit flag.
     expect(parseLeadsProfileCandidates({ ...payload, profile_leads_total: "70000", profile_leads_truncated: true })).toMatchObject({
-      profile_leads_total: 70_000,
-      profile_leads_truncated: true,
+      profile_only_limited: true,
+      computed_at: null,
+      cached: false,
     });
     expect(parseLeadsProfileCandidates(null)).toEqual({
-      profile_leads: [], profile_leads_total: 0, profile_leads_truncated: false, subscription_leads: [],
+      profile_leads: [], profile_only_limited: false, subscription_leads: [],
       kpis: { emails_found: 0, converted_excluded: 0, active_subs_excluded: 0 },
+      computed_at: null, cached: false,
     });
+  });
+
+  it("recognizes PostgREST's missing-function answer (PGRST202 / 404) and nothing else", () => {
+    expect(isMissingRpcError({ code: "PGRST202", message: "x" })).toBe(true);
+    expect(isMissingRpcError({ message: "Could not find the function public.leads_recent_candidates(p_data_key) in the schema cache" })).toBe(true);
+    expect(isMissingRpcError({ message: "boom" }, 404)).toBe(true);
+    for (const error of [{ code: "57014", message: "canceling statement due to statement timeout" }, { message: "permission denied for function" }, null, "PGRST202"]) {
+      expect(isMissingRpcError(error, 500), JSON.stringify(error)).toBe(false);
+    }
   });
 });
 
@@ -863,6 +908,29 @@ describe("filter / sort / paginate", () => {
     expect(rows.map((row) => row.key)).toEqual(["w:u1", "w:u2", "p:p1", "s:delta@example.com"]); // input untouched
   });
 
+  it("keepNewestLeads: the newest N by lead date, ties by row key, undated last; oldestLeadDate ignores undated rows", () => {
+    const at = (key: string, leadDate: string | null): LeadRow => ({ ...rows[0], key, lead_date: leadDate });
+    const set = [
+      at("p:b", "2026-06-20T00:00:00.000Z"),
+      at("s:undated", null),
+      at("p:a", "2026-06-20T00:00:00.000Z"), // ties with p:b: the key decides
+      at("w:new", "2026-06-21T00:00:00.000Z"),
+      at("p:old", "2026-06-01T00:00:00.000Z"),
+    ];
+    expect(keepNewestLeads(set, 3).map((row) => row.key)).toEqual(["w:new", "p:a", "p:b"]);
+    expect(keepNewestLeads(set, 2).map((row) => row.key)).toEqual(["w:new", "p:a"]);
+    expect(keepNewestLeads(set, 10).map((row) => row.key)).toEqual(["w:new", "p:a", "p:b", "p:old", "s:undated"]);
+    expect(keepNewestLeads(set, 0)).toEqual([]);
+    expect(set.map((row) => row.key)).toEqual(["p:b", "s:undated", "p:a", "w:new", "p:old"]); // input untouched
+    // Same result as the page's default sort, so page 1 of the cut set is page 1 of the whole set.
+    expect(keepNewestLeads(set, 4)).toEqual(sortLeadRows(set, "lead_date", "desc").slice(0, 4));
+
+    expect(oldestLeadDate(keepNewestLeads(set, 3))).toBe("2026-06-20T00:00:00.000Z");
+    expect(oldestLeadDate(set)).toBe("2026-06-01T00:00:00.000Z");
+    expect(oldestLeadDate([at("s:undated", null)])).toBeNull();
+    expect(oldestLeadDate([])).toBeNull();
+  });
+
   it("paginates with totals", () => {
     const sorted = sortLeadRows(rows, "email", "asc");
     expect(paginateLeadRows(sorted, 2, 3)).toEqual({ rows: [sorted[3]], pagination: { page: 2, page_size: 3, total_rows: 4, total_pages: 2 } });
@@ -903,10 +971,133 @@ describe("runLeadsList / runLeadsOverview", () => {
     expect(response.ok).toBe(true);
     expect(input.warehouse.queries).toHaveLength(1);
     expect(input.warehouse.queries[0].params).toEqual({ auth_user_id: DATA_KEY });
-    expect(input.pgFake.rpc).toHaveBeenCalledWith("leads_profile_candidates", { p_data_key: DATA_KEY, p_profile_limit: LEADS_PROFILE_CANDIDATES_LIMIT });
+    expect(input.pgFake.rpc).toHaveBeenCalledWith("leads_recent_candidates", { p_data_key: DATA_KEY, p_limit: LEADS_RECENT_LIMIT, p_max_age_seconds: LEADS_CANDIDATES_MAX_AGE_SECONDS });
+    expect(input.pgFake.rpc).not.toHaveBeenCalledWith("leads_profile_candidates", expect.anything());
     expect(input.pgFake.rpc).toHaveBeenCalledWith("active_funnelfox_subscription_emails", { p_data_key: DATA_KEY });
     expect(input.pgFake.eq).toHaveBeenCalledWith("funnelfox_leads_sync_state", "auth_user_id", DATA_KEY);
-    expect(LEADS_PROFILE_CANDIDATES_LIMIT).toBe(50_000);
+    expect(LEADS_RECENT_LIMIT).toBe(1_000);
+    expect(LEADS_CANDIDATES_MAX_AGE_SECONDS).toBe(900);
+  });
+
+  it("asks for exactly the limit the SQL defaults to (the pg_cron job caches that default; another limit never hits the cache)", () => {
+    const sql = readFileSync(resolve(process.cwd(), "supabase/migrations/202610070001_leads_recent_candidates.sql"), "utf8");
+    const defaultOf = (fn: string) => {
+      const match = new RegExp(`create or replace function public\\.${fn}\\(([^)]*)\\)`, "i").exec(sql);
+      const limit = match ? /p_limit integer default (\d+)/i.exec(match[1]) : null;
+      return limit ? Number(limit[1]) : null;
+    };
+    expect(defaultOf("leads_recent_candidates")).toBe(LEADS_RECENT_LIMIT);
+    expect(defaultOf("leads_refresh_recent_candidates")).toBe(LEADS_RECENT_LIMIT);
+    expect(defaultOf("leads_recent_candidates_compute")).toBe(LEADS_RECENT_LIMIT);
+    expect(sql).toMatch(/p_max_age_seconds integer default 900/);
+    expect(sql).toMatch(/cron\.schedule\(\s*'funnelfox-leads-recent-cache',\s*'\*\/5 \* \* \* \*',\s*\$\$select public\.leads_refresh_recent_candidates\(\)\$\$/);
+  });
+
+  it("falls back to the old leads_profile_candidates while migration 202610070001 is not applied (PGRST202)", async () => {
+    const input = runInput({
+      warehouse: fakeWarehouse([]),
+      pgOptions: {
+        recentMissing: true,
+        legacyCandidates: {
+          profile_leads: [{ profile_id: "p1", email: "old@example.com", lead_date: "2026-06-20T00:00:00+00:00" }],
+          profile_leads_total: 5_000,
+          profile_leads_truncated: true,
+          subscription_leads: [],
+          kpis: { emails_found: 7, converted_excluded: 2, active_subs_excluded: 1 },
+        },
+      },
+      request: { action: "leads_overview" },
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const response = await runLeadsOverview(input);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("leads_recent_candidates is missing"));
+    warn.mockRestore();
+    // The old cap (what the previous build sent), not LEADS_RECENT_LIMIT: the old RPC
+    // ranks warehouse-email profiles with the rest, and the "both" merge needs the older ones.
+    expect(input.pgFake.rpc).toHaveBeenCalledWith("leads_profile_candidates", { p_data_key: DATA_KEY, p_profile_limit: LEADS_LEGACY_PROFILE_LIMIT });
+    expect(LEADS_LEGACY_PROFILE_LIMIT).toBe(50_000);
+    expect(response.summary).toMatchObject({ total_leads: 1, emails_found: 7, converted_excluded: 2, active_subs_excluded: 1 });
+    // The old RPC's truncation flag says older leads were left out; it has no cache.
+    expect(response.diagnostics).toMatchObject({
+      lead_set_limit: LEADS_RECENT_LIMIT, lead_set_limited: true, lead_set_oldest_date: "2026-06-20T00:00:00.000Z",
+      candidates_computed_at: null, candidates_cached: false,
+    });
+
+    resetLeadsMemo();
+    const failing = runInput({ pgOptions: { recentMissing: true, legacyError: "canceling statement due to statement timeout" } });
+    const quiet = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await expect(runLeadsList(failing)).rejects.toThrow("Could not load FunnelFox lead candidates: canceling statement due to statement timeout");
+    quiet.mockRestore();
+  });
+
+  it("any other candidates error fails the request without the fallback (a timeout is not a missing function)", async () => {
+    const input = runInput({ pgOptions: { candidatesError: "canceling statement due to statement timeout" } });
+    await expect(runLeadsList(input)).rejects.toThrow("Could not load FunnelFox lead candidates: canceling statement due to statement timeout");
+    expect(input.pgFake.rpc).not.toHaveBeenCalledWith("leads_profile_candidates", expect.anything());
+    // A plain load already accepted the cron's payload: no retry.
+    expect(input.pgFake.rpc.mock.calls.filter(([fn]) => fn === "leads_recent_candidates")).toHaveLength(1);
+  });
+
+  const recentMaxAges = (fake: ReturnType<typeof fakePg>) =>
+    fake.rpc.mock.calls.filter(([fn]) => fn === "leads_recent_candidates").map(([, params]) => params?.p_max_age_seconds);
+
+  it("a refresh request asks for candidates at most a minute old (it must see data newer than itself); a plain load accepts the cron's", async () => {
+    expect(LEADS_CANDIDATES_REFRESH_MAX_AGE_SECONDS).toBe(60);
+    const warehouse = fakeWarehouse([WAREHOUSE_ROW]);
+    const plain = runInput({ warehouse });
+    expect((await runLeadsList(plain)).diagnostics.memo).toBe("miss");
+    expect(recentMaxAges(plain.pgFake)).toEqual([LEADS_CANDIDATES_MAX_AGE_SECONDS]);
+
+    const refreshed = runInput({ warehouse, request: { action: "leads_list", refresh: true } });
+    expect((await runLeadsList(refreshed)).diagnostics.memo).toBe("refresh");
+    expect(refreshed.pgFake.rpc).toHaveBeenCalledWith("leads_recent_candidates", {
+      p_data_key: DATA_KEY, p_limit: LEADS_RECENT_LIMIT, p_max_age_seconds: LEADS_CANDIDATES_REFRESH_MAX_AGE_SECONDS,
+    });
+    expect(recentMaxAges(refreshed.pgFake)).toEqual([LEADS_CANDIDATES_REFRESH_MAX_AGE_SECONDS]);
+
+    // The refreshed set is memoized: the next plain request is a hit, no RPC.
+    const after = runInput({ warehouse });
+    expect((await runLeadsList(after)).diagnostics.memo).toBe("hit");
+    expect(recentMaxAges(after.pgFake)).toEqual([]);
+  });
+
+  it("a refresh whose inline compute fails retries once with the cron's payload; when that fails too the request fails", async () => {
+    const timeout = { maxAge: LEADS_CANDIDATES_REFRESH_MAX_AGE_SECONDS, code: "57014", message: "canceling statement due to statement timeout" };
+    const input = runInput({
+      request: { action: "leads_list", refresh: true },
+      pgOptions: {
+        candidatesErrorAtMaxAge: timeout,
+        candidates: {
+          profile_leads: [{ profile_id: "p1", email: "new@example.com", lead_date: "2026-06-20T00:00:00+00:00" }],
+          subscription_leads: [], kpis: {}, computed_at: "2026-06-21T11:57:00+00:00", cached: true,
+        },
+      },
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const response = await runLeadsList(input);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("retrying with the cached payload"), expect.objectContaining({ code: "57014" }));
+    warn.mockRestore();
+    expect(response.pagination.total_rows).toBe(1);
+    expect(response.diagnostics).toMatchObject({ candidates_cached: true, candidates_computed_at: "2026-06-21T11:57:00.000Z" });
+    expect(recentMaxAges(input.pgFake)).toEqual([LEADS_CANDIDATES_REFRESH_MAX_AGE_SECONDS, LEADS_CANDIDATES_MAX_AGE_SECONDS]);
+    expect(input.pgFake.rpc).not.toHaveBeenCalledWith("leads_profile_candidates", expect.anything());
+
+    resetLeadsMemo();
+    const failing = runInput({ request: { action: "leads_list", refresh: true }, pgOptions: { candidatesError: "canceling statement due to statement timeout" } });
+    const quiet = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await expect(runLeadsList(failing)).rejects.toThrow("Could not load FunnelFox lead candidates: canceling statement due to statement timeout");
+    quiet.mockRestore();
+    expect(recentMaxAges(failing.pgFake)).toEqual([LEADS_CANDIDATES_REFRESH_MAX_AGE_SECONDS, LEADS_CANDIDATES_MAX_AGE_SECONDS]);
+    expect(failing.pgFake.rpc).not.toHaveBeenCalledWith("leads_profile_candidates", expect.anything());
+  });
+
+  it("a refresh before migration 202610070001 goes straight to the old RPC (no retry of the missing function)", async () => {
+    const input = runInput({ request: { action: "leads_list", refresh: true }, pgOptions: { recentMissing: true } });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await runLeadsList(input);
+    warn.mockRestore();
+    expect(recentMaxAges(input.pgFake)).toEqual([LEADS_CANDIDATES_REFRESH_MAX_AGE_SECONDS]);
+    expect(input.pgFake.rpc).toHaveBeenCalledWith("leads_profile_candidates", { p_data_key: DATA_KEY, p_profile_limit: LEADS_LEGACY_PROFILE_LIMIT });
   });
 
   it("a runner handed another tenant is a scope violation, not a silent override", async () => {
@@ -953,8 +1144,9 @@ describe("runLeadsList / runLeadsOverview", () => {
             { profile_id: "p1", email: "lead@example.com", lead_date: "2026-06-09T00:00:00+00:00" },
             { profile_id: "p2", email: "new@example.com", lead_date: "2026-06-20T00:00:00+00:00", campaign_path: "starseed-quiz" },
           ],
-          profile_leads_total: 2,
-          profile_leads_truncated: false,
+          profile_only_limited: false,
+          computed_at: "2026-06-21T11:58:00+00:00",
+          cached: true,
           subscription_leads: [{ email: "sub@example.com", lead_date: "2026-06-19T00:00:00+00:00", funnel: "past_life", customer_id: "prof_s" }],
           kpis: { emails_found: 9, converted_excluded: 4, active_subs_excluded: 1 },
         },
@@ -971,7 +1163,9 @@ describe("runLeadsList / runLeadsOverview", () => {
     expect(response.pagination).toEqual({ page: 1, page_size: 2, total_rows: 3, total_pages: 2 });
     expect(response.diagnostics).toEqual({
       warehouse_leads: 0, profile_leads: 1, both_leads: 1, subscription_leads: 1, memo: "miss", dataset_age_ms: 0,
-      profile_candidates_total: 2, profile_candidates_loaded: 2, profile_candidates_truncated: false,
+      // Three leads, well under the limit: nothing was left out.
+      lead_set_limit: LEADS_RECENT_LIMIT, lead_set_limited: false, lead_set_oldest_date: "2026-06-09T00:00:00.000Z",
+      candidates_computed_at: "2026-06-21T11:58:00.000Z", candidates_cached: true,
     });
     // user_agent / origin are read for the page's profile rows only, tenant-bound.
     expect(input.pgFake.detailReads).toEqual([{ columns: "profile_id,user_agent,origin", ids: ["p2"], tenant: DATA_KEY }]);
@@ -1004,26 +1198,155 @@ describe("runLeadsList / runLeadsOverview", () => {
     expect(response.diagnostics.profile_details_unavailable).toBe(true);
   });
 
-  it("past the profile-lead cap the response says the set is truncated (newest kept), instead of running the isolate out of memory", async () => {
+  it("keeps only the newest LEADS_RECENT_LIMIT leads: list, search, filters, options and lead counts cover them; the whole-base KPIs pass through", async () => {
+    // 1,200 profile-only leads, one per minute back from NOW - 30 min (newest p0000),
+    // 400 warehouse leads one per hour back from NOW - 2 days, 3 subscription leads (one undated).
+    const minute = 60_000;
+    const iso = (ms: number) => new Date(ms).toISOString();
+    const profiles = Array.from({ length: 1_200 }, (_, i) => ({
+      profile_id: `p${String(i).padStart(4, "0")}`,
+      email: `profile${i}@example.com`,
+      lead_date: iso(NOW - 30 * minute - i * minute),
+      campaign_path: i % 2 ? "soulmate-quiz" : "starseed-quiz",
+    }));
+    const warehouse = Array.from({ length: 400 }, (_, i) => ({
+      ...WAREHOUSE_ROW, customer_id: `u${i}`, email: `wh${i}@example.com`, first_touch_ms: String(NOW - 2 * 86_400_000 - i * 3_600_000),
+    }));
     const input = runInput({
-      warehouse: fakeWarehouse([]),
+      warehouse: fakeWarehouse(warehouse),
       pgOptions: {
         candidates: {
-          profile_leads: [{ profile_id: "p9", email: "newest@example.com", lead_date: "2026-06-20T00:00:00+00:00" }],
-          profile_leads_total: 73_000,
-          profile_leads_truncated: true,
-          subscription_leads: [],
-          kpis: {},
+          profile_leads: profiles,
+          profile_only_limited: true,
+          subscription_leads: [
+            { email: "sub-new@example.com", lead_date: iso(NOW - 10 * minute), funnel: "soulmate", customer_id: "s1" },
+            { email: "sub-old@example.com", lead_date: "2025-01-01T00:00:00+00:00", funnel: "soulmate", customer_id: "s2" },
+            { email: "sub-undated@example.com", lead_date: null, funnel: "soulmate", customer_id: "s3" },
+          ],
+          kpis: { emails_found: 230_265, converted_excluded: 14_744, active_subs_excluded: 120 },
+          computed_at: iso(NOW - 4 * minute),
+          cached: true,
         },
       },
       request: { action: "leads_overview" },
     });
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    const response = await runLeadsOverview(input);
-    expect(response.diagnostics).toMatchObject({ profile_leads: 1, profile_candidates_total: 73_000, profile_candidates_loaded: 1, profile_candidates_truncated: true });
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("profile lead cap reached"), { loaded: 1, total: 73_000 });
-    expect(JSON.stringify(warn.mock.calls)).not.toContain("@");
-    warn.mockRestore();
+    const overview = await runLeadsOverview(input);
+    expect(overview.summary).toEqual({
+      total_leads: LEADS_RECENT_LIMIT,
+      // Whole base, untouched by the cut.
+      emails_found: 230_265, converted_excluded: 14_744, active_subs_excluded: 120,
+      // Over the kept 1,000 (NOW = 12:00 UTC): sub-new + p0000..p0690 came in today
+      // (11:30 back to 00:00), all of them in the last 7 days.
+      leads_today: 692,
+      leads_last_7_days: LEADS_RECENT_LIMIT,
+    });
+    // The newest 1,000 are: sub-new (NOW - 10 min) + p0000..p0998 (NOW - 30 min .. NOW - 1,028 min).
+    // The warehouse leads (2+ days old), sub-old and the undated sub are left out.
+    expect(overview.diagnostics).toMatchObject({
+      warehouse_leads: 0, profile_leads: 999, both_leads: 0, subscription_leads: 1,
+      lead_set_limit: 1_000, lead_set_limited: true, lead_set_oldest_date: iso(NOW - 30 * minute - 998 * minute),
+      candidates_computed_at: iso(NOW - 4 * minute), candidates_cached: true,
+    });
+    expect(overview.filter_options.source).toEqual([{ value: "funnelfox_profile", count: 999 }, { value: "funnelfox_subscription", count: 1 }]);
+    expect(overview.filter_options.campaign_path.reduce((total, option) => total + option.count, 0)).toBe(1_000);
+
+    // The list pages over the same 1,000 rows (memo hit), newest first.
+    const list = await runLeadsList({ ...input, request: { action: "leads_list", page: 20, page_size: 50 } });
+    expect(list.pagination).toEqual({ page: 20, page_size: 50, total_rows: 1_000, total_pages: 20 });
+    expect(list.rows.at(-1)?.key).toBe("p:p0998");
+    // Search and filters cannot reach a lead outside the cut.
+    const outside = await runLeadsList({ ...input, request: { action: "leads_list", filters: { search: "profile1100@" } } });
+    expect(outside.pagination.total_rows).toBe(0);
+    const inside = await runLeadsList({ ...input, request: { action: "leads_list", filters: { search: "profile998@" } } });
+    expect(inside.rows.map((row) => row.key)).toEqual(["p:p0998"]);
+    const warehouseOnly = await runLeadsList({ ...input, request: { action: "leads_list", filters: { source: "warehouse" } } });
+    expect(warehouseOnly.pagination.total_rows).toBe(0);
+    // Sorting another way still sorts the kept set only.
+    const oldestFirst = await runLeadsList({ ...input, request: { action: "leads_list", sort: { key: "lead_date", dir: "asc" }, page_size: 1 } });
+    expect(oldestFirst.rows.map((row) => row.key)).toEqual(["p:p0998"]);
+  });
+
+  it("a 'both' row competes with its merged (earlier) date: an old profile date drops it even when the warehouse date is new", async () => {
+    const minute = 60_000;
+    const iso = (ms: number) => new Date(ms).toISOString();
+    const profiles = Array.from({ length: LEADS_RECENT_LIMIT }, (_, i) => ({
+      profile_id: `p${String(i).padStart(4, "0")}`, email: `profile${i}@example.com`, lead_date: iso(NOW - 60 * minute - i * minute),
+    }));
+    const input = runInput({
+      warehouse: fakeWarehouse([
+        // First touch 1 minute ago, but its profile came in two years ago: lead_date = the profile's.
+        { ...WAREHOUSE_ROW, customer_id: "u-both", email: "both@example.com", first_touch_ms: String(NOW - minute) },
+        // Warehouse-only and new: kept.
+        { ...WAREHOUSE_ROW, customer_id: "u-new", email: "new@example.com", first_touch_ms: String(NOW - 2 * minute) },
+      ]),
+      pgOptions: {
+        candidates: {
+          profile_leads: [...profiles, { profile_id: "p-both", email: "both@example.com", lead_date: "2024-10-01T00:00:00+00:00" }],
+          profile_only_limited: false,
+          subscription_leads: [],
+          kpis: {},
+        },
+      },
+      request: { action: "leads_list", page_size: 200 },
+    });
+    const response = await runLeadsList(input);
+    expect(response.pagination.total_rows).toBe(LEADS_RECENT_LIMIT);
+    const keys = new Set<string>();
+    for (let page = 1; page <= response.pagination.total_pages; page += 1) {
+      const next = await runLeadsList({ ...input, request: { action: "leads_list", page, page_size: 200 } });
+      for (const row of next.rows) keys.add(row.key);
+    }
+    expect(keys.has("w:u-new")).toBe(true);
+    expect(keys.has("w:u-both")).toBe(false);
+    // 1,002 merged leads (1,000 profiles + 2 warehouse): the cut left two out, the oldest profile and the both row.
+    expect(keys.has("p:p0999")).toBe(false);
+    expect(keys.has("p:p0998")).toBe(true);
+    expect(response.diagnostics).toMatchObject({ lead_set_limited: true, both_leads: 0, warehouse_leads: 1, profile_leads: 999 });
+  });
+
+  it("the cut keeps the per-page profile details only for kept rows", async () => {
+    const candidates = {
+      profile_leads: Array.from({ length: LEADS_RECENT_LIMIT + 5 }, (_, i) => ({
+        profile_id: `p${String(i).padStart(4, "0")}`, email: `profile${i}@example.com`, lead_date: new Date(NOW - (i + 1) * 60_000).toISOString(),
+      })),
+      profile_only_limited: true,
+      subscription_leads: [],
+      kpis: {},
+    };
+    const dropped = ["p1000", "p1001", "p1002", "p1003", "p1004"];
+    const input = runInput({
+      warehouse: fakeWarehouse([]),
+      pgOptions: {
+        candidates,
+        profileDetails: [
+          { profile_id: "p0999", user_agent: "UA-kept", origin: "https://o/kept" },
+          ...dropped.map((profile_id) => ({ profile_id, user_agent: "UA-dropped", origin: "https://o/dropped" })),
+        ],
+      },
+      request: { action: "leads_list", page: 20, page_size: 50 },
+    });
+    const response = await runLeadsList(input);
+    expect(response.rows.at(-1)).toMatchObject({ key: "p:p0999", user_agent: "UA-kept", origin: "https://o/kept" });
+    expect(input.pgFake.detailReads).toHaveLength(1);
+    expect(input.pgFake.detailReads[0].ids).toHaveLength(50);
+    // Page 21 exists only without the cut (p1000..p1004 sit at indices 1,000..1,004):
+    // with it the page is empty and no profile details are read.
+    const beyond = await runLeadsList({ ...input, request: { action: "leads_list", page: 21, page_size: 50 } });
+    expect(beyond.diagnostics.memo).toBe("hit");
+    expect(beyond.rows).toEqual([]);
+    expect(beyond.pagination).toEqual({ page: 21, page_size: 50, total_rows: LEADS_RECENT_LIMIT, total_pages: 20 });
+    expect(input.pgFake.detailReads).toHaveLength(1);
+    expect(input.pgFake.detailReads.flatMap((read) => read.ids).filter((id) => dropped.includes(String(id)))).toEqual([]);
+
+    // The dataset itself: only the kept rows map to a profile id.
+    const dataset = await loadLeadsDataset(
+      { tenantKey: DATA_KEY, clickhouse: createScopedReader(ownerContext(), fakeWarehouse([]).raw), pg: fakePg({ candidates }).client },
+      NOW,
+    );
+    expect(dataset.rows).toHaveLength(LEADS_RECENT_LIMIT);
+    expect(dataset.profileIdByKey.size).toBe(LEADS_RECENT_LIMIT);
+    for (const id of dropped) expect(dataset.profileIdByKey.has(`p:${id}`), id).toBe(false);
+    expect(dataset.profileIdByKey.get("p:p0999")).toBe("p0999");
   });
 
   it("overview: summary, options and the sanitized sync state", async () => {

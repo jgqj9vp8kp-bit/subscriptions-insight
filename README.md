@@ -191,6 +191,42 @@ carries an email into `public.funnelfox_leads` in the background. Details: DEVEL
    (401) Edge invocation. Check `select * from net._http_response order by created desc` for 200s.
 5. **Deploy the frontend.** The new tab needs the step-2 functions; the old tab keeps working until
    then (the server ignores its `conversion` body and fills in the missing page sizes).
+6. **Latest 1,000 leads (2026-10-07): apply `202610070001_leads_recent_candidates.sql` on its own** —
+   out of band, never `supabase db push` (that would also apply every other pending file, e.g.
+   `202610060011` if it is still pending). It needs only `202610060010` (it refuses to run before it):
+
+   ```text
+   npx supabase db query --linked -f supabase/migrations/202610070001_leads_recent_candidates.sql
+   npx supabase migration repair --status applied 202610070001
+   ```
+
+   (or paste the file into the Dashboard SQL Editor; either way it runs as one transaction). It adds
+   `leads_recent_candidates_compute` / `leads_recent_candidates` / `leads_refresh_recent_candidates`
+   (service_role only), the cache table `public.funnelfox_leads_candidates_cache` (RLS on, no
+   browser access) and the pg_cron job `funnelfox-leads-recent-cache` (every 5 minutes, pure SQL, no
+   HTTP).
+
+   Once `202610070001` is recorded, `supabase db push` refuses any still-pending `202610060011`,
+   because it sorts before the last applied version. Apply that file out of band too:
+   `npx supabase db query --linked -f supabase/migrations/202610060011_funnelfox_leads_cron.sql`,
+   then `npx supabase migration repair --status applied 202610060011` (or use the SQL Editor).
+   Never use `--include-all`.
+
+   Then warm the cache once and check it:
+
+   ```text
+   select public.leads_refresh_recent_candidates();
+   select profile_limit, computed_at, duration_ms from public.funnelfox_leads_candidates_cache;
+   select status, return_message, start_time from cron.job_run_details
+     where jobid = (select jobid from cron.job where jobname = 'funnelfox-leads-recent-cache')
+     order by start_time desc limit 5;
+   ```
+
+   Then deploy the functions and the frontend. The order does not matter: until the migration is
+   applied the functions fall back to `leads_profile_candidates` with its old 50,000 cap (slow and
+   timeout-prone, as before; the merged set is still cut to the latest 1,000), and the old frontend
+   simply shows no banner. Rollback: `select cron.unschedule('funnelfox-leads-recent-cache');`
+   stops the refresh (the Edge then computes on a cache miss, at most every 15 minutes).
 
 How the background export proceeds:
 
@@ -211,11 +247,18 @@ How the background export proceeds:
   profiles_completed, sessions_completed, reconcile_completed, stats->>'profiles_scanned_total',
   stats->>'profiles_with_email', stats->>'rate_limited_until', stats->>'error_backoff_until' from
   public.funnelfox_leads_sync_state;`
-- Leads tab size: the server merges at most the newest 50 000 FunnelFox profile leads in memory.
-  Past that the tab shows "Showing the newest … of … FunnelFox profile leads" — the signal that
-  profile leads must move to ClickHouse (plan §4 step 7).
+- What the Leads tab shows (owner decision 2026-10-07, for speed): only the **latest 1,000 leads**
+  by lead date (about the last 3 days today). The list, search, filters, filter options and the
+  Total Leads / Leads Today / Leads Last 7 Days cards cover those 1,000; Emails Found, Converted
+  Excluded and Active Subs Excluded are whole-base counts. A banner says "Showing the latest 1,000
+  leads (since …)" and when the server last computed them (the cache is at most ~5 minutes old;
+  the Refresh button and the end of a sync rebuild the server's 60 s memo and recompute the cache
+  unless it is under a minute old). Known transient: for up to ~5 min after an import's ClickHouse
+  sync, a returning old lead can show with its new transaction date, and a just-converted recent
+  lead can stay listed, until the next `funnelfox-leads-recent-cache` tick (the cached Postgres
+  candidates are merged with the live ClickHouse rows).
 - Pause / resume: `select cron.alter_job(jobid, active := false) from cron.job where jobname like
-  'funnelfox-leads-%';` (`active := true` to resume).
+  'funnelfox-leads-%';` (`active := true` to resume; this includes `funnelfox-leads-recent-cache`).
 
 Server-summary flags stay off in production until real-data parity is confirmed
 (see `.env.example`): `VITE_FB_ANALYTICS_SOURCE` and `VITE_DASHBOARD_SOURCE`

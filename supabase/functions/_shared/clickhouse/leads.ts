@@ -8,24 +8,31 @@
 //      ScopedReader): one row per user_id with an email and no successful
 //      payment — computeLeads' warehouse leads, field for field (see
 //      buildWarehouseLeadsQuery);
-//   B. Postgres RPC leads_profile_candidates(p_data_key, p_profile_limit):
-//      stored FunnelFox profiles (list emails, preview runs excluded; light
-//      columns only, newest first, at most LEADS_PROFILE_CANDIDATES_LIMIT) and
-//      subscription-only emails, both already without paid / active emails,
-//      plus the KPI counts;
+//   B. Postgres RPC leads_recent_candidates(p_data_key, p_limit,
+//      p_max_age_seconds) (migration 202610070001): the newest
+//      LEADS_RECENT_LIMIT + 1 profile-only leads, the profile of every unpaid
+//      warehouse email, the subscription-only emails (all already without paid /
+//      active emails) and the whole-base KPI counts — served from a Postgres
+//      cache the pg_cron job refreshes every 5 minutes (a refresh request
+//      recomputes it unless it is under a minute old). Before that migration is
+//      applied, the old leads_profile_candidates (same shape, slow, asked for
+//      its old 50,000 cap) is the fallback;
 //   C. activeSubscriptionsByEmail(pg, tenantKey): active emails (the Cohorts
 //      definition) dropped from every source — computeLeads drops them too.
-// mergeLeads (pure, exported) joins them; filtering, the sort allowlist and
-// pagination run here in Edge over the merged set. The set is memoized per
-// workspace for 60 s and concurrent requests share one in-flight load, so
+// mergeLeads (pure, exported) joins them, and the merged set is cut to the
+// newest LEADS_RECENT_LIMIT leads by lead date (owner decision 2026-10-07: the
+// Leads tab shows the latest 1,000 leads, for speed). Filtering, search, the
+// sort allowlist, pagination, the filter options and the lead counts run here
+// in Edge over that cut set; only emails_found / converted_excluded /
+// active_subs_excluded stay whole-base (the RPC's kpis). The set is memoized
+// per workspace for 60 s and concurrent requests share one in-flight load, so
 // paging and filter changes cost no warehouse query.
 //
-// Size: the whole set lives in Edge memory, so the bulk read carries no
-// profile user_agent / origin (the bulk of a row); leads_list reads those for
-// the rows of the requested page only (hydrateProfileDetails). Past
-// LEADS_PROFILE_CANDIDATES_LIMIT profile leads the newest ones are kept and the
-// response says so (diagnostics.profile_candidates_truncated) — the signal to
-// move the profile leads into ClickHouse (leads plan §4 step 7).
+// Size: the bulk read carries no profile user_agent / origin (the bulk of a
+// row); leads_list reads those for the rows of the requested page only
+// (hydrateProfileDetails). When the cut dropped older leads the response says
+// so (diagnostics.lead_set_limited / lead_set_oldest_date): the page shows a
+// "latest 1,000 leads" banner.
 //
 // Tenant: always ctx.tenantKey (the workspace data key) — the ScopedReader
 // binds {auth_user_id:String} to it and the RPCs take it as p_data_key. A
@@ -63,10 +70,31 @@ const MINUTE_MS = 60 * 1000;
 export const LEADS_MEMO_TTL_MS = 60_000;
 /** Workspaces kept in the memo; the oldest entry is evicted beyond this. */
 export const LEADS_MEMO_MAX_ENTRIES = 16;
-/** Most FunnelFox profile leads one load takes into Edge memory (the newest; the
- * plan's scale trigger for the ClickHouse mirror). Beyond it the response is
- * flagged truncated instead of the isolate running out of memory / CPU. */
-export const LEADS_PROFILE_CANDIDATES_LIMIT = 50_000;
+/** The Leads tab holds the newest LEADS_RECENT_LIMIT leads by lead date (owner
+ * decision 2026-10-07, for speed): the merged set is cut to them, and the
+ * candidates RPC is asked for exactly this limit. Must equal the SQL default
+ * p_limit of leads_recent_candidates / leads_refresh_recent_candidates
+ * (migration 202610070001): the pg_cron job caches that default, and a request
+ * for another limit never hits the cache. */
+export const LEADS_RECENT_LIMIT = 1_000;
+/** Oldest cached candidates payload a plain load accepts. The cron refreshes it
+ * every 5 minutes, so an inline compute (2.5-10 s on a cold buffer cache) only
+ * runs when the cron has been failing for 10 minutes. */
+export const LEADS_CANDIDATES_MAX_AGE_SECONDS = 900;
+/** Oldest cached candidates payload a refresh request accepts (refresh: true — the
+ * Refresh button, the end of a manual sync, a finished background pass): such a
+ * request must see data newer than itself, so it recomputes unless the cron (or
+ * another refresh) computed the payload within the last minute. If that inline
+ * compute fails (e.g. a statement timeout on a cold buffer cache), the load
+ * retries once with LEADS_CANDIDATES_MAX_AGE_SECONDS so the tab still opens. */
+export const LEADS_CANDIDATES_REFRESH_MAX_AGE_SECONDS = 60;
+/** The profile cap the fallback asks the old leads_profile_candidates for (what
+ * the previous build sent). Not LEADS_RECENT_LIMIT: the old RPC ranks the
+ * profiles of unpaid warehouse emails together with the profile-only ones, so a
+ * 1,000 cap would drop the older profiles the "both" merge needs (a returning
+ * lead would compete with its fresh warehouse date). keepNewestLeads still cuts
+ * the merged set to LEADS_RECENT_LIMIT. */
+export const LEADS_LEGACY_PROFILE_LIMIT = 50_000;
 
 // ---- A. ClickHouse warehouse lead candidates ----------------------------------------
 
@@ -192,8 +220,8 @@ export interface WarehouseLeadCandidate {
   decline_reason: string | null;
 }
 
-/** One stored FunnelFox profile lead (leads_profile_candidates.profile_leads[]).
- * The RPC no longer sends user_agent / origin (read per page, see
+/** One stored FunnelFox profile lead (leads_recent_candidates.profile_leads[]).
+ * The RPC sends no user_agent / origin (read per page, see
  * hydrateProfileDetails); they stay here for callers that have them. */
 export interface ProfileLeadCandidate {
   profile_id: string;
@@ -209,7 +237,7 @@ export interface ProfileLeadCandidate {
   origin: string | null;
 }
 
-/** One subscription-only lead (leads_profile_candidates.subscription_leads[]). */
+/** One subscription-only lead (leads_recent_candidates.subscription_leads[]). */
 export interface SubscriptionLeadCandidate {
   email: string;
   lead_date: string | null;
@@ -226,12 +254,16 @@ export interface LeadsCandidateKpis {
 
 export interface LeadsProfileCandidates {
   profile_leads: ProfileLeadCandidate[];
-  /** Profile leads before the RPC's cap (>= profile_leads.length). */
-  profile_leads_total: number;
-  /** The cap cut the list: only the newest profile_leads.length are in the set. */
-  profile_leads_truncated: boolean;
+  /** More profile-only leads exist than the RPC sent (it sends the newest
+   * limit + 1). The old leads_profile_candidates' profile_leads_truncated maps here. */
+  profile_only_limited: boolean;
   subscription_leads: SubscriptionLeadCandidate[];
   kpis: LeadsCandidateKpis;
+  /** When Postgres computed the payload (ISO; the cache row's computed_at). Null
+   * from the old RPC, which has no cache. */
+  computed_at: string | null;
+  /** The payload came from funnelfox_leads_candidates_cache. */
+  cached: boolean;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -335,7 +367,8 @@ function parseSubscriptionLead(raw: unknown): SubscriptionLeadCandidate | null {
   return { email, lead_date: toIso(raw.lead_date), funnel: textOrNull(raw.funnel), customer_id: textOrNull(raw.customer_id) };
 }
 
-/** The leads_profile_candidates jsonb (object or JSON text) → typed candidates. */
+/** The leads_recent_candidates jsonb — or the old leads_profile_candidates one
+ * (object or JSON text) → typed candidates. Tolerant: missing parts are empty. */
 export function parseLeadsProfileCandidates(data: unknown): LeadsProfileCandidates {
   let value = data;
   if (typeof value === "string") {
@@ -349,29 +382,71 @@ export function parseLeadsProfileCandidates(data: unknown): LeadsProfileCandidat
   const kpis = isRecord(record.kpis) ? record.kpis : {};
   const list = <T>(entries: unknown, parse: (raw: unknown) => T | null): T[] =>
     (Array.isArray(entries) ? entries : []).map(parse).filter((entry): entry is T => entry !== null);
-  const profileLeads = list(record.profile_leads, parseProfileLead);
   return {
-    profile_leads: profileLeads,
-    profile_leads_total: Math.max(profileLeads.length, n(record.profile_leads_total)),
-    profile_leads_truncated: b(record.profile_leads_truncated),
+    profile_leads: list(record.profile_leads, parseProfileLead),
+    profile_only_limited: b(record.profile_only_limited) || b(record.profile_leads_truncated),
     subscription_leads: list(record.subscription_leads, parseSubscriptionLead),
     kpis: {
       emails_found: n(kpis.emails_found),
       converted_excluded: n(kpis.converted_excluded),
       active_subs_excluded: n(kpis.active_subs_excluded),
     },
+    computed_at: toIso(record.computed_at),
+    cached: b(record.cached),
   };
+}
+
+/** PostgREST's answer for an RPC that is not in its schema cache (the migration
+ * that adds it is not applied yet): PGRST202, HTTP 404. */
+export function isMissingRpcError(error: unknown, status?: unknown): boolean {
+  if (status === 404) return true;
+  if (!isRecord(error)) return false;
+  return error.code === "PGRST202" || /could not find the function/i.test(s(error.message));
+}
+
+export interface LoadLeadsProfileCandidatesOptions {
+  /** p_limit (default LEADS_RECENT_LIMIT, the cached one). */
+  limit?: number;
+  /** A refresh request: accept a payload at most
+   * LEADS_CANDIDATES_REFRESH_MAX_AGE_SECONDS old (else
+   * LEADS_CANDIDATES_MAX_AGE_SECONDS). */
+  refresh?: boolean;
 }
 
 export async function loadLeadsProfileCandidates(
   pg: SupabaseLikeClient,
   tenantKey: string,
-  profileLimit: number = LEADS_PROFILE_CANDIDATES_LIMIT,
+  options: LoadLeadsProfileCandidatesOptions = {},
 ): Promise<LeadsProfileCandidates> {
   if (typeof pg.rpc !== "function") throw new Error("Could not load FunnelFox lead candidates: rpc is not supported by this client.");
-  const { data, error } = await pg.rpc("leads_profile_candidates", { p_data_key: tenantKey, p_profile_limit: profileLimit });
-  if (error) throw new Error(`Could not load FunnelFox lead candidates: ${error.message}`);
-  return parseLeadsProfileCandidates(data);
+  const limit = options.limit ?? LEADS_RECENT_LIMIT;
+  const recent = (maxAgeSeconds: number) =>
+    pg.rpc!("leads_recent_candidates", { p_data_key: tenantKey, p_limit: limit, p_max_age_seconds: maxAgeSeconds });
+  let result = await recent(options.refresh ? LEADS_CANDIDATES_REFRESH_MAX_AGE_SECONDS : LEADS_CANDIDATES_MAX_AGE_SECONDS);
+  if (result?.error && isMissingRpcError(result.error, (result as { status?: unknown }).status)) {
+    // Functions deployed before migration 202610070001: the old RPC (same shape,
+    // computed on every call, no cache) with the cap the previous build sent —
+    // see LEADS_LEGACY_PROFILE_LIMIT. keepNewestLeads cuts the merged set.
+    console.warn("leads: leads_recent_candidates is missing (migration 202610070001 not applied) — using leads_profile_candidates");
+    const legacy = await pg.rpc("leads_profile_candidates", {
+      p_data_key: tenantKey,
+      p_profile_limit: Math.max(limit, LEADS_LEGACY_PROFILE_LIMIT),
+    });
+    if (legacy?.error) throw new Error(`Could not load FunnelFox lead candidates: ${legacy.error.message}`);
+    return parseLeadsProfileCandidates(legacy?.data);
+  }
+  if (result?.error && options.refresh) {
+    // The refresh's inline compute failed (typically 57014, the 8 s statement
+    // timeout on a cold buffer cache): serve the cron's payload (≤ 5 min old)
+    // rather than fail the tab.
+    console.warn("leads: refresh compute of leads_recent_candidates failed — retrying with the cached payload", {
+      code: s((result.error as { code?: unknown }).code),
+      error: s(result.error.message).slice(0, 200),
+    });
+    result = await recent(LEADS_CANDIDATES_MAX_AGE_SECONDS);
+  }
+  if (result?.error) throw new Error(`Could not load FunnelFox lead candidates: ${result.error.message}`);
+  return parseLeadsProfileCandidates(result?.data);
 }
 
 /** Profile ids per funnelfox_leads `.in()` read (one leads_list page is at most 200 rows). */
@@ -735,6 +810,28 @@ export function sortLeadRows(rows: LeadRow[], key: LeadsSortKey, dir: LeadsSortD
   return keyed.map((entry) => entry.row);
 }
 
+/** The newest `limit` leads by lead_date (the default sort: newest first,
+ * undated last, ties by row key) — the Leads tab's lead set. A "both" row
+ * competes with its merged lead_date (the earlier of the warehouse and profile
+ * dates), never its warehouse date alone. */
+export function keepNewestLeads(rows: LeadRow[], limit: number): LeadRow[] {
+  return sortLeadRows(rows, "lead_date", "desc").slice(0, Math.max(0, Math.floor(limit)));
+}
+
+/** The oldest lead_date of a lead set (ISO), null when no row has one. */
+export function oldestLeadDate(rows: LeadRow[]): string | null {
+  let oldest: string | null = null;
+  let oldestMs = Number.POSITIVE_INFINITY;
+  for (const row of rows) {
+    const ms = msOf(row.lead_date);
+    if (Number.isFinite(ms) && ms < oldestMs) {
+      oldestMs = ms;
+      oldest = row.lead_date;
+    }
+  }
+  return oldest;
+}
+
 export function paginateLeadRows(rows: LeadRow[], page: number, pageSize: number): { rows: LeadRow[]; pagination: { page: number; page_size: number; total_rows: number; total_pages: number } } {
   const totalRows = rows.length;
   const offset = (page - 1) * pageSize;
@@ -772,8 +869,10 @@ export function leadsFilterOptions(rows: LeadRow[]): LeadsFilterOptions {
   };
 }
 
-/** KPIs: the merged set's counts plus the RPC's distinct-email counts. leads_today
- * / leads_last_7_days follow computeLeadSummary (UTC date; the last 7 × 24 h). */
+/** KPIs: the lead set's counts (total / today / last 7 days — over the newest
+ * LEADS_RECENT_LIMIT leads the set holds) plus the RPC's whole-base
+ * distinct-email counts. leads_today / leads_last_7_days follow
+ * computeLeadSummary (UTC date; the last 7 × 24 h). */
 export function leadsSummary(rows: LeadRow[], kpis: LeadsCandidateKpis, now: number): LeadsSummary {
   const todayKey = new Date(now).toISOString().slice(0, 10);
   const sevenDaysAgo = now - 7 * DAY_MS;
@@ -874,13 +973,17 @@ export async function readLeadsSyncState(pg: SupabaseLikeClient, tenantKey: stri
 // ---- the merged set, memoized per workspace --------------------------------------------
 
 export interface LeadsDataset {
+  /** The newest LEADS_RECENT_LIMIT merged leads (keepNewestLeads), newest first. */
   rows: LeadRow[];
   /** Row key → the FunnelFox profile id behind it (for the per-page user_agent / origin read). */
   profileIdByKey: Map<string, string>;
   kpis: LeadsCandidateKpis;
+  /** Per source, over `rows`. */
   counts: { warehouse: number; profile: number; both: number; subscription: number };
-  /** The candidates RPC's profile-lead cap: the uncapped count and whether it cut the list. */
-  profileCandidates: { total: number; loaded: number; truncated: boolean };
+  /** The newest-N cut: N, whether it dropped older leads, and the oldest lead_date kept. */
+  leadSet: { limit: number; limited: boolean; oldestDate: string | null };
+  /** The candidates payload's computed_at (ISO; null from the old RPC) and whether it was cached. */
+  candidates: { computedAt: string | null; cached: boolean };
   /** Clock value when the load started. */
   computed_at: number;
 }
@@ -901,7 +1004,9 @@ export interface LeadsRunInput {
 interface MemoEntry {
   startedAt: number;
   settled: boolean;
-  /** Started by a refresh request (one that must see data newer than the request). */
+  /** Started by a refresh request (one that must see data newer than the request:
+   * it rebuilds the memo and asks for candidates at most
+   * LEADS_CANDIDATES_REFRESH_MAX_AGE_SECONDS old). */
   refresh: boolean;
   promise: Promise<LeadsDataset>;
 }
@@ -913,19 +1018,45 @@ export function resetLeadsMemo(): void {
   leadsMemo.clear();
 }
 
-export async function loadLeadsDataset(input: Pick<LeadsRunInput, "tenantKey" | "clickhouse" | "pg">, now: number): Promise<LeadsDataset> {
+/** One load of the merged lead set. `refresh` (a refresh request) makes the
+ * candidates RPC recompute unless its cached payload is under a minute old
+ * (LEADS_CANDIDATES_REFRESH_MAX_AGE_SECONDS); a plain load accepts the cron's
+ * payload (≤ 5 min old normally, LEADS_CANDIDATES_MAX_AGE_SECONDS at most).
+ *
+ * Known transient: the candidates are a Postgres snapshot (computed_at), the
+ * warehouse rows (A) are read live. Until the next cron tick, an old profile
+ * lead whose first transaction reached ClickHouse after computed_at shows as a
+ * fresh "warehouse" lead (its old profile is not in the payload, so it cannot
+ * fold into "both" with the earlier date), and a recent profile-only lead that
+ * has just paid stays listed. An Edge-side profile lookup for those warehouse
+ * rows is not done: only SQL knows the linked-profile exclusion, and a lookup
+ * without it would re-date linked warehouse leads for good. */
+export async function loadLeadsDataset(
+  input: Pick<LeadsRunInput, "tenantKey" | "clickhouse" | "pg">,
+  now: number,
+  refresh = false,
+): Promise<LeadsDataset> {
   const [warehouse, candidates, active] = await Promise.all([
     loadWarehouseLeadCandidates(input.clickhouse, input.tenantKey),
-    loadLeadsProfileCandidates(input.pg, input.tenantKey),
+    loadLeadsProfileCandidates(input.pg, input.tenantKey, { refresh }),
     activeSubscriptionsByEmail(input.pg, input.tenantKey),
   ]);
-  const { rows, profileIdByKey } = mergeLeadsWithProfiles({
+  const merged = mergeLeadsWithProfiles({
     warehouse,
     profiles: candidates.profile_leads,
     subscriptions: candidates.subscription_leads,
     activeEmails: active,
     now,
   });
+  // The Leads tab's set: the newest LEADS_RECENT_LIMIT leads. Everything
+  // downstream (filters, search, sort, pages, options, counts, the per-page
+  // profile details) reads only these rows.
+  const rows = keepNewestLeads(merged.rows, LEADS_RECENT_LIMIT);
+  const profileIdByKey = new Map<string, string>();
+  for (const row of rows) {
+    const profileId = merged.profileIdByKey.get(row.key);
+    if (profileId) profileIdByKey.set(row.key, profileId);
+  }
   const counts = { warehouse: 0, profile: 0, both: 0, subscription: 0 };
   for (const row of rows) {
     if (row.source === "warehouse") counts.warehouse += 1;
@@ -933,18 +1064,20 @@ export async function loadLeadsDataset(input: Pick<LeadsRunInput, "tenantKey" | 
     else if (row.source === "both") counts.both += 1;
     else counts.subscription += 1;
   }
-  const profileCandidates = {
-    total: candidates.profile_leads_total,
-    loaded: candidates.profile_leads.length,
-    truncated: candidates.profile_leads_truncated,
+  const leadSet = {
+    limit: LEADS_RECENT_LIMIT,
+    limited: merged.rows.length > LEADS_RECENT_LIMIT || candidates.profile_only_limited,
+    oldestDate: oldestLeadDate(rows),
   };
-  if (profileCandidates.truncated) {
-    console.warn("leads: profile lead cap reached — only the newest are merged; move profile leads to ClickHouse (leads plan §4 step 7)", {
-      loaded: profileCandidates.loaded,
-      total: profileCandidates.total,
-    });
-  }
-  return { rows, profileIdByKey, kpis: candidates.kpis, counts, profileCandidates, computed_at: now };
+  return {
+    rows,
+    profileIdByKey,
+    kpis: candidates.kpis,
+    counts,
+    leadSet,
+    candidates: { computedAt: candidates.computed_at, cached: candidates.cached },
+    computed_at: now,
+  };
 }
 
 /** The workspace's merged lead set: served from memory for LEADS_MEMO_TTL_MS
@@ -952,7 +1085,9 @@ export async function loadLeadsDataset(input: Pick<LeadsRunInput, "tenantKey" | 
  * failed load is never cached. A refresh request (sent right after a sync) must
  * see data newer than itself, so it never joins an in-flight load that a plain
  * request started (that load may predate the sync) — only one another refresh
- * request started (the list and the overview refresh together). */
+ * request started (the list and the overview refresh together) — and its load
+ * recomputes the Postgres candidates unless they are under a minute old (if
+ * that compute fails, it falls back to the cron's payload, ≤ 5 min old). */
 async function leadsDataset(input: LeadsRunInput, refresh: boolean): Promise<{ dataset: LeadsDataset; memo: LeadsMemoState }> {
   const clock = input.clock ?? Date.now;
   const now = clock();
@@ -962,7 +1097,7 @@ async function leadsDataset(input: LeadsRunInput, refresh: boolean): Promise<{ d
   if (existing && existing.settled && !refresh && now - existing.startedAt < LEADS_MEMO_TTL_MS) return { dataset: await existing.promise, memo: "hit" };
 
   const entry: MemoEntry = { startedAt: now, settled: false, refresh, promise: Promise.resolve(null as unknown as LeadsDataset) };
-  entry.promise = loadLeadsDataset(input, now).then(
+  entry.promise = loadLeadsDataset(input, now, refresh).then(
     (dataset) => {
       entry.settled = true;
       return dataset;
@@ -990,9 +1125,11 @@ function diagnosticsFor(dataset: LeadsDataset, memo: LeadsMemoState, now: number
     subscription_leads: dataset.counts.subscription,
     memo,
     dataset_age_ms: Math.max(0, now - dataset.computed_at),
-    profile_candidates_total: dataset.profileCandidates.total,
-    profile_candidates_loaded: dataset.profileCandidates.loaded,
-    profile_candidates_truncated: dataset.profileCandidates.truncated,
+    lead_set_limit: dataset.leadSet.limit,
+    lead_set_limited: dataset.leadSet.limited,
+    lead_set_oldest_date: dataset.leadSet.oldestDate,
+    candidates_computed_at: dataset.candidates.computedAt,
+    candidates_cached: dataset.candidates.cached,
   };
 }
 
