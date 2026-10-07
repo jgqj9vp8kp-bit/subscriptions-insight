@@ -419,9 +419,46 @@ class FakeDb {
   private leaseSeq = 0;
   failUpsert: ((table: string, rows: Row[]) => string | null) | null = null;
   reconcileResult: Row = { checked: 3, leads: 2, paid_excluded: 1, active_excluded: 0 };
+  /** The inline funnelfox_leads_reconcile fails with this message (e.g. the 8 s statement timeout). */
+  reconcileError: string | null = null;
+  /**
+   * funnelfox_leads_reconcile_request (migration 202610070001): "applied" = queued, and the last
+   * applied run's summary is reconcileResult; "first" = queued, nothing applied yet; "missing" =
+   * PostgREST's PGRST202 / 404 (migration not applied); or an explicit PostgREST answer.
+   */
+  reconcileRequest: "applied" | "first" | "missing" | { data?: unknown; error?: Row | null; status?: number } = "applied";
+  /** Microsecond timestamps, as Postgres serializes timestamptz inside jsonb. */
+  reconcileRequestedAt = "2026-10-06T12:00:00.123456+00:00";
+  reconcileAppliedAt = "2026-10-06T11:58:30.5+00:00";
 
   from(table: string) {
     return new FakeQuery(this, table);
+  }
+
+  private reconcileRequestAnswer(args: Row) {
+    const mode = this.reconcileRequest;
+    if (mode === "missing") {
+      return {
+        data: null,
+        error: { code: "PGRST202", message: "Could not find the function public.funnelfox_leads_reconcile_request(p_data_key) in the schema cache", details: null, hint: null },
+        status: 404,
+      };
+    }
+    if (typeof mode === "object") return { data: mode.data ?? null, error: mode.error ?? null, status: mode.status ?? (mode.error ? 400 : 200) };
+    const row = this.tables.funnelfox_leads_sync_state.find((state) => state.auth_user_id === args.p_data_key);
+    if (!row) return { data: { queued: false, requested_at: null, last_applied_at: null, last_summary: null }, error: null, status: 200 };
+    row.reconcile_requested_at = this.reconcileRequestedAt;
+    const applied = mode === "applied";
+    return {
+      data: {
+        queued: true,
+        requested_at: this.reconcileRequestedAt,
+        last_applied_at: applied ? this.reconcileAppliedAt : null,
+        last_summary: applied ? { ...this.reconcileResult, updated: 0, duration_ms: 41_000, applied_at: this.reconcileAppliedAt } : null,
+      },
+      error: null,
+      status: 200,
+    };
   }
 
   async rpc(name: string, args: Row) {
@@ -440,7 +477,11 @@ class FakeDb {
       }
       return { data: null, error: null };
     }
-    if (name === "funnelfox_leads_reconcile") return { data: this.reconcileResult, error: null };
+    if (name === "funnelfox_leads_reconcile_request") return this.reconcileRequestAnswer(args);
+    if (name === "funnelfox_leads_reconcile") {
+      if (this.reconcileError) return { data: null, error: { code: "57014", message: this.reconcileError }, status: 500 };
+      return { data: this.reconcileResult, error: null };
+    }
     return { data: null, error: { message: `function public.${name} does not exist` } };
   }
 
@@ -790,7 +831,9 @@ describe("Edge funnelfox-leads-sync handler (real code, fake I/O)", () => {
     const third = await invoke(db, { body: { conversion: { paid_emails: ["lead0@example.com"] } } });
     expect(third.body).toMatchObject({ status: "ok", stage: "reconcile", next_stage: null, all_stages_completed: true });
     expect(third.body.summary).toMatchObject({ reconcile_rows: 3, leads_found: 2, converted_excluded: 1, active_sub_excluded: 0 });
-    expect(db.rpcCalls.find((call) => call.name === "funnelfox_leads_reconcile")?.args).toEqual({ p_data_key: DATA_KEY });
+    // Queued for pg_cron (migration 202610070001), never run through PostgREST.
+    expect(db.rpcCalls.find((call) => call.name === "funnelfox_leads_reconcile_request")?.args).toEqual({ p_data_key: DATA_KEY });
+    expect(db.rpcCalls.some((call) => call.name === "funnelfox_leads_reconcile")).toBe(false);
     // The browser context is ignored: nothing but the RPC decides conversion.
     expect(db.leads().every((row) => row.is_lead === false && row.has_successful_payment === false)).toBe(true);
     expect(db.state()).toMatchObject({ reconcile_completed: true, last_status: "ok", current_stage: "reconcile" });
@@ -815,6 +858,122 @@ describe("Edge funnelfox-leads-sync handler (real code, fake I/O)", () => {
     const explicit = await invoke(db, { body: { stage: "reconcile" } });
     expect(explicit.body).toMatchObject({ status: "ok", stage: "reconcile" });
     expect(leaseCalls(db)).toEqual(["acquire_lease", "release_lease"]);
+  });
+
+  describe("stage 3: the reconcile is queued for pg_cron (incident 2026-10-07)", () => {
+    const READY: Row = { auth_user_id: DATA_KEY, profiles_completed: true, details_completed: true, sessions_completed: true, reconcile_completed: false };
+    const nonLeaseCalls = (db: FakeDb) => db.rpcCalls.filter((call) => !call.name.includes("lease"));
+    const readyDb = (stats: Row | null = null) => {
+      const db = new FakeDb();
+      db.tables.funnelfox_leads_sync_state.push({ ...TABLE_DEFAULTS.funnelfox_leads_sync_state, ...READY, last_status: "error", last_error: "reconcile failed: canceling statement due to statement timeout", stats });
+      return db;
+    };
+    beforeEach(() => {
+      vi.stubGlobal("fetch", fakeFox({}).fetchMock);
+    });
+
+    it("one request RPC (one row update), never the inline reconcile; the stage completes and stats carry the last applied run", async () => {
+      const db = readyDb({ profiles_with_email: 7 });
+      const { status, body } = await invoke(db);
+      expect(status).toBe(200);
+      expect(body).toMatchObject({ status: "ok", stage: "reconcile", next_stage: null, all_stages_completed: true, stopped_reason: "completed", made_progress: true });
+      expect(nonLeaseCalls(db)).toEqual([{ name: "funnelfox_leads_reconcile_request", args: { p_data_key: DATA_KEY } }]);
+      expect(body.summary).toMatchObject({
+        profiles_with_email: 7,
+        reconcile_queued_at: "2026-10-06T12:00:00.123Z",
+        reconcile_rows: 3,
+        leads_found: 2,
+        converted_excluded: 1,
+        active_sub_excluded: 0,
+        reconciled_at: "2026-10-06T11:58:30.500Z",
+        all_stages_completed: true,
+      });
+      expect(db.state()).toMatchObject({ reconcile_completed: true, last_status: "ok", last_error: null, current_stage: "reconcile" });
+      expect(db.state().last_full_sync_at).toEqual(expect.any(String));
+      // The Edge's state write never touches the queue column the request stamped.
+      expect(db.state().reconcile_requested_at).toBe(db.reconcileRequestedAt);
+      for (const write of db.stateWrites()) for (const payload of write.payload) expect(payload).not.toHaveProperty("reconcile_requested_at");
+      expect(leaseCalls(db)).toEqual(["acquire_lease", "release_lease"]);
+    });
+
+    it("the first queued reconcile (nothing applied yet) completes and keeps the previous counts", async () => {
+      const previous = { reconcile_rows: 20, leads_found: 11, converted_excluded: 4, active_sub_excluded: 1, reconciled_at: "2026-10-01T00:00:00.000Z" };
+      const db = readyDb(previous);
+      db.reconcileRequest = "first";
+      const { body } = await invoke(db);
+      expect(body).toMatchObject({ status: "ok", stage: "reconcile", all_stages_completed: true });
+      expect(body.summary).toMatchObject({ ...previous, reconcile_queued_at: "2026-10-06T12:00:00.123Z" });
+      expect(db.state()).toMatchObject({ reconcile_completed: true, last_status: "ok", last_error: null });
+
+      // No previous counts either: none are invented.
+      const fresh = readyDb(null);
+      fresh.reconcileRequest = "first";
+      const second = await invoke(fresh);
+      expect(second.body.summary).toMatchObject({ reconcile_queued_at: "2026-10-06T12:00:00.123Z" });
+      for (const key of ["reconcile_rows", "leads_found", "converted_excluded", "active_sub_excluded", "reconciled_at"]) {
+        expect(second.body.summary as Row).not.toHaveProperty(key);
+      }
+    });
+
+    it("the request RPC missing (migration 202610070001 not applied: PGRST202, 404 or the message) → the inline reconcile, exactly as before", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const shapes: Array<{ data?: unknown; error?: Row | null; status?: number } | "missing"> = [
+        "missing",
+        { error: { code: "PGRST202", message: "Could not find the function" }, status: 400 },
+        { error: { message: "Not Found" }, status: 404 },
+        { error: { code: "XX000", message: "Could not find the function public.funnelfox_leads_reconcile_request(p_data_key) in the schema cache" }, status: 400 },
+      ];
+      for (const shape of shapes) {
+        const db = readyDb({ profiles_with_email: 7 });
+        db.reconcileRequest = shape;
+        const before = Date.now();
+        const { status, body } = await invoke(db);
+        expect(status, JSON.stringify(shape)).toBe(200);
+        expect(nonLeaseCalls(db).map((call) => call.name)).toEqual(["funnelfox_leads_reconcile_request", "funnelfox_leads_reconcile"]);
+        expect(nonLeaseCalls(db)[1].args).toEqual({ p_data_key: DATA_KEY });
+        expect(body).toMatchObject({ status: "ok", stage: "reconcile", all_stages_completed: true });
+        expect(body.summary).toMatchObject({ reconcile_rows: 3, leads_found: 2, converted_excluded: 1, active_sub_excluded: 0 });
+        expect(Date.parse(String(field(body, "summary", "reconciled_at")))).toBeGreaterThanOrEqual(before - 1000);
+        expect(body.summary as Row).not.toHaveProperty("reconcile_queued_at");
+        expect(db.state()).toMatchObject({ reconcile_completed: true, last_status: "ok" });
+      }
+      expect(warn).toHaveBeenCalledTimes(shapes.length);
+    });
+
+    it("the inline fallback still fails the run on a reconcile error (as before)", async () => {
+      vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const db = readyDb();
+      db.reconcileRequest = "missing";
+      db.reconcileError = "canceling statement due to statement timeout";
+      const { status, body } = await invoke(db);
+      expect(status).toBe(502);
+      expect(body).toEqual({ error: "FunnelFox leads sync failed.", detail: "reconcile failed: canceling statement due to statement timeout" });
+      expect(db.state()).toMatchObject({ reconcile_completed: false, last_status: "error", last_error: "reconcile failed: canceling statement due to statement timeout" });
+      expect(db.leaseFree).toBe(true);
+    });
+
+    it("any other request error (or nothing queued) fails the run without an inline reconcile", async () => {
+      const cases: Array<{ answer: { data?: unknown; error?: Row | null; status?: number }; detail: string }> = [
+        { answer: { error: { code: "57014", message: "canceling statement due to statement timeout" }, status: 500 }, detail: "reconcile request failed: canceling statement due to statement timeout" },
+        { answer: { error: { code: "42501", message: "permission denied for function funnelfox_leads_reconcile_request" }, status: 403 }, detail: "reconcile request failed: permission denied for function funnelfox_leads_reconcile_request" },
+        { answer: { data: { queued: false, requested_at: null, last_applied_at: null, last_summary: null } }, detail: "reconcile request failed: the sync state row to queue it on is missing." },
+        { answer: { data: null }, detail: "reconcile request failed: the sync state row to queue it on is missing." },
+      ];
+      for (const { answer, detail } of cases) {
+        const db = readyDb();
+        db.reconcileRequest = answer;
+        const { status, body } = await invoke(db);
+        expect(status, detail).toBe(502);
+        expect(body).toEqual({ error: "FunnelFox leads sync failed.", detail });
+        expect(nonLeaseCalls(db).map((call) => call.name)).toEqual(["funnelfox_leads_reconcile_request"]);
+        expect(db.state()).toMatchObject({ reconcile_completed: false, last_status: "error", last_error: detail });
+        expect(db.leaseFree).toBe(true);
+      }
+      // The cron gets the gate-mapped error.
+      const cron = readyDb();
+      cron.reconcileRequest = cases[0].answer;
+      await expect(invoke(cron, { ctx: CRON_CTX })).rejects.toBeInstanceOf(FunnelFoxEdgeError);
+    });
   });
 
   it("busy: another call holds the lease → no fetch, no write", async () => {
@@ -1173,6 +1332,10 @@ describe("Edge funnelfox-leads-sync handler (real code, fake I/O)", () => {
     expect(source).not.toContain("raw_session:");
     expect(source).not.toContain("body.conversion");
     expect(source).not.toContain("detectProfileEmail");
-    for (const rpc of ["funnelfox_leads_acquire_lease", "funnelfox_leads_release_lease", "funnelfox_leads_reconcile"]) expect(source).toContain(`"${rpc}"`);
+    for (const rpc of ["funnelfox_leads_acquire_lease", "funnelfox_leads_release_lease", "funnelfox_leads_reconcile_request", "funnelfox_leads_reconcile"]) {
+      expect(source).toContain(`"${rpc}"`);
+    }
+    // The ClickHouse Leads runner is not loaded by this function (isMissingRpcError is mirrored).
+    expect(source).not.toMatch(/from "\.\.\/_shared\/clickhouse\/leads\.ts"/);
   });
 });

@@ -527,3 +527,251 @@ select cron.schedule(
   '*/5 * * * *',
   $$select public.leads_refresh_recent_candidates()$$
 );
+
+
+-- ===========================================================================
+-- 6. FunnelFox leads reconcile, applied by pg_cron (incident 2026-10-07)
+-- ===========================================================================
+--
+-- Why: the export's stage 3 called funnelfox_leads_reconcile(p_data_key)
+-- through PostgREST. On its first pass over the 235k stored profiles that
+-- set-based UPDATE rewrites almost every row (has_successful_payment,
+-- has_active_subscription, is_lead, first_trial_at, first_sub_at), which takes
+-- longer than the 8 s statement_timeout of the role PostgREST runs the Edge's
+-- service_role calls under: every minute the call was cancelled ("canceling
+-- statement due to statement timeout"), the pipeline stayed at
+-- next_stage = 'reconcile' with last_status = 'error', and each tick burnt ~8 s
+-- of database time.
+--
+-- Now the Edge only QUEUES the reconcile, and pg_cron applies it as postgres
+-- (no PostgREST, no HTTP, so not the 8 s timeout of PostgREST's role). postgres
+-- has no statement_timeout of its own, but Supabase's database-wide default
+-- caps it at 2 minutes, and the first pass (~216k non-HOT row updates over 8
+-- indexes, a per-row trigger, full-page WAL images; the reads alone took
+-- 2.5-10 s cold) is not safely below that on a small instance. So the job's
+-- command sets its own limits first: statement_timeout = 15 min, lock_timeout
+-- = 30 s (since PG13 each statement of a multi-statement command starts its
+-- own timeout, so the SETs apply to the SELECT after them).
+--   a. funnelfox_leads_sync_state.reconcile_requested_at / reconcile_applied_at /
+--      reconcile_summary / reconcile_failure: when the Edge last asked for a
+--      reconcile, the start time of the last applied run, that run's counts,
+--      and the current streak of failed runs (null after a successful one).
+--      Written only by the two functions below (service_role / postgres); the
+--      browser keeps its table-level SELECT and gets no write privilege
+--      (202610050003 item 4).
+--   b. funnelfox_leads_reconcile_request(p_data_key) -> jsonb: the Edge's
+--      stage 3. One row update: stamps reconcile_requested_at = now() on the
+--      key's sync-state row and answers {queued, requested_at, last_applied_at,
+--      last_summary}. A null key or a key without a sync-state row answers
+--      queued = false and writes nothing. EXECUTE for service_role only.
+--   c. funnelfox_leads_reconcile_pending(p_force default false) -> jsonb: for
+--      the workspace data key, when a request is newer than the last applied
+--      run, runs the UNCHANGED funnelfox_leads_reconcile(key) under a
+--      transaction advisory lock and records reconcile_applied_at = the run's
+--      start time and reconcile_summary = the reconcile counts + duration_ms +
+--      applied_at. A request stamped while a run is in progress is newer than
+--      that run's start, so the next run picks it up. Otherwise it answers
+--      {skipped: ...}. A failed run (the 15 min timeout included) is trapped:
+--      its work rolls back, reconcile_failure records {failed_at, started_at,
+--      duration_ms, sqlstate, error, failures, retry_after} (plus a WARNING in
+--      the Postgres log) and the next attempts wait -- 15 min after the first
+--      failure, doubling per consecutive failure, at most 6 h ({skipped:
+--      'backoff'}) -- so a reconcile that never fits does not restart back to
+--      back. p_force = true ignores that wait (the manual run, README step 6).
+--      No API role may execute it.
+--   d. pg_cron job funnelfox-leads-reconcile (every minute): set
+--      statement_timeout = '15min'; set lock_timeout = '30s'; select
+--      public.funnelfox_leads_reconcile_pending(); -- an idle minute costs one
+--      primary-key read.
+-- funnelfox_leads_reconcile itself is unchanged (still service_role-executable:
+-- the Edge falls back to it, as before, while this part is not applied).
+--
+-- Check: select reconcile_requested_at, reconcile_applied_at, reconcile_summary,
+--               reconcile_failure
+--        from public.funnelfox_leads_sync_state;
+-- A run that keeps failing: run it once without a timeout (SQL editor or a
+-- direct connection): set statement_timeout = 0; select
+-- public.funnelfox_leads_reconcile_pending(true); -- or freeze the job:
+-- select cron.alter_job(jobid, active := false) from cron.job
+-- where jobname = 'funnelfox-leads-reconcile';
+
+alter table public.funnelfox_leads_sync_state
+  add column if not exists reconcile_requested_at timestamptz,
+  add column if not exists reconcile_applied_at timestamptz,
+  add column if not exists reconcile_summary jsonb,
+  add column if not exists reconcile_failure jsonb;
+
+comment on column public.funnelfox_leads_sync_state.reconcile_requested_at is
+  'Last time the funnelfox-leads-sync reconcile stage queued a reconcile (funnelfox_leads_reconcile_request).';
+comment on column public.funnelfox_leads_sync_state.reconcile_applied_at is
+  'Start time of the last reconcile pg_cron applied (funnelfox_leads_reconcile_pending); a newer request is pending.';
+comment on column public.funnelfox_leads_sync_state.reconcile_summary is
+  'Counts of the last applied reconcile: checked, leads, paid_excluded, active_excluded, updated, duration_ms, applied_at.';
+comment on column public.funnelfox_leads_sync_state.reconcile_failure is
+  'Current streak of failed reconcile runs (funnelfox_leads_reconcile_pending): failed_at, started_at, duration_ms, sqlstate, error, failures, retry_after. Null after a successful run.';
+
+-- Belt and braces (202610050003 item 4 already revoked them): the browser roles
+-- hold no write privilege on the sync state, so none on the new columns either
+-- (no column-level grant exists). SELECT stays.
+revoke insert, update, delete, truncate on table public.funnelfox_leads_sync_state from anon, authenticated;
+
+-- The Edge's stage 3 (service_role). Fast: one primary-key row update.
+create or replace function public.funnelfox_leads_reconcile_request(p_data_key uuid)
+returns jsonb
+language plpgsql
+volatile
+security invoker
+set search_path = ''
+as $$
+declare
+  v_requested timestamptz;
+  v_applied timestamptz;
+  v_summary jsonb;
+begin
+  if p_data_key is not null then
+    update public.funnelfox_leads_sync_state s
+    set reconcile_requested_at = now()
+    where s.auth_user_id = p_data_key
+    returning s.reconcile_requested_at, s.reconcile_applied_at, s.reconcile_summary
+      into v_requested, v_applied, v_summary;
+    if found then
+      return jsonb_build_object(
+        'queued', true,
+        'requested_at', v_requested,
+        'last_applied_at', v_applied,
+        'last_summary', v_summary
+      );
+    end if;
+  end if;
+
+  -- No key, or no sync-state row for it: nothing queued, nothing written.
+  return jsonb_build_object('queued', false, 'requested_at', null, 'last_applied_at', null, 'last_summary', null);
+end;
+$$;
+
+-- pg_cron (as postgres): applies a pending request of the workspace data key.
+-- An earlier draft took no argument; with both, a no-argument call would be
+-- ambiguous.
+drop function if exists public.funnelfox_leads_reconcile_pending();
+
+create or replace function public.funnelfox_leads_reconcile_pending(p_force boolean default false)
+returns jsonb
+language plpgsql
+volatile
+security invoker
+set search_path = ''
+as $$
+declare
+  v_key uuid := public.workspace_data_key();
+  v_requested timestamptz;
+  v_applied timestamptz;
+  v_failure jsonb;
+  v_failures integer;
+  v_retry_after timestamptz;
+  v_started timestamptz;
+  v_failed_at timestamptz;
+  v_result jsonb;
+  v_summary jsonb;
+  v_duration integer;
+begin
+  if v_key is null then
+    raise notice 'workspace is not bootstrapped — funnelfox leads reconcile skipped';
+    return null;
+  end if;
+
+  select s.reconcile_requested_at, s.reconcile_applied_at into v_requested, v_applied
+  from public.funnelfox_leads_sync_state s
+  where s.auth_user_id = v_key;
+  if v_requested is null then
+    return jsonb_build_object('skipped', 'not_requested', 'last_applied_at', v_applied);
+  end if;
+  if v_applied is not null and v_applied >= v_requested then
+    return jsonb_build_object('skipped', 'up_to_date', 'requested_at', v_requested, 'last_applied_at', v_applied);
+  end if;
+
+  -- One run at a time: pg_cron never overlaps a job with itself, but a manual
+  -- call can. Released at commit.
+  if not pg_catalog.pg_try_advisory_xact_lock(pg_catalog.hashtext('public.funnelfox_leads_reconcile_pending')) then
+    return jsonb_build_object('skipped', 'running', 'requested_at', v_requested, 'last_applied_at', v_applied);
+  end if;
+
+  -- Re-read under the lock: a run that committed meanwhile may already cover the request.
+  select s.reconcile_requested_at, s.reconcile_applied_at, s.reconcile_failure into v_requested, v_applied, v_failure
+  from public.funnelfox_leads_sync_state s
+  where s.auth_user_id = v_key;
+  if v_requested is null or (v_applied is not null and v_applied >= v_requested) then
+    return jsonb_build_object('skipped', 'up_to_date', 'requested_at', v_requested, 'last_applied_at', v_applied);
+  end if;
+
+  -- After failed runs, wait (15 min, doubling, at most 6 h) unless forced.
+  v_retry_after := (v_failure ->> 'retry_after')::timestamptz;
+  if not coalesce(p_force, false) and v_retry_after > now() then
+    return jsonb_build_object(
+      'skipped', 'backoff', 'requested_at', v_requested, 'last_applied_at', v_applied,
+      'failures', v_failure -> 'failures', 'retry_after', v_retry_after
+    );
+  end if;
+
+  -- The reconcile's snapshot is taken after v_started, so it sees everything
+  -- committed before a request stamped at or before v_started; a request
+  -- stamped later stays newer than reconcile_applied_at and runs next time.
+  v_started := clock_timestamp();
+  begin
+    v_result := public.funnelfox_leads_reconcile(v_key);
+  exception when query_canceled or others then
+    -- The block's work is rolled back (the advisory lock, taken outside it,
+    -- stays). A fired statement_timeout does not re-arm within this statement,
+    -- so recording the failure still completes. OTHERS does not match
+    -- query_canceled (a timeout), hence both.
+    v_failed_at := clock_timestamp();
+    v_duration := floor(extract(epoch from v_failed_at - v_started) * 1000)::integer;
+    v_failures := coalesce((v_failure ->> 'failures')::integer, 0) + 1;
+    v_retry_after := v_failed_at
+      + least(interval '15 minutes' * pg_catalog.power(2, least(v_failures, 6) - 1), interval '6 hours');
+    v_failure := jsonb_build_object(
+      'failed_at', v_failed_at, 'started_at', v_started, 'duration_ms', v_duration,
+      'sqlstate', sqlstate, 'error', sqlerrm, 'failures', v_failures, 'retry_after', v_retry_after
+    );
+    update public.funnelfox_leads_sync_state s
+    set reconcile_failure = v_failure
+    where s.auth_user_id = v_key;
+    raise warning 'funnelfox leads reconcile failed (% in a row, after % ms): % [%]; next attempt after %',
+      v_failures, v_duration, sqlerrm, sqlstate, v_retry_after;
+    return v_failure || jsonb_build_object('failed', true, 'requested_at', v_requested);
+  end;
+  v_duration := floor(extract(epoch from clock_timestamp() - v_started) * 1000)::integer;
+  v_summary := coalesce(v_result, '{}'::jsonb) || jsonb_build_object('duration_ms', v_duration, 'applied_at', v_started);
+
+  -- Only the reconcile columns: the Edge's own writes to the row (stats,
+  -- stage flags, a newer request) are never overwritten.
+  update public.funnelfox_leads_sync_state s
+  set reconcile_applied_at = v_started,
+      reconcile_summary = v_summary,
+      reconcile_failure = null
+  where s.auth_user_id = v_key;
+
+  return v_summary || jsonb_build_object('requested_at', v_requested);
+end;
+$$;
+
+revoke all on function public.funnelfox_leads_reconcile_request(uuid) from public, anon, authenticated;
+grant execute on function public.funnelfox_leads_reconcile_request(uuid) to service_role;
+-- pg_cron runs the job as postgres (the owner); no API role needs it.
+revoke all on function public.funnelfox_leads_reconcile_pending(boolean) from public, anon, authenticated, service_role;
+
+-- pg_cron: apply a queued reconcile within a minute. Pure SQL, no HTTP. Runs as
+-- postgres, which Supabase's global default caps at a 2-minute
+-- statement_timeout: the command overrides it (15 min) and bounds lock waits
+-- (30 s) for its own session; a run that still fails backs off (above).
+-- Rescheduled idempotently.
+do $$
+begin
+  perform cron.unschedule('funnelfox-leads-reconcile');
+exception when others then null;
+end $$;
+
+select cron.schedule(
+  'funnelfox-leads-reconcile',
+  '* * * * *',
+  $$set statement_timeout = '15min'; set lock_timeout = '30s'; select public.funnelfox_leads_reconcile_pending()$$
+);

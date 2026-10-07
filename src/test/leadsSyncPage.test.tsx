@@ -212,6 +212,94 @@ describe("Leads page — resumable sync UI", () => {
     expect(screen.getByText("failed")).toBeInTheDocument();
   });
 
+  it("14c. a queued reconcile (pg_cron applies it within a minute) reads as ok, not a failure; Leads found comes from the last applied run", async () => {
+    const requested = new Date(Date.now() - 30_000).toISOString();
+    const completeQueued = (overrides: Partial<FunnelFoxLeadsSyncState>) =>
+      partialState({
+        last_status: "ok",
+        current_stage: "reconcile",
+        profiles_completed: true,
+        sessions_completed: true,
+        reconcile_completed: true,
+        last_full_sync_at: requested,
+        last_profiles_cursor: null,
+        stats: { ...partialState().stats, coverage_warning: false, coverage_warning_message: "", sync_stopped_reason: "completed", leads_found: 11, reconcile_queued_at: requested },
+        reconcile_requested_at: requested,
+        ...overrides,
+      });
+
+    // Never applied yet: the note, status ok, no error styling; the stats copy (11) shows.
+    mockedStats.mockResolvedValue(completeQueued({ reconcile_applied_at: null, reconcile_summary: null }));
+    const first = renderPage();
+    const note = await screen.findByTestId("leads-reconcile-queued");
+    expect(note).toHaveTextContent(`Conversion reconcile queued ${formatLeadDateTime(requested)}; the database applies it within a minute.`);
+    expect(note).not.toHaveClass("text-destructive");
+    expect(screen.getByText("ok")).toHaveClass("text-success");
+    expect(screen.queryByText("failed")).not.toBeInTheDocument();
+    expect(screen.getByText("Leads found:")).toHaveTextContent("11");
+    first.unmount();
+
+    // Applied after the request: no note; the row's reconcile_summary (newer than stats) wins.
+    mockedStats.mockResolvedValue(
+      completeQueued({
+        reconcile_applied_at: new Date(Date.parse(requested) + 5_000).toISOString(),
+        reconcile_summary: { checked: 235_498, leads: 1_234, paid_excluded: 9, active_excluded: 2, updated: 0, duration_ms: 41_000 },
+      }),
+    );
+    renderPage();
+    await waitFor(() => expect(screen.getByText("Leads found:")).toHaveTextContent(/\b1\D?234\b/));
+    expect(screen.queryByTestId("leads-reconcile-queued")).not.toBeInTheDocument();
+  });
+
+  it("14c (overdue). a reconcile still queued after the poll window, or after a failed run, warns instead — the status stays ok", async () => {
+    const requested = new Date(Date.now() - 20 * 60_000).toISOString();
+    const completeQueued = (overrides: Partial<FunnelFoxLeadsSyncState>) =>
+      partialState({
+        last_status: "ok",
+        current_stage: "reconcile",
+        profiles_completed: true,
+        sessions_completed: true,
+        reconcile_completed: true,
+        last_full_sync_at: requested,
+        last_profiles_cursor: null,
+        stats: { ...partialState().stats, coverage_warning: false, coverage_warning_message: "", sync_stopped_reason: "completed", leads_found: 11, reconcile_queued_at: requested },
+        reconcile_requested_at: requested,
+        reconcile_applied_at: null,
+        reconcile_summary: null,
+        ...overrides,
+      });
+
+    // Queued 20 minutes ago, never applied: the job is likely not running.
+    mockedStats.mockResolvedValue(completeQueued({}));
+    const first = renderPage();
+    const note = await screen.findByTestId("leads-reconcile-queued");
+    expect(note).toHaveTextContent(
+      `Conversion reconcile queued since ${formatLeadDateTime(requested)} but not applied yet — the pg_cron job funnelfox-leads-reconcile may not be running (check cron.job_run_details).`,
+    );
+    expect(note).toHaveClass("text-warning");
+    expect(note).not.toHaveClass("text-muted-foreground");
+    expect(screen.getByText("ok")).toHaveClass("text-success");
+    expect(screen.queryByText("failed")).not.toBeInTheDocument();
+    first.unmount();
+
+    // A recent request whose last run failed (pg_cron backs off): the warning names the error and the retry.
+    const recent = new Date(Date.now() - 60_000).toISOString();
+    const retryAfter = new Date(Date.now() + 14 * 60_000).toISOString();
+    mockedStats.mockResolvedValue(
+      completeQueued({
+        reconcile_requested_at: recent,
+        reconcile_failure: { failed_at: recent, error: "canceling statement due to statement timeout", sqlstate: "57014", failures: 1, retry_after: retryAfter },
+      }),
+    );
+    renderPage();
+    const failed = await screen.findByTestId("leads-reconcile-queued");
+    expect(failed).toHaveTextContent(
+      `Conversion reconcile queued since ${formatLeadDateTime(recent)} but not applied yet — its last run failed: canceling statement due to statement timeout; the pg_cron job funnelfox-leads-reconcile retries after ${formatLeadDateTime(retryAfter)}.`,
+    );
+    expect(failed).toHaveClass("text-warning");
+    expect(screen.getByText("ok")).toHaveClass("text-success");
+  });
+
   it("15. Diagnose (owner) renders the PII-free dry-run JSON", async () => {
     mockedDiagnose.mockResolvedValue({
       status: "ok",

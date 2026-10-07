@@ -14,10 +14,21 @@
 // candidates as over the old full list); the cache (fresh hit, stale / other
 // limit / max age 0 recompute, null and unknown keys never cached, the newer
 // payload wins); the pg_cron refresh; grants / RLS; the guard and idempotence.
+// Section 6 (incident 2026-10-07): the reconcile queue -- funnelfox_leads_reconcile_request
+// stamps and answers the last applied run, funnelfox_leads_reconcile_pending runs the
+// unchanged funnelfox_leads_reconcile only for a newer request (same effect as a direct
+// call), records it, picks up a request stamped mid-run next time, skips without a
+// workspace; a failed run (timeout or any error) rolls back, is recorded in
+// reconcile_failure and backs off (15 min doubling, at most 6 h; p_force ignores the
+// wait; a success clears it); its grants, the queue columns' (lack of) browser write
+// access, the lockdown's fail-closed lints and the pg_cron job (its command sets its
+// own statement / lock timeouts). (The advisory-lock "running" skip needs a second
+// connection, which PGlite does not have; PGlite does not fire statement_timeout, so
+// the timeout is simulated by raising query_canceled.)
 //
 // Runs in the default jsdom environment (src/test/setup.ts needs `window`).
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
-import { createSupabasePglite, listMigrations, type SqlRunner, type SupabasePglite } from "./support/pgliteSupabase";
+import { createSupabasePglite, listMigrations, readMigration, type SqlRunner, type SupabasePglite } from "./support/pgliteSupabase";
 import {
   keepNewestLeads,
   mergeLeadsWithProfiles,
@@ -579,6 +590,298 @@ describe("leads_recent_candidates (the Edge read) and the cache", { timeout: CLO
 });
 
 // ---------------------------------------------------------------------------
+// 6. The reconcile queue (incident 2026-10-07): the Edge queues, pg_cron applies
+// ---------------------------------------------------------------------------
+
+interface ReconcileRequest {
+  queued: boolean;
+  requested_at: string | null;
+  last_applied_at: string | null;
+  last_summary: Record<string, unknown> | null;
+}
+type ReconcileRun = Record<string, unknown>;
+interface QueueState {
+  requested: Date | null;
+  applied: Date | null;
+  summary: Record<string, unknown> | null;
+}
+
+const NOT_QUEUED: ReconcileRequest = { queued: false, requested_at: null, last_applied_at: null, last_summary: null };
+/** The pg_cron job's command: its own limits first (postgres is capped at Supabase's 2-minute global default). */
+const RECONCILE_JOB_COMMAND = "set statement_timeout = '15min'; set lock_timeout = '30s'; select public.funnelfox_leads_reconcile_pending()";
+
+/** The Edge's stage 3 (service_role). */
+const requestReconcile = (h: SupabasePglite, key: string | null) =>
+  rpc<ReconcileRequest>(h, "public.funnelfox_leads_reconcile_request($1::uuid)", [key]);
+/** The pg_cron job's call (as postgres); `force` = the manual run that ignores the backoff. */
+const runPending = async (h: SupabasePglite, force?: boolean) =>
+  (
+    await one<{ value: ReconcileRun | null }>(
+      h.db,
+      force === undefined ? "select public.funnelfox_leads_reconcile_pending() as value" : "select public.funnelfox_leads_reconcile_pending($1) as value",
+      force === undefined ? [] : [force],
+    )
+  ).value;
+const failureOf = async (h: SupabasePglite, key: string = owner) =>
+  (await one<{ failure: Record<string, unknown> | null }>(h.db, "select reconcile_failure as failure from public.funnelfox_leads_sync_state where auth_user_id = $1", [key]))
+    .failure;
+const queueState = (h: SupabasePglite, key: string = owner) =>
+  one<QueueState>(
+    h.db,
+    `select reconcile_requested_at as requested, reconcile_applied_at as applied, reconcile_summary as summary
+     from public.funnelfox_leads_sync_state where auth_user_id = $1`,
+    [key],
+  );
+/** Every stored profile's conversion columns (the five reconcile writes), both accounts. */
+const conversionColumns = async (h: SupabasePglite) =>
+  (
+    await h.db.query(
+      `select auth_user_id, profile_id, has_successful_payment, has_active_subscription, is_lead, first_trial_at, first_sub_at
+       from public.funnelfox_leads order by auth_user_id, profile_id`,
+    )
+  ).rows;
+/** The seeded fixture plus the owner's sync-state row (the Edge creates it before any stage). */
+async function withSyncState(source: SupabasePglite = seeded): Promise<SupabasePglite> {
+  const h = await copyOf(source);
+  await h.db.query(
+    `insert into public.funnelfox_leads_sync_state (auth_user_id, profiles_completed, details_completed, sessions_completed, last_status, stats)
+     values ($1, true, true, true, 'error', '{"profiles_with_email": 7}'::jsonb)`,
+    [owner],
+  );
+  return h;
+}
+
+describe("reconcile queue: funnelfox_leads_reconcile_request / funnelfox_leads_reconcile_pending", { timeout: CLONE_TIMEOUT }, () => {
+  it("request: one row update on the key's sync-state row, answering the last applied run; a null / unknown key or no row queues nothing", async () => {
+    const h = await withSyncState();
+    const select = "select * from public.funnelfox_leads_sync_state where auth_user_id = $1";
+    const { reconcile_requested_at: requestedBefore, updated_at: _updatedBefore, ...rowBefore } = await one(h.db, select, [owner]);
+    expect(requestedBefore).toBeNull();
+    const leadsBefore = await conversionColumns(h);
+
+    const first = await requestReconcile(h, owner);
+    expect(first).toMatchObject({ queued: true, last_applied_at: null, last_summary: null });
+    const state = await queueState(h);
+    expect(iso(first.requested_at)).toBe(iso(state.requested));
+    expect(state).toMatchObject({ applied: null, summary: null });
+    // Only the queue column changed (plus the updated_at trigger); no lead row was touched.
+    const { reconcile_requested_at: _requestedAfter, updated_at: _updatedAfter, ...rowAfter } = await one(h.db, select, [owner]);
+    expect(rowAfter).toEqual(rowBefore);
+    expect(await conversionColumns(h)).toEqual(leadsBefore);
+
+    // The last applied run comes back (the Edge copies its counts into stats).
+    const summary = { checked: 9, leads: 4, paid_excluded: 3, active_excluded: 1, updated: 2, duration_ms: 1500, applied_at: "2026-10-07T10:00:00+00:00" };
+    await h.db.query(
+      "update public.funnelfox_leads_sync_state set reconcile_applied_at = '2026-10-07T10:00:00Z', reconcile_summary = $2::jsonb where auth_user_id = $1",
+      [owner, JSON.stringify(summary)],
+    );
+    const second = await requestReconcile(h, owner);
+    expect(second).toMatchObject({ queued: true, last_summary: summary });
+    expect(iso(second.last_applied_at)).toBe("2026-10-07T10:00:00.000Z");
+    expect(Date.parse(second.requested_at as string)).toBeGreaterThanOrEqual(Date.parse(first.requested_at as string));
+
+    for (const key of [null, other, "00000000-0000-0000-0000-000000000000"]) {
+      expect(await requestReconcile(h, key), String(key)).toEqual(NOT_QUEUED);
+    }
+    // No row was created for the keys without one.
+    expect((await one<{ n: number }>(h.db, "select count(*)::int as n from public.funnelfox_leads_sync_state")).n).toBe(1);
+  });
+
+  it("pending: a no-op until a request is newer than the last applied run, then exactly funnelfox_leads_reconcile(workspace key), recorded", async () => {
+    const h = await withSyncState();
+    const direct = await copyOf(seeded);
+    const untouched = await conversionColumns(h);
+
+    // Nothing requested, or no sync-state row at all: skipped, nothing written.
+    expect(await runPending(direct)).toEqual({ skipped: "not_requested", last_applied_at: null });
+    expect(await runPending(h)).toEqual({ skipped: "not_requested", last_applied_at: null });
+    expect(await conversionColumns(h)).toEqual(untouched);
+    expect(await queueState(h)).toEqual({ requested: null, applied: null, summary: null });
+
+    const queued = await requestReconcile(h, owner);
+    const run = (await runPending(h)) as ReconcileRun;
+    const expected = await rpc<Record<string, number>>(direct, "public.funnelfox_leads_reconcile($1::uuid)", [owner]);
+    expect(expected.updated).toBeGreaterThan(0); // the first pass rewrites rows
+    expect(run).toEqual({ ...expected, duration_ms: expect.any(Number), applied_at: expect.any(String), requested_at: expect.any(String) });
+    expect(iso(run.requested_at)).toBe(iso(queued.requested_at));
+    // Same flags, row for row (the other account's rows untouched in both).
+    const reconciled = await conversionColumns(h);
+    expect(reconciled).toEqual(await conversionColumns(direct));
+    expect(reconciled).not.toEqual(untouched);
+
+    // Recorded: applied_at = the run's start, the summary = the counts + duration + applied_at.
+    const state = await queueState(h);
+    expect(iso(state.applied)).toBe(iso(run.applied_at));
+    const { requested_at: _requested, ...recorded } = run;
+    expect(state.summary).toEqual(recorded);
+    expect((state.applied as Date).getTime()).toBeGreaterThanOrEqual((state.requested as Date).getTime());
+
+    // Applied: the next ticks are no-ops.
+    expect(await runPending(h)).toMatchObject({ skipped: "up_to_date" });
+    expect(await queueState(h)).toEqual(state);
+    expect(await conversionColumns(h)).toEqual(reconciled);
+
+    // The next request answers this run and runs again (idempotent: nothing left to change).
+    expect(await requestReconcile(h, owner)).toMatchObject({ queued: true, last_summary: recorded });
+    const again = (await runPending(h)) as ReconcileRun;
+    expect(again).toMatchObject({ checked: expected.checked, leads: expected.leads, paid_excluded: expected.paid_excluded, active_excluded: expected.active_excluded, updated: 0 });
+    expect(
+      (await one<{ newer: boolean }>(h.db, "select reconcile_applied_at > $2::timestamptz as newer from public.funnelfox_leads_sync_state where auth_user_id = $1", [owner, run.applied_at]))
+        .newer,
+    ).toBe(true);
+    expect(await runPending(h)).toMatchObject({ skipped: "up_to_date" });
+  });
+
+  it("a request stamped while a run is in progress is newer than that run's start: the next run picks it up", async () => {
+    const h = await withSyncState();
+    await requestReconcile(h, owner);
+    // Stands in for the Edge's request arriving mid-run: stamped (wall clock) while the
+    // reconcile's UPDATE executes.
+    await h.db.exec(`
+      create function public.test_stamp_request_mid_run() returns trigger language plpgsql as $$
+      begin
+        update public.funnelfox_leads_sync_state set reconcile_requested_at = clock_timestamp() where auth_user_id = '${owner}';
+        return null;
+      end
+      $$;
+      create trigger test_stamp_request_mid_run after update on public.funnelfox_leads
+        for each statement execute function public.test_stamp_request_mid_run();
+    `);
+    const first = (await runPending(h)) as ReconcileRun;
+    expect(first.updated).toEqual(expect.any(Number));
+    await h.db.exec("drop trigger test_stamp_request_mid_run on public.funnelfox_leads; drop function public.test_stamp_request_mid_run();");
+    const pendingAgain = await one<{ newer: boolean }>(
+      h.db,
+      "select reconcile_requested_at > reconcile_applied_at as newer from public.funnelfox_leads_sync_state where auth_user_id = $1",
+      [owner],
+    );
+    expect(pendingAgain.newer).toBe(true);
+    const second = (await runPending(h)) as ReconcileRun;
+    expect(second).toMatchObject({ checked: first.checked, leads: first.leads, updated: 0 });
+    expect(await runPending(h)).toMatchObject({ skipped: "up_to_date" });
+  });
+
+  it("no workspace: a notice and null, nothing run", async () => {
+    const h = await withSyncState();
+    await requestReconcile(h, owner);
+    const before = await conversionColumns(h);
+    // Stands in for a database whose workspace is not bootstrapped.
+    await h.db.exec("create or replace function public.workspace_data_key() returns uuid language sql stable security definer set search_path = '' as $$ select null::uuid $$;");
+    const notices: string[] = [];
+    const result = await h.db.query<{ value: unknown }>("select public.funnelfox_leads_reconcile_pending() as value", [], {
+      onNotice: (notice) => notices.push(String(notice.message)),
+    });
+    expect(result.rows[0].value).toBeNull();
+    expect(notices).toEqual([expect.stringMatching(/workspace is not bootstrapped/)]);
+    expect((await queueState(h)).applied).toBeNull();
+    expect(await conversionColumns(h)).toEqual(before);
+  });
+
+  it("re-applying the migration keeps the queue state and schedules the job once", async () => {
+    const h = await withSyncState();
+    await requestReconcile(h, owner);
+    await runPending(h);
+    const state = await queueState(h);
+    await h.applyMigration(RECENT);
+    expect(await queueState(h)).toEqual(state);
+    expect((await h.db.query("select schedule, command from cron.job where jobname = 'funnelfox-leads-reconcile'")).rows).toEqual([
+      { schedule: "* * * * *", command: RECONCILE_JOB_COMMAND },
+    ]);
+  });
+
+  it("a failed run (a timeout or any error) rolls back, is recorded and backs off: 15 min, doubling, at most 6 h; force ignores the wait; a success clears it", async () => {
+    const h = await withSyncState();
+    const direct = await copyOf(seeded);
+    const queued = await requestReconcile(h, owner);
+    const untouched = await conversionColumns(h);
+    const realReconcile = (
+      await one<{ def: string }>(h.db, "select pg_get_functiondef('public.funnelfox_leads_reconcile(uuid)'::regprocedure) as def")
+    ).def;
+    // Stands in for a reconcile that does part of its UPDATE and then fails: PGlite never fires
+    // statement_timeout, so the timeout's error (SQLSTATE 57014, query_canceled) is raised directly.
+    const failingReconcile = (errcode: string, message: string) =>
+      h.db.exec(`
+        create or replace function public.funnelfox_leads_reconcile(p_data_key uuid) returns jsonb language plpgsql as $$
+        begin
+          update public.funnelfox_leads set is_lead = not coalesce(is_lead, false), first_sub_at = now() where auth_user_id = p_data_key;
+          raise exception '${message}' using errcode = '${errcode}';
+        end
+        $$;
+      `);
+    const minutesBetween = (from: unknown, to: unknown) => (Date.parse(to as string) - Date.parse(from as string)) / 60_000;
+
+    // 1. Timed out: the partial work is rolled back, the failure recorded (and logged), nothing applied.
+    await failingReconcile("query_canceled", "canceling statement due to statement timeout");
+    const notices: string[] = [];
+    const first = (
+      await h.db.query<{ value: ReconcileRun }>("select public.funnelfox_leads_reconcile_pending() as value", [], {
+        onNotice: (notice) => notices.push(String(notice.message)),
+      })
+    ).rows[0].value;
+    expect(first).toEqual({
+      failed: true,
+      requested_at: expect.any(String),
+      failed_at: expect.any(String),
+      started_at: expect.any(String),
+      duration_ms: expect.any(Number),
+      sqlstate: "57014",
+      error: "canceling statement due to statement timeout",
+      failures: 1,
+      retry_after: expect.any(String),
+    });
+    expect(iso(first.requested_at)).toBe(iso(queued.requested_at));
+    expect(minutesBetween(first.failed_at, first.retry_after)).toBeCloseTo(15, 6);
+    expect(notices).toEqual([expect.stringMatching(/funnelfox leads reconcile failed \(1 in a row, after \d+ ms\): canceling statement due to statement timeout \[57014\]/)]);
+    expect(await conversionColumns(h)).toEqual(untouched);
+    expect(await queueState(h)).toMatchObject({ applied: null, summary: null });
+    const { failed: _failed, requested_at: _requestedAt, ...recordedFailure } = first;
+    expect(await failureOf(h)).toEqual(recordedFailure);
+
+    // 2. The next ticks wait (no attempt, nothing written) until retry_after.
+    expect(await runPending(h)).toEqual({
+      skipped: "backoff", requested_at: expect.any(String), last_applied_at: null, failures: 1, retry_after: first.retry_after,
+    });
+    expect(await runPending(h, false)).toMatchObject({ skipped: "backoff" });
+    expect(await failureOf(h)).toEqual(recordedFailure);
+
+    // 3. A forced run ignores the wait; consecutive failures (any error) double it: 30 min, 60 min ...
+    await failingReconcile("P0001", "boom");
+    const second = (await runPending(h, true)) as ReconcileRun;
+    expect(second).toMatchObject({ failed: true, sqlstate: "P0001", error: "boom", failures: 2 });
+    expect(minutesBetween(second.failed_at, second.retry_after)).toBeCloseTo(30, 6);
+    const third = (await runPending(h, true)) as ReconcileRun;
+    expect(third).toMatchObject({ failures: 3 });
+    expect(minutesBetween(third.failed_at, third.retry_after)).toBeCloseTo(60, 6);
+    // ... at most 6 h however long the streak.
+    await h.db.query(
+      "update public.funnelfox_leads_sync_state set reconcile_failure = reconcile_failure || '{\"failures\": 40}'::jsonb where auth_user_id = $1",
+      [owner],
+    );
+    const capped = (await runPending(h, true)) as ReconcileRun;
+    expect(capped).toMatchObject({ failures: 41 });
+    expect(minutesBetween(capped.failed_at, capped.retry_after)).toBeCloseTo(360, 6);
+    expect(await conversionColumns(h)).toEqual(untouched);
+
+    // 4. Once the wait is over the tick runs again; this time it succeeds: same flags as a direct
+    //    call, recorded, the failure cleared.
+    await h.db.exec(realReconcile);
+    await h.db.query(
+      "update public.funnelfox_leads_sync_state set reconcile_failure = jsonb_set(reconcile_failure, '{retry_after}', to_jsonb(now() - interval '1 second')) where auth_user_id = $1",
+      [owner],
+    );
+    const applied = (await runPending(h)) as ReconcileRun;
+    const expected = await rpc<Record<string, number>>(direct, "public.funnelfox_leads_reconcile($1::uuid)", [owner]);
+    expect(applied).toEqual({ ...expected, duration_ms: expect.any(Number), applied_at: expect.any(String), requested_at: expect.any(String) });
+    expect(await conversionColumns(h)).toEqual(await conversionColumns(direct));
+    expect(await failureOf(h)).toBeNull();
+    expect(iso((await queueState(h)).applied)).toBe(iso(applied.applied_at));
+    expect(await runPending(h)).toMatchObject({ skipped: "up_to_date" });
+    // Forcing never re-runs an applied request.
+    expect(await runPending(h, true)).toMatchObject({ skipped: "up_to_date" });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Schema, grants, cron, guard
 // ---------------------------------------------------------------------------
 
@@ -646,12 +949,13 @@ describe("schema, grants and cron", { timeout: CLONE_TIMEOUT }, () => {
     ]);
   });
 
-  it("schedules the 5-minute pure-SQL refresh, idempotently, next to the existing leads jobs", async () => {
+  it("schedules the 5-minute pure-SQL refresh and the minute reconcile job, idempotently, next to the existing leads jobs", async () => {
     const jobs = async (h: SupabasePglite) =>
       (await h.db.query("select jobname, schedule, command from cron.job where jobname like 'funnelfox-leads-%' order by jobname")).rows;
     const expected = [
       { jobname: "funnelfox-leads-advance", schedule: "* * * * *", command: "select public.invoke_funnelfox_leads_sync(false)" },
       { jobname: "funnelfox-leads-recent-cache", schedule: "*/5 * * * *", command: "select public.leads_refresh_recent_candidates()" },
+      { jobname: "funnelfox-leads-reconcile", schedule: "* * * * *", command: RECONCILE_JOB_COMMAND },
       { jobname: "funnelfox-leads-refresh", schedule: "15 6 * * *", command: "select public.invoke_funnelfox_leads_sync(true)" },
     ];
     expect(await jobs(recent)).toEqual(expected);
@@ -661,10 +965,116 @@ describe("schema, grants and cron", { timeout: CLONE_TIMEOUT }, () => {
     expect(await jobs(h)).toEqual(expected);
     // Re-applying keeps the cached row and the functions.
     expect((await one<{ n: number }>(h.db, "select count(*)::int as n from public.funnelfox_leads_candidates_cache")).n).toBe(1);
-    // The job's command runs as postgres (pg_cron's user) and touches no HTTP.
+    // The jobs' commands run as postgres (pg_cron's user) and touch no HTTP.
     const requests = (await one<{ n: number }>(h.db, "select count(*)::int as n from net.stub_requests")).n;
     await h.db.query((expected[1] as { command: string }).command);
+    // The reconcile job's command is three statements (pg_cron sends it as one simple query): its
+    // own limits, then the call -- postgres would otherwise get Supabase's 2-minute global cap.
+    const results = await h.db.exec((expected[2] as { command: string }).command);
+    expect(results.map((result) => result.rows)).toEqual([[], [], [{ funnelfox_leads_reconcile_pending: { skipped: "not_requested", last_applied_at: null } }]]);
+    expect(await one(h.db, "select current_setting('statement_timeout') as statement, current_setting('lock_timeout') as lock")).toEqual({
+      statement: "15min",
+      lock: "30s",
+    });
+    await h.db.exec("reset statement_timeout; reset lock_timeout;");
     expect((await one<{ n: number }>(h.db, "select count(*)::int as n from net.stub_requests")).n).toBe(requests);
+  });
+
+  it("the reconcile queue functions: invoker, search_path pinned; the request is service_role-only, pending is for no API role", async () => {
+    for (const fn of [
+      { signature: "public.funnelfox_leads_reconcile_request(uuid)", service: true, args: "p_data_key uuid" },
+      { signature: "public.funnelfox_leads_reconcile_pending(boolean)", service: false, args: "p_force boolean DEFAULT false" },
+    ]) {
+      const row = await one(
+        recent.db,
+        `select has_function_privilege('anon', $1, 'execute') as anon,
+                has_function_privilege('authenticated', $1, 'execute') as authenticated,
+                has_function_privilege('service_role', $1, 'execute') as service,
+                coalesce(array_to_string(p.proacl, ',') ~ '(^|,)=X', true) as public_acl,
+                p.prosecdef as definer,
+                p.proconfig as config,
+                p.provolatile as volatile,
+                pg_get_function_arguments(p.oid) as args
+         from pg_proc p where p.oid = $1::regprocedure`,
+        [fn.signature],
+      );
+      expect(row, fn.signature).toEqual({
+        anon: false, authenticated: false, service: fn.service, public_acl: false, definer: false, config: ['search_path=""'], volatile: "v", args: fn.args,
+      });
+    }
+    const request = "select public.funnelfox_leads_reconcile_request($1::uuid)";
+    await expect(recent.asUser(owner, (tx) => tx.query(request, [owner]))).rejects.toThrow(/permission denied for function/);
+    await expect(recent.asAnon((tx) => tx.query(request, [owner]))).rejects.toThrow(/permission denied for function/);
+    for (const pending of ["select public.funnelfox_leads_reconcile_pending()", "select public.funnelfox_leads_reconcile_pending(true)"]) {
+      await expect(recent.asService((tx) => tx.query(pending)), pending).rejects.toThrow(/permission denied for function/);
+      await expect(recent.asUser(owner, (tx) => tx.query(pending)), pending).rejects.toThrow(/permission denied for function/);
+      await expect(recent.asAnon((tx) => tx.query(pending)), pending).rejects.toThrow(/permission denied for function/);
+    }
+    // One overload only (a no-argument twin would make the job's call ambiguous).
+    expect(
+      (await recent.db.query("select p.oid::regprocedure::text as signature from pg_proc p where p.proname = 'funnelfox_leads_reconcile_pending'")).rows,
+    ).toEqual([{ signature: "funnelfox_leads_reconcile_pending(boolean)" }]);
+    // funnelfox_leads_reconcile itself is unchanged: still service_role-only (the Edge's fallback).
+    expect(
+      await one(
+        recent.db,
+        `select has_function_privilege('service_role', 'public.funnelfox_leads_reconcile(uuid)', 'execute') as service,
+                has_function_privilege('authenticated', 'public.funnelfox_leads_reconcile(uuid)', 'execute') as authenticated`,
+      ),
+    ).toEqual({ service: true, authenticated: false });
+  });
+
+  it("the queue columns: nullable, readable where the sync state is, writable by no browser role; the lockdown's fail-closed lints still pass", async () => {
+    const columns = await recent.db.query(
+      `select column_name, data_type, is_nullable, column_default from information_schema.columns
+       where table_schema = 'public' and table_name = 'funnelfox_leads_sync_state' and column_name like 'reconcile\\_%'
+       order by column_name`,
+    );
+    expect(columns.rows).toEqual([
+      { column_name: "reconcile_applied_at", data_type: "timestamp with time zone", is_nullable: "YES", column_default: null },
+      { column_name: "reconcile_completed", data_type: "boolean", is_nullable: "NO", column_default: "false" },
+      { column_name: "reconcile_failure", data_type: "jsonb", is_nullable: "YES", column_default: null },
+      { column_name: "reconcile_requested_at", data_type: "timestamp with time zone", is_nullable: "YES", column_default: null },
+      { column_name: "reconcile_summary", data_type: "jsonb", is_nullable: "YES", column_default: null },
+    ]);
+    for (const column of ["reconcile_requested_at", "reconcile_applied_at", "reconcile_summary", "reconcile_failure"]) {
+      const privileges = await one(
+        recent.db,
+        `select has_column_privilege('anon', 'public.funnelfox_leads_sync_state', $1, 'INSERT') as anon_insert,
+                has_column_privilege('anon', 'public.funnelfox_leads_sync_state', $1, 'UPDATE') as anon_update,
+                has_column_privilege('authenticated', 'public.funnelfox_leads_sync_state', $1, 'INSERT') as auth_insert,
+                has_column_privilege('authenticated', 'public.funnelfox_leads_sync_state', $1, 'UPDATE') as auth_update,
+                has_column_privilege('authenticated', 'public.funnelfox_leads_sync_state', $1, 'SELECT') as auth_select,
+                has_column_privilege('service_role', 'public.funnelfox_leads_sync_state', $1, 'UPDATE') as service_update`,
+        [column],
+      );
+      expect(privileges, column).toEqual({ anon_insert: false, anon_update: false, auth_insert: false, auth_update: false, auth_select: true, service_update: true });
+    }
+
+    const h = await withSyncState(recent);
+    for (const write of [
+      "update public.funnelfox_leads_sync_state set reconcile_requested_at = now()",
+      "update public.funnelfox_leads_sync_state set reconcile_applied_at = now(), reconcile_summary = '{}'::jsonb",
+      "update public.funnelfox_leads_sync_state set reconcile_failure = null",
+      `insert into public.funnelfox_leads_sync_state (auth_user_id, reconcile_requested_at) values ('${other}', now())`,
+    ]) {
+      await expect(h.asUser(owner, (tx) => tx.query(write)), write).rejects.toThrow(/permission denied/);
+      await expect(h.asAnon((tx) => tx.query(write)), write).rejects.toThrow(/permission denied/);
+    }
+    expect(await queueState(h)).toEqual({ requested: null, applied: null, summary: null });
+    // The sync card reads them: the data owner (an active member) sees the row; a non-member nothing.
+    const read = "select reconcile_requested_at, reconcile_applied_at, reconcile_summary, reconcile_failure from public.funnelfox_leads_sync_state";
+    expect((await h.asUser(owner, (tx) => tx.query(read))).rows).toEqual([
+      { reconcile_requested_at: null, reconcile_applied_at: null, reconcile_summary: null, reconcile_failure: null },
+    ]);
+    expect((await h.asUser(other, (tx) => tx.query(read))).rows).toEqual([]);
+
+    // 202610050003's fail-closed block (browser-reachable tables without the lockdown policy,
+    // browser write policies on the sync-state tables, RLS-bypassing views) still passes.
+    const lockdown = readMigration(LOCKDOWN);
+    const failClosed = lockdown.slice(lockdown.indexOf("do $$", lockdown.indexOf("-- Fail closed")));
+    expect(failClosed).toMatch(/browser write policies remain/);
+    await expect(h.db.exec(failClosed)).resolves.toBeDefined();
   });
 
   it("refuses to apply before 202610060010, and creates nothing", async () => {
@@ -672,6 +1082,17 @@ describe("schema, grants and cron", { timeout: CLONE_TIMEOUT }, () => {
     await expect(h.applyMigration(RECENT)).rejects.toThrow(/202610060010_funnelfox_leads_export\.sql has not been applied/);
     expect(await one(h.db, "select to_regclass('public.funnelfox_leads_candidates_cache') as cache, to_regprocedure('public.leads_recent_candidates(uuid, integer, integer)') as fn")).toEqual({ cache: null, fn: null });
     expect((await h.db.query("select jobname from cron.job where jobname = 'funnelfox-leads-recent-cache'")).rows).toEqual([]);
+    expect(
+      await one(
+        h.db,
+        `select to_regprocedure('public.funnelfox_leads_reconcile_request(uuid)') as request,
+                to_regprocedure('public.funnelfox_leads_reconcile_pending(boolean)') as pending,
+                (select count(*)::int from information_schema.columns
+                 where table_schema = 'public' and table_name = 'funnelfox_leads_sync_state'
+                   and column_name in ('reconcile_requested_at', 'reconcile_applied_at', 'reconcile_summary', 'reconcile_failure')) as columns`,
+      ),
+    ).toEqual({ request: null, pending: null, columns: 0 });
+    expect((await h.db.query("select jobname from cron.job where jobname = 'funnelfox-leads-reconcile'")).rows).toEqual([]);
   });
 
   it("leaves the old RPC in place (the Edge's fallback before this migration)", async () => {

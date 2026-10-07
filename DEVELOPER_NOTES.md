@@ -342,10 +342,64 @@ Pipeline (`supabase/functions/funnelfox-leads-sync/index.ts`; pure twin
   checkpointed every 10 pages; every page has a 20 s timeout.
 - `sessions` → crawl `/sessions` and attach the earliest session's attribution
   to STORED profiles only (light columns, no `raw_session`).
-- `reconcile` → one SQL call, `public.funnelfox_leads_reconcile(p_data_key)`:
-  paid emails from `public.transactions`, active ones from
+- `reconcile` → `public.funnelfox_leads_reconcile(p_data_key)`: paid emails
+  from `public.transactions`, active ones from
   `active_funnelfox_subscription_emails` (Cohorts definition). The Edge ignores
   any `conversion` body key; the browser no longer builds one.
+- Reconcile queue (incident 2026-10-07, migration `202610070001` section 6):
+  the stage used to call `funnelfox_leads_reconcile` through PostgREST. Its
+  first pass over the export (235k rows) rewrites almost every row
+  (`has_successful_payment`, `has_active_subscription`, `is_lead`,
+  `first_trial_at`, `first_sub_at`) and hit the 8 s statement timeout of the
+  role PostgREST runs service_role calls under, every minute (sync state stuck
+  at `next_stage = 'reconcile'`, `last_status = 'error'`, ~8 s of DB time per
+  tick). Now the stage calls `funnelfox_leads_reconcile_request(p_data_key)`
+  (service_role only; stamps `funnelfox_leads_sync_state.reconcile_requested_at`,
+  one row update, answers `{queued, requested_at, last_applied_at,
+  last_summary}`), marks `reconcile_completed` and copies the last APPLIED
+  run's counts into `stats` (`reconcile_rows` / `leads_found` /
+  `converted_excluded` / `active_sub_excluded` / `reconciled_at` from
+  `checked` / `leads` / `paid_excluded` / `active_excluded` / `applied_at`;
+  without an applied run the previous values stay) plus `reconcile_queued_at`.
+  The pg_cron job `funnelfox-leads-reconcile` (every minute, as postgres, pure
+  SQL) runs `set statement_timeout = '15min'; set lock_timeout = '30s'; select
+  funnelfox_leads_reconcile_pending()` — postgres has no timeout of its own but
+  Supabase's global default caps it at 2 minutes, which the first pass (~216k
+  non-HOT row updates over 8 indexes) may not fit on a small instance; since
+  PG13 each statement of a multi-statement command arms its own timeout, so
+  the SETs apply to the SELECT. `funnelfox_leads_reconcile_pending(p_force
+  boolean default false)`: when `reconcile_requested_at` is newer than
+  `reconcile_applied_at` it takes a transaction advisory lock, runs the
+  unchanged `funnelfox_leads_reconcile(workspace_data_key())` and stores
+  `reconcile_applied_at` = the run's START time and `reconcile_summary` = the
+  counts + `duration_ms` + `applied_at` (and clears `reconcile_failure`), so a
+  request stamped during a run is picked up by the next one. The reconcile
+  call sits in a block that traps `query_canceled` (a timeout; `others` does
+  not match it) and every other error: its work rolls back, the advisory lock
+  stays, `reconcile_failure` = `{failed_at, started_at, duration_ms, sqlstate,
+  error, failures, retry_after}` plus a WARNING, and later ticks answer
+  `{skipped: 'backoff'}` until `retry_after` (15 min after the first failure,
+  doubling per consecutive failure, at most 6 h). `p_force = true` skips that
+  wait (the manual `set statement_timeout = 0; select
+  public.funnelfox_leads_reconcile_pending(true);`). Trade-off: a trapped
+  failure shows as `succeeded` in `cron.job_run_details` (the failure lives in
+  `reconcile_failure` instead — recording it needs the transaction to commit).
+  The migration drops a no-argument `funnelfox_leads_reconcile_pending()` (an
+  earlier draft) so the job's call is never ambiguous. Nothing in the app reads
+  the five conversion columns (the Leads tab computes exclusions on the fly in
+  `leads_recent_candidates_compute`), so the queue only delays those columns
+  and the card's "Leads found". The Edge falls back (PGRST202 / 404 /
+  "could not find the function", `isMissingRpcError` mirrored from
+  `_shared/clickhouse/leads.ts`) to the inline call while the migration is not
+  applied; any other request error (or `queued: false`) fails the run as
+  before. The sync card shows "Conversion reconcile queued …" (muted, not an
+  error) while a request waits, polls for up to 15 min, and prefers the row's
+  `reconcile_summary.leads` over the stats copy. `isReconcileOverdue` (queued
+  for at least `RECONCILE_QUEUE_POLL_WINDOW_MS`, i.e. where polling stops, or
+  queued with a `reconcile_failure`) turns the note into an amber warning
+  ("… but not applied yet — the pg_cron job funnelfox-leads-reconcile may not
+  be running (check cron.job_run_details)", or the failure's error and
+  `retry_after`); `last_status` and its styling stay as they are.
 - A stored profile is also never a lead when ITS OWN subscription
   (`funnelfox_subscriptions.profile_id`) shows a paying / subscribed customer
   (its email paid or active, or priced and not cancelled / still in its paid
@@ -460,8 +514,12 @@ Leads tab read path (`clickhouse-users` actions `leads_list` /
 Deploy order (each step needs the previous one): migration `202610060010` →
 deploy all functions → Diagnose + one Continue → migration `202610060011` (cron)
 → frontend. See README "FunnelFox Leads export — rollout". Migration
-`202610070001` (latest-1 000 candidates + cache + its cron job) only needs
-`202610060010`; it is applied on its own (README step 6).
+`202610070001` (latest-1 000 candidates + cache + its cron job, and the
+reconcile queue + the `funnelfox-leads-reconcile` job) only needs
+`202610060010`; it is applied on its own (README step 6). The leads pg_cron
+jobs are `funnelfox-leads-advance`, `funnelfox-leads-refresh`,
+`funnelfox-leads-recent-cache` and `funnelfox-leads-reconcile` (freeze them
+together: `jobname like 'funnelfox-leads-%'`).
 
 ## FunnelFox Backend Requirement
 

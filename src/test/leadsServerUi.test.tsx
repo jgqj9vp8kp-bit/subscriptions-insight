@@ -46,8 +46,11 @@ import {
   diagnoseFunnelFoxLeadsSync,
   getFunnelFoxLeadsStats,
   isLeadsSyncActive,
+  isReconcileOverdue,
+  isReconcileQueued,
   runFunnelFoxLeadsSync,
   LEADS_SYNC_POLL_MS,
+  RECONCILE_QUEUE_POLL_WINDOW_MS,
   MANUAL_SYNC_MAX_STEPS,
   type FunnelFoxLeadsSyncState,
 } from "@/services/funnelfoxLeads";
@@ -295,6 +298,51 @@ describe("useLeadsSyncState polling", () => {
     expect(isLeadsSyncActive(syncState({ lease_until: "2026-10-06T12:01:00.000Z" }), now)).toBe(true);
     expect(isLeadsSyncActive(syncState({ lease_until: "2026-10-06T11:59:00.000Z" }), now)).toBe(false);
     expect(isLeadsSyncActive(syncState({ stats: { rate_limited_until: "2026-10-06T12:00:30.000Z" } }), now)).toBe(true);
+  });
+
+  it("isReconcileQueued / isLeadsSyncActive: a reconcile requested after the last applied run is queued; the card polls for it a while", () => {
+    const now = Date.parse("2026-10-06T12:00:00.000Z");
+    const minutesAgo = (minutes: number) => new Date(now - minutes * 60_000).toISOString();
+    expect(isReconcileQueued(null)).toBe(false);
+    expect(isReconcileQueued(syncState())).toBe(false); // before migration 202610070001: no columns
+    expect(isReconcileQueued(syncState({ reconcile_requested_at: null, reconcile_applied_at: minutesAgo(5) }))).toBe(false);
+    expect(isReconcileQueued(syncState({ reconcile_requested_at: minutesAgo(1), reconcile_applied_at: null }))).toBe(true);
+    expect(isReconcileQueued(syncState({ reconcile_requested_at: minutesAgo(1), reconcile_applied_at: minutesAgo(2) }))).toBe(true);
+    expect(isReconcileQueued(syncState({ reconcile_requested_at: minutesAgo(2), reconcile_applied_at: minutesAgo(1) }))).toBe(false);
+    expect(isReconcileQueued(syncState({ reconcile_requested_at: "not a date", reconcile_applied_at: null }))).toBe(false);
+
+    // Polls while the queued request is recent (pg_cron applies it within a minute), then gives up.
+    expect(isLeadsSyncActive(syncState({ reconcile_requested_at: minutesAgo(1) }), now)).toBe(true);
+    expect(isLeadsSyncActive(syncState({ reconcile_requested_at: minutesAgo(RECONCILE_QUEUE_POLL_WINDOW_MS / 60_000 + 1) }), now)).toBe(false);
+    expect(isLeadsSyncActive(syncState({ reconcile_requested_at: minutesAgo(2), reconcile_applied_at: minutesAgo(1) }), now)).toBe(false);
+  });
+
+  it("isReconcileOverdue: queued for the whole poll window (the job is likely not running) or after a failed run; never once applied", () => {
+    const now = Date.parse("2026-10-06T12:00:00.000Z");
+    const msAgo = (ms: number) => new Date(now - ms).toISOString();
+    const windowMs = RECONCILE_QUEUE_POLL_WINDOW_MS;
+    expect(windowMs).toBe(15 * 60_000);
+    // The window edge: still inside it 1 ms before, overdue exactly at it and after.
+    expect(isReconcileOverdue(syncState({ reconcile_requested_at: msAgo(windowMs - 1), reconcile_applied_at: null }), now)).toBe(false);
+    expect(isReconcileOverdue(syncState({ reconcile_requested_at: msAgo(windowMs), reconcile_applied_at: null }), now)).toBe(true);
+    expect(isReconcileOverdue(syncState({ reconcile_requested_at: msAgo(windowMs + 60_000), reconcile_applied_at: msAgo(windowMs + 120_000) }), now)).toBe(true);
+    // Polling stops exactly where the warning starts.
+    expect(isLeadsSyncActive(syncState({ reconcile_requested_at: msAgo(windowMs) }), now)).toBe(false);
+    expect(isLeadsSyncActive(syncState({ reconcile_requested_at: msAgo(windowMs - 1) }), now)).toBe(true);
+    // Applied (however old the request): not overdue.
+    expect(isReconcileOverdue(syncState({ reconcile_requested_at: msAgo(3 * windowMs), reconcile_applied_at: msAgo(3 * windowMs - 1_000) }), now)).toBe(false);
+    expect(isReconcileOverdue(syncState({ reconcile_requested_at: msAgo(3 * windowMs), reconcile_applied_at: msAgo(3 * windowMs) }), now)).toBe(false);
+    // Missing / invalid requested_at, no row, before the migration: never.
+    expect(isReconcileOverdue(null, now)).toBe(false);
+    expect(isReconcileOverdue(syncState(), now)).toBe(false);
+    expect(isReconcileOverdue(syncState({ reconcile_requested_at: null, reconcile_applied_at: null }), now)).toBe(false);
+    expect(isReconcileOverdue(syncState({ reconcile_requested_at: "not a date", reconcile_applied_at: null }), now)).toBe(false);
+    // A failed run of a queued request (pg_cron backs off): overdue at once; an applied one with a stale failure: not.
+    const failure = { failed_at: msAgo(30_000), error: "canceling statement due to statement timeout", failures: 1, retry_after: msAgo(-15 * 60_000) };
+    expect(isReconcileOverdue(syncState({ reconcile_requested_at: msAgo(60_000), reconcile_failure: failure }), now)).toBe(true);
+    expect(
+      isReconcileOverdue(syncState({ reconcile_requested_at: msAgo(60_000), reconcile_applied_at: msAgo(1_000), reconcile_failure: failure }), now),
+    ).toBe(false);
   });
 });
 

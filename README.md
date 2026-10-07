@@ -228,12 +228,65 @@ carries an email into `public.funnelfox_leads` in the background. Details: DEVEL
    simply shows no banner. Rollback: `select cron.unschedule('funnelfox-leads-recent-cache');`
    stops the refresh (the Edge then computes on a cache miss, at most every 15 minutes).
 
+   **Reconcile queue (incident 2026-10-07), same file, section 6.** The export's `reconcile` stage
+   called `funnelfox_leads_reconcile` through PostgREST; its first pass over the 235k stored
+   profiles rewrites almost every row and ran into the 8 s statement timeout every minute
+   (`reconcile failed: canceling statement due to statement timeout`, `last_status = 'error'`,
+   `next_stage = 'reconcile'`). The file now also adds the `funnelfox_leads_sync_state` columns
+   `reconcile_requested_at` / `reconcile_applied_at` / `reconcile_summary` / `reconcile_failure`
+   (no browser write access), `funnelfox_leads_reconcile_request` (service_role only: stamps the
+   request, one row update), `funnelfox_leads_reconcile_pending(p_force default false)` (no API
+   role) and the pg_cron job `funnelfox-leads-reconcile` (every minute, pure SQL, no HTTP, as
+   postgres): the stage now only queues the reconcile and completes; the job runs the unchanged
+   `funnelfox_leads_reconcile` within a minute and records it. postgres is not under PostgREST's
+   8 s limit but IS under Supabase's 2-minute global `statement_timeout`, so the job's command sets
+   its own first: `set statement_timeout = '15min'; set lock_timeout = '30s'; select
+   public.funnelfox_leads_reconcile_pending()`. A run that still fails (timeout or any error) rolls
+   back, is recorded in `reconcile_failure` (`failed_at`, `duration_ms`, `sqlstate`, `error`,
+   `failures`, `retry_after`; a WARNING in the Postgres log — the cron run itself reads `succeeded`)
+   and the job waits 15 min before the next attempt, doubling per consecutive failure up to 6 h, so
+   it never restarts back to back. Deploy order does not matter either: before the SQL, the new
+   `funnelfox-leads-sync` falls back (PGRST202) to the inline reconcile, which keeps failing exactly
+   as today until the file is applied. Once both are live, the next advance tick queues the
+   reconcile (a click on **Continue Sync** does it at once) and the pipeline turns `ok`.
+
+   The first pass is the heavy one (~216k rows rewritten): within a few minutes of the first
+   request, check that it applied and how long it took. Check:
+
+   ```text
+   select reconcile_requested_at, reconcile_applied_at, reconcile_summary->>'duration_ms' as duration_ms,
+          reconcile_summary, reconcile_failure from public.funnelfox_leads_sync_state;
+   select status, return_message, start_time, end_time from cron.job_run_details
+     where jobid = (select jobid from cron.job where jobname = 'funnelfox-leads-reconcile')
+     order by start_time desc limit 5;
+   ```
+
+   `reconcile_applied_at >= reconcile_requested_at` means the last request is applied;
+   `reconcile_summary` holds its counts (`checked`, `leads`, `paid_excluded`, `active_excluded`,
+   `updated`, `duration_ms`, `applied_at`). An idle minute of the job costs one primary-key read.
+   If `reconcile_failure` is set (e.g. `canceling statement due to statement timeout` after 15 min),
+   run the pass once by hand without a timeout, from the SQL editor or better a direct connection
+   (`p_force` skips the backoff; a run already in progress answers `skipped: running`):
+
+   ```text
+   set statement_timeout = 0; select public.funnelfox_leads_reconcile_pending(true);
+   ```
+
+   If runs keep failing, freeze the job until it is understood:
+   `select cron.alter_job(jobid, active := false) from cron.job where jobname = 'funnelfox-leads-reconcile';`
+   Rollback: `select cron.unschedule('funnelfox-leads-reconcile');` (requests then simply stay
+   queued; nothing reads the five conversion columns the reconcile writes). While a request stays
+   queued for more than 15 minutes, or after a failed run, the sync card shows an amber "Conversion
+   reconcile queued since … but not applied yet" warning (the status itself stays `ok`).
+
 How the background export proceeds:
 
 - `funnelfox-leads-advance` posts every minute and runs ONE stage per call (~50 s budget):
   `profiles` (crawl the profile list newest first, store only rows with an email; checkpoint every
-  10 pages) → `sessions` (attribution for the stored profiles) → `reconcile` (one SQL call: paid /
-  active emails stop being leads). Each call resumes from the saved cursor.
+  10 pages) → `sessions` (attribution for the stored profiles) → `reconcile` (queues the conversion
+  reconcile: paid / active emails stop being leads once the pg_cron job `funnelfox-leads-reconcile`
+  applies it, within a minute; before `202610070001` it runs inline). Each call resumes from the
+  saved cursor.
 - The tick is skipped without an HTTP call while another call holds the lease (120 s), while a
   FunnelFox 429 pause runs (`stats.rate_limited_until`, Retry-After or 60 s), while the backoff after
   a FunnelFox error runs (`stats.error_backoff_until`, 60 s doubling to at most 1 h) and once every
@@ -245,8 +298,11 @@ How the background export proceeds:
   restarts; a pipeline whose last run failed is restarted.
 - Progress (read-only): `select current_stage, last_status, last_error, lease_until,
   profiles_completed, sessions_completed, reconcile_completed, stats->>'profiles_scanned_total',
-  stats->>'profiles_with_email', stats->>'rate_limited_until', stats->>'error_backoff_until' from
-  public.funnelfox_leads_sync_state;`
+  stats->>'profiles_with_email', stats->>'rate_limited_until', stats->>'error_backoff_until',
+  reconcile_requested_at, reconcile_applied_at, reconcile_summary, reconcile_failure from
+  public.funnelfox_leads_sync_state;` (the four new `reconcile_*` columns exist once `202610070001`
+  is applied; the sync card shows "Conversion reconcile queued …" while a request waits for the job —
+  not a failure — and an amber warning once it waits past 15 minutes or its last run failed).
 - What the Leads tab shows (owner decision 2026-10-07, for speed): only the **latest 1,000 leads**
   by lead date (about the last 3 days today). The list, search, filters, filter options and the
   Total Leads / Leads Today / Leads Last 7 Days cards cover those 1,000; Emails Found, Converted
@@ -258,7 +314,8 @@ How the background export proceeds:
   lead can stay listed, until the next `funnelfox-leads-recent-cache` tick (the cached Postgres
   candidates are merged with the live ClickHouse rows).
 - Pause / resume: `select cron.alter_job(jobid, active := false) from cron.job where jobname like
-  'funnelfox-leads-%';` (`active := true` to resume; this includes `funnelfox-leads-recent-cache`).
+  'funnelfox-leads-%';` (`active := true` to resume; this includes `funnelfox-leads-recent-cache`
+  and `funnelfox-leads-reconcile` — freeze all four leads jobs around a deploy that touches them).
 
 Server-summary flags stay off in production until real-data parity is confirmed
 (see `.env.example`): `VITE_FB_ANALYTICS_SOURCE` and `VITE_DASHBOARD_SOURCE`

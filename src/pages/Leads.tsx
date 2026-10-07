@@ -38,6 +38,8 @@ import { isSupabaseConfigured } from "@/services/supabaseClient";
 import {
   diagnoseFunnelFoxLeadsSync,
   futureMs,
+  isReconcileOverdue,
+  isReconcileQueued,
   runFunnelFoxLeadsSync,
   LEADS_SYNC_LIMIT,
   LEADS_SYNC_MAX_PAGES,
@@ -387,6 +389,13 @@ export function LeadsPanel({ embedded = false }: { embedded?: boolean }) {
   const running = syncRow ? futureMs(syncRow.lease_until ?? null, now) != null : serverSync?.running === true;
   // The overview may be minutes old: a hint already in the past says nothing.
   const nextTickMs = futureMs(serverSync?.next_tick_hint ?? null, now);
+  // The reconcile stage only queues the reconcile; pg_cron applies it within a minute (not a failure).
+  const reconcileQueued = isReconcileQueued(syncRow);
+  // ... unless it has waited past the poll window or its last run failed: then warn (status stays ok).
+  const reconcileOverdue = isReconcileOverdue(syncRow, now);
+  const reconcileFailure = reconcileQueued ? syncRow?.reconcile_failure ?? null : null;
+  // The row's reconcile_summary is the last applied run; stats copy it only when the stage runs.
+  const leadsFound = syncRow?.reconcile_summary?.leads ?? stats?.leads_found;
 
   // ---- KPIs, options, rows ----
   const summary = overview.data?.summary ?? null;
@@ -505,6 +514,26 @@ export function LeadsPanel({ embedded = false }: { embedded?: boolean }) {
         {!isPartial && coverageWarningMessage && (
           <div className="mt-2 text-xs text-warning">{coverageWarningMessage}</div>
         )}
+        {reconcileQueued &&
+          (reconcileOverdue ? (
+            <div data-testid="leads-reconcile-queued" className="mt-2 text-xs text-warning">
+              Conversion reconcile queued since {formatLeadDateTime(syncRow?.reconcile_requested_at ?? null)} but not applied yet
+              {reconcileFailure ? (
+                <>
+                  {" "}
+                  — its last run failed{reconcileFailure.error ? `: ${reconcileFailure.error}` : ""}; the pg_cron job
+                  funnelfox-leads-reconcile retries after {formatLeadDateTime(reconcileFailure.retry_after ?? null)}.
+                </>
+              ) : (
+                <> — the pg_cron job funnelfox-leads-reconcile may not be running (check cron.job_run_details).</>
+              )}
+            </div>
+          ) : (
+            <div data-testid="leads-reconcile-queued" className="mt-2 text-xs text-muted-foreground">
+              Conversion reconcile queued {formatLeadDateTime(syncRow?.reconcile_requested_at ?? null)}; the database applies it
+              within a minute.
+            </div>
+          ))}
 
         {stats && (
           <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-muted-foreground sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6">
@@ -515,7 +544,7 @@ export function LeadsPanel({ embedded = false }: { embedded?: boolean }) {
             <Stat label="Preview excluded:">{formatCount(stats.preview_excluded)}</Stat>
             <Stat label="Sessions scanned:">{formatCount(stats.sessions_scanned_total ?? stats.sessions_scanned)}</Stat>
             <Stat label="Sessions joined:">{formatCount(stats.sessions_joined)}</Stat>
-            <Stat label="Leads found:">{formatCount(stats.leads_found)}</Stat>
+            <Stat label="Leads found:">{formatCount(leadsFound)}</Stat>
             {syncRow && <Stat label="Last cursor exists:">{hasSavedCursor ? "yes" : "no"}</Stat>}
             <Stat label="Stopped reason:">{stats.sync_stopped_reason ?? "—"}</Stat>
             <Stat label="Coverage:">{stats.profiles_coverage_percent != null ? `${stats.profiles_coverage_percent}%` : "total profiles unknown"}</Stat>
