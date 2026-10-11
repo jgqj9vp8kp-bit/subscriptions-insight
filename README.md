@@ -468,6 +468,82 @@ Known limits of Phase 2 (accepted, or waiting for a later phase):
 - **Capacity**: no per-member limit on parallel restricted requests yet (each request runs at most 3
   ClickHouse queries at once) — the step-9 cap and the Phase 8 ClickHouse user are the gate.
 
+### Payment health P0 — rollout (data fixes, in this order)
+
+A separate release with a before / after comparison (plan "Payment System Health", phase P0, owner
+decision 1). It changes data, not pages: raw CSV rows are paired with transactions by Primer id, the
+32 mis-paired `raw_payload` rows are repaired, `transactions.country_code` is filled (FunnelFox
+country), `transactions.refund_observed_at` appears (trigger-owned), `analytics_transactions` gains
+the payment health columns (`raw_status`, MID, descriptor, CIT/MIT, decline codes, 3DS, ...), and
+Payment Pass stops counting CANCELLED / PENDING rows as attempts. Details: DEVELOPER_NOTES.md
+"Payment health P0". Nothing changes `status` (CANCELLED / PENDING stay `failed`) and no cohort anchor
+moves — the comparison below proves it.
+
+1. **Before**: run every statement of `scripts/sql/p0_before_after.sql` (read-only, one statement per
+   `npx supabase db query --linked --project-ref wsjbpkderyhdefukppvb "<statement>"` call) and keep
+   the output. Expected on 2026-10-11 data: 0% country fill, 32 mismatched raw ids (all repairable),
+   8 status / 4 processor disagreements (#5, both sides present; 6 of the 8 flip the outcome), 14
+   card-type disagreements and 3 success rows with a decline bucket (#7), 0 refunds with
+   `refund_observed_at`.
+2. **Apply `202610110001_payment_health_p0.sql` alone** — out of band, never `supabase db push` (it
+   would also apply any other pending file), and record it:
+
+   ```text
+   npx supabase db query --linked -f supabase/migrations/202610110001_payment_health_p0.sql
+   npx supabase migration repair --status applied 202610110001
+   ```
+
+   (or paste the file into the Dashboard SQL Editor; either way one transaction). It refuses to run
+   before `202610070001`. It adds the column + trigger, backfills `refund_observed_at` of the refunded
+   rows with `updated_at` (approximate), repairs the mis-paired rows from the row that holds the
+   correct payload, rebuilds their `normalized_payload->'raw'` and drops their derived `card_type` /
+   `normalized_decline_reason` / `decline_message` keys (the ClickHouse mapper and the browser
+   hydration read those first and fall back to the payload only when they are absent; both re-derive
+   them from the repaired payload, and the Integrations "repair legacy normalized payloads" action
+   re-persists them whenever it is next run), fills `country_code` from `metadata.ff_country_code`
+   (safe parse), and aborts if a mismatched row whose correct payload exists is left. The NOTICE
+   lines report the three counts. Idempotent.
+3. **After**: run `scripts/sql/p0_before_after.sql` again. #2 (trial anchors: count and checksum) must
+   be identical; #4 `repairable`, #5 and #7 must be 0; #3 fill rate ~37.5%; #6 `with_observed_at` =
+   `refunded_rows`. Stop here if #2 differs.
+4. **Deploy every function** with `npm run deploy:functions` (above). The backfill build selects
+   `refund_observed_at`, so it must come AFTER step 2 (before it, every `clickhouse-backfill` batch
+   read fails on the missing column and the post-import auto-sync reports "failed"; nothing is written).
+   Press step 5's **Init immediately after** the deploy finishes, and let **no CSV import** (its
+   post-import auto-sync) and **no Continue Backfill** run in between: the new backfill build inserts
+   the 24 payment-health columns, and ClickHouse rejects the batch (unknown JSONEachRow fields) until
+   Init adds them. A run in that window first evicts the batch's rows (DELETE before INSERT), so they
+   are missing from every ClickHouse surface until the next successful run after Init rewrites them
+   (the cursor does not advance on a failed batch, so that run does).
+5. **ClickHouse Init** once from Integrations (adds the columns, `ADD COLUMN IF NOT EXISTS`), then a
+   **full backfill** from Integrations (`mode: full_backfill`, Continue until `completed`; ~68k rows,
+   a few minutes). Until it completes, the new columns are `''` / 0 / NULL on the rows not yet rewritten
+   and Payment Pass keeps its old denominator (`raw_status = ''` rows are kept).
+6. **Deploy the frontend**: new imports pair raw rows by id and show "Raw rows unpaired" in the
+   warehouse summary (0 expected; a non-zero count means a transaction whose id has no raw row stored
+   its own normalized subset as `raw_payload` — never a neighbouring CSV row — and the raw-row index
+   should be looked at).
+
+Numbers that change (expected, not regressions):
+
+- **Payment Pass / Banks attempts** drop by the CANCELLED + PENDING rows (168 + 48 on 2026-10-10
+  data, ~0.3% of attempts); approvals do not move, so every pass rate rises slightly (Stripe CIT cards
+  the most, ~+1.7 pp). Users → declines and the cohort / revenue numbers do not change.
+- **Transactions country**: ClickHouse `country_code` already fell back to the user's country, so it
+  moves only where a transaction's FunnelFox country differs from the user's; measure with #3.
+- **32 rows** get their own raw payload: 6 change raw status, 4 change processor in the ClickHouse
+  columns derived from `raw_payload` (`processor`, issuer, network, decline fields); their `card_type`
+  and `decline_reason` are re-derived from their own payload (14 card types change, 3 success rows
+  lose the decline bucket a neighbour's DECLINED payload gave them); `status` and the amounts never
+  move.
+- **Refund dates** exist from now on (`refund_observed_at`): approximate (`updated_at` of the row at
+  rollout) for refunds observed before 2026-10-11, the first import that saw the refund afterwards.
+
+Rollback: the migration is additive (the column, trigger and `app.*` helpers can stay); the repaired
+payloads and the filled countries are the correct data and are not rolled back. Redeploying the
+previous functions is safe (they ignore the new columns). To undo the Payment Pass denominator alone,
+revert `ATTEMPT_RAW_STATUS_EXCLUSION` in `paymentAnalytics.ts` and redeploy.
+
 ### Supabase Edge Function secret
 
 ```text

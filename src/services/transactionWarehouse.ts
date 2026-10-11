@@ -1,6 +1,6 @@
 import { publicRuntimeConfig } from "@/config/publicRuntimeConfig";
 import { supabase } from "@/services/supabaseClient";
-import { addCohortFields, backfillTransactionCardTypesFromRawRows, classifyUserTransactions } from "@/services/palmerTransform";
+import { addCohortFields, backfillTransactionCardTypesFromRawRows, classifyUserTransactions, rawPalmerRowTransactionId } from "@/services/palmerTransform";
 import { declineDetailsForTransaction } from "@/services/paymentFailures";
 import { sha256Hex } from "@/services/sha256";
 import { traceAsync, traceEvent, traceRequest } from "@/services/performanceTrace";
@@ -46,6 +46,11 @@ export interface WarehouseImportSummary {
   skipped: number;
   failed: number;
   potentialDuplicates: number;
+  /** Transactions whose raw CSV row was not found by transaction_id. They
+   * store their own normalized subset (row.raw) as raw_payload — never a
+   * neighbouring CSV row, which is what index pairing did before P0 — so a
+   * non-zero count means the raw-row index missed: visible, never silent. */
+  rawRowsUnpaired: number;
   dateRange: DateRangeSummary | null;
   overlapsExisting: boolean;
   duplicateFile: boolean;
@@ -57,9 +62,16 @@ export interface DateRangeSummary {
   to: string;
 }
 
+/** How raw CSV rows are matched to transactions. "id" (Palmer raw imports):
+ * by the transaction_id each raw row produces, because transformPalmerRows
+ * re-sorts the output. "index" (clean-template imports): applyMapping keeps
+ * the CSV order, so rows[i] IS rawRows[i] by construction. */
+export type RawRowPairing = "id" | "index";
+
 export interface WarehouseImportInput {
   rows: Transaction[];
   rawRows?: Record<string, unknown>[];
+  rawRowPairing?: RawRowPairing;
   filename?: string;
   fileSize?: number;
   source?: string;
@@ -229,14 +241,15 @@ export async function normalizeForWarehouse(
     transaction_id: transactionId,
   };
   const sourceName = row.traffic_source === "unknown" ? null : row.traffic_source;
-  const countryCode =
-    typeof row.raw?.ff_country_code === "string"
-      ? row.raw.ff_country_code
-      : typeof row.metadata?.ff_country_code === "string"
-        ? row.metadata.ff_country_code
-        : typeof row.metadata?.country_code === "string"
-          ? row.metadata.country_code
-          : null;
+  // transactions.country_code = the FunnelFox country (metadata.ff_country_code,
+  // parsed by parseMetadata) and nothing else — never the billing or issuer
+  // country. The Primer CSV has no top-level ff_country_code column, and the
+  // old `typeof raw.ff_country_code === "string"` test took its empty string
+  // first, so the column was empty on 100% of rows (plan F). Migration
+  // 202610110001 backfills history with the same source.
+  const countryCode = [row.metadata?.ff_country_code, row.raw?.ff_country_code]
+    .map((value) => (typeof value === "string" ? value.trim() : ""))
+    .find((value) => value) ?? null;
 
   return {
     user_id: normalizeText(row.user_id),
@@ -262,23 +275,57 @@ export async function normalizeForWarehouse(
   };
 }
 
+/** Raw CSV rows keyed by the transaction_id they produce (palmerTransform's
+ * id aliases, `palmer-row-N` fallback). The first row wins a duplicate id,
+ * mirroring the `seen` dedupe of the transactions below. Keys are trimmed the
+ * way normalizeForWarehouse trims transaction_id (valueFrom returns the cell
+ * verbatim), so a whitespace-padded id still finds its own row. */
+export function indexRawRowsByTransactionId(rawRows: readonly Record<string, unknown>[]): Map<string, Record<string, unknown>> {
+  const byId = new Map<string, Record<string, unknown>>();
+  rawRows.forEach((rawRow, index) => {
+    const id = rawPalmerRowTransactionId(rawRow, index);
+    const key = normalizeText(id) ?? id;
+    if (!byId.has(key)) byId.set(key, rawRow);
+  });
+  return byId;
+}
+
 export async function prepareWarehouseRecords(input: {
   rows: Transaction[];
   rawRows?: Record<string, unknown>[];
+  rawRowPairing?: RawRowPairing;
   batchId: string | null;
   source: string;
-}): Promise<{ records: WarehouseTransactionRecord[]; failed: number; errors: string[] }> {
+}): Promise<{ records: WarehouseTransactionRecord[]; failed: number; rawRowsUnpaired: number; errors: string[] }> {
   const records: WarehouseTransactionRecord[] = [];
   const seen = new Set<string>();
   let failed = 0;
+  let rawRowsUnpaired = 0;
   const errors: string[] = [];
+  // Pair by Primer id, never by index: transformPalmerRows re-sorts the
+  // transactions (classifyUserTransactions), so input.rows[index] is not
+  // input.rawRows[index]. Index pairing stored another customer's raw row on
+  // 32 live rows that shared an event second (payment health P0 repair,
+  // migration 202610110001). A transaction whose id has no raw row never
+  // falls back to the positional row — that would store a neighbour's CSV row
+  // again and break the invariant raw_payload->>'id' = transaction_id the
+  // migration enforces; it stores its own normalized subset (row.raw, as the
+  // no-raw-rows path does) and is counted, so the miss is visible.
+  // Clean-template imports opt into "index" explicitly (order preserved).
+  const rawById = input.rawRows && (input.rawRowPairing ?? "id") === "id" ? indexRawRowsByTransactionId(input.rawRows) : null;
 
   for (const [index, row] of input.rows.entries()) {
     try {
       if (!row.event_time || Number.isNaN(new Date(row.event_time).getTime())) {
         throw new Error("event_time is required");
       }
-      const record = await normalizeForWarehouse(row, input.rawRows?.[index], input.batchId, input.source);
+      let rawRow = rawById ? undefined : input.rawRows?.[index];
+      if (rawById) {
+        const ownRow = rawById.get(normalizeText(row.transaction_id) ?? "");
+        if (ownRow) rawRow = ownRow;
+        else rawRowsUnpaired += 1;
+      }
+      const record = await normalizeForWarehouse(row, rawRow, input.batchId, input.source);
       if (seen.has(record.transaction_id)) continue;
       seen.add(record.transaction_id);
       records.push(record);
@@ -288,7 +335,7 @@ export async function prepareWarehouseRecords(input: {
     }
   }
 
-  return { records, failed, errors };
+  return { records, failed, rawRowsUnpaired, errors };
 }
 
 export async function summarizeWarehouseUpsert(
@@ -462,6 +509,7 @@ export async function importTransactionsToWarehouse(input: WarehouseImportInput)
     const prepared = await prepareWarehouseRecords({
       rows: input.rows,
       rawRows: input.rawRows,
+      rawRowPairing: input.rawRowPairing,
       batchId,
       source,
     });
@@ -476,6 +524,7 @@ export async function importTransactionsToWarehouse(input: WarehouseImportInput)
       skipped: upsertSummary.skipped,
       failed: prepared.failed,
       potentialDuplicates: upsertSummary.potentialDuplicates,
+      rawRowsUnpaired: prepared.rawRowsUnpaired,
       dateRange,
       overlapsExisting: upsertSummary.overlapsExisting,
       duplicateFile: Boolean(previousBatch),
@@ -495,6 +544,7 @@ export async function importTransactionsToWarehouse(input: WarehouseImportInput)
         overlaps_existing_transactions: summary.overlapsExisting,
         potential_duplicate_rows: summary.potentialDuplicates,
         failed_rows: prepared.failed,
+        raw_rows_unpaired: prepared.rawRowsUnpaired,
         errors: prepared.errors.slice(0, 25),
       },
     });

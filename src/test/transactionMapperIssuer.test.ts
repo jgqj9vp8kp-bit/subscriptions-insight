@@ -121,16 +121,19 @@ describe("issuer columns through the mapper", () => {
     expect(rows[0].issuer_key).toBe("unknown");
   });
 
-  it("the six new fields sit at the tail of the emitted row object", () => {
-    // The ClickHouse INSERT relies on positional column order matching the
-    // CREATE TABLE tail; the platform column comment documents this discipline.
+  it("the six issuer fields follow platform and precede the payment health P0 tail", () => {
+    // Columns are appended in CREATE TABLE order (schema.ts tail discipline);
+    // the P0 columns (payment health, 2026-10-11) come after these six.
     const { rows } = mapSupabaseTransactionsToClickHouse({
       authUserId: "auth_1",
       rows: [row({ transaction_id: "t1", raw: SUTTON })],
     });
     const keys = Object.keys(rows[0]);
-    expect(keys.slice(-6)).toEqual([
+    const at = keys.indexOf("issuer_key");
+    expect(keys[at - 1]).toBe("platform");
+    expect(keys.slice(at, at + 6)).toEqual([
       "issuer_key", "issuer_name", "issuer_group", "issuer_country", "card_network", "payment_method",
     ]);
+    expect(keys[at + 6]).toBe("raw_status");
   });
 });

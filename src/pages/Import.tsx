@@ -738,6 +738,9 @@ export default function ImportPage() {
         const summary = await importTransactionsToWarehouse({
           rows,
           rawRows: importMode === "palmer_raw" ? rawRows : parsed.rows,
+          // Palmer raw rows are re-sorted by the classifier: pair them by Primer
+          // id. A mapped clean-template import keeps the CSV order.
+          rawRowPairing: importMode === "palmer_raw" ? "id" : "index",
           filename: sourceKind === "csv" ? sourceLabel : undefined,
           fileSize: sourceFileSize,
           source: importMode === "palmer_raw" ? "palmer_csv" : "primer_csv",
@@ -753,7 +756,9 @@ export default function ImportPage() {
         void triggerAutoClickHouseSync();
         const warehouseRows = await refreshLocalAnalyticsCacheFromWarehouse();
         setWarehouseMessage(
-          `Warehouse updated: ${summary.inserted} inserted, ${summary.updated} updated, ${summary.skipped} skipped, ${summary.failed} failed. Analytics now use ${warehouseRows.length} merged DB transactions.`,
+          `Warehouse updated: ${summary.inserted} inserted, ${summary.updated} updated, ${summary.skipped} skipped, ${summary.failed} failed` +
+            `${summary.rawRowsUnpaired ? `, ${summary.rawRowsUnpaired} with no matching raw row (own normalized subset stored)` : ""}. ` +
+            `Analytics now use ${warehouseRows.length} merged DB transactions.`,
         );
         await refreshLocalCacheInfo();
       } catch (error) {
@@ -1859,7 +1864,7 @@ export default function ImportPage() {
         )}
 
         {warehouseSummary && (
-          <div className="mb-3 grid gap-2 text-xs sm:grid-cols-4 lg:grid-cols-7">
+          <div className="mb-3 grid gap-2 text-xs sm:grid-cols-4 lg:grid-cols-8">
             {[
               ["Total", warehouseSummary.totalRows],
               ["Estimated new", warehouseSummary.inserted],
@@ -1868,13 +1873,14 @@ export default function ImportPage() {
               ["Updated", warehouseSummary.updated],
               ["Skipped", warehouseSummary.skipped],
               ["Failed", warehouseSummary.failed],
+              ["Raw rows unpaired", warehouseSummary.rawRowsUnpaired],
             ].map(([label, value]) => (
               <div key={label} className="rounded-md border border-border bg-muted/20 p-2">
                 <div className="text-muted-foreground">{label}</div>
                 <div className="mt-1 font-mono text-sm font-semibold text-foreground">{value}</div>
               </div>
             ))}
-            <div className="sm:col-span-4 lg:col-span-7 space-y-1 text-muted-foreground">
+            <div className="sm:col-span-4 lg:col-span-8 space-y-1 text-muted-foreground">
               <div>
                 Last imported date range:{" "}
                 <span className="font-mono text-foreground">

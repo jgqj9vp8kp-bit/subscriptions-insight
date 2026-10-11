@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  ATTEMPT_RAW_STATUS_EXCLUSION,
   PaymentAnalyticsRequestError,
   normalizePaymentAnalyticsRequest,
   stagedWith,
@@ -46,6 +47,25 @@ describe("clickhouse-payment-analytics SQL safety", () => {
     expect(sql).not.toMatch(/normalized_payload/);
     // canonical warehouse decline_reason is used (not a client re-derivation)
     expect(sql).toContain("decline_reason");
+  });
+});
+
+describe("payment health P0: attempts exclude CANCELLED / PENDING through raw_status (plan G)", () => {
+  it("allrows filters on raw_status; the classifier CTE and the status column are untouched", () => {
+    const params: Record<string, unknown> = {};
+    const sql = stagedWith("user-9", _EMPTY_FILTERS, params);
+    expect(ATTEMPT_RAW_STATUS_EXCLUSION).toBe("raw_status NOT IN ('CANCELLED', 'PENDING')");
+    const allrows = sql.indexOf("allrows AS (");
+    expect(allrows).toBeGreaterThan(0);
+    const exclusion = sql.indexOf(ATTEMPT_RAW_STATUS_EXCLUSION);
+    // inside allrows, after the tenant predicate — never in the classifier CTEs before it
+    expect(exclusion).toBeGreaterThan(allrows);
+    expect(sql.slice(0, allrows)).not.toContain("raw_status");
+    expect(sql.slice(allrows)).toContain(`WHERE auth_user_id = {auth_user_id:String} AND ${ATTEMPT_RAW_STATUS_EXCLUSION}`);
+    // status mapping is not the mechanism: no status = 'cancelled' / 'pending' anywhere
+    expect(sql).not.toMatch(/status\s*(=|IN)\s*\(?\s*'(cancelled|pending)'/i);
+    // exactly one occurrence: one attempt list feeds every aggregation
+    expect(sql.split(ATTEMPT_RAW_STATUS_EXCLUSION).length - 1).toBe(1);
   });
 });
 

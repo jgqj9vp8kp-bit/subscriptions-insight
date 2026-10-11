@@ -85,8 +85,11 @@ const DEFAULT_BATCH_SIZE = 2000;
 const DEFAULT_MAX_BATCHES = 10;
 const DEFAULT_SOFT_TIMEOUT_MS = 45_000;
 
+// refund_observed_at exists from migration 202610110001 (payment health P0) on:
+// apply it before deploying this build, or every batch read fails on the
+// missing column (README "Payment health P0").
 const TRANSACTION_SELECT =
-  "id,auth_user_id,user_id,transaction_id,external_transaction_id,import_batch_id,source,event_time,status,transaction_type,amount_gross,amount_net,amount_refunded,currency,email,country_code,campaign_path,funnel,source_name,raw_payload,normalized_payload,created_at,updated_at,deleted_at";
+  "id,auth_user_id,user_id,transaction_id,external_transaction_id,import_batch_id,source,event_time,status,transaction_type,amount_gross,amount_net,amount_refunded,currency,email,country_code,campaign_path,funnel,source_name,raw_payload,normalized_payload,refund_observed_at,created_at,updated_at,deleted_at";
 
 function clampInt(value: unknown, fallback: number, min: number, max: number): number {
   const parsed = Number(value);

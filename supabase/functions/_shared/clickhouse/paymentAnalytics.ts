@@ -123,6 +123,17 @@ function inClause(col: string, values: string[], prefix: string, params: Record<
 // This dataset is UNFILTERED and date-basis-independent: it is materialized ONCE
 // per request into a Memory table (see materializeStaged) so the expensive
 // classifier scan runs a single time; every aggregation then filters that table.
+//
+// Attempts = Primer rows whose raw status is SETTLED / DECLINED / FAILED (plan G
+// `attempts`, payment health P0): CANCELLED and PENDING rows are not attempts
+// the issuer answered, so they leave the denominator here through raw_status.
+// Their `status` stays 'failed' on purpose (a new status value would make ~210
+// of them cohort anchors), so the classifier CTE still sees them as
+// failed_payment and they never occupy a lifecycle slot. Rows synced before the
+// P0 backfill carry raw_status '' and are kept, so the numbers move only once
+// the full backfill has run (README "Payment health P0", before/after check).
+export const ATTEMPT_RAW_STATUS_EXCLUSION = `raw_status NOT IN ('CANCELLED', 'PENDING')`;
+
 export function stagedWith(authUserId: string, _filters: PaymentAnalyticsFilters, params: Record<string, unknown>): string {
   params.auth_user_id = authUserId;
   const stageFrom = (lv: string) => `multiIf(${lv}<=1,'first_subscription',${lv}=2,'renewal_2',${lv}=3,'renewal_3','renewal_n')`;
@@ -134,7 +145,7 @@ allrows AS (
     is_success, is_failed, status, decline_reason, funnel, campaign_path, campaign_id, media_buyer, country_code, card_type,
     issuer_key, issuer_name, issuer_group, issuer_country, card_network, payment_method,
     toString(toDate(event_time)) event_day_tx, toString(cohort_date) event_day_cohort
-  FROM ${CH} FINAL WHERE auth_user_id = {auth_user_id:String}
+  FROM ${CH} FINAL WHERE auth_user_id = {auth_user_id:String} AND ${ATTEMPT_RAW_STATUS_EXCLUSION}
 ),
 uattr AS (
   SELECT ar.uid uid,

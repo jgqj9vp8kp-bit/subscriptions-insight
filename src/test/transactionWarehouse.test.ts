@@ -71,6 +71,27 @@ describe("transaction warehouse import logic", () => {
     expect(record.normalized_payload.transaction_id).toBe("tx_1");
   });
 
+  it("country_code is the FunnelFox country: metadata.ff_country_code first, raw.ff_country_code second, blank -> null", async () => {
+    // Payment health P0: the Primer CSV has no top-level ff_country_code
+    // column and the old `typeof raw.ff_country_code === "string"` test took
+    // its empty string first, so the column was empty on 100% of rows. The
+    // precedence is asserted here on hand-built rows (palmerTransform now
+    // copies the metadata value into raw too, so a transform-based fixture
+    // cannot tell the warehouse half apart).
+    const metadataOnly = await normalizeForWarehouse(tx({ raw: { ff_country_code: "" }, metadata: { ff_country_code: "US" } }), undefined, "batch_1", "palmer_csv");
+    expect(metadataOnly.country_code).toBe("US");
+
+    const blankEverywhere = await normalizeForWarehouse(tx({ raw: { ff_country_code: "  " }, metadata: {} }), undefined, "batch_1", "palmer_csv");
+    expect(blankEverywhere.country_code).toBeNull();
+
+    const metadataFirst = await normalizeForWarehouse(tx({ raw: { ff_country_code: "DE" }, metadata: { ff_country_code: "US" } }), undefined, "batch_1", "palmer_csv");
+    expect(metadataFirst.country_code).toBe("US");
+
+    // raw alone still fills it (rows whose metadata was not parsed)
+    const rawOnly = await normalizeForWarehouse(tx({ raw: { ff_country_code: "BR" } }), undefined, "batch_1", "palmer_csv");
+    expect(rawOnly.country_code).toBe("BR");
+  });
+
   it("dedupes overlapping rows inside one import before upsert", async () => {
     const prepared = await prepareWarehouseRecords({
       rows: [tx({ transaction_id: "tx_1" }), tx({ transaction_id: "tx_1", amount_usd: 99 })],

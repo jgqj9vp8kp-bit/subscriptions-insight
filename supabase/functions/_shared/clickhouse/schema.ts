@@ -64,7 +64,31 @@ CREATE TABLE IF NOT EXISTS ${ANALYTICS_TRANSACTIONS_TABLE}
     issuer_group LowCardinality(String) DEFAULT '',
     issuer_country LowCardinality(String) DEFAULT '',
     card_network LowCardinality(String) DEFAULT '',
-    payment_method LowCardinality(String) DEFAULT ''
+    payment_method LowCardinality(String) DEFAULT '',
+    raw_status LowCardinality(String) DEFAULT '',
+    processor_merchant_id LowCardinality(String) DEFAULT '',
+    statement_descriptor LowCardinality(String) DEFAULT '',
+    initiation_type LowCardinality(String) DEFAULT '',
+    ff_billing_reason LowCardinality(String) DEFAULT '',
+    payment_type_flag LowCardinality(String) DEFAULT '',
+    primer_decline_code LowCardinality(String) DEFAULT '',
+    issuer_result_code LowCardinality(String) DEFAULT '',
+    advice_code LowCardinality(String) DEFAULT '',
+    advised_action LowCardinality(String) DEFAULT '',
+    lifecycle_event LowCardinality(String) DEFAULT '',
+    decline_record_count UInt8 DEFAULT 0,
+    decline_type LowCardinality(String) DEFAULT '',
+    three_ds_response LowCardinality(String) DEFAULT '',
+    three_ds_challenge LowCardinality(String) DEFAULT '',
+    three_ds_version LowCardinality(String) DEFAULT '',
+    is_network_tokenized LowCardinality(String) DEFAULT '',
+    account_number_type LowCardinality(String) DEFAULT '',
+    amount_authorized Decimal(20, 6) DEFAULT 0,
+    billing_country LowCardinality(String) DEFAULT '',
+    payment_instrument_key String DEFAULT '',
+    price_point LowCardinality(String) DEFAULT '',
+    price_id LowCardinality(String) DEFAULT '',
+    refund_observed_at Nullable(DateTime64(3, 'UTC'))
 )
 ENGINE = ReplacingMergeTree(row_version)
 PARTITION BY toYYYYMM(event_time)
@@ -145,6 +169,67 @@ export const ALTER_ISSUER_COLUMNS_SQL = [
   `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS issuer_country LowCardinality(String) DEFAULT ''`,
   `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS card_network LowCardinality(String) DEFAULT ''`,
   `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS payment_method LowCardinality(String) DEFAULT ''`,
+];
+
+// Payment health P0 (plan T, 2026-10-11). Same tail-append discipline. Every
+// column is PER-TRANSACTION and read from the stored raw_payload by the mapper
+// (transactionMapper.ts), so a full backfill fills them for history:
+//   raw_status            Primer status verbatim (SETTLED / DECLINED / FAILED /
+//                         CANCELLED / PENDING). `status` is NOT changed for
+//                         CANCELLED / PENDING (they stay 'failed'): a new status
+//                         value would turn ~210 such rows into cohort anchors.
+//                         Payment Pass excludes them from attempts through this
+//                         column instead (paymentAnalytics.ts allrows).
+//   processor_merchant_id / statement_descriptor   the PSP account (MID) and the
+//                         descriptor; shown only as registry labels later.
+//   initiation_type       'cit' | 'mit' | '' (metadata.ff_initiation_type).
+//   ff_billing_reason / payment_type_flag          metadata.ff_billing_reason,
+//                         metadata.paymentType ('UNSCHEDULED' marks upsells).
+//   primer_decline_code … lifecycle_event           the LAST declineReasons record
+//                         (final outcome); decline_record_count keeps how many
+//                         records the cell held (>1 = cascade / retry inside one
+//                         payment, plan G `cascade_rows`); decline_type is derived
+//                         from advised_action (declineReasons.ts).
+//   three_ds_*            paymentInstrumentThreeDSecureAuthentication{ResponseCode,
+//                         ChallengeIssued, ProtocolVersion}; challenge is a
+//                         tri-state 'true' / 'false' / '' (absent is not false:
+//                         3DS ran on 0.19% of rows).
+//   is_network_tokenized  tri-state text for the same reason; account_number_type
+//                         paymentInstrumentBinDataAccountNumberType.
+//   amount_authorized     amountAuthorized in the ORIGINAL currency with the same
+//                         minor-unit normalization as amount (0 when absent).
+//   billing_country       customerBillingAddressCountryCode (never the FunnelFox
+//                         country_code, which keeps its meaning).
+//   payment_instrument_key paymentInstrumentAnalyticsId (the card fingerprint
+//                         without BIN / last4), the retry-chain key.
+//   price_point / price_id metadata.ff_price_point / ff_price_id.
+//   refund_observed_at    transactions.refund_observed_at (migration
+//                         202610110001): when the import first saw the refund.
+export const ALTER_PAYMENT_HEALTH_COLUMNS_SQL = [
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS raw_status LowCardinality(String) DEFAULT ''`,
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS processor_merchant_id LowCardinality(String) DEFAULT ''`,
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS statement_descriptor LowCardinality(String) DEFAULT ''`,
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS initiation_type LowCardinality(String) DEFAULT ''`,
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS ff_billing_reason LowCardinality(String) DEFAULT ''`,
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS payment_type_flag LowCardinality(String) DEFAULT ''`,
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS primer_decline_code LowCardinality(String) DEFAULT ''`,
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS issuer_result_code LowCardinality(String) DEFAULT ''`,
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS advice_code LowCardinality(String) DEFAULT ''`,
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS advised_action LowCardinality(String) DEFAULT ''`,
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS lifecycle_event LowCardinality(String) DEFAULT ''`,
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS decline_record_count UInt8 DEFAULT 0`,
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS decline_type LowCardinality(String) DEFAULT ''`,
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS three_ds_response LowCardinality(String) DEFAULT ''`,
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS three_ds_challenge LowCardinality(String) DEFAULT ''`,
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS three_ds_version LowCardinality(String) DEFAULT ''`,
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS is_network_tokenized LowCardinality(String) DEFAULT ''`,
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS account_number_type LowCardinality(String) DEFAULT ''`,
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS amount_authorized Decimal(20, 6) DEFAULT 0`,
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS billing_country LowCardinality(String) DEFAULT ''`,
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS payment_instrument_key String DEFAULT ''`,
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS price_point LowCardinality(String) DEFAULT ''`,
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS price_id LowCardinality(String) DEFAULT ''`,
+  `ALTER TABLE ${ANALYTICS_TRANSACTIONS_TABLE} ADD COLUMN IF NOT EXISTS refund_observed_at Nullable(DateTime64(3, 'UTC'))`,
 ];
 
 // Sorting key note (load-bearing): it must contain ONLY stable identity
@@ -514,7 +599,7 @@ export async function initializeClickHouseSchema(input: {
   // updated_at-millis scale; no-op once the table carries timestamp versions.
   await rebuildAnalyticsTransactionsRowVersion(client);
   await client.command({ query: CREATE_FACT_USER_COHORTS_SQL });
-  for (const query of [...ALTER_PLATFORM_COLUMNS_SQL, ...ALTER_ISSUER_COLUMNS_SQL]) {
+  for (const query of [...ALTER_PLATFORM_COLUMNS_SQL, ...ALTER_ISSUER_COLUMNS_SQL, ...ALTER_PAYMENT_HEALTH_COLUMNS_SQL]) {
     await client.command({ query });
   }
   await ensureFactSupportRequestsSchema(client);

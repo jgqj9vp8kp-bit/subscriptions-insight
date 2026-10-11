@@ -282,6 +282,15 @@ function transactionIdFrom(row: RawPalmerRow, index: number): string {
   return valueFrom(row, FIELD_ALIASES.transaction_id) || `palmer-row-${index + 1}`;
 }
 
+/** The transaction_id a raw Palmer / Primer row produces (its `id` column
+ * through the same aliases normalizePalmerRows uses, or the positional
+ * fallback). The warehouse import pairs every transaction with its raw row by
+ * this id — never by array index: classifyUserTransactions re-sorts the
+ * transactions, so index N of the output is not row N of the CSV. */
+export function rawPalmerRowTransactionId(row: RawPalmerRow, index: number): string {
+  return transactionIdFrom(row, index);
+}
+
 function rawTransactionMatchKey(row: RawPalmerRow, index: number): string {
   const metadata = parseMetadata(row);
   return [
@@ -352,7 +361,10 @@ export function normalizePalmerRows(rows: RawPalmerRow[]): Transaction[] {
       metadata,
       raw: {
         metadata,
-        ff_country_code: valueFrom(row, ["ff_country_code"]),
+        // The Primer CSV has no top-level ff_country_code column: the FunnelFox
+        // country lives in metadata.ff_country_code (parsed above). Mirrored in
+        // SQL by app.palmer_normalized_raw (migration 202610110001).
+        ff_country_code: valueFrom(row, ["ff_country_code"]) || metadataString(metadata, "ff_country_code"),
         paymentInstrumentBinDataAccountFundingType: valueFrom(row, ["paymentInstrumentBinDataAccountFundingType"]),
         status: valueFrom(row, ["status"]),
         processor: valueFrom(row, ["processor"]),

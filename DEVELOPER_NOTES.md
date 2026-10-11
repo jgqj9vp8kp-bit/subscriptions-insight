@@ -36,6 +36,116 @@ of non-deleted Supabase transactions (66,370 == 66,370 after the cleanup);
 a gap means copies again. Do not "fix" this in the classifier — deduping
 `(uid, tid)` there would hide doubled revenue rather than remove it.
 
+## Payment health P0: raw-row pairing, raw_status, decline parser, refund_observed_at (2026-10-11)
+
+Plan "Payment System Health" phase P0 (owner decision 1). Rollout: README "Payment health P0".
+
+**Raw-row pairing by Primer id.** `prepareWarehouseRecords` (src/services/transactionWarehouse.ts)
+used `rawRows[index]` for `rows[index]`, but `transformPalmerRows` re-sorts the transactions
+(`classifyUserTransactions` returns newest-first), so output index N is not CSV row N. 32 live rows
+got another customer's `raw_payload` (same event second, 5 s apart at most; 6 with the opposite raw
+status, 4 with another processor). Now the raw rows are indexed by the transaction_id they produce
+(`rawPalmerRowTransactionId`: the same `id` aliases `normalizePalmerRows` uses, `palmer-row-N` as the
+fallback; keys trimmed like the lookup, so a whitespace-padded id still matches) and every
+transaction takes its own row. A transaction whose id has no raw row never falls back to the
+positional row (that would store a neighbour's CSV row again): it stores its own normalized subset
+(`row.raw`, as the no-raw-rows path does) and is counted: `WarehouseImportSummary.rawRowsUnpaired`,
+the "Raw rows unpaired" tile on Import, `import_batches.metadata.raw_rows_unpaired`. The 32 history rows
+were repaired by migration `202610110001` from the row that holds the correct payload
+(`raw_payload->>'id' = transaction_id`, same account, snapshots taken in one materialized CTE so a
+swapped pair does not interfere); their `normalized_payload->'raw'` was rebuilt with
+`app.palmer_normalized_raw`, the SQL mirror of the `raw: {...}` subset `normalizePalmerRows` writes
+(`app.palmer_raw_value` = `valueFrom`, `app.palmer_parse_metadata` = `parseMetadata`; the PGlite test
+proves the SQL output equals the TypeScript output). The migration also drops the three keys
+`normalized_payload` derives from the payload (`card_type`, `normalized_decline_reason`,
+`decline_message`) on those rows: the ClickHouse mapper (`cardTypeFromTransaction`,
+`declineDetailsForTransaction`) and the browser hydration read them FIRST and fall back to the payload
+only when they are absent, and `repairLegacyNormalizedPayloads` had derived them from the merged
+(mis-paired) `raw_payload` — 3 success rows carried a decline bucket a neighbour's DECLINED payload
+gave them, 14 card types disagreed with the payload (`p0_before_after.sql` #7). Dropped, both
+consumers re-derive them from the repaired payload (`normalized_payload->'raw'` carries the funding
+type and `declineReasons`, so the slim startup fetch needs no `raw_payload`); the Integrations repair
+action re-persists them from the correct payload whenever it is next run. Rows without a normalized
+`raw` object keep their keys (the slim fetch would have nothing to re-derive them from). Rule:
+`raw_payload->>'id' = transaction_id` on 100% of `palmer_csv` rows (`scripts/sql/p0_before_after.sql`
+#4 / #5).
+
+**`country_code` in Postgres.** The Primer CSV has no top-level `ff_country_code` column; the
+FunnelFox country lives in `metadata.ff_country_code` (parsed by `parseMetadata`). `normalizeForWarehouse`
+tested `typeof raw.ff_country_code === "string"` first, which the empty string satisfied, so the
+column was empty on 100% of rows. It now takes the first non-blank of `metadata.ff_country_code` /
+`raw.ff_country_code` (and `raw.ff_country_code` itself now falls back to the metadata value). The
+semantics are unchanged: the FunnelFox country, never the billing or the issuer country (those are
+`billing_country` / `issuer_country` in ClickHouse). The migration backfilled history from the
+metadata JSON with a safe parse (`app.try_jsonb_object`; invalid JSON -> skipped; a stored value is
+never changed). ClickHouse `country_code` already fell back to metadata and to the user's country
+(`transactionMapper.ts` / `userCountry.ts`), so analytics move only where the two differ.
+
+**`transactions.refund_observed_at`.** The Primer export has no refund date; a refund is only
+`amount_refunded > 0` on the original payment. The trigger `transactions_set_refund_observed_at`
+(`app.transactions_refund_observed_at`, BEFORE INSERT OR UPDATE) stamps `now()` once when
+`amount_refunded` goes from null / 0 to > 0 (or on an INSERT that already carries a refund) and then
+keeps OLD's value whatever an UPDATE says: an import rewrites the whole row (upsert), so a browser-
+written column would be lost, and an explicit NULL or a refund amount back to 0 does not clear it. A
+statement that supplies a value on the transition keeps it (the migration backfill: `updated_at` of
+every refunded row at rollout — APPROXIMATE, the last rewrite of the row, not the refund; the column
+comment says so). The exact date arrives with the settlement report / FunnelFox refund webhook (P3 /
+P6). The value rides into ClickHouse `refund_observed_at` (`Nullable(DateTime64(3,'UTC'))`) through
+`backfill.ts` `TRANSACTION_SELECT` — which is why the P0 functions must be deployed AFTER the
+migration — and ClickHouse Init must be pressed immediately after the deploy, with no CSV import
+(post-import auto-sync) and no Continue Backfill in between: the new build inserts the 24
+payment-health columns and ClickHouse rejects the batch (unknown JSONEachRow fields) until Init adds
+them; the batch's rows are evicted (DELETE before INSERT) until the next successful run after Init
+rewrites them (the cursor does not advance on a failed batch). README "Payment health P0" step 4.
+
+**New `analytics_transactions` columns** (`schema.ts` `ALTER_PAYMENT_HEALTH_COLUMNS_SQL`, appended
+at the tail, `ADD COLUMN IF NOT EXISTS`, filled by `paymentHealthColumns` in `transactionMapper.ts`
+from `raw_payload` with `normalized_payload.raw` as the fallback for legacy rows; a full backfill
+fills history): `raw_status` (Primer status verbatim), `processor_merchant_id`, `statement_descriptor`,
+`initiation_type` ('cit' | 'mit' | ''), `ff_billing_reason`, `payment_type_flag`,
+`primer_decline_code`, `issuer_result_code`, `advice_code`, `advised_action`, `lifecycle_event`,
+`decline_record_count` (UInt8), `decline_type`, `three_ds_response`, `three_ds_challenge`,
+`three_ds_version`, `is_network_tokenized`, `account_number_type`, `amount_authorized`,
+`billing_country`, `payment_instrument_key` (`paymentInstrumentAnalyticsId`: the card fingerprint
+without BIN / last4, the retry-chain key), `price_point`, `price_id`, `refund_observed_at`.
+Conventions: absent = `''` (never 'unknown'); `three_ds_challenge` and `is_network_tokenized` are
+tri-state text ('true' / 'false' / '') because absent is not false (3DS ran on 0.19% of rows);
+`amount_authorized` is in the ORIGINAL currency with the amount's minor-unit rule (`normalizeAmount`:
+JPY has no minor unit, decimal cells are not divided), 0 when absent. The decline columns come from
+the LAST `declineReasons` record (the final outcome of a cascade / retry inside one payment);
+`decline_record_count` keeps how many records the cell held (362 rows > 1, plan G `cascade_rows`).
+`decline_type` is DERIVED from `advised_action` (`declineTypeFromAdvisedAction`): RETRY_LATER ->
+'soft', DO_NOT_RETRY / STOP_ALL_PAYMENTS -> 'hard', UPDATE_DATA -> 'update', else '' — Primer's own
+SOFT / HARD lives in the Payments API, not in the CSV. The existing `decline_reason` bucket is
+untouched (still `paymentFailures.ts` over the first record).
+
+**`parseDeclineReasons` (`_shared/clickhouse/declineReasons.ts`, pure).** The cell is the Python
+repr of a list of dicts: single-quoted strings, double-quoted when the value holds an apostrophe,
+backslash escapes when it holds both, `None` / `True` / `False`, commas inside messages, several
+records per cell; sometimes real JSON (`[]`, `null`). A small recursive-descent parser over the
+literal subset both syntaxes share (lists, dicts, strings in either quote with escapes, numbers,
+the literals) returns `DeclineRecord[]` with every known field present (`''` for None / missing,
+'true' / 'false' for booleans, unknown keys ignored); a cell that is neither falls back to a
+quote-anchored per-field extraction (records rebuilt positionally) so the mapper never throws. The
+query-time regexes in `users.ts` (`declineMessageSQL`) and `paymentFailures.ts`
+(`parseDeclineReasonRecords`) are unchanged and keep working: `raw_payload` holds the same cell.
+
+**Payment Pass denominator (plan G `attempts`).** `paymentAnalytics.ts` `allrows` now adds
+`raw_status NOT IN ('CANCELLED', 'PENDING')` (`ATTEMPT_RAW_STATUS_EXCLUSION`): attempts =
+SETTLED / DECLINED / FAILED. Banks shares the staged table, so it moves with it. `status` is NOT
+changed (`normalizeStatus` still maps CANCELLED / PENDING to `failed`): a new status value would turn
+~210 such rows without an earlier payment into trial anchors and shift cohorts, revenue and
+`fact_user_cohorts` app-wide. Rows synced before the full backfill carry `raw_status = ''` and are
+kept, so the numbers move only once the backfill has run. Users → declines (`users.ts`) keeps its own
+attempt list and is unchanged.
+
+**Reports.** `reportCollect.ts` `processor_split`: the "no Adyen transactions" note was stale (Adyen
+rows exist since 2026-07-30, `processor` is in the warehouse); the metric stays unavailable until the
+split is wired into reports.
+
+**Still open after P0** (plan AC): the PII / card-fragment cleanup of the two ClickHouse JSON columns
+is postponed (owner decision 2).
+
 ## Known Limitations
 
 - Palmer column names can vary by export. `palmerTransform.ts` supports common aliases, but new exports may require additional aliases.

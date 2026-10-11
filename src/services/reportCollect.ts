@@ -50,7 +50,9 @@ export const KNOWN_REPORT_GAPS: readonly ReportGap[] = [
   {
     key: "processor_split",
     label: "Разрез Stripe / Adyen",
-    reason: "В витрине нет транзакций Adyen — сравнение процессоров из текущих данных не строится.",
+    reason:
+      "Разрез по процессору есть в складе с 2026-07-30 (колонка processor; транзакции Adyen идут с этой даты), " +
+      "но в отчёты он ещё не подключён — метрика пока недоступна.",
     affectsSections: ["geo_payments"],
     manualEntryAvailable: false,
   },

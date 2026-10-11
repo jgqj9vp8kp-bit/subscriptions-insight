@@ -4,9 +4,11 @@ import { cardTypeForUserTransactions, cardTypeFromTransaction } from "./userCard
 import { platformForUserTransactions, platformFromTransaction, type Platform } from "./userPlatform.ts";
 import { issuerCountryFromTransaction, issuerIdentityFromTransaction } from "./cardIssuer.ts";
 import { cardNetworkFromTransaction, paymentMethodFromTransaction } from "./cardNetwork.ts";
-import { countryCodeForUserTransactions, countryCodeFromTransaction } from "./userCountry.ts";
+import { countryCodeForUserTransactions, countryCodeFromTransaction, normalizeCountryCode } from "./userCountry.ts";
 import { mediaBuyerForUserTransactions, utmSourceFromTransaction } from "./userMediaBuyer.ts";
 import { isTokenPurchaseTransaction, productIdForTransaction } from "./monetization.ts";
+import { normalizeAmount } from "./palmerTransform.ts";
+import { declineTypeFromAdvisedAction, finalDeclineRecord, parseDeclineReasons, type DeclineType } from "./declineReasons.ts";
 import type { CardType, MediaBuyer, Transaction } from "./serviceTypes.ts";
 
 export type SupabaseTransactionRow = {
@@ -31,6 +33,8 @@ export type SupabaseTransactionRow = {
   source_name?: string | null;
   raw_payload?: Record<string, unknown> | null;
   normalized_payload?: Record<string, unknown> | null;
+  /** When an import first saw amount_refunded > 0 (migration 202610110001). */
+  refund_observed_at?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
   deleted_at?: string | null;
@@ -93,6 +97,32 @@ export type ClickHouseTransactionRow = {
   issuer_country: string;
   card_network: string;
   payment_method: string;
+  // Payment health P0 columns (schema.ts ALTER_PAYMENT_HEALTH_COLUMNS_SQL, same
+  // order). Appended at the tail like every column added since platform.
+  raw_status: string;
+  processor_merchant_id: string;
+  statement_descriptor: string;
+  initiation_type: "cit" | "mit" | "";
+  ff_billing_reason: string;
+  payment_type_flag: string;
+  primer_decline_code: string;
+  issuer_result_code: string;
+  advice_code: string;
+  advised_action: string;
+  lifecycle_event: string;
+  decline_record_count: number;
+  decline_type: DeclineType;
+  three_ds_response: string;
+  three_ds_challenge: "true" | "false" | "";
+  three_ds_version: string;
+  is_network_tokenized: "true" | "false" | "";
+  account_number_type: string;
+  amount_authorized: number;
+  billing_country: string;
+  payment_instrument_key: string;
+  price_point: string;
+  price_id: string;
+  refund_observed_at: string | null;
 };
 
 export interface MapperDiagnostics {
@@ -222,6 +252,90 @@ function processorFrom(tx: Transaction, row: SupabaseTransactionRow): string {
     text(row.raw_payload?.processor) ||
     text(row.normalized_payload?.processor)
   );
+}
+
+// ---- payment health P0 columns (plan T) ----------------------------------------
+//
+// Read from the stored raw_payload, i.e. the Primer CSV row verbatim; tx.raw is
+// { ...normalized_payload.raw, ...raw_payload } (toTransaction), so a legacy row
+// whose raw_payload lacks a key falls back to the normalized copy of it.
+
+/** A JSON object, parsed from text when the CSV cell is still a string. */
+function objectFrom(value: unknown): Record<string, unknown> | null {
+  if (isRecord(value)) return value;
+  if (typeof value !== "string" || !value.trim()) return null;
+  try {
+    const parsed = JSON.parse(value);
+    return isRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Python / JSON booleans as exported ('True', 'true', 'False', ...) -> a
+ * tri-state text: '' when the cell is absent or anything else. Absent must stay
+ * distinguishable from false (3DS and tokenization have partial coverage). */
+function triState(value: unknown): "true" | "false" | "" {
+  if (typeof value === "boolean") return value ? "true" : "false";
+  const token = text(value).toLowerCase();
+  if (token === "true" || token === "1") return "true";
+  if (token === "false" || token === "0") return "false";
+  return "";
+}
+
+function initiationType(value: unknown): "cit" | "mit" | "" {
+  const token = text(value).toLowerCase();
+  return token === "cit" || token === "mit" ? token : "";
+}
+
+export type PaymentHealthColumns = Pick<
+  ClickHouseTransactionRow,
+  | "raw_status" | "processor_merchant_id" | "statement_descriptor" | "initiation_type" | "ff_billing_reason" | "payment_type_flag"
+  | "primer_decline_code" | "issuer_result_code" | "advice_code" | "advised_action" | "lifecycle_event" | "decline_record_count"
+  | "decline_type" | "three_ds_response" | "three_ds_challenge" | "three_ds_version" | "is_network_tokenized" | "account_number_type"
+  | "amount_authorized" | "billing_country" | "payment_instrument_key" | "price_point" | "price_id" | "refund_observed_at"
+>;
+
+/** The P0 columns of one row. `currency` is the ORIGINAL currency of the
+ * attempt: amountAuthorized is exported in the same minor units as amount, so
+ * it takes the same currency-aware normalization (JPY has no minor unit). */
+export function paymentHealthColumns(input: {
+  tx: Transaction;
+  row: Pick<SupabaseTransactionRow, "refund_observed_at">;
+  currency: string;
+}): PaymentHealthColumns {
+  const raw = isRecord(input.tx.raw) ? input.tx.raw : {};
+  // raw_payload.metadata is the JSON string of the CSV cell; the normalized copy
+  // (tx.metadata) is the parsed object. Either form, the same keys.
+  const metadata = objectFrom(raw.metadata) ?? objectFrom(input.tx.metadata) ?? {};
+  const records = parseDeclineReasons(raw.declineReasons);
+  const last = finalDeclineRecord(records);
+  return {
+    raw_status: text(raw.status).toUpperCase().replace(/[\s-]+/g, "_"),
+    processor_merchant_id: text(raw.processorMerchantId),
+    statement_descriptor: text(raw.statementDescriptor),
+    initiation_type: initiationType(metadata.ff_initiation_type),
+    ff_billing_reason: text(metadata.ff_billing_reason),
+    payment_type_flag: text(metadata.paymentType),
+    primer_decline_code: last?.decline_reason ?? "",
+    issuer_result_code: last?.payment_method_result_code ?? "",
+    advice_code: last?.payment_method_advice_code ?? "",
+    advised_action: last?.advised_action ?? "",
+    lifecycle_event: last?.transaction_lifecycle_event ?? "",
+    decline_record_count: Math.min(records.length, 255),
+    decline_type: declineTypeFromAdvisedAction(last?.advised_action),
+    three_ds_response: text(raw.paymentInstrumentThreeDSecureAuthenticationResponseCode),
+    three_ds_challenge: triState(raw.paymentInstrumentThreeDSecureAuthenticationChallengeIssued),
+    three_ds_version: text(raw.paymentInstrumentThreeDSecureAuthenticationProtocolVersion),
+    is_network_tokenized: triState(raw.paymentInstrumentIsNetworkTokenized),
+    account_number_type: text(raw.paymentInstrumentBinDataAccountNumberType),
+    amount_authorized: Math.abs(normalizeAmount(raw.amountAuthorized, input.currency)),
+    billing_country: normalizeCountryCode(raw.customerBillingAddressCountryCode) ?? "",
+    payment_instrument_key: text(raw.paymentInstrumentAnalyticsId),
+    price_point: text(metadata.ff_price_point),
+    price_id: text(metadata.ff_price_id),
+    refund_observed_at: input.row.refund_observed_at && dateOrNull(input.row.refund_observed_at) ? dateTimeKey(input.row.refund_observed_at) : null,
+  };
 }
 
 function toTransaction(row: SupabaseTransactionRow): Transaction | null {
@@ -386,6 +500,7 @@ export function mapSupabaseTransactionToClickHouse(input: {
   const cohortDate = tx.cohort_date || firstTrial?.event_time.slice(0, 10) || (tx.transaction_type === "trial" ? tx.event_time.slice(0, 10) : dateKey(tx.event_time));
   const rawPayload = input.row.raw_payload ?? tx.raw ?? {};
   const normalizedPayload = input.row.normalized_payload ?? tx;
+  const currency = String(conversion.original_currency ?? tx.currency ?? "").toUpperCase();
 
   return {
     auth_user_id: input.authUserId,
@@ -406,7 +521,7 @@ export function mapSupabaseTransactionToClickHouse(input: {
     transaction_type: transactionType,
     payment_stage: paymentStage(transactionType),
     subscription_level: subscriptionLevel(transactionType),
-    currency: String(conversion.original_currency ?? tx.currency ?? "").toUpperCase(),
+    currency,
     original_amount: conversion.original_amount,
     gross_amount_usd: grossUsd,
     net_amount_usd: convertMoney(net),
@@ -444,6 +559,7 @@ export function mapSupabaseTransactionToClickHouse(input: {
     issuer_country: issuerCountry,
     card_network: cardNetwork,
     payment_method: paymentMethod,
+    ...paymentHealthColumns({ tx, row: input.row, currency }),
   };
 }
 
