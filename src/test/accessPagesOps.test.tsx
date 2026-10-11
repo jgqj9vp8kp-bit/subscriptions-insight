@@ -146,6 +146,7 @@ vi.mock("@/services/clickhouse", async (importOriginal) => {
     testClickHouseConnection: vi.fn(),
     initializeClickHouseSchema: vi.fn(),
     runClickHouseBackfill: vi.fn(),
+    runClickHouseBackfillToCompletion: vi.fn(),
     runClickHouseValidation: vi.fn(),
     invalidateClickHouseSummaryCache: vi.fn(),
     autoSyncClickHouseAfterImport: vi.fn(),
