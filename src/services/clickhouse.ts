@@ -560,17 +560,107 @@ export interface AutoSyncResult {
   last?: ClickHouseBackfillResult;
 }
 
+// One Edge request maps and inserts at most max_batches × batch_size rows. The
+// Edge runtime bills CPU time per request, and the payment-health mapping (24
+// columns parsed out of the raw payload) pushed a 2,000-row batch close to that
+// budget: in production (2026-10-11) 10-batch runs were killed in their second
+// or third batch without writing their state, which then held the run lease for
+// BACKFILL_LEASE_STALE_MS. 250 × 2 keeps every pass far under the budget; the
+// loops below (auto-sync and the manual buttons) make up the difference with
+// more passes.
+export const BACKFILL_PASS_BATCH_SIZE = 250;
+export const BACKFILL_PASS_MAX_BATCHES = 2;
+
 // Same request the "Continue Backfill" button sends (Integrations.tsx).
 const AUTO_SYNC_CONTINUE_REQUEST: ClickHouseBackfillRequest = {
   mode: "continue",
-  batch_size: 2000,
-  max_batches: 10,
+  batch_size: BACKFILL_PASS_BATCH_SIZE,
+  max_batches: BACKFILL_PASS_MAX_BATCHES,
   dry_run: false,
   full_reset_cursor: false,
 };
 // Safety ceiling on the catch-up loop (each pass covers up to
-// max_batches * batch_size = 20k rows → up to 1M rows before yielding).
-const AUTO_SYNC_MAX_LOOPS = 50;
+// max_batches * batch_size = 500 rows → up to 200k rows before yielding; a CSV
+// import is a few thousand rows).
+const AUTO_SYNC_MAX_LOOPS = 400;
+
+export type BackfillLoopStop = "completed" | "failed" | "already_running" | "no_progress" | "max_passes";
+
+export interface BackfillLoopProgress {
+  passes: number;
+  rows_scanned: number;
+  rows_inserted: number;
+  batches_processed: number;
+  last: ClickHouseBackfillResult;
+}
+
+export interface BackfillLoopResult extends BackfillLoopProgress {
+  stopped: BackfillLoopStop;
+  duration_ms: number;
+}
+
+export interface BackfillLoopOptions {
+  /** "full_backfill" resets the cursor on the first pass; every later pass continues. */
+  mode: "continue" | "full_backfill";
+  /** Ceiling on passes (each ≤ BACKFILL_PASS_MAX_BATCHES × BACKFILL_PASS_BATCH_SIZE rows). */
+  maxPasses?: number;
+  onProgress?: (progress: BackfillLoopProgress) => void;
+  /** Test seam: the per-pass request. */
+  run?: (request: ClickHouseBackfillRequest) => Promise<ClickHouseBackfillResult>;
+}
+
+/**
+ * The manual buttons' loop (Integrations.tsx): one small pass after another
+ * until the source is caught up. Same stop rules as the post-import auto-sync
+ * — completed, failed, the server lease held by another run, no forward
+ * progress — plus a pass ceiling. Never throws for a run outcome; a transport
+ * error propagates so the button shows it.
+ */
+export async function runClickHouseBackfillToCompletion(options: BackfillLoopOptions): Promise<BackfillLoopResult> {
+  const startedAt = Date.now();
+  const run = options.run ?? runClickHouseBackfill;
+  const maxPasses = Math.max(1, options.maxPasses ?? AUTO_SYNC_MAX_LOOPS);
+  const totals: BackfillLoopProgress = { passes: 0, rows_scanned: 0, rows_inserted: 0, batches_processed: 0, last: undefined as unknown as ClickHouseBackfillResult };
+  let stopped: BackfillLoopStop = "max_passes";
+  autoSyncActive = true;
+  try {
+    for (let pass = 0; pass < maxPasses; pass += 1) {
+      const first = pass === 0;
+      const result = await run({
+        mode: first ? options.mode : "continue",
+        batch_size: BACKFILL_PASS_BATCH_SIZE,
+        max_batches: BACKFILL_PASS_MAX_BATCHES,
+        dry_run: false,
+        full_reset_cursor: first && options.mode === "full_backfill",
+      });
+      totals.last = result;
+      // A refused pass (the server lease is held) read and wrote nothing: it is
+      // not a pass of ours.
+      if (result.stopped_reason === "already_running") { stopped = "already_running"; break; }
+      totals.passes += 1;
+      totals.rows_scanned += result.rows_scanned;
+      totals.rows_inserted += result.rows_inserted;
+      totals.batches_processed += result.batches_processed;
+      options.onProgress?.({ ...totals });
+      if (result.stopped_reason === "completed" || result.status === "completed" || result.status === "completed_with_inconsistencies") { stopped = "completed"; break; }
+      if (result.status === "failed") { stopped = "failed"; break; }
+      if (result.batches_processed === 0) { stopped = "no_progress"; break; }
+    }
+  } finally {
+    autoSyncActive = false;
+  }
+  if (stopped === "completed") triggerCohortMembershipRebuildAfterSync(totals.last);
+  return { ...totals, stopped, duration_ms: Date.now() - startedAt };
+}
+
+/** Toast line for a manual backfill loop. */
+export function describeClickHouseBackfillLoop(result: BackfillLoopResult, locale = "en-US"): string {
+  const rows = `${result.rows_inserted.toLocaleString(locale)} rows inserted in ${result.passes} pass${result.passes === 1 ? "" : "es"}`;
+  if (result.stopped === "already_running") return `${rows}. ${describeClickHouseBackfillResult(result.last, locale)}`;
+  if (result.stopped === "max_passes") return `${rows}; pass ceiling reached — press Continue Backfill to go on.`;
+  if (result.stopped === "no_progress") return `${rows}; the last pass made no progress (stopped: ${result.last.stopped_reason}).`;
+  return `${result.stopped}: ${rows}.`;
+}
 
 function triggerCohortMembershipRebuildAfterSync(last: ClickHouseBackfillResult | undefined): void {
   if (!last) return;

@@ -44,11 +44,15 @@ import {
 } from "@/services/capsuledFacebook";
 import {
   clickHouseStatusLabel,
+  BACKFILL_PASS_BATCH_SIZE,
+  BACKFILL_PASS_MAX_BATCHES,
+  describeClickHouseBackfillLoop,
   describeClickHouseBackfillResult,
   getClickHouseSummary,
   initializeClickHouseSchema,
   invalidateClickHouseSummaryCache,
   runClickHouseBackfill,
+  runClickHouseBackfillToCompletion,
   runClickHouseValidation,
   testClickHouseConnection,
   type ClickHouseBackfillResult,
@@ -431,18 +435,31 @@ export default function IntegrationsPage() {
     if (mode === "full_backfill" && !window.confirm("Run a full ClickHouse backfill from the beginning? This will not truncate ClickHouse or delete Supabase data.")) {
       return;
     }
-    const result = await runClickHouseAction(
-      controlled ? "controlled_backfill" : mode,
-      () => runClickHouseBackfill({
-        mode,
-        batch_size: controlled ? 1000 : 2000,
-        max_batches: controlled ? 2 : 10,
-        dry_run: false,
-        full_reset_cursor: mode === "full_backfill",
-      }),
-      (backfill) => describeClickHouseBackfillResult(backfill),
+    // Small passes, many of them: one Edge request must stay under the runtime's
+    // CPU budget (see BACKFILL_PASS_* in services/clickhouse.ts). "Controlled"
+    // runs a single pass; the other two loop until the source is caught up and
+    // show each pass as it lands.
+    if (controlled) {
+      const result = await runClickHouseAction(
+        "controlled_backfill",
+        () => runClickHouseBackfill({
+          mode,
+          batch_size: BACKFILL_PASS_BATCH_SIZE,
+          max_batches: BACKFILL_PASS_MAX_BATCHES,
+          dry_run: false,
+          full_reset_cursor: mode === "full_backfill",
+        }),
+        (backfill) => describeClickHouseBackfillResult(backfill),
+      );
+      if (result) setClickHouseLastBackfill(result);
+      return;
+    }
+    const loop = await runClickHouseAction(
+      mode,
+      () => runClickHouseBackfillToCompletion({ mode, onProgress: (progress) => setClickHouseLastBackfill(progress.last) }),
+      (result) => describeClickHouseBackfillLoop(result),
     );
-    if (result) setClickHouseLastBackfill(result);
+    if (loop) setClickHouseLastBackfill(loop.last);
   }
 
   // Resumable validation: one Edge call processes a bounded chunk; the client
