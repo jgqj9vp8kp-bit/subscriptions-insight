@@ -53,7 +53,9 @@ function def(
 }
 
 /** Privileged keys: full scope only, and only the Owner may grant them (SQL
- * enforces the same rule by `like 'admin.%' or in ('funnels.manage','api_export.use')`). */
+ * enforces the same rule: app.is_privileged_permission = `like 'admin.%'` or the
+ * explicit list funnels.manage, api_export.use, payment_health.psp_global.view,
+ * payment_health.manage_alerts — migrations 202610050002 and 202610120001). */
 function privileged(key: string, area: PermissionArea, label: string, description: string, requires: string[] = []): PermissionDef {
   return def(key, area, label, description, { requires, requiresFullScope: true, sensitive: "admin" });
 }
@@ -86,6 +88,27 @@ export const PERMISSION_CATALOG: readonly PermissionDef[] = Object.freeze([
   }),
   def("payment_pass.view", "pages", "Payment pass", "Open the Payment Pass analytics tab."),
   def("payment_pass.banks.view", "details", "Bank breakdown", "See the issuer / bank breakdown in Payment Pass analytics.", { requires: ["payment_pass.view"] }),
+
+  // ---- payment system health (plan X) ----------------------------------------
+  // Ordinary keys: no action of the module is scopeReady in the MVP, so a
+  // funnel-restricted member holding them still gets 403 scope_not_supported.
+  // The two privileged keys cover whole-tenant PSP account figures (PSP × MID,
+  // descriptors, later the network rates) and the alert writes: full scope only,
+  // Owner-granted (the SQL predicate lists them, migration 202610120001).
+  def("payment_health.view", "pages", "Payment health", "Open the Payment System Health page: approvals, declines, retries, refunds and complaints."),
+  def("payment_health.export", "exports", "Export payment health", "Download Payment System Health tables.", {
+    requires: ["payment_health.view"],
+    sensitive: "export",
+  }),
+  def("payment_health.risk_events.view", "details", "Risk events", "See dispute and fraud-report events once a source is connected (phase P3).", {
+    requires: ["payment_health.view"],
+  }),
+  privileged("payment_health.psp_global.view", "pages", "PSP accounts", "See PSP × MID and descriptor breakdowns (whole-tenant account figures, later the network rates).", [
+    "payment_health.view",
+  ]),
+  privileged("payment_health.manage_alerts", "pages", "Manage payment alerts", "Acknowledge, assign and resolve payment risk alerts (phase P2.5).", [
+    "payment_health.view",
+  ]),
 
   // ---- end users -------------------------------------------------------------
   def("users.view", "pages", "Users", "Open the Users page (aggregates)."),
@@ -150,7 +173,8 @@ export const ENFORCED_PERMISSION_KEYS: readonly string[] = Object.freeze(
   PERMISSION_CATALOG.filter((entry) => entry.status === "enforced").map((entry) => entry.key),
 );
 
-/** The requiresFullScope set: admin.*, funnels.manage, api_export.use. */
+/** The requiresFullScope set: admin.*, funnels.manage, api_export.use,
+ * payment_health.psp_global.view, payment_health.manage_alerts. */
 export const PRIVILEGED_PERMISSION_KEYS: ReadonlySet<string> = new Set(
   PERMISSION_CATALOG.filter((entry) => entry.requiresFullScope).map((entry) => entry.key),
 );

@@ -537,6 +537,8 @@ const CATCH_LINT_FILES = [
     "cohorts", "cohortMembership", "fbCohortStats", "users", "paymentAnalytics", "bankAnalytics", "revenueIntelligence", "support", "facebookStats",
     // access Phase 2: the scoped builders and the snapshot / campaign-scope / coverage runners.
     "cohortSubscriptions", "campaignScope", "pathCoverage", "cohortSnapshotState", "scopeSql",
+    // Payment health P2: the runner (its registry / snapshot / state reads are best effort).
+    "paymentHealth",
   ].map((name) => resolve(CLICKHOUSE_DIR, `${name}.ts`)),
   // The routers of the restricted-reachable functions (their catches wrap scoped runners).
   ...["clickhouse-cohorts", "clickhouse-revenue", "clickhouse-facebook", "clickhouse-cohort-membership"].map((fn) => resolve(FUNCTIONS_DIR, fn, "index.ts")),

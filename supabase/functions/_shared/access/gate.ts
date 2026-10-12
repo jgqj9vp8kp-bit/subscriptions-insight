@@ -41,7 +41,9 @@
 //   7. Any recorded scope violation → 500 scope_violation, whatever the handler
 //      returned or swallowed (R7).
 // Audit (§24, best effort, never changes a response): a 403 for an
-// authenticated user is counted (access_record_denial, deduplicated per day);
+// authenticated user is counted (access_record_denial, deduplicated per day),
+// whether the gate refused it or the handler raised it (ScopeForbiddenError,
+// or an error onError maps to 403);
 // a `write` action run by a member who is not the data owner writes one
 // sync.triggered / warehouse.admin row (access_write_audit). The `access`
 // function's own writes are audited in SQL, the data owner's are not audited,
@@ -447,7 +449,7 @@ export async function handleWithAccess<A extends string>(
       // A ScopeViolation is recorded by the reader before it throws; record it
       // here too in case it came from a reader built for another context.
       if (error instanceof Error && error.name === "ScopeViolation" && !ctx.violations.length) ctx.violations.push(error.message);
-      response = handlerErrorResponse(error, ctx, action);
+      response = await handlerErrorResponse(error, ctx, action);
     } finally {
       const opened = reader as ClickHouseClientLike | null;
       if (opened?.close) {
@@ -486,11 +488,24 @@ export async function handleWithAccess<A extends string>(
     await bestEffort(() => deps.writeAudit!(entry), log, "access_audit_not_written", { fn: policy.fn, request_id: requestId, action });
   };
 
-  const handlerErrorResponse = (error: unknown, ctx: AccessContext, action: A): Response => {
+  // §24: a 403 raised INSIDE the handler (a scope refusal, or a permission
+  // refusal the policy maps through onError, e.g. a PSP dimension named without
+  // its key) is a refusal of an authenticated user like any gate-level deny(),
+  // so it is counted the same way; without this the owner's denial counters
+  // would miss exactly the probing a privileged key exists to stop.
+  const countHandlerDenial = async (ctx: AccessContext, action: A, errorCode: string): Promise<void> => {
+    const actorUserId = ctx.actor.userId;
+    if (!actorUserId || !deps.recordDenial) return;
+    const entry: GateDenialEntry = { actorUserId, fn: policy.fn, action, errorCode, requestId };
+    await bestEffort(() => deps.recordDenial!(entry), log, "access_denial_not_recorded", { fn: policy.fn, request_id: requestId });
+  };
+
+  const handlerErrorResponse = async (error: unknown, ctx: AccessContext, action: A): Promise<Response> => {
     // Scope refusals raised by the scopeSql.ts helpers inside the handler: fixed
     // coded bodies, mapped before onError and exempt from the generic rewrite.
     if (error instanceof ScopeForbiddenError) {
       log("warn", "access_denied", { fn: policy.fn, request_id: requestId, status: 403, error_code: error.code, user_id: ctx.actor.userId, action, restricted: ctx.restricted });
+      await countHandlerDenial(ctx, action, error.code);
       return respond({ ok: false, error_code: error.code, error: ACCESS_ERROR_MESSAGES[error.code], request_id: requestId }, 403);
     }
     if (error instanceof ScopeSnapshotNotReadyError) {
@@ -510,7 +525,14 @@ export async function handleWithAccess<A extends string>(
       body = isRecord(mapped.body) ? { ...mapped.body } : { ok: false };
       if (body.request_id === undefined) body.request_id = requestId;
     }
-    log("error", "handler_failed", { fn: policy.fn, request_id: requestId, action, status, actor_kind: ctx.actor.kind, error: errorMessage(error) });
+    if (status === 403) {
+      // A mapped refusal is a denial, not a failed handler: logged and counted as one.
+      const errorCode = typeof body.error_code === "string" && body.error_code ? body.error_code : ACCESS_ERROR.PERMISSION_DENIED;
+      log("warn", "access_denied", { fn: policy.fn, request_id: requestId, status, error_code: errorCode, user_id: ctx.actor.userId, action, restricted: ctx.restricted });
+      await countHandlerDenial(ctx, action, errorCode);
+    } else {
+      log("error", "handler_failed", { fn: policy.fn, request_id: requestId, action, status, actor_kind: ctx.actor.kind, error: errorMessage(error) });
+    }
     // Generic body for every employee. The data owner keeps today's detailed
     // body, and so does the cron: it proved the shared secret, and its body only
     // lands in net._http_response, the owner's existing way to see why a tick

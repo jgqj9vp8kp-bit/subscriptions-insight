@@ -37,6 +37,7 @@ const CLICKHOUSE_REVENUE_FUNCTION = "clickhouse-revenue";
 const CLICKHOUSE_COHORT_MEMBERSHIP_FUNCTION = "clickhouse-cohort-membership";
 const CLICKHOUSE_USERS_FUNCTION = "clickhouse-users";
 const CLICKHOUSE_PAYMENT_ANALYTICS_FUNCTION = "clickhouse-payment-analytics";
+const CLICKHOUSE_PAYMENT_HEALTH_FUNCTION = "clickhouse-payment-health";
 const CLICKHOUSE_SUPPORT_FUNCTION = "clickhouse-support";
 const CLICKHOUSE_FACEBOOK_FUNCTION = "clickhouse-facebook";
 
@@ -800,6 +801,15 @@ export async function runClickHousePaymentAnalytics<T = unknown>(request: Record
 // so a downed warehouse fails the tab instantly instead of hanging it.
 export async function runClickHouseBankAnalytics<T = unknown>(request: Record<string, unknown>): Promise<T> {
   return clickHouseRequest<T>(CLICKHOUSE_PAYMENT_ANALYTICS_FUNCTION, request, { breakerGated: true });
+}
+
+// --- Payment System Health read path (clickhouse-payment-health) -----------
+// Six read actions (overview, declines, retries, refunds_support, sources,
+// options; paymentHealthContract.ts) behind payment_health.view. Breaker-gated
+// like Payment Pass: every action is a warehouse scan, and there is no legacy
+// in-browser engine to fall back to — the page shows the error instead.
+export async function runClickHousePaymentHealth<T = unknown>(request: Record<string, unknown>): Promise<T> {
+  return clickHouseRequest<T>(CLICKHOUSE_PAYMENT_HEALTH_FUNCTION, request, { breakerGated: true });
 }
 
 // --- Support Analytics read path + sync (clickhouse-support) --------------

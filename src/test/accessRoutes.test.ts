@@ -198,6 +198,20 @@ describe("funnel-restricted routes (Phase 2)", () => {
     for (const path of RESTRICTED_READY_ROUTES) expect(findRouteAccess(path)?.path, path).toBe(path);
   });
 
+  it("pins the /payment-health rule (after Transactions, payment_health.view, closed to restricted members)", () => {
+    const paths = ROUTE_ACCESS.map((rule) => rule.path);
+    expect(paths.indexOf("/payment-health")).toBe(paths.indexOf("/transactions") + 1);
+    expect(findRouteAccess("/payment-health")).toEqual({ path: "/payment-health", anyOf: ["payment_health.view"], restrictedReady: false });
+    expect(canAccessRoute("/payment-health", owner)).toBe(true);
+    expect(canAccessRoute("/payment-health", valueFor(okAccess({ permissions: ["payment_health.view"] })))).toBe(true);
+    // The PSP key alone never opens the page (it requires view; the UI only reads view).
+    expect(canAccessRoute("/payment-health", valueFor(okAccess({ permissions: ["payment_health.psp_global.view"] })))).toBe(false);
+    expect(canAccessRoute("/payment-health", viewer)).toBe(false);
+    expect(canAccessRoute("/payment-health", mediaBuyer)).toBe(false);
+    expect(canAccessRoute("/payment-health", valueFor(okAccess({ permissions: ["payment_health.view"], mode: "selected" })))).toBe(false);
+    expect(accessRuleDenial(findRouteAccess("/payment-health")!, valueFor(okAccess({ permissions: ["payment_health.view"], mode: "selected" })))).toBe("scope");
+  });
+
   it("pins the /admin/funnels rule (after the audit log, closed to restricted members)", () => {
     const paths = ROUTE_ACCESS.map((rule) => rule.path);
     expect(paths.indexOf("/admin/funnels")).toBe(paths.indexOf("/admin/audit") + 1);

@@ -379,6 +379,23 @@ describe("scope refusals raised inside the handler", () => {
     expect(pending.deps.log).toHaveBeenCalledWith("warn", "access_denied", expect.objectContaining({ status: 409, reason: "snapshot_missing" }));
   });
 
+  it("a scope refusal raised inside the handler is counted like a gate denial (§24); the 409 is not", async () => {
+    const outOfScope = makeDeps();
+    const refused = await handleWithAccess(request({ action: "cohort_read" }), POLICY, async () => { throw new ScopeForbiddenError("funnel_out_of_scope"); }, outOfScope.deps);
+    expect(refused.status).toBe(403);
+    expect(outOfScope.deps.recordDenial).toHaveBeenCalledTimes(1);
+    expect(outOfScope.deps.recordDenial).toHaveBeenCalledWith({ actorUserId: EMPLOYEE, fn: "phase2-fn", action: "cohort_read", errorCode: "funnel_out_of_scope", requestId: "req-p2" });
+    expect(outOfScope.deps.log).not.toHaveBeenCalledWith("error", "handler_failed", expect.anything());
+
+    const notSupported = makeDeps();
+    await handleWithAccess(request({ action: "fb_read" }), POLICY, async () => { throw new ScopeForbiddenError("scope_not_supported"); }, notSupported.deps);
+    expect(notSupported.deps.recordDenial).toHaveBeenCalledWith(expect.objectContaining({ action: "fb_read", errorCode: "scope_not_supported" }));
+
+    const pending = makeDeps();
+    await handleWithAccess(request({ action: "cohort_read" }), POLICY, async () => { throw new ScopeSnapshotNotReadyError("snapshot_missing"); }, pending.deps);
+    expect(pending.deps.recordDenial).not.toHaveBeenCalled();
+  });
+
   it("the data owner gets the same coded bodies (no raw message to fall back to)", async () => {
     const { deps } = makeDeps({ row: OWNER_ROW(), userId: DATA_KEY });
     const response = await handleWithAccess(request({ action: "cohort_read" }), POLICY, async () => { throw new ScopeSnapshotNotReadyError("stale"); }, deps);

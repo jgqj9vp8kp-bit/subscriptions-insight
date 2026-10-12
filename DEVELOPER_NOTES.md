@@ -146,6 +146,238 @@ split is wired into reports.
 **Still open after P0** (plan AC): the PII / card-fragment cleanup of the two ClickHouse JSON columns
 is postponed (owner decision 2).
 
+## Payment health P2 backend: clickhouse-payment-health (2026-10-12)
+
+Plan "Payment System Health" phase P2 (MVP, owner decisions 3 / 4 / 10): the server side of the
+Payment System Health page. Rollout: README "Payment health P2". Files: Edge function
+`supabase/functions/clickhouse-payment-health/index.ts`, policy
+`_shared/access/policies/clickhouse-payment-health.ts`, runner `_shared/clickhouse/paymentHealth.ts`,
+contract `_shared/clickhouse/paymentHealthContract.ts` (request / response shapes the browser data
+source imports), migration `202610120001_payment_health_permissions.sql`. Tests:
+`accessEdgePaymentHealth.test.ts` (gate), `paymentHealthClickhouse.test.ts` (SQL + parity on
+fixtures), `paymentHealthPermissionsMigration.test.ts` (PGlite), `support/paymentHealthFixtures.ts`
+(a semantic ClickHouse responder: it answers the runner's statements from fixture rows with the
+SQL's own window / period / filter / group-by semantics, dispatched on the `/* ph:<name> */` marker
+every statement carries, so the parity expectations are computed independently of the runner).
+
+**Actions** (body `action`, POST only, no default; every other value is 400 `unknown_action`):
+`overview`, `declines`, `retries`, `refunds_support`, `sources`, `options`. All need
+`payment_health.view`; none is scopeReady (a funnel-restricted member gets 403 `scope_not_supported`,
+like Payment Pass; the restricted variant is plan P7).
+
+**PSP dimensions behind `payment_health.psp_global.view`** (plan X; the task's "gate or strip" choice:
+strip). Processor, merchant account (MID) and descriptor are whole-tenant account figures. A caller
+without the privileged key (the data owner always has it) still gets every action, but: the overview's
+`psp_mid_rows` is `[]` and `what_changed` skips the processor / merchant_account dimensions; the
+options' `processor` / `merchant_account` / `descriptor` lists are `[]` and `dimensions` omits the
+three; the retries rows carry `processor: null`, `merchant_account: null`; the complaints
+`by_account` is `[]`; `meta.psp_global_visible` is false. A request that NAMES a PSP filter or
+dimension without the key is refused with 403 `permission_denied` (`PaymentHealthPermissionError`
+through `paymentHealthErrorResponse`), never answered with other numbers than it asked for; the default
+dimension is `funnel` for such a caller, `processor` otherwise.
+
+**Request** (`normalizePaymentHealthRequest`): `date_from` / `date_to` (YYYY-MM-DD, inclusive;
+default the last 30 days up to today UTC; at most 400 days; a longer or inverted window is 400
+`invalid_request`), `filters` (`processor[]` keys as options lists them incl. `unrouted`;
+`merchant_account[]` and `descriptor[]` OPAQUE ids from options; `funnel[]` anchor campaign paths or
+`unattributed`; `country[]` issuer-country codes or `unknown`; `card_network[]`, `payment_method[]`
+upper-cased; `initiation[]` cit / mit / unknown; `transaction_type[]` raw column values; lists
+de-duplicated after normalization, 200 values each), `dimension` (declines / refunds_support
+breakdown: processor, merchant_account, descriptor, funnel, country, card_network, payment_method,
+initiation, stage). The comparison window is the previous window of the same length (`compare`), read
+in the SAME scan as the current one (`period` column).
+
+**SQL** (`attemptCtes`, CTE-only, no scratch table, every statement binds `{auth_user_id:String}`):
+`anchors` (the validated `fact_user_cohorts` snapshot: `clickhouse_cohort_snapshot_state` through
+`activeCohortSnapshotVersion`; no snapshot → versions bound as `''`, every row `unattributed`,
+`meta.funnel_attribution.status = 'no_snapshot'`) → `src` (`analytics_transactions FINAL` of the
+window, `raw_status NOT IN ('CANCELLED', 'PENDING')` = `ATTEMPT_RAW_STATUS_EXCLUSION`, LEFT JOIN
+anchors on `user_id = canonical_user_id`; raw columns aliased `*_raw` where a derived column reuses
+the name — an alias shadowing the column its expression reads is a ClickHouse cyclic-alias trap) →
+`base` (derived: `period`, `processor` = upper or `unrouted`, `initiation` (`unknown` for ''),
+`stage` (`STAGE_SQL`: a success's type; a decline's `declined_<ff_billing_reason>` else
+`declined_mit` / `declined_cit` / `declined_unknown` — a heuristic, labelled), `card_network`,
+`payment_method`, `country` = `issuer_country` (98.4% filled vs 77.4% billing; `COUNTRY_BASIS`),
+`funnel`) → `att` (the request's filters; MID / descriptor ids are mapped back to the raw values
+through the registry and bound as `(processor, processor_merchant_id) IN ((…), …)` tuples, an unknown
+id is 400). Attempts = `count()`, successes = `sum(is_success)`, amounts = `sumIf(amount_usd,
+is_success = 1)`: parity with Payment Pass on attempts / successes by processor and day is a test.
+
+**Decline classes**: the grouped SQL carries the raw code columns (`is_success, lifecycle_event,
+issuer_result_code, primer_decline_code, advice_code, advised_action, decline_type, card_network_raw,
+proc, cascade_row, three_ds`) and the Edge classifies each group with `classifyDecline`
+(`declineTaxonomy.ts`) — one taxonomy, never a SQL copy of it. `issuer_fraud_declines` is the
+`issuer_suspected_fraud` class (the issuer's suspicion code, never "fraud"). The overview's trend
+groups by day (≤ 120-day windows) or Monday-week (`toStartOfWeek(day, 1)`) with the code columns, so
+the per-bucket fraud-suspicion count is classified the same way.
+
+**Registry labels** (`loadDimensionRegistry`): `public.psp_accounts` (service role, `auth_user_id =
+tenant`) × the distinct `(processor, MID, descriptor)` triples of the tenant's attempts (`/* ph:registry
+*/`, also the warehouse's first / last attempt day = `meta.data_through`). Known MID → `{ key:
+psp_accounts.id, label }`; unknown MID → `key 'unlabelled:<16-hex keyed hash>'`, label "Unlabelled
+MID" (`labelled: false` — run `psp_accounts_sync` after an import; the runner does not call it, see
+README); no MID → `none:<processor>` / "No MID". Descriptors: `key 'd:<16-hex keyed hash>'`, label
+"<Processor> descriptor #n" numbered per processor by first seen, or "<prefix> (<account label>)"
+when a registry `descriptor_prefix` of that processor matches. The keyed hash is
+`sha256(tenantKey|kind|processor|value)` (`opaqueId`): stable within the workspace, meaningless
+outside it; raw MIDs, descriptors and instrument keys never leave the server.
+
+**retries**: the window's attempt rows plus `RETRY_LOOKBACK_DAYS` (30) before it (a ban issued before
+the window still bans), minimal columns (`event_time` as `toUnixTimestamp64Milli` → ISO in the Edge,
+never a local-time parse), `ORDER BY event_time, transaction_id LIMIT {row_cap}` with
+`ATTEMPT_ROW_CAP + 1` (300,001) → `meta.limited.attempt_rows`. `computeRetries` runs
+`buildAttemptChains` + `retryCompliance` and keeps chains that STARTED in the window, post-ban attempts
+and rolling windows that END in it; the summaries are recomputed over that subset
+(`post_ban.within_window`). The report is memoized per `tenantKey | sha256(range + filters)` for
+`PAYMENT_HEALTH_MEMO_TTL_MS` (60 s, 16 entries, in-flight coalescing, a failed load never cached —
+the leads.ts pattern); the memo holds the PSP-visible report and `stripRetriesForViewer` nulls the
+account references for a caller without the key. Post-ban rows: newest 200, instrument = keyed hash,
+no transaction ids; rolling windows: the pairs over the limit (≤ 100). Each cap that was hit is said in
+`meta.limited` (`attempt_rows`, `post_ban_attempts`, `rolling_windows`; the declines action likewise
+reports `code_mix` when more than `CODE_MIX_LIMIT` code groups were cut), so the UI's "cap hit" badge
+appears instead of a truncated list posing as the whole. `cascade_rows` is the plan G definition in every
+tab — every row with `decline_record_count > 1`, a payment that settled after an in-payment cascade
+included — accumulated from the SQL `cascade_row` flag, not from the decline classification.
+
+**refunds_support**: refunds by original payment date (`is_success = 1 AND is_refund = 1`, the
+Primer row stays SETTLED with `amount_refunded > 0`), by dimension (both windows) and by month
+(current); timing buckets from `refund_observed_at` (`dateDiff('day', event_time, refund_observed_at)`
+≤ 7 / 30 / 90 / beyond; `unobserved` = refunded rows synced before P0). Complaints (`/* ph:complaints
+*/`): `fact_support_requests FINAL` of both windows by `request_date`, attributed to the LAST settled
+payment of `matched_user_id` within `COMPLAINT_ATTRIBUTION_DAYS` (30) before `received_at`
+(`argMax(proc, paid_at)` over an INNER JOIN on the user with the time predicate; settled rows read from
+30 days before the baseline window), else `unattributed` (also when `matched_user_id` is ''). By
+received month with the `classification_version` set and a `version_break` flag (the set differs from
+the previous month: plan F), by category, by account (current window, PSP key only).
+`support_unauthorized_rate` = flagged requests over the window's settled payments **regardless of the
+request's filters**: a support request carries no funnel / country / network / initiation, so the
+numerator cannot be filtered and the denominator comes from a second filter-free statement (`/*
+ph:settled_counts */`, settled payments of both windows per processor × MID) rather than the filtered
+`att` CTE — numerator and denominator describe the same population. The PSP × MID row carries the same
+figure per account as `complaint_rate` (server-computed; the browser never divides the complaints by
+the filtered successes). `COMPLAINT_NOTE` says so in `meta.estimates`.
+
+**sources**: tenant-wide coverage per P0 column (`countIf(col != '')` / `> 0` over attempt rows;
+decline-record coverage over declines, `refund_observed_at` over refunded rows), warehouse bounds and
+`max(clickhouse_synced_at)` (read as `toUnixTimestamp64Milli` and returned as ISO with a zone — a
+zone-less ClickHouse DateTime text would be parsed as LOCAL time by the browser), the last `import_batches` row (`user_id = tenant`: imported_at, status,
+counts, source — not the filename), the transactions sync state reduced to lifecycle fields (status,
+updated_at, last_run_at — no cursor, counters or error text), support requests by month with versions,
+and the metric dictionary with `available` = phase P1 / P2.
+
+**options**: one scan of the whole tenant history through the same base (`window 1970-01-02 …
+2100-12-31`, inside the ClickHouse `Date` range; no filters; `ARRAY JOIN` of `(dimension, value)`
+tuples → one GROUP BY), the registry lists for the PSP key, `bounds` from the registry.
+
+**meta** on every response: `range`, `compare`, `data_through` (newest attempt day), `incomplete`
+(`range.to` after it: the manual import has not covered the window, plan P), `lag_days`,
+`funnel_attribution`, `country_basis`, `psp_global_visible`, `limited`, `estimates` (plain-language
+notes: the anchor funnel differs from Payment Pass's per-user split, chains are a heuristic, the
+network rules are unverified, refund dates are approximate, the complaint rule, the maturity rule),
+`definitions` (metric dictionary keys), `query_duration_ms`. No diagnostics beyond that (no tenant-wide
+counters a filtered action would not already return).
+
+**Maturity of the comparisons** (`maturityOf`, computed once per run so `meta.incomplete` and the
+comparisons cannot drift): every `comparePeriods` call gets `{ immature }` — `immature` = the
+incomplete flag for the approval, issuer-suspicion and per-class rates; for `refund_rate` and
+`support_unauthorized_rate`, which are time-to-event figures by original payment date (the newest
+window is structurally lower because its payments have had fewer days to be refunded or complained
+about), `refund_immature` = incomplete OR `data_through` less than `REFUND_MATURITY_DAYS` (30, the
+contract) past `range.to`. An immature comparison carries `significance_reason: 'immature_period'`
+and is never `significant` (the UI draws the grey "incomplete period" badge from it). The overview's
+trend is filled over the whole window (`trendBuckets`: every day, or every Monday from the week of
+`range.from`): a bucket without attempts is a zero point and a bucket after `data_through` is flagged
+`incomplete` — only a filled series can show that, since `data_through` is the newest attempt day.
+
+**Errors**: `PaymentHealthRequestError` → 400 `invalid_request`; `PaymentHealthPermissionError` →
+403 `permission_denied` — counted by `access_record_denial` like a gate-level refusal (the gate's
+`handlerErrorResponse` records any 403 the handler raises, `ScopeForbiddenError` included, and logs it
+as `access_denied`, not `handler_failed`); anything else → the gate's 502 (sanitized for employees); a
+`ScopeViolation` is rethrown from every best-effort catch (snapshot state, sync state) and becomes 500
+`scope_violation`. Timeout 55 s like clickhouse-payment-analytics.
+
+**Live SQL not yet exercised.** The statements are proven on the recording client and the semantic
+fixture responder, not against ClickHouse: the first live call should be the owner's, on the
+`sources` and `options` actions first (one statement each), then `overview`.
+
+## Payment health P2 frontend: /payment-health (2026-10-12)
+
+The page over the function above (README "Payment System Health (page)" for what each tab means).
+Files: page `src/pages/PaymentHealth.tsx`; components `src/components/payment-health/*`
+(`PaymentHealthFilterBar`, `OverviewTab`, `DeclinesTab`, `RetriesTab`, `RefundsComplaintsTab`,
+`SourcesTab`, `DimensionSelect`, `shared.tsx` = QueryFrame / comparison cells / MetaNotes /
+Sparkline / placeholder, `format.ts` + `model.ts` + `pageState.ts` = pure helpers); data source
+`src/services/paymentHealthDataSource.ts`; cache keys `src/services/paymentHealthCache.ts`; hook
+`src/hooks/usePaymentHealth.ts`; invoke `runClickHousePaymentHealth` in `src/services/clickhouse.ts`
+(breaker-gated like Payment Pass, no legacy engine). Tests: `paymentHealthPage.test.tsx` (every tab
+from typed fixtures, filters, persistence, PSP stripping, 403 → NoAccess, leak scan),
+`paymentHealthDataSource.test.ts` (request builders against the server normalizer, shape check,
+typed errors, cache keys, page state, formatting rules), `paymentHealthHooks.test.tsx` (partition
+keys, no retry on 4xx, SWR), `support/paymentHealthResponses.ts` (fixtures with planted sentinels);
+`accessShell.test.tsx` / `accessRoutes.test.ts` pin the route, the sidebar item and the guard.
+
+**Wiring.** `ROUTE_ACCESS` `/payment-health`: `anyOf ["payment_health.view"]`, `restrictedReady:
+false` (right after `/transactions`, so `firstAllowedRoute` order is unchanged for the existing
+roles); `App.tsx` lazy route inside `RequirePermission route="/payment-health"`; sidebar item
+"Payment health" (HeartPulse) after Transactions; `PAGE_TITLES` for the admin preview. The page
+reads `payment_health.view` only — the PSP key is never checked in the browser.
+
+**Types are the Edge contract.** The data source imports the request / response types from
+`supabase/functions/_shared/clickhouse/paymentHealthContract.ts` (and the labels from
+`declineTaxonomy.ts`, both pure modules), so a field the server renames fails `tsc` here, not in a
+tab. `buildPaymentHealthRequest(action, query)`: window-free actions (`options`, `sources`) send the
+action alone; the dimension goes only with `declines` / `refunds_support`; empty filter lists are
+omitted; the test feeds every built body through the server's `normalizePaymentHealthRequest`.
+`loadPaymentHealth` throws on a 200 with `ok:false` and on an incomplete body
+(`isCompletePaymentHealthResponse`: required top-level fields per action), so the tables never
+render zeros from a half answer. `describePaymentHealthError` → `kind` access (gate 401/403/404/409
+codes: NoAccess, never retried) / request (400) / upstream (5xx) / transport / shape.
+
+**Cache.** Key `["payment-health", action, schema 1, access partition, warehouse version,
+normalized request]` (`paymentHealthQueryKey`): the partition slot is `useAccess().partition`
+through `useCacheScope`, `""` ⇒ the query stays disabled. `"payment-health"` is in
+`WAREHOUSE_DEPENDENT_ROOTS` (persisted with the other analytics roots, refetched after an import +
+sync; the version slot already re-keys). SWR with `keepPreviousData`, `transientRetry` (a 4xx is
+never asked again). Only the active tab mounts its query; the others fetch when opened.
+
+**PSP visibility.** `meta.psp_global_visible` of the `options` response decides everything: the
+PSP × MID table, the registry filters, the account columns of the retry tables, the complaints
+by-account table and the three PSP dimensions in the picker. `effectiveQuery(state, pspVisible,
+today)` (pageState.ts) strips a persisted PSP filter / dimension when it is false, and the windowed
+queries stay disabled until `options` has settled whenever the persisted state names one
+(`hasPspSelection`) — a stale filter from a session that had the key can never turn into a 403.
+Without a PSP selection the first tab request goes out in parallel with `options`.
+
+**Page state** (`usePersistedPageState("ui_state_payment_health")`, per principal): tab, range
+preset (`7d | 14d | 30d | 90d | custom`: presets are re-resolved against today's UTC day on every
+render, so "last 30 days" rolls; custom keeps the two dates), one value per filter (`"all"` = none;
+the request carries one-element lists, the contract accepts arrays for a later multi-select),
+dimension (`""` = the server default: processor with the key, funnel without). The compare caption
+uses the contract's `windowsFor`. A custom window the server would refuse (`customRangeProblem`:
+from after to, over `MAX_RANGE_DAYS`) is not sent: the windowed queries stay disabled, the filter bar
+names the problem and the tab shows the hook's `isDisabled` state (`QueryFrame` idle card with the
+page's `idleNote`) instead of a progress bar or an error card per keystroke. "Clear" resets the
+filters and the preset but keeps the open tab and the dimension. An `options` failure that is not
+an access denial is said in the filter bar with a retry (the lists stay empty, the banner reads
+"data through unknown", the tabs still load without the PSP parts); an access denial on `options`
+renders NoAccess for the Data Sources tab directly, since the same gate would refuse it.
+
+**Rendering rules** (format.ts, pinned by tests): `fmtPct(null)` = "no data" (never 0%);
+`summarizeComparison` takes `significant` / `small_sample` / `immature_period` from the server
+(never from the delta) and maps the arrow to a tone through `higherIsBetter` (approval up = good,
+refunds / issuer-suspected-fraud / complaints up = bad); `MetaNotes` shows `meta.estimates`
+verbatim plus the grey "incomplete period" badge, the no-snapshot badge and any `limited` cap.
+Instrument keys appear as 10-character prefixes of the server's opaque hash; MIDs and descriptors
+only as the registry labels; the Retries tab carries an explicit "Rules unverified" note and
+"heuristic" badges on the chain rates. Disputes / 3DS / alerts: one `DisputesPlaceholderCard`
+(Overview and Refunds), no tab.
+
+**Not done / later.** Multi-select filters (the contract already takes arrays); an export button
+behind `payment_health.export`; the Disputes / 3DS / Alerts tabs (P2.5 / P3); a restricted
+(funnel-scoped) variant (plan P7). The page has not been exercised against the live function yet
+(see "Live SQL not yet exercised" above): the first live open should be the owner's, Data Sources
+tab first.
+
 ## Known Limitations
 
 - Palmer column names can vary by export. `palmerTransform.ts` supports common aliases, but new exports may require additional aliases.

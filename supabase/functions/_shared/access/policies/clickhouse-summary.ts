@@ -10,6 +10,7 @@
 //   payment_pass.banks.view  — Transactions → Banks tab
 //   facebook_analytics.view  — FB Analytics (AI context version)
 //   support.view             — Support (swhv)
+//   payment_health.view      — Payment System Health (whv for every tab)
 //   admin.integrations.view  — Integrations → ClickHouse panel
 //   admin.data.import        — Import → post-import auto-sync (data owner only)
 //
@@ -37,6 +38,7 @@ export const WAREHOUSE_PROBE_VIEW_PERMISSIONS: readonly string[] = Object.freeze
   "payment_pass.banks.view",
   "facebook_analytics.view",
   "support.view",
+  "payment_health.view",
   "admin.integrations.view",
   "admin.data.import",
 ]);

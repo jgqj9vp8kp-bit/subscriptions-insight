@@ -43,6 +43,11 @@ const EXPECTED_REQUIRES: Record<string, string[]> = {
   "transactions.details.view": ["transactions.view"],
   "payment_pass.view": [],
   "payment_pass.banks.view": ["payment_pass.view"],
+  "payment_health.view": [],
+  "payment_health.export": ["payment_health.view"],
+  "payment_health.risk_events.view": ["payment_health.view"],
+  "payment_health.psp_global.view": ["payment_health.view"],
+  "payment_health.manage_alerts": ["payment_health.view"],
   "users.view": [],
   "users.details.view": ["users.view"],
   "users.pii.view": ["users.view"],
@@ -79,7 +84,9 @@ const EXPECTED_REQUIRES: Record<string, string[]> = {
 
 const PLANNED = ["financials.revenue.view", "financials.spend.view", "financials.profit.view", "financials.costs.view"];
 const PII = ["transactions.details.view", "users.pii.view", "support.messages.view"];
-const isPrivilegedKey = (key: string) => key.startsWith("admin.") || key === "funnels.manage" || key === "api_export.use";
+/** Mirrors app.is_privileged_permission (202610050002 + 202610120001). */
+const PRIVILEGED_LISTED = ["funnels.manage", "api_export.use", "payment_health.psp_global.view", "payment_health.manage_alerts"];
+const isPrivilegedKey = (key: string) => key.startsWith("admin.") || PRIVILEGED_LISTED.includes(key);
 
 describe("permission catalog", () => {
   it("contains exactly the contract keys, each once", () => {
@@ -102,7 +109,7 @@ describe("permission catalog", () => {
     expect(ENFORCED_PERMISSION_KEYS.length).toBe(PERMISSION_CATALOG.length - PLANNED.length);
   });
 
-  it("makes admin.*, funnels.manage and api_export.use full-scope + admin-sensitive, and nothing else", () => {
+  it("makes admin.*, funnels.manage, api_export.use and the two payment_health keys full-scope + admin-sensitive, and nothing else", () => {
     for (const entry of PERMISSION_CATALOG) {
       expect(entry.requiresFullScope, entry.key).toBe(isPrivilegedKey(entry.key));
       if (isPrivilegedKey(entry.key)) expect(entry.sensitive, entry.key).toBe("admin");

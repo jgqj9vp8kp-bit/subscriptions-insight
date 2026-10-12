@@ -4,9 +4,10 @@
 // Rules the tests pin down:
 //   * every template is a subset of the ENFORCED catalog and closed under `requires`;
 //   * none of the non-admin templates carries PII keys or anything privileged
-//     (admin.*, funnels.manage, api_export.use) — a privileged role may only be
-//     assigned by the Owner to full-scope members, and templates are meant to be
-//     handed out freely;
+//     (PRIVILEGED_PERMISSION_KEYS in permissions.ts: admin.*, funnels.manage,
+//     api_export.use, payment_health.psp_global.view, payment_health.manage_alerts)
+//     — a privileged role may only be assigned by the Owner to full-scope
+//     members, and templates are meant to be handed out freely;
 //   * the Owner is NOT a template: bootstrap_workspace creates the single
 //     is_owner role, which implicitly holds every enforced key.
 // New catalog keys are never auto-added to roles already stored in the DB; the

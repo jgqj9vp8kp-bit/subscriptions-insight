@@ -334,7 +334,7 @@ export const PAYMENT_HEALTH_METRICS: readonly MetricDefinition[] = [
     phase: "P1",
     heuristic: false,
     estimate: false,
-    notes: "All refunds are full today. The refund date is approximated by refund_observed_at (P0 trigger) until the settlement report or the FunnelFox refund webhook (P3 / P6).",
+    notes: "All refunds are full today. The refund date is approximated by refund_observed_at (P0 trigger) until the settlement report or the FunnelFox refund webhook (P3 / P6). Matures late: the newest window is structurally lower (its payments have had fewer days to be refunded), so the comparison is flagged immature until data_through is REFUND_MATURITY_DAYS past the window.",
   },
   {
     key: "support_unauthorized_rate",
@@ -348,7 +348,7 @@ export const PAYMENT_HEALTH_METRICS: readonly MetricDefinition[] = [
     phase: "P1",
     heuristic: true,
     estimate: false,
-    notes: "An early indicator, not a dispute. PSP / MID attribution: the last SETTLED payment of matched_user_id within N days before received_at (parameter); none -> 'not attributed'. A classification_version change is drawn as a trend break.",
+    notes: "An early indicator, not a dispute. The denominator is the window's settled payments REGARDLESS of the page filters (a support request carries no funnel / country / network, so the numerator cannot be filtered). PSP / MID attribution: the last SETTLED payment of matched_user_id within N days before received_at (parameter); none -> 'not attributed'. A classification_version change is drawn as a trend break. Matures late like refund_rate: the comparison is flagged immature until data_through is REFUND_MATURITY_DAYS past the window.",
   },
   {
     key: "vamp_estimate",

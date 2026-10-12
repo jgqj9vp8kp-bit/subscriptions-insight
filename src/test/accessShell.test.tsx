@@ -84,6 +84,7 @@ vi.mock("@/pages/admin/AdminFunnelCoverage.tsx", shell.stubPage("admin funnel co
 vi.mock("@/pages/Reports.tsx", shell.stubPage("reports page"));
 vi.mock("@/pages/Funnels.tsx", shell.stubPage("funnels page"));
 vi.mock("@/pages/FBAnalytics.tsx", shell.stubPage("fb analytics page"));
+vi.mock("@/pages/PaymentHealth.tsx", shell.stubPage("payment health page"));
 
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -350,7 +351,7 @@ describe("AppSidebar", () => {
   }
 
   const linkNames = () => screen.queryAllByRole("link").map((link) => link.textContent);
-  const ALL_PAGES = ["Dashboard", "Transactions", "Users", "Cohorts", "Funnels", "Reports", "FB-Analytics", "Integrations", "Support", "Forecasting", "Subscriptions", "Import data"];
+  const ALL_PAGES = ["Dashboard", "Transactions", "Payment health", "Users", "Cohorts", "Funnels", "Reports", "FB-Analytics", "Integrations", "Support", "Forecasting", "Subscriptions", "Import data"];
 
   it("owner sees every page plus the Administration group", () => {
     renderSidebar(OWNER());
@@ -398,6 +399,15 @@ describe("AppSidebar", () => {
   it("raw-only pages stay hidden for an employee holding their permissions", () => {
     renderSidebar(member(["leads.view", "subscriptions.view", "admin.data.import", "support.view"]));
     expect(linkNames()).toEqual(["Support"]);
+  });
+
+  it("Payment health shows for payment_health.view with scope all only (no action of the module is scopeReady)", () => {
+    renderSidebar(member(["payment_health.view"]));
+    expect(screen.getByRole("link", { name: "Payment health" })).toHaveAttribute("href", "/payment-health");
+    expect(linkNames()).toEqual(["Payment health"]);
+    cleanup();
+    renderSidebar(member(["payment_health.view", "cohorts.view"], { mode: "selected" }));
+    expect(linkNames()).toEqual(["Cohorts"]);
   });
 
   it("shows only the admin pages the member may open", () => {
@@ -820,6 +830,17 @@ describe.runIf(ADMIN_PAGES_PRESENT)("App", () => {
     const nav = screen.getAllByRole("link").map((link) => link.textContent);
     expect(nav).toEqual(expect.arrayContaining(["Dashboard", "Cohorts", "Funnels", "Reports"]));
     expect(nav).not.toContain("Users");
+  });
+
+  it("/payment-health opens for payment_health.view and is denied without it", async () => {
+    accessValue = member(["payment_health.view"]);
+    renderApp("/payment-health");
+    expect(await screen.findByText("payment health page")).toBeInTheDocument();
+    cleanup();
+    accessValue = member(["transactions.view", "payment_pass.view"]);
+    renderApp("/payment-health");
+    expect(await screen.findByTestId("no-access")).toHaveAttribute("data-reason", "permission");
+    expect(screen.queryByText("payment health page")).toBeNull();
   });
 
   it("raw-only pages are denied to an employee even with the permission", async () => {

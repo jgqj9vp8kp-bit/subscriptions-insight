@@ -364,6 +364,7 @@ export interface FakeGate {
     loadCohortSnapshotState: ReturnType<typeof vi.fn>;
     createClickHouse: ReturnType<typeof vi.fn>;
     log: ReturnType<typeof vi.fn>;
+    recordDenial: ReturnType<typeof vi.fn>;
   };
   clickhouse: RecordingClickHouse;
 }
@@ -387,6 +388,8 @@ export function fakeGate(options: FakeGateOptions = {}): FakeGate {
     createClickHouse: vi.fn((ctx: AccessContext) => createScopedReader(ctx, clickhouse)),
     newRequestId: () => options.requestId ?? "req-security",
     log: vi.fn(),
+    // §24 denial counter: lets a policy test assert that a 403 was counted.
+    recordDenial: vi.fn(async () => ({ data: 1, error: null })),
   };
   return { deps, clickhouse };
 }
@@ -565,6 +568,7 @@ export const ACTION_REQUESTS: Readonly<Record<string, Readonly<Record<string, Ac
     bank_detail: post({ action: "bank_detail", bank: "Sentinel Bank" }),
     ai_pass_rates: post({ action: "analytics", purpose: "ai_pass_rates" }),
   },
+  "clickhouse-payment-health": named("overview", "declines", "retries", "refunds_support", "sources", "options"),
   "clickhouse-revenue": named("bundle", "day_breakdown"),
   "clickhouse-summary": { summary: post({}) },
   "clickhouse-support": {

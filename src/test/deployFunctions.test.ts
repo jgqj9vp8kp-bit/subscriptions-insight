@@ -29,10 +29,11 @@ const ROOT = process.cwd();
 const BUILD_ID_SOURCE = readFileSync(resolve(ROOT, BUILD_ID_FILE), "utf8");
 
 describe("pure helpers", () => {
-  it("lists every function folder of the repo (27, no _shared), and the removed probe is not one", () => {
+  it("lists every function folder of the repo (28, no _shared), and the removed probe is not one", () => {
     const repo = listRepoFunctions(ROOT);
-    expect(repo).toHaveLength(27);
+    expect(repo).toHaveLength(28);
     expect(repo).toContain("access");
+    expect(repo).toContain("clickhouse-payment-health");
     expect(repo).toContain("export-campaign-performance");
     expect(repo).not.toContain("_shared");
     expect(repo).not.toContain("funnelfox-endpoint-probe");

@@ -40,6 +40,8 @@ const ENFORCED_PERMISSIONS = [
   "forecasting.view", "forecasting.create", "forecasting.edit", "forecasting.delete",
   "transactions.view", "transactions.export", "transactions.details.view",
   "payment_pass.view", "payment_pass.banks.view",
+  "payment_health.view", "payment_health.export", "payment_health.risk_events.view",
+  "payment_health.psp_global.view", "payment_health.manage_alerts",
   "users.view", "users.details.view", "users.pii.view", "leads.view", "subscriptions.view",
   "support.view", "support.messages.view", "support.export", "support.classification.edit",
   "reports.view", "reports.create", "reports.edit", "reports.publish", "reports.export",
@@ -1015,7 +1017,14 @@ describe("contract parity with the TS gate, catalog and browser client", () => {
   it("agrees with the TS catalog on enforced, privileged and well-formed keys", async () => {
     expect([...ENFORCED_PERMISSIONS].sort()).toEqual([...ENFORCED_PERMISSION_KEYS].sort());
     const keys = PERMISSION_CATALOG.map((entry) => entry.key);
-    const result = await seeded.h.asPostgres((tx) =>
+    // The predicate is the 202610050002 one plus 202610120001 (the two
+    // payment_health privileged keys). That file guards on the P1 registries
+    // table, which the access suite does not build: a minimal stand-in (the
+    // guard only tests to_regclass) lets the real file run on a copy.
+    const s = await seededCopy();
+    await s.h.db.exec("create table if not exists public.network_program_thresholds (id uuid primary key default gen_random_uuid());");
+    await s.h.applyMigration("202610120001_payment_health_permissions.sql");
+    const result = await s.h.asPostgres((tx) =>
       tx.query<{ k: string; privileged: boolean; well_formed: boolean }>(
         `select k, app.is_privileged_permission(k) as privileged, app.permissions_well_formed(array[k]) as well_formed
          from unnest($1::text[]) k`,

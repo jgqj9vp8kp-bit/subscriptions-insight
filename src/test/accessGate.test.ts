@@ -823,6 +823,27 @@ describe("audit of write actions (sync.triggered / warehouse.admin) and denial c
     await expectDenied(await handleWithAccess(request({ body: { action: "view" } }).req, AUDIT_POLICY, auditHandler, disabled.deps), 403, ACCESS_ERROR.MEMBERSHIP_DISABLED);
     expect(disabled.recordDenial).toHaveBeenCalledWith(expect.objectContaining({ actorUserId: EMPLOYEE, errorCode: ACCESS_ERROR.MEMBERSHIP_DISABLED }));
 
+    // A refusal the handler raises and onError maps to 403 is a denial too: counted, logged as access_denied, never as handler_failed.
+    const mapped = auditDeps(ADMIN());
+    const onError = vi.fn(() => ({ status: 403, body: { ok: false, error_code: ACCESS_ERROR.PERMISSION_DENIED, error: "dimension needs a key" } }));
+    const mappedResponse = await handleWithAccess(request({ body: { action: "view" } }).req, AUDIT_POLICY, async () => { throw new Error("psp"); }, mapped.deps, { onError });
+    expect(mappedResponse.status).toBe(403);
+    // A handler-path body: the member gets the generic message and the request id (unlike a gate-level deny()).
+    expect(await json(mappedResponse)).toEqual({ ok: false, error_code: ACCESS_ERROR.PERMISSION_DENIED, error: ACCESS_ERROR_MESSAGES.request_failed, request_id: "req-test-1" });
+    expect(mapped.recordDenial.mock.calls.map(([entry]) => entry)).toEqual([
+      { actorUserId: EMPLOYEE, fn: "audit-fn", action: "view", errorCode: ACCESS_ERROR.PERMISSION_DENIED, requestId: "req-test-1" },
+    ]);
+    expect(mapped.deps.log).toHaveBeenCalledWith("warn", "access_denied", expect.objectContaining({ status: 403, error_code: ACCESS_ERROR.PERMISSION_DENIED, action: "view", user_id: EMPLOYEE }));
+    expect(mapped.deps.log).not.toHaveBeenCalledWith("error", "handler_failed", expect.anything());
+    // A mapped 403 without a code is counted as permission_denied; a mapped 400 is not a denial.
+    const uncoded = auditDeps(ADMIN());
+    await handleWithAccess(request({ body: { action: "view" } }).req, AUDIT_POLICY, async () => { throw new Error("psp"); }, uncoded.deps, { onError: () => ({ status: 403, body: { ok: false } }) });
+    expect(uncoded.recordDenial).toHaveBeenCalledWith(expect.objectContaining({ errorCode: ACCESS_ERROR.PERMISSION_DENIED }));
+    const invalid = auditDeps(ADMIN());
+    await handleWithAccess(request({ body: { action: "view" } }).req, AUDIT_POLICY, async () => { throw new Error("bad"); }, invalid.deps, { onError: () => ({ status: 400, body: { ok: false, error_code: "invalid_request" } }) });
+    expect(invalid.recordDenial).not.toHaveBeenCalled();
+    expect(invalid.deps.log).toHaveBeenCalledWith("error", "handler_failed", expect.objectContaining({ status: 400 }));
+
     const quiet = auditDeps(ADMIN());
     await expectDenied(await handleWithAccess(request({ token: null }).req, AUDIT_POLICY, auditHandler, quiet.deps), 401, ACCESS_ERROR.INVALID_SESSION);
     await expectDenied(await handleWithAccess(request({ body: { action: "nope" } }).req, AUDIT_POLICY, auditHandler, quiet.deps), 400, ACCESS_ERROR.UNKNOWN_ACTION);

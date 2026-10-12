@@ -544,6 +544,122 @@ payloads and the filled countries are the correct data and are not rolled back. 
 previous functions is safe (they ignore the new columns). To undo the Payment Pass denominator alone,
 revert `ATTEMPT_RAW_STATUS_EXCLUSION` in `paymentAnalytics.ts` and redeploy.
 
+### Payment health P2 — permissions, migration, deploy
+
+The Payment System Health page's backend (plan phase P2; DEVELOPER_NOTES.md "Payment health P2
+backend"): the Edge function `clickhouse-payment-health` and five catalog keys. Owner + Admin only in
+the MVP (owner decision 3).
+
+**Permissions** (`supabase/functions/_shared/access/permissions.ts`):
+
+| key | kind | what it opens |
+|---|---|---|
+| `payment_health.view` | ordinary | the page: approvals and declines, retries, refunds and complaints, data sources, filter options |
+| `payment_health.export` | ordinary (requires view, export-sensitive) | downloads (frontend) |
+| `payment_health.risk_events.view` | ordinary (requires view) | dispute / fraud-report events once a source is connected (P3) |
+| `payment_health.psp_global.view` | **privileged** (requires view; full scope, Owner-granted) | PSP × MID and descriptor breakdowns, the MID / descriptor filters and options |
+| `payment_health.manage_alerts` | **privileged** (requires view) | alert writes (P2.5) |
+
+Ordinary keys do not make the module reachable for a funnel-restricted member: no action is
+scopeReady, so a narrowed member holding `payment_health.view` gets 403 `scope_not_supported`
+(`permission_denied` without it), exactly like Payment Pass. Without `payment_health.psp_global.view`
+the page is served with the PSP × MID table, the account references and the registry filter options
+stripped, and a request naming a PSP filter or dimension is 403 `permission_denied` — counted in the
+owner's denial counters like any other 403 (the gate records a 403 the handler raises too).
+`payment_health.view` is also a **warehouse-probe key** (`WAREHOUSE_PROBE_VIEW_PERMISSIONS` in
+`policies/clickhouse-summary.ts`): the page keys its cache on the warehouse version from
+`clickhouse-summary`, so a member holding only this key must be able to call that probe.
+
+**New keys are not added to stored roles.** The Owner role holds every enforced key implicitly. The
+`admin` template only reflects the catalog at seeding time, so the live Admin role does NOT gain the
+keys by deploying: the owner adds `payment_health.view`, `payment_health.export`,
+`payment_health.risk_events.view`, `payment_health.psp_global.view` (and later
+`payment_health.manage_alerts`) to the Admin role by hand under Admin → Roles (owner decision 10;
+only the Owner may grant the two privileged keys, and only to full-scope members).
+
+**Rollout, in this order:**
+
+1. **Apply `202610120001_payment_health_permissions.sql` alone**, out of band like the P0 / P1 files
+   (never `supabase db push` while earlier-sorting migrations are pending), and record it:
+
+   ```text
+   npx supabase db query --linked -f supabase/migrations/202610120001_payment_health_permissions.sql
+   npx supabase migration repair --status applied 202610120001
+   ```
+
+   It refuses to run before `202610110002` (the P1 registries) and refuses — changing nothing — when a
+   member outside funnel scope all already holds a role with one of the two privileged keys (name the
+   member, re-scope or edit the role, re-apply). It extends `app.is_privileged_permission` to the two
+   keys (the SQL side of the anti-escalation rules); the TS catalog and the predicate are kept in
+   parity by `accessCoreMigration.test.ts`. One transaction, idempotent.
+2. **Deploy every function** with `npm run deploy:functions` (28 functions now; the script refuses a
+   partial set). The migration comes FIRST: with the new catalog live and the old predicate, an Admin
+   could grant `payment_health.psp_global.view` as if it were ordinary.
+3. **Registry labels**: the page shows MIDs as `psp_accounts` labels ("Stripe MID #1", ...). A MID
+   that appears after the last `psp_accounts_sync` shows as "Unlabelled MID" until the sync runs
+   (the runner does not call it); run `select public.psp_accounts_sync();` after an import that may
+   have introduced a MID, or edit the labels / `descriptor_prefix` in `public.psp_accounts`.
+4. **Funnel attribution** needs a validated `fact_user_cohorts` snapshot (the Cohorts snapshot state);
+   without one every row is "unattributed" and the response says so (`meta.funnel_attribution`).
+5. **Frontend**: the `/payment-health` page ships with the SPA (Lovable deploys `main`); see
+   "Payment System Health (page)" below. It needs the function above live: every tab is one
+   `clickhouse-payment-health` request, and until the function is deployed the page shows its
+   error card (never zeros).
+
+Rollback: redeploy the previous functions (the policy file is only read by the new function; the
+catalog keys stay harmless in `permissions.ts` and in roles that list them). The migration can stay:
+the predicate only matters for keys no role holds unless the owner granted them.
+
+### Payment System Health (page)
+
+Sidebar "Payment health" → `/payment-health`. What the page shows, who sees it and what is an
+estimate (DEVELOPER_NOTES.md "Payment health P2 frontend" for the code).
+
+**Who opens it.** The route needs `payment_health.view` (Owner always; the Admin role once the owner
+adds the key under Admin → Roles). A funnel-restricted member never sees it (no action of the module
+is scope-ready yet, like Payment Pass). The PSP × MID table, the processor / merchant account /
+descriptor filters and those three breakdown dimensions appear only when the server answers with
+`psp_global_visible` — the data owner or a member holding `payment_health.psp_global.view`; the page
+never probes for the key, and a filter remembered from a session that had it is dropped, not sent.
+
+**The banner** on every tab: *Estimates from the Primer export; data through <day>; network ratios need
+official reports.* "Data through" is the newest attempt day in the warehouse (the manual CSV import,
+not a live feed). A window that ends after it carries a grey **incomplete period** marker, and a
+comparison inside it is never called significant. The refund rate and the unauthorized-charge complaint
+rate mature later still: a payment can be refunded or complained about for weeks, so their comparison
+keeps the marker (and is never called significant) until "data through" is 30 days past the window's
+end — the newest window is always lower on these two for structural reasons, not because anything
+improved. The trend chart covers every day of the window (a day without attempts is a zero bar) and
+draws the days after "data through" lighter.
+
+**Filters** (remembered per person): period (last 7 / 14 / 30 / 90 days, rolling with today in UTC, or
+custom dates) compared with the previous period of the same length; processor, merchant account and
+statement descriptor (registry labels such as "Stripe MID #1", "Unlabelled MID" for a MID that
+appeared after the last `psp_accounts_sync`); funnel (the user's acquisition anchor from the cohort
+snapshot — totals match Payment Pass, the per-funnel split can differ, and without a validated
+snapshot every row is "unattributed"); issuer country (BIN, not the billing address); card network;
+payment method; CIT / MIT; stage / transaction type.
+
+**Reading the numbers.** A rate whose denominator is zero reads **no data**, never 0%. Every
+comparison shows the current rate, the arrow against the previous period, the delta in percentage
+points and flags: **significant** (95% Wilson intervals do not overlap and both periods reach the
+minimum sample, 200 attempts), **small sample**, **incomplete period**. Declines are classified
+(insufficient funds, issuer suspected fraud, lost or stolen, restricted, closed account, policy,
+issuer unreachable, other issuer, authentication, PSP / integration, cause not verified); "Issuer
+suspected fraud (decline, not fraud)" is the issuer's suspicion code — a decline, never a fraud count.
+
+**Tabs**
+
+| tab | what it answers |
+|---|---|
+| Overview | Attempts, approval rate, issuer-suspected-fraud decline rate, refund rate, unauthorized-charge complaint rate and settled amount, each against the previous period; the daily (or weekly) attempts / declines / approval trend; the PSP × merchant account table (volume, approval, issuer-suspected-fraud rate, refund rate, complaint rate, trend sparkline); the decline-class mix; "What changed": for each dimension's top movers, Δ declines split into the volume effect (more attempts at the old rate) and the rate effect (a worse rate on the new volume). |
+| Approvals & Declines | Approval by a chosen dimension (processor, MID, descriptor, funnel, issuer country, card network, payment method, CIT / MIT, stage); decline classes with their rate over attempts; the issuer code / Primer code / advised action / advice code mix with soft / hard severity, the re-attempt guidance each code carries and the **ban** rows (DO_NOT_RETRY, STOP_ALL_PAYMENTS, Visa category 1, Mastercard MAC 03 / 21). |
+| Retries & Network Rules | Attempt chains (**heuristic**: Primer gives every retry a new orderId, so chains link attempts by user, instrument or currency + amount, price point and initiation within CIT 60 min / MIT 72 h): first-try approval, final success, retry recovery, cascade recovery; post-ban re-attempts (CIT / MIT, same / switched processor, within one hour, succeeded) with the newest rows; instrument × account pairs over 15 decline records in a rolling 30 days. The tab says **rules unverified**: the network rules come from secondary sources, the flags are potential violations, not fines. |
+| Refunds & Complaints | Refunds by the original payment date: rate against the previous period, timing buckets from the import that first saw the refund (≤ 7 / 30 / 90 / > 90 days; "unobserved" = synced before P0), by payment month and by dimension. Support complaints (possible unauthorized charge, requires refund, duplicate charge) by received month, attributed to the last settled payment of the matched user within 30 days, else unattributed; by PSP × MID with the key; a month whose classifier version changed is marked **version break**. The Disputes & fraud reports card says the source is not connected yet. |
+| Data Sources | Warehouse bounds, last ClickHouse sync, rows synced before the P0 backfill, data through and lag; the share of attempt rows that fill each P0 column (decline-record columns over declines, `refund_observed_at` over refunded payments); the last import and the sync state (lifecycle fields only); support requests by month with classifier versions; the metric dictionary: every metric of the plan with its phase and whether it is measured, a heuristic or an estimate. |
+
+Disputes, 3DS and alerts are later phases: the page shows a placeholder, not a zero.
+
 ### Supabase Edge Function secret
 
 ```text

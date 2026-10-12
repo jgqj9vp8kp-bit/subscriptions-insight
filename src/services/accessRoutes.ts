@@ -51,6 +51,9 @@ export type AccessSubject = Pick<AccessContextValue, "status" | "legacy" | "rawA
 export const ROUTE_ACCESS: readonly RouteAccessRule[] = Object.freeze<RouteAccessRule[]>([
   { path: "/", anyOf: ["dashboard.view"], restrictedReady: true },
   { path: "/transactions", anyOf: ["transactions.view", "payment_pass.view", "payment_pass.banks.view"], restrictedReady: false },
+  // Payment System Health (P2): no action of clickhouse-payment-health is
+  // scopeReady, so a funnel-restricted member is closed out like Payment Pass.
+  { path: "/payment-health", anyOf: ["payment_health.view"], restrictedReady: false },
   { path: "/users", anyOf: ["users.view"], allOf: ["users.view", "users.pii.view"], restrictedReady: false },
   { path: "/leads", anyOf: ["leads.view"], rawOnly: true, restrictedReady: false },
   { path: "/cohorts", anyOf: ["cohorts.view"], restrictedReady: true },

@@ -74,7 +74,9 @@ export function warehouseVersionKey(partition?: string | null): string[] {
 // the shared persistence layer. fb-analytics rides the same lifecycle (persist,
 // logout clear, external invalidation) — its own re-keying comes from the FB
 // warehouse version, so a transaction-sync invalidation is just a cheap refetch.
-export const WAREHOUSE_DEPENDENT_ROOTS: readonly string[] = ["cohorts", "users", "payment-analytics", "support", "fb-analytics", "revenue"];
+// payment-health (2026-10, Payment System Health P2): its keys already carry
+// the warehouse version, so the post-import invalidation is a cheap refetch.
+export const WAREHOUSE_DEPENDENT_ROOTS: readonly string[] = ["cohorts", "users", "payment-analytics", "support", "fb-analytics", "revenue", "payment-health"];
 
 export function fnv(input: string): string {
   let h = 0x811c9dc5;

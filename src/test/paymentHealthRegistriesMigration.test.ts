@@ -157,10 +157,13 @@ afterEach(async () => {
 });
 
 describe("guard", () => {
-  it("is the last migration and covers every one before it", () => {
+  it("follows P0 and covers every migration before it", () => {
+    // Relative ordering only: pinning "last migration" breaks on the next file (P2 permissions did).
     const all = listMigrations();
-    expect(all[all.length - 1]).toBe(REGISTRIES);
-    expect(listMigrations({ before: REGISTRIES })).toEqual(all.slice(0, -1));
+    const i = all.indexOf(REGISTRIES);
+    expect(i).toBeGreaterThan(all.indexOf("202610110001_payment_health_p0.sql"));
+    expect(listMigrations({ before: REGISTRIES })).toEqual(all.slice(0, i));
+    expect(all.indexOf("202610120001_payment_health_permissions.sql")).toBe(i + 1);
   });
 
   it("refuses to apply before 202610070001, and creates nothing", { timeout: CLONE_TIMEOUT }, async () => {

@@ -28,6 +28,7 @@ import NotFound from "./pages/NotFound.tsx";
 // navigation instead of shipping in the main chunk. Login / NotFound stay eager (first paint).
 const Dashboard = lazy(() => import("./pages/Dashboard.tsx"));
 const Transactions = lazy(() => import("./pages/Transactions.tsx"));
+const PaymentHealthPage = lazy(() => import("./pages/PaymentHealth.tsx"));
 const UsersPage = lazy(() => import("./pages/Users.tsx"));
 const Cohorts = lazy(() => import("./pages/Cohorts.tsx"));
 const FunnelsPage = lazy(() => import("./pages/Funnels.tsx"));
@@ -106,6 +107,7 @@ const App = () => (
                   <Route element={<ProtectedRoute />}>
                     <Route path="/" element={<RequirePermission route="/"><Dashboard /></RequirePermission>} />
                     <Route path="/transactions" element={<RequirePermission route="/transactions"><Transactions /></RequirePermission>} />
+                    <Route path="/payment-health" element={<RequirePermission route="/payment-health"><PaymentHealthPage /></RequirePermission>} />
                     <Route path="/users" element={<RequirePermission route="/users"><UsersPage /></RequirePermission>} />
                     {/* Leads is now a tab of the Users page; keep old links working. */}
                     <Route path="/leads" element={<Navigate to="/users?tab=leads" replace />} />

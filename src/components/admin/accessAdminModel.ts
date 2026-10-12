@@ -145,7 +145,9 @@ export function permissionLabel(key: string, catalog?: readonly PermissionDef[])
   return catalog?.find((def) => def.key === key)?.label ?? getPermission(key)?.label ?? key;
 }
 
-/** Owner, or any admin.* / funnels.manage / api_export.use key (D10). */
+/** Owner, or any PRIVILEGED_PERMISSION_KEYS key (admin.*, funnels.manage,
+ * api_export.use, payment_health.psp_global.view, payment_health.manage_alerts;
+ * D10) — the shared isPrivilegedPermission decides, so this list cannot drift. */
 export function isPrivilegedRole(role: Pick<AdminRole, "is_owner" | "permissions"> | null | undefined): boolean {
   return Boolean(role && (role.is_owner || role.permissions.some((key) => isPrivilegedPermission(key))));
 }
@@ -566,6 +568,7 @@ export function planMemberSave(member: AdminMember, draft: MemberDraft): MemberS
 export const PAGE_TITLES: Readonly<Record<string, string>> = Object.freeze({
   "/": "Dashboard",
   "/transactions": "Transactions",
+  "/payment-health": "Payment health",
   "/users": "Users",
   "/leads": "Leads",
   "/cohorts": "Cohorts",
