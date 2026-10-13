@@ -19,6 +19,7 @@ import {
   noteClickHouseReachable,
   runClickHouseBackfill,
   runClickHouseCohorts,
+  runClickHousePaymentHealthAlerts,
   runClickHouseUsers,
   testClickHouseConnection,
 } from "@/services/clickhouse";
@@ -107,6 +108,28 @@ describe("breaker open/close flow", () => {
 
     invokeMock.mockResolvedValueOnce({ data: { connected: true }, error: null });
     await testClickHouseConnection();
+    expect(isClickHouseCircuitOpen()).toBe(false);
+  });
+
+  it("payment alerts: alerts_list / alert_update (Postgres-only) bypass the open breaker and never move it; alerts_run (reads the warehouse) is gated", async () => {
+    invokeMock.mockResolvedValueOnce({ data: null, error: new Error("connection reset by peer") });
+    await expect(runClickHouseCohorts(cohortsRequest)).rejects.toThrow();
+    expect(isClickHouseCircuitOpen()).toBe(true);
+
+    // The list still loads while the warehouse is down — and its success does not claim the warehouse is back.
+    invokeMock.mockResolvedValueOnce({ data: { ok: true, action: "alerts_list", alerts: [] }, error: null });
+    await runClickHousePaymentHealthAlerts({ action: "alerts_list" });
+    expect(invokeMock).toHaveBeenCalledTimes(2);
+    expect(isClickHouseCircuitOpen()).toBe(true);
+
+    // A run is refused instantly, like the page's reads.
+    await expect(runClickHousePaymentHealthAlerts({ action: "alerts_run" })).rejects.toThrow(CLICKHOUSE_UNAVAILABLE_MESSAGE);
+    expect(invokeMock).toHaveBeenCalledTimes(2);
+
+    // A down-shaped failure of a Postgres-only action does not open a closed breaker either.
+    noteClickHouseReachable();
+    invokeMock.mockResolvedValueOnce({ data: null, error: new Error("connection reset by peer") });
+    await expect(runClickHousePaymentHealthAlerts({ action: "alert_update" })).rejects.toThrow();
     expect(isClickHouseCircuitOpen()).toBe(false);
   });
 });

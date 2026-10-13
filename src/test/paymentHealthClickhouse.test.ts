@@ -26,6 +26,7 @@ import {
   MAX_RANGE_DAYS,
   POST_BAN_ATTEMPT_LIMIT,
   REFUND_MATURITY_DAYS,
+  ROLLING_WINDOW_LIMIT,
   PaymentHealthPermissionError,
   PaymentHealthRequestError,
   normalizePaymentHealthRequest,
@@ -369,6 +370,8 @@ describe("retries", () => {
     expect(response.chains.attempt_approval_rate).toMatchObject({ numerator: 6, denominator: 16 });
 
     expect(response.post_ban).toMatchObject({ banned_instruments: 4, retried_instruments: 2, attempts: 2, within_window: 2, cit: 2, mit: 0, same_processor: 1, switched_processor: 1, succeeded: 1, succeeded_switched_processor: 1, within_one_hour: 0 });
+    // Per initiation over every post-ban attempt (the alert engine's fact; post_ban_attempts is capped and mixed).
+    expect(response.post_ban.by_initiation).toEqual({ cit: { attempts: 2, succeeded: 1, switched_processor: 1 }, mit: { attempts: 0, succeeded: 0, switched_processor: 0 } });
     expect(response.post_ban_attempts.map((row) => [row.event_time.slice(0, 10), row.processor_relation, row.succeeded, row.ban_decline_class, row.ban_sources])).toEqual([
       ["2026-09-19", "same", false, "closed_account", ["visa_category_1"]],
       ["2026-09-11", "switched", true, "issuer_suspected_fraud", ["advised_action"]],
@@ -376,7 +379,7 @@ describe("retries", () => {
     expect(response.post_ban_attempts[1].processor).toEqual({ key: "ADYEN", label: "Adyen" });
     expect(response.post_ban_attempts[1].merchant_account?.label).toBe("Adyen MID #1");
     for (const row of response.post_ban_attempts) expect(row.instrument).toMatch(/^[0-9a-f]{16}$/);
-    expect(response.rolling).toMatchObject({ pairs: 9, violations: 0, windows: [] });
+    expect(response.rolling).toMatchObject({ pairs: 9, violations: 0, windows: [], newest_violation_end: null });
     expect(response.cascade_rows).toBe(1);
     expect(scanForLeaks(response, { extra: SENTINELS })).toEqual([]);
     expect(JSON.stringify(response)).not.toContain("tx-");
@@ -481,6 +484,9 @@ describe("sources and options", () => {
       { month: "2026-08-01", requests: 1, classification_versions: ["v1"], version_break: false },
       { month: "2026-09-01", requests: 4, classification_versions: ["v2"], version_break: true },
     ]);
+    // How far the support data reaches (newest received day, newest ClickHouse sync of a support row): its own pipeline.
+    expect(response.support).toMatchObject({ last_day: "2026-09-25", last_synced_at: "2026-10-06T08:00:00.000Z" });
+    expect(h.recording.statements.find((statement) => statement.query.includes("ph:support_versions"))?.query).toMatch(/max\(request_date\)[\s\S]*toUnixTimestamp64Milli\(max\(clickhouse_synced_at\)\)/);
     expect(response.metrics.find((metric) => metric.key === "disputes")).toMatchObject({ phase: "P3", available: false });
     expect(response.metrics.find((metric) => metric.key === "attempt_approval_rate")).toMatchObject({ phase: "P1", available: true });
     // The filename, the cursor and the error text of the Postgres rows stay out.
@@ -638,5 +644,24 @@ describe("maturity, caps, cascade rows and the complaint denominator", () => {
     expect(retries.post_ban.attempts).toBe(POST_BAN_ATTEMPT_LIMIT + 1);
     expect(retries.post_ban_attempts).toHaveLength(POST_BAN_ATTEMPT_LIMIT);
     expect(retries.meta.limited).toEqual({ attempt_rows: false, post_ban_attempts: true, rolling_windows: false });
+    // The per-initiation split counts every attempt, not the capped list.
+    expect(retries.post_ban.by_initiation.cit).toEqual({ attempts: POST_BAN_ATTEMPT_LIMIT + 1, succeeded: 0, switched_processor: 0 });
+  });
+
+  it("the rolling-window list is cut at ROLLING_WINDOW_LIMIT by max_declines; newest_violation_end still covers every violation", async () => {
+    resetPaymentHealthMemo();
+    // ROLLING_WINDOW_LIMIT pairs with 17 declines ending 2026-09-17, and one new pair with 16 ending 2026-09-27:
+    // the newest violation has the fewest declines, so it is the one the cut drops.
+    const day = (offset: number) => shiftDay("2026-09-01", offset);
+    const heavy = Array.from({ length: ROLLING_WINDOW_LIMIT }, (_, pair) =>
+      Array.from({ length: 17 }, (_, index) => tx({ t: T(day(index), "06:00"), user_id: `r${pair}`, payment_instrument_key: `pi-r${pair}`, transaction_id: `r-${pair}-${index}` }))).flat();
+    const fresh = Array.from({ length: 16 }, (_, index) => tx({ t: T(day(11 + index), "06:30"), user_id: "r-new", payment_instrument_key: "pi-r-new", transaction_id: `r-new-${index}` }));
+    const retries = await harness({ rows: [...heavy, ...fresh] }).run<RetriesResponse>({ action: "retries" });
+    expect(retries.rolling.violations).toBe(ROLLING_WINDOW_LIMIT + 1);
+    expect(retries.rolling.windows).toHaveLength(ROLLING_WINDOW_LIMIT);
+    expect(retries.meta.limited.rolling_windows).toBe(true);
+    expect(retries.rolling.windows.every((entry) => entry.max_declines === 17)).toBe(true);
+    expect(retries.rolling.windows.map((entry) => entry.window_end.slice(0, 10)).sort().at(-1)).toBe("2026-09-17");
+    expect(retries.rolling.newest_violation_end?.slice(0, 10)).toBe("2026-09-27");
   });
 });

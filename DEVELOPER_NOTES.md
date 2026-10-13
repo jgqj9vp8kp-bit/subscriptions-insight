@@ -369,14 +369,240 @@ refunds / issuer-suspected-fraud / complaints up = bad); `MetaNotes` shows `meta
 verbatim plus the grey "incomplete period" badge, the no-snapshot badge and any `limited` cap.
 Instrument keys appear as 10-character prefixes of the server's opaque hash; MIDs and descriptors
 only as the registry labels; the Retries tab carries an explicit "Rules unverified" note and
-"heuristic" badges on the chain rates. Disputes / 3DS / alerts: one `DisputesPlaceholderCard`
-(Overview and Refunds), no tab.
+"heuristic" badges on the chain rates. Disputes / 3DS: one `DisputesPlaceholderCard` (Overview and
+Refunds), no tab. Alerts have their own tab since P2.5 ("Payment health P2.5 alerts frontend" below).
 
 **Not done / later.** Multi-select filters (the contract already takes arrays); an export button
-behind `payment_health.export`; the Disputes / 3DS / Alerts tabs (P2.5 / P3); a restricted
+behind `payment_health.export`; the Disputes / 3DS tabs (P3 / P5); a restricted
 (funnel-scoped) variant (plan P7). The page has not been exercised against the live function yet
 (see "Live SQL not yet exercised" above): the first live open should be the owner's, Data Sources
 tab first.
+
+## Payment health P2.5 alerts (2026-10-13)
+
+Plan "Payment System Health" section Q, phase P2.5 (rules MVP; network-ratio rules are P4). Rollout:
+README "Payment health P2.5". Files: engine `_shared/clickhouse/paymentRiskAlerts.ts`, contract
+`_shared/clickhouse/paymentRiskAlertsContract.ts` (actions, rule keys, statuses, transitions,
+request normalizers, response shapes, errors — the browser imports it), recommendation library
+`_shared/clickhouse/paymentRiskRecommendations.ts`, policy
+`_shared/access/policies/clickhouse-payment-health.ts` (alert actions + the cron branch), router in
+`clickhouse-payment-health/index.ts`, migrations `202610130001_payment_health_alerts.sql` (tables +
+functions) and `202610130002_payment_health_alerts_cron.sql` (pg_cron). Tests:
+`paymentRiskAlerts.test.ts` (ban, rules, windows, confidence, engine over the fixture warehouse,
+end to end with the SQL functions on PGlite), `paymentHealthAlertsMigration.test.ts` (PGlite),
+`accessEdgePaymentHealth.test.ts` ("P2.5" blocks).
+
+**Actions** (same function, POST, body `action`):
+
+| action | policy | does |
+|---|---|---|
+| `alerts_list` | `payment_health.view` | the alerts (filters `status[]`, `severity[]`, `rule[]`, `limit` ≤ 500), counts, the last run, the rule table |
+| `alert_update` | `payment_health.manage_alerts`, write | `{alert_id, status, note?}` through `payment_alert_update_status` |
+| `alerts_run` | `payment_health.manage_alerts`, write | run the engine now; 429 `rate_limited` inside 300 s of the last run |
+| `alerts_tick` | cron branch only (`x-cron-secret` = `FB_CRON_SECRET`) | the daily run; a tick within 60 s of another run returns `skipped: "recent_run"` |
+
+None is scopeReady (restricted members: 403). `manage_alerts` is privileged, so a narrowed member
+never holds it (403 `permission_denied` before scope). PSP-scoped alerts (`scope.kind = 'account'`,
+the generated column `psp_scoped`) are filtered out IN SQL for a caller without
+`payment_health.psp_global.view` (the limit counts visible rows; `hidden_psp_scoped` says how many
+were left out), and the tenant-wide retry alerts lose `evidence.by_account`; `alert_update` on an
+alert the caller cannot list is 404 `alert_not_found` (no PSP detail through the answer).
+
+**The run** (`runPaymentRiskAlerts`): `payment_alerts_claim_run` (advisory xact lock per data key;
+refuses inside `p_min_interval_seconds` of the last run's start or while a run started < 10 min
+ago is running; a run older than that is closed as failed) → `evaluateWorkspaceAlerts` → 
+`payment_alerts_apply_run`; any failure → `payment_alerts_fail_run` (best effort, the original
+error propagates — a ScopeViolation too). The reads: the rules, then ONE `loadDimensionRegistry` +
+`loadAnchorSnapshot`, then `runPaymentHealth` with `preloaded` (no registry rescan) for each request
+of `planAlertRequests` — `declines` by `merchant_account` filtered `initiation: [cit]` and `[mit]`
+(approval) and by `processor` (the PSP-wide approval line), `overview` of the latest window (fraud
+codes, integration, complaints), `overview` of the mature refund window, `retries` (30 days),
+`sources` (freshness; and the support data's reach for the complaint rule). No SQL of its own: every number is
+what the page shows for `evidence.reproduce` (action, dates, filters, dimension, the field read).
+Then up to `FUNNEL_LOOKUP_LIMIT` (12) funnel splits (`declines` / `refunds_support` filtered on the
+account, dimension `funnel`) name `affected_funnels` (labels; Δrate × current volume, positive only,
+top 5) for warning / critical account alerts.
+
+**Windows are whole days ending the day before `data_through`** (registry `last_day`, the newest
+attempt day; `ALERT_WINDOW_END_LAG_DAYS = 1`): the Primer CSV is exported during its newest day, so
+that day is partial by construction (plan P "the last days are incomplete"), and a window holding it
+would compare a part-day with a whole baseline week while still reading as complete. 7 days vs the
+previous 7 (`windowsFor`) for the rate rules, the last 30 for the retry rules, and for
+`refund_rate_rise` the 7 days ending `params.maturity_days` (30) before that (only mature windows: a
+payment is refunded for weeks). `data_stale` reads `data_through` itself. One day of latency.
+
+**Decision per scope** (`evaluateRate`, `evaluateCount`, pure): `comparePeriods` with the rule's
+`min_sample`. A side without data or a window under `params.min_sample_info` (50) → inconclusive
+(neither raised nor resolved). Move ≥ `severity_warning` pp and significant with both windows ≥
+`min_sample` and mature → warning / critical (≥ `severity_critical`); the same move on a smaller
+sample or an immature window → `info` + `data_confidence: low` (a check constraint enforces "low ⇒
+info"). CLEARED (open alerts of that rule + scope auto-resolve) only on a conclusive "no": enough
+mature data AND a move under the warning threshold. A move ≥ warning whose intervals overlap is
+INCONCLUSIVE, not clear: two non-overlapping 95% intervals is a conservative test that ordinary per
+MID × initiation samples fail even for large moves, and "not proven" must not resolve an open alert
+while the move is still there — the band between "significant" and "under warning" is the
+hysteresis. Count rules: count ≥ warning → warning / critical; under it → cleared; a capped row read
+(`meta.limited.attempt_rows`) → at most info / low and never cleared. `approval_drop` is per account
+AND initiation because CIT and MIT approval differ by ~30 pp (plan F): on a mixed rate a renewal
+wave would read as a drop; it also reads every MID of a PSP together (`declines` by `processor`,
+scope `account:<proc>:all:<initiation>`, no `merchant_account`, PSP-scoped, explanation variant
+`processor`) for a processor with at least two routed accounts in the window pair, so a PSP-wide drop
+is caught when each MID alone is inconclusive (plan Q "по PSP или MID"); a single-MID PSP is not read
+twice. `unauthorized_complaints_rise` is judged on the received-date basis (complaints received in
+the window over the window's settled payments) and only on windows the SUPPORT data covers: the
+support pipeline (mail import, classification, sync) is not `data_through`'s, so the engine reads
+`sources.support.last_day` (newest `request_date`) and a window ending after it — or a workspace
+without support data — is immature: info / low at most, never cleared ("absence of data is not zero
+risk"; `evidence.support_through`, `support_complete`). The page keeps its refund-style maturity
+badge on that comparison as display caution, so the alert can say "significant" where the page says
+"maturing". `psp_integration_rise` has a per-account line and one tenant line (integration +
+unrouted declines over all attempts), which is not PSP-scoped. `data_stale` has three lines:
+`data_through` (days), the payment rows' ClickHouse sync (`warehouse_sync`) and the support
+requests' (`support_sync`, `sources.support.last_synced_at`), the two syncs on
+`params.sync_warning_hours` / `sync_critical_hours`; a sync without a time (no support data at all)
+is inconclusive. The retry facts use the runner's full figures: `post_ban.by_initiation` (settled /
+switched per initiation over every post-ban attempt; `post_ban_attempts` is the newest 200 of both)
+and `rolling.newest_violation_end` (over every pair over the limit; `rolling.windows` is the top 100
+by `max_declines`, so its newest entry is not the newest violation — without the full figure a cut
+list gives no `newest_event_day`).
+
+**Keys and apply** (`payment_alerts_apply_run`, one transaction): `alert_key = rule|scope_key|window_end`
+(unique per data key), `scope_key = account:<proc>:<account key>[:<initiation>]` or
+`tenant:<subject>[:<initiation>]` (opaque keys only, labels never). Per candidate: same alert_key →
+refresh (an auto-resolved one reopens as `new`; any other status is kept); else an OPEN alert of the
+same rule + scope → carried to the new window (row, status, assignee, history kept; alert_key
+rewritten); else a candidate that repeats the evidence of an owner-closed (dismissed / resolved by a
+person) alert of the scope, at a severity no higher than that alert's → suppressed: a count alert
+whose `newest_event_day` the closed alert's `window_end` reaches (a sliding 30-day window re-showing
+old re-attempts is not news), a rate alert (no `newest_event_day`) whose window overlaps the closed
+one (`closed.window_end >= window_start`: window_end follows `data_through`, so every import is a new
+alert_key, and the next 7-day window shares 6 days with the one the owner closed) — once the overlap
+ends, a condition that still holds is a new alert; a freshness line compares its `window_end`; else
+insert `new`. Cleared conditions resolve only `new` / `investigating` alerts (`auto_resolved =
+true`); dismissed and owner-resolved ones are never touched. A disabled rule or a rule without data
+evaluates nothing, so its open alerts stay open. History entries: `raised`, `reopened`,
+`auto_resolved` (engine, `by: null`), `status` (a person, with the note).
+
+**Unlabelled MID → registered.** An account scope is keyed on the registry's account key, which is
+`unlabelled:<hash>` until `psp_accounts_sync` registers the MID and its `psp_accounts.id` after. The
+engine names, for every registered account, the key it had before (`registeredAccountAliases`:
+`unlabelledAccountKey` of the registry's raw pair, server-side, opaque) — `candidate.scope_aliases`
+(carry forward and suppression match the alias too; the carried row takes the new scope_key; never
+stored) and a second cleared ref under the alias (an orphaned open alert resolves). A registry row
+that is deleted (id → unlabelled again) has no alias: its open alerts must be closed by hand.
+
+**alerts_list** reads open and closed alerts separately (each `last_seen_at` desc, `limit + 1`, the
+caller's filters; a status filter narrows both), then orders open first, severity, last seen, and
+cuts to `limit`: the limit can never drop an open alert in favour of a closed one (a dismissed alert
+on a re-run window keeps being refreshed, an open one whose scope stays inconclusive does not).
+
+**Status changes** (`payment_alert_update_status`, SECURITY DEFINER, service_role only): the
+transition table of `ALERT_STATUS_TRANSITIONS` under `FOR UPDATE` (the Edge pre-checks it for a clean
+400, the SQL is the authority: `invalid_transition: <from> -> <to>` → 400, `not_found:` → 404),
+`investigating` assigns the actor when nobody holds the alert, `resolved` sets `resolved_at`, and
+`public.access_write_audit('payment_health.alert_status_changed', ...)` writes the audit row in the
+same transaction (statuses, assignee, rule, severity, scope key, request id — never the note's
+text). The gate also writes its generic `sync.triggered` row for a write action by a non-owner, as
+for every write action. The tables grant the service role SELECT only: no status can change
+without its history entry and audit row.
+
+**Recommendations** (`buildAlertExplanation`): `{fact, likely_explanation, hypothesis, action[]}`;
+only the fact is filled (numbers + labels); every hypothesis starts "Unverified". The ban of plan Q
+is code: `FORBIDDEN_RECOMMENDATION_PATTERNS` (rerouting, splitting, spreading, distributing, load
+balancing, moving traffic, another / several / across MIDs · descriptors · PSPs, cascades,
+fallbacks, "below the threshold", evading, hiding, descriptor rotation, artificial / micro payments,
+MCC changes, disabling / skipping / exempting authentication, frictionless, retry after a ban) is
+checked over every template when the module loads (a violation throws: the function would not
+boot) and over every built explanation; the tests also run the patterns against known-bad phrasings.
+
+**Live SQL not yet exercised.** The engine reuses statements the page already sends (proven on the
+semantic fixture responder, not live); the SQL functions are proven on PGlite. The first live run
+should be the owner's `select public.invoke_payment_alerts_tick();` after step 3 of the README.
+
+## Payment health P2.5 alerts frontend: the Alerts tab (2026-10-13)
+
+The tab over the alert actions above (README "Payment System Health (page)", row Alerts, for what the
+user sees). Files: `src/components/payment-health/AlertsTab.tsx` (the tab), `alertsModel.ts` (pure
+view model: labels, values by unit, scope labels, flags, typed evidence readers, the status buttons,
+error copy, run summary), `pageState.ts` (the tab's two filters, `alertsFilters`,
+`parseAlertReproduce` / `reproduceState`), the page `src/pages/PaymentHealth.tsx` (tab, badge, the
+manage key), data source `paymentHealthDataSource.ts` (alert section at the end), cache keys
+`paymentHealthCache.ts`, hooks `usePaymentHealth.ts` (`usePaymentAlertsQuery`,
+`useAlertStatusMutation`, `useRunAlertsMutation`), transport `runClickHousePaymentHealthAlerts` in
+`clickhouse.ts`. Tests: `paymentHealthAlertsTab.test.tsx` (the page with the tab over an in-memory
+alerts server: list, badge, filters, evidence and explanation, deep link, permission-gated buttons,
+mutation flow, run + interval + 429, a run in flight across a remount, PSP stripping, not-deployed
+state, leak scan, ban check), `paymentHealthDataSource.test.ts` ("alert requests", "alert cache
+keys", "Alerts tab state", "alert view model"), `paymentHealthHooks.test.tsx` ("payment alert
+hooks"), `clickhouseCircuitBreaker.test.ts` (the alert transport and the breaker),
+`paymentHealthPage.test.tsx` (tab order, no count without open alerts),
+`support/paymentHealthAlertResponses.ts` (synthetic alerts built with the engine's own
+`buildAlertExplanation`, sentinels planted in fields the tab must never read, and the in-memory
+server using the contract's normalizers, transition table and sort order).
+
+**Types are the Edge contract** (`paymentRiskAlertsContract.ts`, imported like the page contract):
+rule keys, statuses, `ALERT_STATUS_TRANSITIONS`, `ALERT_RULE_META`, response shapes. Request
+builders: `buildAlertsListRequest(filters)` sends only non-empty canonical lists (contract order,
+de-duplicated, unknown values dropped — `normalizeAlertsFilters`), never `limit` (the server's 100;
+`meta.limited` → "showing 100, narrow the filters" and "100+" on the badge);
+`buildAlertUpdateRequest` runs the contract's `normalizeAlertUpdateRequest` first (a bad id or an
+over-long note fails before anything is sent; the note is trimmed or left out). Responses go through
+`missingAlertsFields` (an embedded `ok:false` or a half body throws the usual "Incomplete …" shape
+error, never an empty list).
+
+**Transport and breaker.** `runClickHousePaymentHealthAlerts`: `alerts_list` and `alert_update` are
+Postgres-only on the server, so they are not breaker-gated (the list must load while the warehouse is
+down — a `data_stale` alert matters most then) and their outcome never opens or closes the breaker
+(`warehouseSignal: false`); `alerts_run` reads the warehouse and is gated like the page's reads.
+
+**Cache.** Key `["payment-health-alerts", "alerts_list", schema 1, access partition, canonical
+filters]` (`paymentHealthAlertsQueryKey`). Its own root, deliberately NOT in
+`WAREHOUSE_DEPENDENT_ROOTS`: alerts are mutable shared state, so they are never persisted to
+sessionStorage and not keyed by the warehouse version (an import changes no alert until the next
+run). `staleTime` 1 min, refetch on focus only after a success, `transientRetry` (a 4xx is never
+asked again) and `retryOnMount: false` (the badge and the tab observe the same key; a refused list
+must not be re-asked when the second observer mounts — the error card's Retry asks). Both mutations
+invalidate the whole root on settle — success or refusal (a refused transition usually means someone
+moved the alert first). The page mounts the open-alerts query (`OPEN_ALERTS_FILTERS`) for the badge;
+the tab's default filter is the same canonical value, so badge + default view = one request. Alerts
+do not wait for the warehouse version or the options answer; a funnel-restricted member sends no
+request (no alert action is scope-ready). The mutations and the notice live in `AlertsTab`, above
+`QueryFrame`: a run (up to ~2 min) keeps its pending state and its answer when a failed list replaces
+the body with its error card.
+
+**Permissions in the browser (UX only; the server re-checks).** The status buttons and "Run checks
+now" need `access.can("payment_health.manage_alerts")` (`MANAGE_ALERTS_PERMISSION`, pinned to the
+policy's constant by a test) AND `meta.can_manage` from the server — the server's word wins either
+way. Buttons are exactly `ALERT_STATUS_TRANSITIONS[status]` in a fixed order (Investigating / Reopen,
+Resolve, Dismiss), one optional note (≤ 1000, kept per row and cleared when the status changes).
+"Run checks now" is disabled until `last_run.started_at + meta.run_min_interval_seconds` (a timer
+re-enables it); a 429 (inside the interval or while a run is still going) says so. PSP visibility is
+`meta.psp_global_visible`: without it the server leaves PSP-scoped alerts out (`hidden_psp_scoped` is
+said in the header) and strips `evidence.by_account`; the tab also drops any `psp_scoped` alert and
+the account split on its own (defence in depth).
+
+**Rendering rules** (alertsModel.ts, pinned by tests). `displaySeverity`: low confidence ⇒ Info,
+whatever is stored, with a dashed "low confidence" badge and a note in the details; the change of an
+info alert is not painted red. Values by unit: a rate is a fraction (two-decimal %, change in pp), a
+count, days ("15 d"), hours. Scope from labels only (merchant account label, processor label, CIT /
+MIT, or "Whole workspace" + the subject), "unlabelled" for a MID after the last registry sync. The
+evidence is read field by field through known keys (`rateEvidence`, `countEvidenceRows`,
+`accountCounts`) and never dumped, so an unknown stored field never reaches the screen. The
+explanation's four parts are labelled Fact / Likely explanation / Hypothesis (badge *unverified*) /
+Recommended actions; a text `forbiddenRecommendationHits` flags is withheld with a count (the engine
+refuses such texts already). Issuer fraud-suspicion alerts carry "issuer suspicion codes — declines,
+not confirmed fraud"; the retry rules "network re-attempt rules unverified". People appear as "you"
+(the signed-in auth id) / "a teammate" / "the alert engine", never an id. "Open in …" applies
+`reproduceState(evidence.reproduce)`: the tab, the window as a custom range, exactly the alert's
+filters (all others cleared) and its dimension; hidden when the request needs a PSP filter or
+dimension the caller may not send, or names more than one value for a filter (the bar is
+single-select). A 400 `unknown_action` on `alerts_list` (the SPA ahead of the functions) renders
+"not deployed on the server yet" instead of an error card; a 403 renders NoAccess like the other tabs.
+
+**Page state.** `alertStatus` (`open` = new + investigating, default; `all`; one status) and
+`alertSeverity` (`all` or one) in the persisted page state; persisted junk falls back to the default
+(`coerceAlert*Filter`). The filter bar's Clear leaves them alone, and the page's window and filters
+do not apply to alerts (fixed windows of whole days ending the day before data through).
 
 ## Known Limitations
 

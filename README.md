@@ -598,7 +598,10 @@ only the Owner may grant the two privileged keys, and only to full-scope members
 3. **Registry labels**: the page shows MIDs as `psp_accounts` labels ("Stripe MID #1", ...). A MID
    that appears after the last `psp_accounts_sync` shows as "Unlabelled MID" until the sync runs
    (the runner does not call it); run `select public.psp_accounts_sync();` after an import that may
-   have introduced a MID, or edit the labels / `descriptor_prefix` in `public.psp_accounts`.
+   have introduced a MID, or edit the labels / `descriptor_prefix` in `public.psp_accounts`. Alerts
+   (P2.5) raised on an "Unlabelled MID" carry over to its label after the sync (the alert engine
+   matches the MID's former key); only deleting a `psp_accounts` row leaves its open alerts to be
+   resolved or dismissed by hand.
 4. **Funnel attribution** needs a validated `fact_user_cohorts` snapshot (the Cohorts snapshot state);
    without one every row is "unattributed" and the response says so (`meta.funnel_attribution`).
 5. **Frontend**: the `/payment-health` page ships with the SPA (Lovable deploys `main`); see
@@ -609,6 +612,99 @@ only the Owner may grant the two privileged keys, and only to full-scope members
 Rollback: redeploy the previous functions (the policy file is only read by the new function; the
 catalog keys stay harmless in `permissions.ts` and in roles that list them). The migration can stay:
 the predicate only matters for keys no role holds unless the owner granted them.
+
+### Payment health P2.5 — alerts: migrations, deploy, daily run
+
+The alert engine of the Payment System Health page (plan section Q, phase P2.5; DEVELOPER_NOTES.md
+"Payment health P2.5 alerts"). Once a day it reads the page's own figures for the newest complete
+windows of whole days (the 7 days before "data through" against the 7 before them — "data through"
+itself is the day the export was taken during, so it is partial and left out; the last 30 days for
+the retry rules; the newest window that is 30 days old for refunds), raises an alert where a rule's
+threshold is crossed **and** the change is significant (95% Wilson intervals, at least 200
+observations per window), and resolves an open alert by itself only when a later run finds the
+condition clear: enough data and a change under the warning threshold. A change above the threshold
+that is not significant leaves an open alert as it is. A smaller sample or a still-maturing window
+— for complaints also support data that does not reach the window's end — never raises a warning
+and never resolves anything: at most an `info` alert marked **low confidence**. Every alert says the fact, the likely explanation, an **unverified**
+hypothesis and lawful actions only (clear descriptor, re-attempt rules, 3DS where the issuer requires
+it, cancellation and refunds, traffic quality) — never moving or splitting volume between MIDs,
+descriptors or PSPs, and never lowering authentication. Network-ratio alerts (VAMP / ECP) come with
+the dispute data (P4).
+
+**Rules** (`public.payment_alert_rules`; the owner may change thresholds, `enabled` and `params` in
+the SQL editor, a re-applied migration never resets them):
+
+| rule | fires on | warning / critical |
+|---|---|---|
+| `approval_drop` | approval per PSP × MID and CIT / MIT fell, significant — and per PSP (all its MIDs together) when it has more than one | 5 / 10 pp |
+| `issuer_fraud_rise` | issuer fraud-suspicion declines (59 / 63 / 83) per PSP × MID rose — a decline code, not fraud | 1 / 2.5 pp |
+| `psp_integration_rise` | PSP / integration declines per PSP × MID, and those + unrouted declines over all attempts, rose | 1 / 3 pp |
+| `post_ban_retries` | re-attempts after a do-not-retry decline in the last 30 days, CIT and MIT separately | 1 / 10 attempts |
+| `excessive_reattempts` | card × MID pairs with more than 15 declines in a rolling 30 days | 1 / 5 pairs |
+| `unauthorized_complaints_rise` | "possible unauthorized charge" requests per settled payment, per PSP × MID, rose (low confidence while the support data does not reach the window's end) | 1 / 3 pp |
+| `refund_rate_rise` | refund rate per PSP × MID by original payment date rose, on the mature window | 1 / 2.5 pp |
+| `data_stale` | "data through" older than 7 / 14 days, or the last ClickHouse sync of payment rows or of support requests older than 72 / 168 hours | — |
+
+A dismissed alert, or one resolved by a person, is not raised again for the same evidence: while the
+next windows still overlap the one that was closed (a 7-day window shares 6 days with the day
+before's; for the retry rules, until a newer re-attempt or violation appears), unless it becomes more
+severe.
+
+**Who.** Reading alerts needs `payment_health.view`; alerts that name a PSP account are shown only
+with `payment_health.psp_global.view` (or to the data owner), like the page's PSP × MID table.
+Changing a status (new → investigating / resolved / dismissed, investigating → resolved / dismissed,
+a closed alert back to investigating) and "run now" need the privileged
+`payment_health.manage_alerts` — the owner adds it to the Admin role by hand under Admin → Roles.
+Every status change writes an `access_audit_log` row (`payment_health.alert_status_changed`).
+"Run now" is limited to one run per 5 minutes.
+
+**Rollout, in this order:**
+
+1. **Apply `202610130001_payment_health_alerts.sql` alone**, out of band like the earlier payment
+   health files (never `supabase db push` while earlier-sorting migrations are pending), and record it:
+
+   ```text
+   npx supabase db query --linked -f supabase/migrations/202610130001_payment_health_alerts.sql
+   npx supabase migration repair --status applied 202610130001
+   ```
+
+   It refuses to run before `202610120001` (the key that gates the writes must already be
+   privileged). One transaction, idempotent: the tables `payment_alert_rules` (seeded with the
+   eight rules), `payment_alert_runs`, `payment_risk_alerts` (RLS on, no browser access, the service
+   role reads them and writes only through the four `payment_alert*` functions).
+2. **Deploy every function** with `npm run deploy:functions` (still 28: the alerts are actions of
+   `clickhouse-payment-health`, not a new function).
+3. **Apply `202610130002_payment_health_alerts_cron.sql`** the same way, AFTER step 2 (before it,
+   every tick would be answered 401 `invalid_session`: the old function has no cron branch, so the
+   tick is treated as a user request with the anon key):
+
+   ```text
+   npx supabase db query --linked -f supabase/migrations/202610130002_payment_health_alerts_cron.sql
+   npx supabase migration repair --status applied 202610130002
+   ```
+
+   It schedules the pg_cron job `payment-health-alerts` daily at 07:40 UTC (after the night's syncs
+   and the 06:15 leads refresh). It posts `{auth_user_id: <data key>, action: "alerts_tick"}` with the
+   shared FB cron secret, like the cohort freshness tick.
+4. **First run**: `select public.invoke_payment_alerts_tick() as request_id;` (it returns the pg_net
+   request id), then — after about two minutes, a run can take that long — read THAT response (other
+   cron jobs write `net._http_response` too, so "the newest row" can be someone else's):
+   `select status_code, timed_out, left(content, 400) from net._http_response where id = <request_id>;`
+   → 200 with `{"ok":true,"action":"alerts_tick","run":{...,"status":"succeeded",...}}`. The run row
+   says the same: `select status, trigger, data_through from public.payment_alert_runs order by started_at desc limit 1;`
+   → `succeeded`, `cron`.
+5. **Verify** (read-only):
+   - `select status, trigger, data_through, summary -> 'applied' from public.payment_alert_runs order by started_at desc limit 3;`
+   - `select rule_key, severity, status, data_confidence, window_end, sample_size from public.payment_risk_alerts order by last_seen_at desc;`
+   - `select jobname, schedule from cron.job where jobname = 'payment-health-alerts';` → `40 7 * * *`
+   - no alert carries a raw MID (prints a count only):
+     `select count(*) from public.payment_risk_alerts a join public.psp_accounts p on p.auth_user_id = a.auth_user_id and a.evidence::text || a.explanation::text || a.scope::text like '%' || p.processor_merchant_id || '%';` → 0
+6. **Frontend**: the Alerts tab ships with the SPA and reads `alerts_list`; it needs step 2 live
+   (until then the tab says the checks are not deployed yet). What the tab shows: "Payment System
+   Health (page)" below.
+
+Rollback: `select cron.unschedule('payment-health-alerts');` and redeploy the previous functions.
+The tables can stay (nothing else reads them).
 
 ### Payment System Health (page)
 
@@ -656,9 +752,22 @@ suspected fraud (decline, not fraud)" is the issuer's suspicion code — a decli
 | Approvals & Declines | Approval by a chosen dimension (processor, MID, descriptor, funnel, issuer country, card network, payment method, CIT / MIT, stage); decline classes with their rate over attempts; the issuer code / Primer code / advised action / advice code mix with soft / hard severity, the re-attempt guidance each code carries and the **ban** rows (DO_NOT_RETRY, STOP_ALL_PAYMENTS, Visa category 1, Mastercard MAC 03 / 21). |
 | Retries & Network Rules | Attempt chains (**heuristic**: Primer gives every retry a new orderId, so chains link attempts by user, instrument or currency + amount, price point and initiation within CIT 60 min / MIT 72 h): first-try approval, final success, retry recovery, cascade recovery; post-ban re-attempts (CIT / MIT, same / switched processor, within one hour, succeeded) with the newest rows; instrument × account pairs over 15 decline records in a rolling 30 days. The tab says **rules unverified**: the network rules come from secondary sources, the flags are potential violations, not fines. |
 | Refunds & Complaints | Refunds by the original payment date: rate against the previous period, timing buckets from the import that first saw the refund (≤ 7 / 30 / 90 / > 90 days; "unobserved" = synced before P0), by payment month and by dimension. Support complaints (possible unauthorized charge, requires refund, duplicate charge) by received month, attributed to the last settled payment of the matched user within 30 days, else unattributed; by PSP × MID with the key; a month whose classifier version changed is marked **version break**. The Disputes & fraud reports card says the source is not connected yet. |
+| Alerts | The alerts the daily checks raised (section "Payment health P2.5 — alerts" above). The tab carries the number of open alerts (new + investigating; red when one is critical). Each row: severity, rule, what it is about (registry labels only: "Stripe MID #1 · Stripe · CIT", or "Whole workspace"), current against previous with the change in pp (or the count / days for the retry and freshness rules), the sample and flags (**significant**, **small sample**, **incomplete window**, **low confidence**), the window, first / last seen, status and who holds it ("you" / "a teammate", never an id). Expanding a row shows the evidence (both windows with numerator, denominator, rate and 95% interval, the thresholds and minimum sample; for the retry rules the counts and, with the PSP key, the split by merchant account), the explanation in four labelled parts — **Fact**, **Likely explanation**, **Hypothesis** (marked *unverified*), **Recommended actions** — the history with notes, and **Open in …**, which switches to the tab, window and filters that show the same numbers. Filters: status (default: open) and severity; the page's period and filter bar do not apply here. |
 | Data Sources | Warehouse bounds, last ClickHouse sync, rows synced before the P0 backfill, data through and lag; the share of attempt rows that fill each P0 column (decline-record columns over declines, `refund_observed_at` over refunded payments); the last import and the sync state (lifecycle fields only); support requests by month with classifier versions; the metric dictionary: every metric of the plan with its phase and whether it is measured, a heuristic or an estimate. |
 
-Disputes, 3DS and alerts are later phases: the page shows a placeholder, not a zero.
+**Alerts: what to expect.** A **low confidence** alert (a small sample or a still-incomplete window) always
+reads *Info*, never warning or critical — it is a hint to look, not a finding. An issuer fraud-suspicion
+alert counts the issuers' decline codes, not fraud. Alerts about a PSP account appear only with
+`payment_health.psp_global.view` (or to the data owner); without it the tab says how many were left out.
+With `payment_health.manage_alerts` (privileged; the data owner always) an expanded row offers the status
+buttons the transition table allows — **Investigating** (you become the assignee if nobody is),
+**Resolve**, **Dismiss**, and **Reopen** on a closed alert — each with an optional note saved in the
+history, and the header offers **Run checks now** (one run per 5 minutes per workspace, whoever started
+it; a run can take up to two minutes). Without open alerts the tab says *No open alerts — last run at
+<time>*. The tab needs the P2.5 functions deployed (rollout above); against an older function it says
+*The alert checks are not deployed on the server yet* and shows no count.
+
+Disputes and 3DS are later phases: the page shows a placeholder, not a zero.
 
 ### Supabase Edge Function secret
 

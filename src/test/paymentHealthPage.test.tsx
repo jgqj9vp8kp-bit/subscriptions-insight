@@ -22,7 +22,7 @@ Element.prototype.scrollIntoView = function scrollIntoView() {};
 if (!Element.prototype.hasPointerCapture) Element.prototype.hasPointerCapture = () => false;
 if (!Element.prototype.releasePointerCapture) Element.prototype.releasePointerCapture = () => {};
 
-const fns = vi.hoisted(() => ({ run: vi.fn() }));
+const fns = vi.hoisted(() => ({ run: vi.fn(), alerts: vi.fn() }));
 
 vi.mock("@/services/supabaseClient", () => ({ supabase: null, isSupabaseConfigured: false }));
 vi.mock("@/components/AppLayout", async () => {
@@ -39,6 +39,8 @@ vi.mock("@/hooks/useAnalyticsCache", async (importOriginal) => ({
 vi.mock("@/services/clickhouse", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   runClickHousePaymentHealth: fns.run,
+  // The Alerts tab and its badge (paymentHealthAlertsTab.test.tsx covers them).
+  runClickHousePaymentHealthAlerts: fns.alerts,
 }));
 
 import { ClickHouseRequestError } from "@/services/clickhouse";
@@ -50,6 +52,7 @@ import { PAYMENT_HEALTH_UI_STATE_KEY } from "@/components/payment-health/pageSta
 import { RESTRICTED_SCOPE_DENIAL_COPY } from "@/components/NoAccess";
 import { scanForLeaks } from "./support/leakScan";
 import { UI_SENTINELS, responseFor } from "./support/paymentHealthResponses";
+import { alertsListResponse } from "./support/paymentHealthAlertResponses";
 import PaymentHealthPage from "@/pages/PaymentHealth";
 
 const USER: AuthUser = { id: "user-ph", email: "ph@example.com", provider: "supabase" };
@@ -106,6 +109,8 @@ beforeEach(() => {
   localStorage.clear();
   fns.run.mockReset();
   fns.run.mockImplementation(async (body: Body) => responseFor(body.action, { dimension: body.dimension }));
+  fns.alerts.mockReset();
+  fns.alerts.mockImplementation(async () => alertsListResponse([]));
 });
 afterEach(() => cleanup());
 
@@ -150,6 +155,16 @@ describe("PaymentHealth page", () => {
     expect(notes).toHaveTextContent("Attempt chains are a heuristic (Primer gives every retry a new orderId).");
     expect(within(notes).getByTestId("incomplete-period")).toHaveTextContent("data through 2026-10-10");
     expectNoLeak();
+  });
+
+  it("offers the Alerts tab before Data Sources; without open alerts it carries no count", async () => {
+    renderPage();
+    await screen.findByText("Stripe MID #1");
+    expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual(["Overview", "Approvals & Declines", "Retries & Network Rules", "Refunds & Complaints", "Alerts", "Data Sources"]);
+    await waitFor(() => expect(fns.alerts).toHaveBeenCalledWith({ action: "alerts_list", status: ["new", "investigating"] }));
+    expect(screen.queryByTestId("alerts-tab-count")).toBeNull();
+    // The alert list goes its own way (Postgres-only, not the warehouse runner).
+    expect(calls().some((body) => body.action === "alerts_list")).toBe(false);
   });
 
   it("Approvals & Declines: requests the declines action, shows classes, the code mix with ban rows and soft / hard, and re-requests on a dimension change", async () => {

@@ -76,7 +76,11 @@ export interface FixtureSupport {
   duplicate_charge: 0 | 1;
   category: string;
   classification_version: string;
+  /** DateTime64(3, 'UTC') text, like the transaction rows' (default: the same sync time). */
+  clickhouse_synced_at?: string;
 }
+
+const DEFAULT_SYNCED_AT = "2026-10-06 08:00:00.000";
 
 type Spec = Partial<FixtureTx> & { t: string; status?: FixtureTx["raw_status"]; amount?: number };
 
@@ -119,7 +123,7 @@ export function tx(spec: Spec): FixtureTx {
     decline_record_count: success ? 0 : spec.decline_record_count ?? 1,
     decline_type: success ? "" : spec.decline_type ?? "soft",
     three_ds_response: spec.three_ds_response ?? "",
-    clickhouse_synced_at: "2026-10-06 08:00:00.000",
+    clickhouse_synced_at: DEFAULT_SYNCED_AT,
   };
 }
 
@@ -530,14 +534,21 @@ export function fixtureWarehouse(input: { rows: FixtureTx[]; anchors?: ReadonlyM
         return [out];
       }
       case "support_versions": {
-        const groups = new Map<string, { month: string; classification_version: string; requests: number }>();
+        const groups = new Map<string, { month: string; classification_version: string; requests: number; last_day: string; synced: string }>();
         for (const request of support) {
           const key = `${monthOf(dayOf(request.received_at))}|${request.classification_version}`;
-          const entry = groups.get(key) ?? { month: monthOf(dayOf(request.received_at)), classification_version: request.classification_version, requests: 0 };
+          const day = dayOf(request.received_at);
+          const synced = request.clickhouse_synced_at ?? DEFAULT_SYNCED_AT;
+          const entry = groups.get(key) ?? { month: monthOf(day), classification_version: request.classification_version, requests: 0, last_day: day, synced };
           entry.requests += 1;
+          if (day > entry.last_day) entry.last_day = day;
+          if (synced > entry.synced) entry.synced = synced;
           groups.set(key, entry);
         }
-        return [...groups.values()].sort((a, b) => a.month.localeCompare(b.month) || a.classification_version.localeCompare(b.classification_version));
+        return [...groups.values()]
+          .sort((a, b) => a.month.localeCompare(b.month) || a.classification_version.localeCompare(b.classification_version))
+          // max(request_date) as text and toUnixTimestamp64Milli(max(clickhouse_synced_at)) as Int64 text, as ClickHouse answers.
+          .map(({ synced, ...entry }) => ({ ...entry, last_synced_ms: String(Date.parse(`${synced.replace(" ", "T")}Z`)) }));
       }
       case "options": {
         const rows = att(params, false);

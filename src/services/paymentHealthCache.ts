@@ -11,6 +11,8 @@ import {
   DIMENSION_ACTIONS,
   WINDOWED_ACTIONS,
   activeFilters,
+  normalizeAlertsFilters,
+  type PaymentAlertsFilters,
   type PaymentHealthAction,
   type PaymentHealthFilters,
   type PaymentHealthQuery,
@@ -57,3 +59,24 @@ export function paymentHealthQueryKey(parts: {
     normalizePaymentHealthRequest(parts.action, parts.request),
   ];
 }
+
+// ---- payment risk alerts (P2.5) ----------------------------------------------
+// A root of their own, deliberately NOT in WAREHOUSE_DEPENDENT_ROOTS: alerts are
+// mutable shared state (people change statuses, the daily run raises and
+// resolves them), so they are never persisted to sessionStorage — a reload
+// reads them fresh — and they are not keyed by the warehouse version (an import
+// changes no alert until the next run). The partition slot keeps one
+// principal's list (PSP-scoped alerts included or not) from serving another.
+
+export const PAYMENT_HEALTH_ALERTS_QUERY_ROOT = "payment-health-alerts" as const;
+/** v1: paymentRiskAlertsContract.ts as of P2.5. */
+export const PAYMENT_HEALTH_ALERTS_SCHEMA_VERSION = 1;
+
+export type PaymentHealthAlertsQueryKey = [typeof PAYMENT_HEALTH_ALERTS_QUERY_ROOT, "alerts_list", number, string, PaymentAlertsFilters];
+
+export function paymentHealthAlertsQueryKey(parts: { userScopeHash: string; filters: Partial<PaymentAlertsFilters> }): PaymentHealthAlertsQueryKey {
+  return [PAYMENT_HEALTH_ALERTS_QUERY_ROOT, "alerts_list", PAYMENT_HEALTH_ALERTS_SCHEMA_VERSION, parts.userScopeHash, normalizeAlertsFilters(parts.filters)];
+}
+
+/** What a status change or a run invalidates: every alert list (any filter). */
+export const PAYMENT_HEALTH_ALERTS_QUERY_PREFIX = [PAYMENT_HEALTH_ALERTS_QUERY_ROOT] as const;

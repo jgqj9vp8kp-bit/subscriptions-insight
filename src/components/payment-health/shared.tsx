@@ -13,8 +13,8 @@ import { Card } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { NoAccess } from "@/components/NoAccess";
 import { cn } from "@/lib/utils";
-import type { UsePaymentHealthResult } from "@/hooks/usePaymentHealth";
-import type { PaymentHealthAction, PaymentHealthQuery } from "@/services/paymentHealthDataSource";
+import type { PaymentHealthQueryState } from "@/hooks/usePaymentHealth";
+import type { PaymentHealthQuery } from "@/services/paymentHealthDataSource";
 import type { PaymentHealthMeta, TrendPoint } from "../../../supabase/functions/_shared/clickhouse/paymentHealthContract";
 import type { PeriodComparison, RateEstimate } from "../../../supabase/functions/_shared/clickhouse/paymentHealthMetrics";
 import { fmtNum, summarizeComparison, summarizeRate, type ComparisonTone } from "./format";
@@ -242,11 +242,11 @@ export function Sparkline({ points, width = 96, height = 24 }: { points: TrendPo
  * the gate renders the inline NoAccess shell (scope copy for a funnel-restricted
  * member); other failures show the message with a retry; a failed background
  * refresh keeps the last response visible with a warning line. */
-export function QueryFrame<A extends PaymentHealthAction>({ result, label, idleNote, children }: {
-  result: UsePaymentHealthResult<A>;
+export function QueryFrame<T>({ result, label, idleNote, children }: {
+  result: PaymentHealthQueryState<T>;
   label: string;
   idleNote?: string;
-  children: (data: NonNullable<UsePaymentHealthResult<A>["data"]>) => ReactNode;
+  children: (data: T) => ReactNode;
 }) {
   const { data, error } = result;
   if (result.isDisabled) {
@@ -300,8 +300,8 @@ export function QueryFrame<A extends PaymentHealthAction>({ result, label, idleN
   );
 }
 
-/** Plan R: disputes, fraud reports, 3DS and alerts are later phases; the page
- * says so instead of showing zeros. */
+/** Plan R: disputes, fraud reports and 3DS are later phases; the page says so
+ * instead of showing zeros. (Alerts have their own tab since P2.5.) */
 export function DisputesPlaceholderCard({ className }: { className?: string }) {
   return (
     <Card className={cn("flex items-start gap-3 border-dashed p-4 shadow-none", className)} data-testid="disputes-placeholder">

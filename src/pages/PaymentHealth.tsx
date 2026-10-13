@@ -1,18 +1,22 @@
 // Payment System Health (plan phase P2, section R): attempt quality, declines,
 // retries, refunds and complaints over the Primer export in the warehouse,
-// computed by the clickhouse-payment-health Edge function. Five tabs, one
+// computed by the clickhouse-payment-health Edge function. Six tabs, one
 // global filter bar, one request per tab (cached per access partition and
 // warehouse version). Everything on screen is an aggregate or a registry
-// label; the banner says what is an estimate.
+// label; the banner says what is an estimate. The Alerts tab (P2.5) reads the
+// daily checks' alerts; its open count is the tab's badge (one alerts_list
+// request per partition, shared with the tab's default view).
 //
 // Access: the route needs payment_health.view (ROUTE_ACCESS, restrictedReady
 // false); the PSP × MID table, the registry filters and the PSP dimensions
 // appear only when the server's options response says psp_global_visible —
 // the page never probes for the key. A persisted PSP selection waits for that
 // answer before any windowed request is sent, so a stale filter can never turn
-// into a 403.
+// into a 403. The alert status buttons and "Run checks now" follow the
+// privileged payment_health.manage_alerts of the access context (and the
+// server's meta.can_manage); the server re-checks every change.
 
-import { useEffect, useMemo, useRef } from "react";
+import { useContext, useEffect, useMemo, useRef } from "react";
 import { Info } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -20,8 +24,10 @@ import { NoAccess } from "@/components/NoAccess";
 import { usePersistedPageState } from "@/hooks/usePersistedPageState";
 import { useAccess } from "@/hooks/useAccess";
 import { useWarehouseVersion } from "@/hooks/useAnalyticsCache";
-import { usePaymentHealthQuery } from "@/hooks/usePaymentHealth";
-import { EMPTY_PAYMENT_HEALTH_QUERY } from "@/services/paymentHealthDataSource";
+import { usePaymentAlertsQuery, usePaymentHealthQuery } from "@/hooks/usePaymentHealth";
+import { AuthContext } from "@/contexts/authContext";
+import { EMPTY_PAYMENT_HEALTH_QUERY, OPEN_ALERTS_FILTERS } from "@/services/paymentHealthDataSource";
+import { cn } from "@/lib/utils";
 import { traceMark } from "@/services/performanceTrace";
 import { PaymentHealthFilterBar } from "@/components/payment-health/PaymentHealthFilterBar";
 import { OverviewTab } from "@/components/payment-health/OverviewTab";
@@ -29,12 +35,16 @@ import { DeclinesTab } from "@/components/payment-health/DeclinesTab";
 import { RetriesTab } from "@/components/payment-health/RetriesTab";
 import { RefundsComplaintsTab } from "@/components/payment-health/RefundsComplaintsTab";
 import { SourcesTab } from "@/components/payment-health/SourcesTab";
+import { AlertsTab } from "@/components/payment-health/AlertsTab";
+import { MANAGE_ALERTS_PERMISSION } from "@/components/payment-health/alertsModel";
 import { dimensionOptions } from "@/components/payment-health/model";
 import {
   DEFAULT_PAYMENT_HEALTH_UI_STATE,
   PAYMENT_HEALTH_TABS,
   PAYMENT_HEALTH_UI_STATE_KEY,
   TAB_LABELS,
+  coerceAlertSeverityFilter,
+  coerceAlertStatusFilter,
   coerceTab,
   customRangeProblem,
   effectiveQuery,
@@ -42,7 +52,7 @@ import {
   type PaymentHealthTab,
   type PaymentHealthUiState,
 } from "@/components/payment-health/pageState";
-import { fmtDay, todayUtc } from "@/components/payment-health/format";
+import { fmtDay, fmtNum, todayUtc } from "@/components/payment-health/format";
 import { windowsFor, type PaymentHealthDimension } from "../../supabase/functions/_shared/clickhouse/paymentHealthContract";
 
 export default function PaymentHealthPage() {
@@ -57,7 +67,9 @@ export default function PaymentHealthPage() {
   const update = (patch: Partial<PaymentHealthUiState>) => setUiState((current) => ({ ...current, ...patch }));
   // "Clear" is about the filters: the open tab and the breakdown dimension are
   // navigation, and jumping back to Overview on a clear reads as a bug.
-  const clearFilters = () => setUiState((current) => ({ ...DEFAULT_PAYMENT_HEALTH_UI_STATE, tab: current.tab, dimension: current.dimension }));
+  // The Alerts tab's own filters are not the bar's either.
+  const clearFilters = () =>
+    setUiState((current) => ({ ...DEFAULT_PAYMENT_HEALTH_UI_STATE, tab: current.tab, dimension: current.dimension, alertStatus: current.alertStatus, alertSeverity: current.alertSeverity }));
   const tab = coerceTab(uiState.tab);
 
   // The access partition keys every query (plan §20); the warehouse version
@@ -105,6 +117,18 @@ export default function PaymentHealthPage() {
   }, []);
 
   const tabProps = { query, userScopeHash, warehouseVersion, enabled: windowedEnabled, pspVisible, idleNote };
+
+  // Alerts: Postgres-only on the server, so they do not wait for the warehouse
+  // version or the options answer. A funnel-restricted member would get 403
+  // (no alert action is scope-ready): no request at all.
+  const alertsEnabled = !access.restricted;
+  const openAlerts = usePaymentAlertsQuery({ filters: OPEN_ALERTS_FILTERS, userScopeHash, enabled: alertsEnabled });
+  const openCount = openAlerts.data?.counts.open ?? 0;
+  const openCountText = openAlerts.data?.meta.limited ? `${fmtNum(openCount)}+` : fmtNum(openCount);
+  const openBySeverity = openAlerts.data?.counts.open_by_severity;
+  const badgeTone = openBySeverity?.critical ? "bg-destructive text-destructive-foreground" : openBySeverity?.warning ? "bg-warning text-warning-foreground" : "bg-muted-foreground/20 text-foreground";
+  const canManageAlerts = access.can(MANAGE_ALERTS_PERMISSION);
+  const currentUserId = useContext(AuthContext)?.user?.id ?? null;
   const dataThrough = options.data?.meta.data_through ?? null;
   // The banner's "data through" comes from options: an ellipsis while it loads,
   // "unknown" after a failure (never a stale or made-up day).
@@ -146,7 +170,18 @@ export default function PaymentHealthPage() {
         <Tabs value={tab} onValueChange={(value) => update({ tab: coerceTab(value) })}>
           <TabsList className="flex h-auto w-full flex-wrap justify-start gap-1">
             {PAYMENT_HEALTH_TABS.map((key: PaymentHealthTab) => (
-              <TabsTrigger key={key} value={key} className="text-xs sm:text-sm">{TAB_LABELS[key]}</TabsTrigger>
+              <TabsTrigger key={key} value={key} className="text-xs sm:text-sm">
+                {TAB_LABELS[key]}
+                {key === "alerts" && openCount > 0 && (
+                  <span
+                    className={cn("ml-1.5 inline-flex min-w-[1.25rem] items-center justify-center rounded-full px-1.5 text-[10px] font-semibold leading-4", badgeTone)}
+                    title={`${openCountText} open alert(s)`}
+                    data-testid="alerts-tab-count"
+                  >
+                    {openCountText}
+                  </span>
+                )}
+              </TabsTrigger>
             ))}
           </TabsList>
           {/* Only the active tab mounts its query: the others fetch when opened and keep their cache. */}
@@ -154,6 +189,20 @@ export default function PaymentHealthPage() {
           <TabsContent value="declines" className="mt-4">{tab === "declines" && <DeclinesTab {...tabProps} dimensionSelect={dimensionSelect} />}</TabsContent>
           <TabsContent value="retries" className="mt-4">{tab === "retries" && <RetriesTab {...tabProps} />}</TabsContent>
           <TabsContent value="refunds" className="mt-4">{tab === "refunds" && <RefundsComplaintsTab {...tabProps} dimensionSelect={dimensionSelect} />}</TabsContent>
+          <TabsContent value="alerts" className="mt-4">
+            {tab === "alerts" && (
+              <AlertsTab
+                userScopeHash={userScopeHash}
+                enabled={alertsEnabled}
+                statusFilter={coerceAlertStatusFilter(uiState.alertStatus)}
+                severityFilter={coerceAlertSeverityFilter(uiState.alertSeverity)}
+                onFiltersChange={update}
+                canManage={canManageAlerts}
+                currentUserId={currentUserId}
+                onReproduce={update}
+              />
+            )}
+          </TabsContent>
           <TabsContent value="sources" className="mt-4">
             {/* Sources is tenant-wide (no window, no filters). After an access denial on options the same gate would refuse it: show the shell instead of asking again. */}
             {tab === "sources" && optionsAccessDenied && <NoAccess reason={options.error?.errorCode === "scope_not_supported" ? "scope" : "permission"} />}

@@ -337,6 +337,9 @@ function tenantOwnerColumns(): Map<string, string> {
     "project_forecasts", "forecast_scenarios", "ai_recommendations", "ai_feedback", "ai_assistant_runs", "report_ai_runs",
   ]) owners.set(table, "auth_user_id");
   owners.set("api_keys", "user_id");
+  // Payment health P2.5: service-role-only tables keyed by the workspace data key (no RLS policy to
+  // classify them, so they are listed here): every Edge read must still filter on it.
+  for (const table of ["payment_risk_alerts", "payment_alert_runs"]) owners.set(table, "auth_user_id");
   return owners;
 }
 
@@ -539,6 +542,8 @@ const CATCH_LINT_FILES = [
     "cohortSubscriptions", "campaignScope", "pathCoverage", "cohortSnapshotState", "scopeSql",
     // Payment health P2: the runner (its registry / snapshot / state reads are best effort).
     "paymentHealth",
+    // Payment health P2.5: the alert engine (its failed-run bookkeeping is best effort).
+    "paymentRiskAlerts",
   ].map((name) => resolve(CLICKHOUSE_DIR, `${name}.ts`)),
   // The routers of the restricted-reachable functions (their catches wrap scoped runners).
   ...["clickhouse-cohorts", "clickhouse-revenue", "clickhouse-facebook", "clickhouse-cohort-membership"].map((fn) => resolve(FUNCTIONS_DIR, fn, "index.ts")),

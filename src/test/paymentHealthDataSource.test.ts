@@ -1,50 +1,97 @@
 // Payment System Health frontend, pure parts: the request builders, the
 // response shape check, the typed error classification, the cache keys (access
 // partition + schema version) and the page-state → query mapping (a persisted
-// PSP selection is never sent without the key; preset windows roll).
+// PSP selection is never sent without the key; preset windows roll). P2.5: the
+// alert requests (against the contract normalizers), their shape check and
+// transport, the alert cache keys, the Alerts tab state (filters, the
+// evidence.reproduce deep link) and the alert view-model rules.
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { hashKey } from "@tanstack/react-query";
 
-const fns = vi.hoisted(() => ({ run: vi.fn() }));
+const fns = vi.hoisted(() => ({ run: vi.fn(), alerts: vi.fn() }));
 vi.mock("@/services/supabaseClient", () => ({ supabase: null, isSupabaseConfigured: false }));
 vi.mock("@/services/clickhouse", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   runClickHousePaymentHealth: fns.run,
+  runClickHousePaymentHealthAlerts: fns.alerts,
 }));
 
 import { ClickHouseRequestError } from "@/services/clickhouse";
 import {
   EMPTY_PAYMENT_HEALTH_FILTERS,
   EMPTY_PAYMENT_HEALTH_QUERY,
+  OPEN_ALERTS_FILTERS,
   activeFilters,
+  buildAlertUpdateRequest,
+  buildAlertsListRequest,
   buildPaymentHealthRequest,
   describePaymentHealthError,
+  isCompleteAlertsListResponse,
   isCompletePaymentHealthResponse,
+  loadPaymentAlerts,
   loadPaymentHealth,
+  missingAlertsFields,
   missingPaymentHealthFields,
+  runPaymentAlerts,
+  updatePaymentAlert,
   type PaymentHealthQuery,
 } from "@/services/paymentHealthDataSource";
 import {
+  PAYMENT_HEALTH_ALERTS_QUERY_PREFIX,
+  PAYMENT_HEALTH_ALERTS_QUERY_ROOT,
+  PAYMENT_HEALTH_ALERTS_SCHEMA_VERSION,
   PAYMENT_HEALTH_QUERY_ROOT,
   PAYMENT_HEALTH_RESPONSE_SCHEMA_VERSION,
   normalizePaymentHealthRequest,
+  paymentHealthAlertsQueryKey,
   paymentHealthQueryKey,
 } from "@/services/paymentHealthCache";
 import { WAREHOUSE_DEPENDENT_ROOTS } from "@/services/analyticsCache";
 import {
   DEFAULT_PAYMENT_HEALTH_UI_STATE,
+  alertsFilters,
+  coerceAlertSeverityFilter,
+  coerceAlertStatusFilter,
   coerceTab,
   customRangeProblem,
   effectiveQuery,
   hasActiveFilters,
   hasPspSelection,
+  parseAlertReproduce,
+  reproduceState,
   resolveRange,
 } from "@/components/payment-health/pageState";
 import { fmtPct, fmtPoints, ratio, summarizeComparison, summarizeRate } from "@/components/payment-health/format";
 import { declineClassRows, dimensionOptions, groupWhatChanged, topDeclineClass } from "@/components/payment-health/model";
-import { comparison, declinesResponse, optionsResponse, overviewResponse, rate, retriesResponse, sourcesResponse } from "./support/paymentHealthResponses";
+import {
+  MANAGE_ALERTS_PERMISSION,
+  accountCounts,
+  actorText,
+  alertActionErrorText,
+  alertFlags,
+  compliantActions,
+  compliantText,
+  countEvidenceRows,
+  displaySeverity,
+  fmtAlertChange,
+  fmtAlertValue,
+  nextManualRunAt,
+  rateEvidence,
+  scopeLabels,
+  statusActions,
+} from "@/components/payment-health/alertsModel";
+import { UI_SENTINELS, comparison, declinesResponse, optionsResponse, overviewResponse, rate, retriesResponse, sourcesResponse } from "./support/paymentHealthResponses";
+import { ALERT_IDS, alertsListResponse, approvalAlert, fraudLowAlert, postBanAlert, runSummary, staleAlert } from "./support/paymentHealthAlertResponses";
 import { PAYMENT_HEALTH_ACTIONS, normalizePaymentHealthRequest as serverNormalize } from "../../supabase/functions/_shared/clickhouse/paymentHealthContract";
+import {
+  ALERT_NOTE_MAX_LENGTH,
+  ALERT_STATUSES,
+  isAllowedAlertTransition,
+  normalizeAlertUpdateRequest,
+  normalizeAlertsListRequest,
+} from "../../supabase/functions/_shared/clickhouse/paymentRiskAlertsContract";
+import { PAYMENT_HEALTH_MANAGE_ALERTS } from "../../supabase/functions/_shared/access/policies/clickhouse-payment-health";
 
 const q = (over: Partial<PaymentHealthQuery> = {}): PaymentHealthQuery => ({
   dateFrom: "2026-09-13",
@@ -56,6 +103,7 @@ const q = (over: Partial<PaymentHealthQuery> = {}): PaymentHealthQuery => ({
 
 beforeEach(() => {
   fns.run.mockReset();
+  fns.alerts.mockReset();
 });
 
 describe("buildPaymentHealthRequest", () => {
@@ -288,5 +336,172 @@ describe("formatting rules", () => {
     expect(topDeclineClass({ decline_classes: {} })).toBeNull();
     const groups = groupWhatChanged(overviewResponse().what_changed);
     expect(groups.map((group) => group.dimension)).toEqual(["country", "processor"]);
+  });
+});
+
+// =====================================================================================
+// P2.5 — payment risk alerts
+// =====================================================================================
+
+describe("alert requests", () => {
+  it("alerts_list: canonical filter lists (contract order, de-duplicated, unknown values dropped) that the server's normalizer accepts", () => {
+    expect(buildAlertsListRequest({})).toEqual({ action: "alerts_list" });
+    expect(buildAlertsListRequest({ status: ["investigating", "new", "new"], severity: ["critical"] })).toEqual({ action: "alerts_list", status: ["new", "investigating"], severity: ["critical"] });
+    expect(buildAlertsListRequest({ status: ["bogus" as never], rule: ["data_stale"] })).toEqual({ action: "alerts_list", rule: ["data_stale"] });
+    expect(OPEN_ALERTS_FILTERS).toEqual({ status: ["new", "investigating"], severity: [], rule: [] });
+    const normalized = normalizeAlertsListRequest(buildAlertsListRequest({ status: ["resolved", "dismissed"], severity: ["warning", "info"], rule: ["approval_drop"] }));
+    expect(normalized).toEqual({ status: ["resolved", "dismissed"], severity: ["info", "warning"], rule: ["approval_drop"], limit: 100 });
+  });
+
+  it("alert_update: validated by the contract's normalizer before anything is sent; the note is trimmed or left out", async () => {
+    const id = "AAAA0000-0000-4000-8000-0000000000A1";
+    expect(buildAlertUpdateRequest({ alertId: id, status: "investigating", note: "  looking  " })).toEqual({ action: "alert_update", alert_id: id.toLowerCase(), status: "investigating", note: "looking" });
+    expect(buildAlertUpdateRequest({ alertId: id, status: "resolved", note: "   " })).toEqual({ action: "alert_update", alert_id: id.toLowerCase(), status: "resolved" });
+    expect(normalizeAlertUpdateRequest(buildAlertUpdateRequest({ alertId: id, status: "dismissed", note: "dup" }))).toEqual({ alert_id: id.toLowerCase(), status: "dismissed", note: "dup" });
+    await expect(updatePaymentAlert({ alertId: "not-a-uuid", status: "resolved" })).rejects.toThrow(/uuid/);
+    await expect(updatePaymentAlert({ alertId: id, status: "resolved", note: "x".repeat(ALERT_NOTE_MAX_LENGTH + 1) })).rejects.toThrow(/longer than 1000/);
+    expect(fns.alerts).not.toHaveBeenCalled();
+  });
+
+  it("goes through the alerts transport (never the breaker-gated page runner) and returns the typed answers", async () => {
+    fns.alerts.mockResolvedValueOnce(alertsListResponse([approvalAlert()]));
+    const list = await loadPaymentAlerts({ status: ["new"] });
+    expect(list.alerts[0].id).toBe(ALERT_IDS.approval);
+    expect(fns.alerts).toHaveBeenLastCalledWith({ action: "alerts_list", status: ["new"] });
+    fns.alerts.mockResolvedValueOnce({ ok: true, action: "alert_update", alert: approvalAlert({ status: "investigating" }) });
+    expect((await updatePaymentAlert({ alertId: ALERT_IDS.approval, status: "investigating" })).alert.status).toBe("investigating");
+    fns.alerts.mockResolvedValueOnce({ ok: true, action: "alerts_run", run: runSummary({ trigger: "manual" }), skipped: null });
+    expect((await runPaymentAlerts()).run?.trigger).toBe("manual");
+    expect(fns.alerts).toHaveBeenLastCalledWith({ action: "alerts_run" });
+    expect(fns.run).not.toHaveBeenCalled();
+  });
+
+  it("an embedded ok:false and an incomplete body throw (shape), never an empty list", async () => {
+    fns.alerts.mockResolvedValueOnce({ ok: false, error: "alerts store busy" });
+    await expect(loadPaymentAlerts({})).rejects.toThrow("alerts store busy");
+    const { counts: _counts, ...partial } = alertsListResponse([]);
+    fns.alerts.mockResolvedValueOnce(partial);
+    const error = await loadPaymentAlerts({}).catch((caught: unknown) => caught);
+    expect(String(error)).toMatch(/Incomplete ClickHouse payment health response \(alerts_list\): missing counts/);
+    expect(describePaymentHealthError(error).kind).toBe("shape");
+    expect(missingAlertsFields("alerts_list", { ...alertsListResponse([]), alerts: [null] })).toEqual(["alerts"]);
+    expect(missingAlertsFields("alerts_run", { ok: true, action: "alerts_run" })).toEqual(["run"]);
+    expect(isCompleteAlertsListResponse(alertsListResponse([staleAlert()]))).toBe(true);
+    expect(isCompleteAlertsListResponse(overviewResponse())).toBe(false);
+  });
+
+  it("the alert refusals classify as request errors (shown, never retried), not as access denials", () => {
+    const edge = (status: number, errorCode: string) => new ClickHouseRequestError(`ClickHouse Edge Function failed: ${errorCode}`, { status, errorCode, requestId: "req-a" });
+    expect(describePaymentHealthError(edge(429, "rate_limited")).kind).toBe("request");
+    expect(describePaymentHealthError(edge(404, "alert_not_found")).kind).toBe("request");
+    expect(describePaymentHealthError(edge(400, "invalid_transition")).kind).toBe("request");
+    expect(describePaymentHealthError(edge(403, "permission_denied")).kind).toBe("access");
+  });
+});
+
+describe("alert cache keys", () => {
+  it("own root, never persisted with the warehouse roots, keyed by partition and canonical filters", () => {
+    const key = paymentHealthAlertsQueryKey({ userScopeHash: "p-owner", filters: { status: ["investigating", "new"] } });
+    expect(key).toEqual([PAYMENT_HEALTH_ALERTS_QUERY_ROOT, "alerts_list", PAYMENT_HEALTH_ALERTS_SCHEMA_VERSION, "p-owner", { status: ["new", "investigating"], severity: [], rule: [] }]);
+    expect(WAREHOUSE_DEPENDENT_ROOTS).not.toContain(PAYMENT_HEALTH_ALERTS_QUERY_ROOT);
+    expect(PAYMENT_HEALTH_ALERTS_QUERY_PREFIX).toEqual([PAYMENT_HEALTH_ALERTS_QUERY_ROOT]);
+    expect(hashKey(key)).toBe(hashKey(paymentHealthAlertsQueryKey({ userScopeHash: "p-owner", filters: OPEN_ALERTS_FILTERS })));
+    expect(hashKey(key)).not.toBe(hashKey(paymentHealthAlertsQueryKey({ userScopeHash: "p-viewer", filters: OPEN_ALERTS_FILTERS })));
+    expect(hashKey(key)).not.toBe(hashKey(paymentHealthAlertsQueryKey({ userScopeHash: "p-owner", filters: { status: ["new"] } })));
+  });
+});
+
+describe("Alerts tab state", () => {
+  it("the default view is the open alerts (the badge's key); persisted junk falls back to it", () => {
+    expect(alertsFilters(DEFAULT_PAYMENT_HEALTH_UI_STATE)).toEqual(OPEN_ALERTS_FILTERS);
+    expect(alertsFilters({ alertStatus: "all", alertSeverity: "critical" })).toEqual({ status: [], severity: ["critical"], rule: [] });
+    expect(alertsFilters({ alertStatus: "dismissed", alertSeverity: "all" })).toEqual({ status: ["dismissed"], severity: [], rule: [] });
+    expect(coerceAlertStatusFilter("archived")).toBe("open");
+    expect(coerceAlertSeverityFilter(undefined)).toBe("all");
+    expect(coerceTab("alerts")).toBe("alerts");
+  });
+
+  it("evidence.reproduce → the tab, the window as a custom range, exactly its filters, its dimension", () => {
+    const reproduce = parseAlertReproduce((approvalAlert().evidence as Record<string, unknown>).reproduce);
+    expect(reproduce).toEqual({ action: "declines", dateFrom: "2026-10-04", dateTo: "2026-10-10", filters: { initiation: ["cit"] }, dimension: "merchant_account" });
+    const patch = reproduceState(reproduce!, true)!;
+    expect(patch).toMatchObject({ tab: "declines", rangePreset: "custom", dateFrom: "2026-10-04", dateTo: "2026-10-10", initiation: "cit", country: "all", processor: "all", merchantAccount: "all", dimension: "merchant_account" });
+    // The page then sends exactly the alert's request, whatever the filters were.
+    const query = effectiveQuery({ ...DEFAULT_PAYMENT_HEALTH_UI_STATE, country: "DE", ...patch }, true, "2026-10-13");
+    expect(buildPaymentHealthRequest("declines", query)).toEqual({ action: "declines", date_from: "2026-10-04", date_to: "2026-10-10", filters: { initiation: ["cit"] }, dimension: "merchant_account" });
+    // A PSP dimension without the key would be a 403: no link at all.
+    expect(reproduceState(reproduce!, false)).toBeNull();
+    // Overview keeps the dimension as it is; sources only switches the tab.
+    expect(reproduceState(parseAlertReproduce((fraudLowAlert().evidence as Record<string, unknown>).reproduce)!, false)).not.toHaveProperty("dimension");
+    expect(reproduceState(parseAlertReproduce((staleAlert().evidence as Record<string, unknown>).reproduce)!, false)).toEqual({ tab: "sources" });
+    // The single-select bar cannot show a multi-valued filter; unknown actions and malformed days are refused.
+    expect(reproduceState({ action: "overview", dateFrom: null, dateTo: null, filters: { country: ["DE", "US"] }, dimension: null }, true)).toBeNull();
+    expect(parseAlertReproduce({ action: "options" })).toBeNull();
+    expect(parseAlertReproduce({ action: "alerts_list" })).toBeNull();
+    expect(parseAlertReproduce({ action: "retries", date_from: "10/04/2026", filters: { initiation: "cit", country: ["", 7] } })).toEqual({ action: "retries", dateFrom: null, dateTo: null, filters: {}, dimension: null });
+  });
+});
+
+describe("alert view model", () => {
+  it("the status buttons are exactly the contract's transitions, behind the policy's key", () => {
+    for (const from of ALERT_STATUSES) {
+      const offered = statusActions(from).map((action) => action.to);
+      expect(offered.sort()).toEqual(ALERT_STATUSES.filter((to) => isAllowedAlertTransition(from, to)).sort());
+    }
+    expect(statusActions("new").map((action) => action.label)).toEqual(["Investigating", "Resolve", "Dismiss"]);
+    expect(statusActions("resolved").map((action) => action.label)).toEqual(["Reopen"]);
+    expect(MANAGE_ALERTS_PERMISSION).toBe(PAYMENT_HEALTH_MANAGE_ALERTS);
+  });
+
+  it("low confidence is info whatever is stored; values and changes by unit; scope from labels only", () => {
+    expect(displaySeverity({ severity: "critical", data_confidence: "low" })).toBe("info");
+    expect(displaySeverity({ severity: "critical", data_confidence: "high" })).toBe("critical");
+    expect(fmtAlertValue("rate", 0.0512)).toBe("5.12%");
+    expect(fmtAlertValue("rate", null)).toBe("—");
+    expect(fmtAlertValue("days", 15)).toBe("15 d");
+    expect(fmtAlertValue("hours", 80.26)).toBe("80.3 h");
+    expect(fmtAlertChange("rate", -13)).toBe("−13.00 pp");
+    expect(fmtAlertChange("count", 3)).toBe("+3");
+    expect(scopeLabels(approvalAlert().scope)).toEqual({ primary: "Stripe MID #1", details: ["Stripe", "CIT"], unlabelled: false });
+    expect(scopeLabels({ kind: "tenant", subject: "post_ban", initiation: "mit" })).toEqual({ primary: "Whole workspace", details: ["Re-attempts after a do-not-retry decline", "MIT"], unlabelled: false });
+    // approval_drop's PSP-wide line names the processor, not an account; the support pipeline has its own freshness line.
+    expect(scopeLabels({ kind: "account", processor: { key: "STRIPE", label: "Stripe" }, initiation: "cit" })).toEqual({ primary: "All merchant accounts", details: ["Stripe", "CIT"], unlabelled: false });
+    expect(scopeLabels({ kind: "tenant", subject: "support_sync" })).toEqual({ primary: "Whole workspace", details: ["Support requests sync"], unlabelled: false });
+    expect(countEvidenceRows({ rule_key: "data_stale", unit: "hours", evidence: { stream: "support", last_synced_at: "2026-09-29T09:00:00.000Z", age_hours: 99, support_through: "2026-09-29" } }).map((row) => row.label)).toEqual([
+      "Last support requests sync", "Age", "Support requests through",
+    ]);
+    expect(alertFlags(fraudLowAlert())).toEqual(["low confidence", "small sample"]);
+    expect(alertFlags(approvalAlert())).toEqual(["significant"]);
+  });
+
+  it("evidence is read through known fields only", () => {
+    const evidence = rateEvidence(approvalAlert().evidence)!;
+    expect(evidence.current).toMatchObject({ from: "2026-10-04", to: "2026-10-10", numerator: 620, denominator: 1000 });
+    expect(evidence.thresholds).toEqual({ warning: 5, critical: 10 });
+    expect(rateEvidence(postBanAlert().evidence)).toBeNull();
+    expect(countEvidenceRows(staleAlert())).toEqual([
+      { label: "Data through", value: "2026-09-28" },
+      { label: "Today (UTC)", value: "2026-10-13" },
+      { label: "Lag", value: "15 d" },
+      { label: "Last import", value: "2026-09-28 18:00 UTC" },
+      { label: "Thresholds", value: "warning ≥ 7 d · critical ≥ 14 d" },
+    ]);
+    expect(JSON.stringify(countEvidenceRows(postBanAlert()))).not.toContain(UI_SENTINELS.instrumentToken);
+    expect(accountCounts(postBanAlert().evidence)).toEqual([{ label: "Stripe MID #1", processor: "Stripe", count: 3 }]);
+  });
+
+  it("a recommendation the plan Q ban flags is withheld; the copy of the refusals; the run interval; who did it", () => {
+    expect(compliantActions(["Refund quickly on request.", "Spread the volume across two MIDs.", "Use another descriptor."])).toEqual({ shown: ["Refund quickly on request."], withheld: 2 });
+    expect(compliantText("Unverified: route traffic to a backup PSP.")).toBeNull();
+    const error = (errorCode: string) => ({ kind: "request" as const, message: "raw", status: 400, errorCode, requestId: null });
+    expect(alertActionErrorText(error("rate_limited"))).toMatch(/less than 5 minutes ago/);
+    expect(alertActionErrorText(error("invalid_transition"))).toMatch(/changed in the meantime/);
+    expect(alertActionErrorText(error("alert_not_found"))).toMatch(/no longer available/);
+    expect(alertActionErrorText(error("other"))).toBe("raw");
+    expect(nextManualRunAt({ started_at: "2026-10-13T07:40:00.000Z" }, 300)).toBe(Date.parse("2026-10-13T07:45:00.000Z"));
+    expect(nextManualRunAt(null, 300)).toBeNull();
+    expect(actorText(null, "u-1")).toBe("the alert engine");
+    expect(actorText("U-1", "u-1")).toBe("you");
+    expect(actorText("u-2", "u-1")).toBe("a teammate");
   });
 });

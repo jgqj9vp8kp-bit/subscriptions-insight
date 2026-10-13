@@ -276,6 +276,7 @@ export function retriesResponse(over: { pspVisible?: boolean; limited?: boolean 
       succeeded_switched_processor: 1,
       within_one_hour: 6,
       within_window: 12,
+      by_initiation: { cit: { attempts: 5, succeeded: 1, switched_processor: 1 }, mit: { attempts: 8, succeeded: 1, switched_processor: 2 } },
     },
     post_ban_attempts: [
       {
@@ -313,6 +314,7 @@ export function retriesResponse(over: { pspVisible?: boolean; limited?: boolean 
       windows: [
         { instrument: "0a0b0c0d0e0f1011", merchant_account: pspVisible ? STRIPE_MID : null, max_declines: 17, limit: 15, window_start: "2026-09-15T00:00:00.000Z", window_end: "2026-10-10T00:00:00.000Z", decline_records_total: 21 },
       ],
+      newest_violation_end: "2026-10-10T00:00:00.000Z",
     },
     cascade_rows: 22,
   };
@@ -374,6 +376,8 @@ export function sourcesResponse(): SourcesResponse {
         { month: "2026-09-01", requests: 30, classification_versions: ["v2"], version_break: false },
         { month: "2026-10-01", requests: 18, classification_versions: ["v3"], version_break: true },
       ],
+      last_day: "2026-10-10",
+      last_synced_at: "2026-10-10T21:07:00.000Z",
     },
     metrics: [
       { key: "attempt_approval_rate", title: "Attempt approval rate", phase: "P1", available: true, heuristic: false, estimate: false, notes: "Attempt level." },

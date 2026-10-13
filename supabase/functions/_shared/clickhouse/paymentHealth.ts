@@ -129,6 +129,12 @@ export interface PaymentHealthRunInput {
   pspVisible: boolean;
   /** Injectable clock (tests). */
   clock?: () => number;
+  /**
+   * The registry and the anchor snapshot, already loaded: the P2.5 alert engine
+   * runs several actions over one workspace state, so one registry scan and one
+   * snapshot read serve the whole run instead of one per action. Omitted: loaded here.
+   */
+  preloaded?: { registry: DimensionRegistry; snapshot: AnchorSnapshot | null };
 }
 
 // ---------------------------------------------------------------------------
@@ -321,6 +327,15 @@ ORDER BY proc, first_seen, mid, descriptor`,
   return rows.map((row) => ({ processor: s(row.proc), mid: s(row.mid), descriptor: s(row.descriptor), first_seen: s(row.first_seen), last_seen: s(row.last_seen), rows: n(row.rows) }));
 }
 
+/**
+ * The key a (processor, MID) pair has while it is not in psp_accounts ("Unlabelled MID"): a keyed hash, so
+ * the raw MID never leaves the server. Exported for the alert engine: once psp_accounts_sync registers the
+ * MID its key becomes the registry id, and the engine names this one as the alias of the old alerts' scope.
+ */
+export async function unlabelledAccountKey(tenantKey: string, processor: string, mid: string): Promise<string> {
+  return `unlabelled:${await opaqueId(tenantKey, "mid", processor, mid)}`;
+}
+
 export async function loadDimensionRegistry(input: Pick<PaymentHealthRunInput, "tenantKey" | "clickhouse" | "pg">): Promise<DimensionRegistry> {
   const [accounts, rows] = await Promise.all([loadRegistryAccounts(input.pg, input.tenantKey), loadRegistryRows(input.clickhouse, input.tenantKey)]);
   const byPair = new Map(accounts.map((account) => [accountMapKey(account.processor, account.mid), account]));
@@ -348,7 +363,7 @@ export async function loadDimensionRegistry(input: Pick<PaymentHealthRunInput, "
         const account = byPair.get(pair);
         ref = account
           ? { key: account.id, label: account.label, processor: row.processor, labelled: true }
-          : { key: `unlabelled:${await opaqueId(input.tenantKey, "mid", row.processor, row.mid)}`, label: "Unlabelled MID", processor: row.processor, labelled: false };
+          : { key: await unlabelledAccountKey(input.tenantKey, row.processor, row.mid), label: "Unlabelled MID", processor: row.processor, labelled: false };
       }
       registry.accounts.set(pair, ref);
       registry.accountsByKey.set(ref.key, { processor: row.processor, mid: row.mid });
@@ -395,13 +410,13 @@ function descriptorRef(registry: DimensionRegistry, processor: string, descripto
 // The funnel anchor snapshot
 // ---------------------------------------------------------------------------
 
-interface AnchorSnapshot {
+export interface AnchorSnapshot {
   warehouse_version: string;
   classification_version: string;
 }
 
 /** The validated active fact_user_cohorts snapshot, or null (every row 'unattributed'). */
-async function loadAnchorSnapshot(pg: SupabaseLikeClient, tenantKey: string): Promise<AnchorSnapshot | null> {
+export async function loadAnchorSnapshot(pg: SupabaseLikeClient, tenantKey: string): Promise<AnchorSnapshot | null> {
   try {
     return activeCohortSnapshotVersion(await getCohortSnapshotState(pg, tenantKey));
   } catch (error) {
@@ -1359,6 +1374,11 @@ export async function computeRetries(
     within_one_hour: postBan.filter((attempt) => attempt.minutes_since_ban <= 60).length,
     retried_instruments: new Set(postBan.map((attempt) => attempt.payment_instrument_key)).size,
     within_window: postBan.length,
+    // The alert engine states settled / switched counts per initiation: from every attempt, not from the capped list.
+    by_initiation: Object.fromEntries((["cit", "mit"] as const).map((initiation) => {
+      const of = postBan.filter((attempt) => attempt.initiation_type === initiation);
+      return [initiation, { attempts: of.length, succeeded: of.filter((attempt) => attempt.succeeded).length, switched_processor: of.filter((attempt) => attempt.processor_relation === "switched").length }];
+    })) as RetriesResponse["post_ban"]["by_initiation"],
   };
 
   const banClassByTransaction = new Map<string, DeclineClass>();
@@ -1415,7 +1435,13 @@ export async function computeRetries(
     },
     post_ban: postBanSummary,
     post_ban_attempts: postBanRows,
-    rolling: { pairs: windows.length, violations: windows.filter((entry) => entry.exceeds_limit).length, windows: rollingRows },
+    rolling: {
+      pairs: windows.length,
+      violations: overLimit.length,
+      windows: rollingRows,
+      // Over every violation: the list above is cut and ordered by max_declines, not by recency.
+      newest_violation_end: overLimit.reduce<string | null>((newest, entry) => (newest == null || entry.window_end > newest ? entry.window_end : newest), null),
+    },
     cascade_rows: rows.filter((row) => typeof row.decline_record_count === "number" && row.decline_record_count > 1 && inWindow(row.event_time)).length,
   };
 }
@@ -1650,9 +1676,12 @@ FROM ${TX} FINAL
 WHERE ${TENANT} AND ${ATTEMPT_RAW_STATUS_EXCLUSION}`,
     { auth_user_id: input.tenantKey },
   );
+  // last_day / last_synced_ms per group, folded below: how far the support data reaches (the alert engine's
+  // complaint rule is judged only on windows the support data covers, and data_stale watches the support sync).
   const support = json(
     input.clickhouse,
-    `/* ph:support_versions */ SELECT toString(toStartOfMonth(request_date)) AS month, classification_version, count() AS requests
+    `/* ph:support_versions */ SELECT toString(toStartOfMonth(request_date)) AS month, classification_version, count() AS requests,
+  toString(max(request_date)) AS last_day, toString(toUnixTimestamp64Milli(max(clickhouse_synced_at))) AS last_synced_ms
 FROM ${FSR} FINAL
 WHERE ${TENANT}
 GROUP BY month, classification_version
@@ -1683,7 +1712,12 @@ ORDER BY month, classification_version`,
   );
 
   const monthMap = new Map<string, { requests: number; versions: Set<string> }>();
+  let supportLastDay: string | null = null;
+  let supportSyncedMs = 0;
   for (const row of supportRows) {
+    const lastDay = dayOf(row.last_day);
+    if (lastDay && (!supportLastDay || lastDay > supportLastDay)) supportLastDay = lastDay;
+    supportSyncedMs = Math.max(supportSyncedMs, n(row.last_synced_ms));
     const month = s(row.month).slice(0, 10);
     const entry = monthMap.get(month) ?? { requests: 0, versions: new Set<string>() };
     entry.requests += n(row.requests);
@@ -1732,7 +1766,7 @@ ORDER BY month, classification_version`,
       : null,
     // Lifecycle only: no cursor, no counters, no error text (plan N, §24).
     sync_state: stateRow ? { status: nullable(stateRow.status), updated_at: nullable(stateRow.updated_at), last_run_at: nullable(stateRow.last_run_at ?? stateRow.last_synced_at) } : null,
-    support: { by_month: supportByMonth },
+    support: { by_month: supportByMonth, last_day: supportLastDay, last_synced_at: supportSyncedMs > 0 ? isoOfMillis(supportSyncedMs) : null },
     metrics: PAYMENT_HEALTH_METRICS.map((metric) => ({
       key: metric.key,
       title: metric.title,
@@ -1818,7 +1852,9 @@ export async function runPaymentHealth(input: PaymentHealthRunInput): Promise<Pa
   const started = clock();
   const today = todayOf(clock);
   const nreq = normalizePaymentHealthRequest(input.request, { today, pspVisible: input.pspVisible });
-  const [registry, snapshot] = await Promise.all([loadDimensionRegistry(input), loadAnchorSnapshot(input.pg, input.tenantKey)]);
+  const [registry, snapshot] = input.preloaded
+    ? [input.preloaded.registry, input.preloaded.snapshot]
+    : await Promise.all([loadDimensionRegistry(input), loadAnchorSnapshot(input.pg, input.tenantKey)]);
   const ctx: RunContext = { input, nreq, registry, snapshot, maturity: maturityOf(nreq, registry), today, started, clock };
   switch (nreq.action) {
     case "overview":

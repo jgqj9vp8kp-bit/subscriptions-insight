@@ -498,6 +498,7 @@ export const GATED_POLICIES = ALL_POLICIES.filter((policy) => !NOT_GATED[policy.
 export const CRON_ONLY_ACTIONS: Readonly<Record<string, readonly string[]>> = Object.freeze({
   "clickhouse-cohort-membership": ["cron_tick"],
   "clickhouse-facebook": ["cron_daily"],
+  "clickhouse-payment-health": ["alerts_tick"],
 });
 
 /** Access Phase 2: exactly these actions serve a funnel-restricted context
@@ -568,7 +569,10 @@ export const ACTION_REQUESTS: Readonly<Record<string, Readonly<Record<string, Ac
     bank_detail: post({ action: "bank_detail", bank: "Sentinel Bank" }),
     ai_pass_rates: post({ action: "analytics", purpose: "ai_pass_rates" }),
   },
-  "clickhouse-payment-health": named("overview", "declines", "retries", "refunds_support", "sources", "options"),
+  "clickhouse-payment-health": {
+    ...named("overview", "declines", "retries", "refunds_support", "sources", "options", "alerts_list", "alerts_run"),
+    alert_update: post({ action: "alert_update", alert_id: "aaaa0000-0000-4000-8000-0000000000a1", status: "investigating" }),
+  },
   "clickhouse-revenue": named("bundle", "day_breakdown"),
   "clickhouse-summary": { summary: post({}) },
   "clickhouse-support": {

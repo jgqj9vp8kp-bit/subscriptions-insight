@@ -526,11 +526,19 @@ export interface RetriesResponse {
   };
   /** Chains that started inside the window. */
   chains: ChainSummary & ChainRates;
-  post_ban: PostBanSummary & { within_window: number };
+  post_ban: PostBanSummary & {
+    within_window: number;
+    /** Per initiation over EVERY post-ban attempt of the window (post_ban_attempts is capped and mixes both). */
+    by_initiation: Record<"cit" | "mit", { attempts: number; succeeded: number; switched_processor: number }>;
+  };
   /** Newest POST_BAN_ATTEMPT_LIMIT rows (post_ban.attempts counts them all); meta.limited.post_ban_attempts when cut. */
   post_ban_attempts: PostBanAttemptRow[];
-  /** windows: the pairs over the limit, at most ROLLING_WINDOW_LIMIT (violations counts them all); meta.limited.rolling_windows when cut. */
-  rolling: { pairs: number; violations: number; windows: RollingWindowRow[] };
+  /**
+   * windows: the pairs over the limit, at most ROLLING_WINDOW_LIMIT, the most declines first (violations counts them
+   * all); meta.limited.rolling_windows when cut. newest_violation_end: the latest window_end over EVERY pair over the
+   * limit — the cut list is ordered by max_declines, so its newest entry is not the newest violation.
+   */
+  rolling: { pairs: number; violations: number; windows: RollingWindowRow[]; newest_violation_end: string | null };
   cascade_rows: number;
 }
 
@@ -634,6 +642,10 @@ export interface SourcesResponse {
   sync_state: { status: string | null; updated_at: string | null; last_run_at: string | null } | null;
   support: {
     by_month: Array<{ month: string; requests: number; classification_versions: string[]; version_break: boolean }>;
+    /** The newest request_date (received day) in fact_support_requests; null without support data. Complaint figures reach this day at most. */
+    last_day: string | null;
+    /** The newest clickhouse_synced_at of the support rows (ISO, UTC); null without support data. */
+    last_synced_at: string | null;
   };
   /** The metric dictionary with the phase each metric's data arrives in (what is and is not measured). */
   metrics: Array<{ key: MetricKey; title: string; phase: string; available: boolean; heuristic: boolean; estimate: boolean; notes: string }>;

@@ -12,7 +12,7 @@
 // text) reaches any response.
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { assertValidPolicy, type AccessHandler, type AccessRequest } from "../../supabase/functions/_shared/access/gate.ts";
 import { ACCESS_ERROR, ActionNormalizeError } from "../../supabase/functions/_shared/access/errors.ts";
 import { ENFORCED_PERMISSION_KEYS, PRIVILEGED_PERMISSION_KEYS } from "../../supabase/functions/_shared/access/permissions.ts";
@@ -20,18 +20,30 @@ import { ROLE_TEMPLATES } from "../../supabase/functions/_shared/access/roles.ts
 import { createScopedReader, ScopeViolation } from "../../supabase/functions/_shared/clickhouse/scopedClient.ts";
 import {
   CLICKHOUSE_PAYMENT_HEALTH_POLICY,
+  alertsManageable,
   normalizeClickHousePaymentHealthAction,
   paymentHealthErrorResponse,
   pspDimensionsVisible,
 } from "../../supabase/functions/_shared/access/policies/clickhouse-payment-health.ts";
+import {
+  DEFAULT_ALERT_RULES,
+  PAYMENT_ALERT_USER_ACTIONS,
+  PaymentAlertNotFoundError,
+  PaymentAlertTransitionError,
+  PaymentAlertsRateLimitedError,
+  isPaymentAlertAction,
+} from "../../supabase/functions/_shared/clickhouse/paymentRiskAlertsContract.ts";
+import { runPaymentAlertsAction } from "../../supabase/functions/_shared/clickhouse/paymentRiskAlerts.ts";
+import { buildAlertExplanation } from "../../supabase/functions/_shared/clickhouse/paymentRiskRecommendations.ts";
+import { createStrictFakeSupabase, type StrictFakeSupabase } from "./support/strictFakeSupabase";
 import { CLICKHOUSE_SUMMARY_POLICY, WAREHOUSE_PROBE_VIEW_PERMISSIONS } from "../../supabase/functions/_shared/access/policies/clickhouse-summary.ts";
 import { ROUTE_ACCESS } from "../services/accessRoutes";
 import { PAYMENT_HEALTH_ACTIONS, PaymentHealthPermissionError, PaymentHealthRequestError } from "../../supabase/functions/_shared/clickhouse/paymentHealthContract.ts";
 import { resetPaymentHealthMemo, runPaymentHealth } from "../../supabase/functions/_shared/clickhouse/paymentHealth.ts";
-import { PERSONAS, callGate, contextFor, edgeRequest, fakeGate, withGrant, withScope, type Persona } from "./support/accessFixtures";
+import { CRON_SECRETS, DATA_KEY, PERSONAS, callGate, contextFor, edgeRequest, fakeGate, withGrant, withScope, type Persona } from "./support/accessFixtures";
 import { createRecordingClickHouse } from "./support/recordingClickHouse";
 import { SENTINEL_EMAILS, scanForLeaks } from "./support/leakScan";
-import { PH_DATA_KEY, PH_SENTINELS, asPg, fixturePg, fixtureRows, fixtureWarehouse } from "./support/paymentHealthFixtures";
+import { PH_DATA_KEY, PH_SENTINELS, asPg, fixtureAccounts, fixturePg, fixtureRows, fixtureWarehouse } from "./support/paymentHealthFixtures";
 
 const ACTIONS = [...PAYMENT_HEALTH_ACTIONS];
 const RANGE = { date_from: "2026-09-01", date_to: "2026-09-30" };
@@ -39,8 +51,12 @@ const NOW = Date.parse("2026-10-06T12:00:00.000Z");
 const SENTINELS = [...Object.values(PH_SENTINELS), SENTINEL_EMAILS[1], "secret-cursor"];
 const EMPLOYEE = "22222222-2222-4222-8222-222222222222";
 
+const ALERT_ACTIONS = [...PAYMENT_ALERT_USER_ACTIONS];
+
 const viewHolder = withGrant(PERSONAS.viewer, ["payment_health.view"], { name: "ph-view" });
 const pspHolder = withGrant(PERSONAS.viewer, ["payment_health.view", "payment_health.psp_global.view"], { name: "ph-psp" });
+const manageHolder = withGrant(PERSONAS.viewer, ["payment_health.view", "payment_health.manage_alerts"], { name: "ph-manage" });
+const fullAlertHolder = withGrant(PERSONAS.viewer, ["payment_health.view", "payment_health.manage_alerts", "payment_health.psp_global.view"], { name: "ph-manage-psp" });
 
 /** The index.ts handler, verbatim in behaviour: the real runner over the request's ScopedReader and the strict pg fake. */
 function runnerHandler(pg = fixturePg()): AccessHandler<string> {
@@ -63,36 +79,55 @@ async function call(persona: Persona, body: Record<string, unknown>, handler: Ac
 beforeEach(() => resetPaymentHealthMemo());
 
 describe("policy table", () => {
-  it("is valid, POST-only, without cron, and every action needs payment_health.view and nothing else", () => {
+  it("is valid, POST-only, with the alerts_tick cron branch; every page action needs payment_health.view and nothing else", () => {
     expect(() => assertValidPolicy(CLICKHOUSE_PAYMENT_HEALTH_POLICY)).not.toThrow();
     expect(CLICKHOUSE_PAYMENT_HEALTH_POLICY.fn).toBe("clickhouse-payment-health");
     expect(CLICKHOUSE_PAYMENT_HEALTH_POLICY.methods).toEqual(["POST"]);
-    expect(CLICKHOUSE_PAYMENT_HEALTH_POLICY.cron).toBeUndefined();
-    expect(Object.keys(CLICKHOUSE_PAYMENT_HEALTH_POLICY.actions).sort()).toEqual([...ACTIONS].sort());
+    expect(CLICKHOUSE_PAYMENT_HEALTH_POLICY.cron).toEqual({ header: "x-cron-secret", secretEnv: "FB_CRON_SECRET", actions: ["alerts_tick"] });
+    expect(Object.keys(CLICKHOUSE_PAYMENT_HEALTH_POLICY.actions).sort()).toEqual([...ACTIONS, ...ALERT_ACTIONS, "alerts_tick"].sort());
     for (const action of ACTIONS) expect(CLICKHOUSE_PAYMENT_HEALTH_POLICY.actions[action]).toEqual({ anyOf: ["payment_health.view"] });
+    // P2.5: reading alerts is a view; changing them and running the engine need the privileged manage key (a write);
+    // the tick is reachable only through the cron branch (its user-side entry is owner + raw + manage, never reachable).
+    expect(CLICKHOUSE_PAYMENT_HEALTH_POLICY.actions.alerts_list).toEqual({ anyOf: ["payment_health.view"] });
+    expect(CLICKHOUSE_PAYMENT_HEALTH_POLICY.actions.alert_update).toEqual({ allOf: ["payment_health.manage_alerts"], write: true });
+    expect(CLICKHOUSE_PAYMENT_HEALTH_POLICY.actions.alerts_run).toEqual({ allOf: ["payment_health.manage_alerts"], write: true });
+    expect(CLICKHOUSE_PAYMENT_HEALTH_POLICY.actions.alerts_tick).toEqual({ ownerOnly: true, rawOnly: true, allOf: ["payment_health.manage_alerts"], write: true });
     // Not scopeReady, not rawOnly: restricted members are refused like Payment Pass; the privileged keys gate dimensions, not actions.
-    for (const rule of Object.values(CLICKHOUSE_PAYMENT_HEALTH_POLICY.actions)) {
-      expect(rule.scopeReady).toBeUndefined();
-      expect(rule.rawOnly).toBeUndefined();
-      expect(rule.ownerOnly).toBeUndefined();
-      expect(rule.write).toBeUndefined();
+    for (const [action, rule] of Object.entries(CLICKHOUSE_PAYMENT_HEALTH_POLICY.actions)) {
+      expect(rule.scopeReady, action).toBeUndefined();
+      if (action === "alerts_tick") continue;
+      expect(rule.rawOnly, action).toBeUndefined();
+      expect(rule.ownerOnly, action).toBeUndefined();
+      if (!["alert_update", "alerts_run"].includes(action)) expect(rule.write, action).toBeUndefined();
     }
+    expect(alertsManageable(contextFor(PERSONAS.owner))).toBe(true);
+    expect(alertsManageable(contextFor(manageHolder))).toBe(true);
+    expect(alertsManageable(contextFor(viewHolder))).toBe(false);
+    // A narrowed member never holds the privileged manage key.
+    expect(alertsManageable(contextFor(withScope(manageHolder, PERSONAS.buyerA.scope)))).toBe(false);
     expect(ENFORCED_PERMISSION_KEYS).toContain("payment_health.view");
     expect(PRIVILEGED_PERMISSION_KEYS.has("payment_health.psp_global.view")).toBe(true);
     expect(PRIVILEGED_PERMISSION_KEYS.has("payment_health.manage_alerts")).toBe(true);
     expect(PRIVILEGED_PERMISSION_KEYS.has("payment_health.view")).toBe(false);
   });
 
-  it("normalizes exactly the six actions and rejects everything else (no default)", () => {
-    for (const action of ACTIONS) expect(normalizeClickHousePaymentHealthAction({ action })).toBe(action);
-    for (const body of [{}, { action: "" }, { action: "analytics" }, { action: "OVERVIEW" }, { action: ["overview"] }, { action: "cron_tick" }]) {
+  it("normalizes exactly the six page actions and the three user alert actions and rejects everything else (no default); the cron branch runs the tick only", () => {
+    for (const action of [...ACTIONS, ...ALERT_ACTIONS]) expect(normalizeClickHousePaymentHealthAction({ action })).toBe(action);
+    for (const body of [{}, { action: "" }, { action: "analytics" }, { action: "OVERVIEW" }, { action: ["overview"] }, { action: "cron_tick" }, { action: "alerts_tick" }, { action: "ALERTS_LIST" }]) {
       expect(() => normalizeClickHousePaymentHealthAction(body)).toThrow(ActionNormalizeError);
+    }
+    for (const body of [{}, { action: null }, { action: "alerts_tick" }]) expect(normalizeClickHousePaymentHealthAction(body, true)).toBe("alerts_tick");
+    for (const body of [{ action: "overview" }, { action: "alerts_run" }, { action: "alert_update" }, { action: "cron_tick" }]) {
+      expect(() => normalizeClickHousePaymentHealthAction(body, true)).toThrow(ActionNormalizeError);
     }
   });
 
   it("maps the runner's errors: malformed request 400, PSP dimension without the key 403 permission_denied, anything else to the gate", () => {
     expect(paymentHealthErrorResponse(new PaymentHealthRequestError("bad"))).toEqual({ status: 400, body: { ok: false, error_code: "invalid_request", error: "bad" } });
     expect(paymentHealthErrorResponse(new PaymentHealthPermissionError("psp"))).toEqual({ status: 403, body: { ok: false, error_code: ACCESS_ERROR.PERMISSION_DENIED, error: "psp" } });
+    expect(paymentHealthErrorResponse(new PaymentAlertNotFoundError())).toEqual({ status: 404, body: { ok: false, error_code: "alert_not_found", error: "Alert not found." } });
+    expect(paymentHealthErrorResponse(new PaymentAlertTransitionError("dismissed", "resolved"))).toMatchObject({ status: 400, body: { ok: false, error_code: "invalid_transition", from: "dismissed", to: "resolved" } });
+    expect(paymentHealthErrorResponse(new PaymentAlertsRateLimitedError(120))).toMatchObject({ status: 429, body: { ok: false, error_code: "rate_limited", retry_after_seconds: 120 } });
     expect(paymentHealthErrorResponse(new Error("boom"))).toBeNull();
     expect(paymentHealthErrorResponse(new ScopeViolation("tenant_param_mismatch"))).toBeNull();
   });
@@ -276,6 +311,330 @@ describe("runner through the ScopedReader", () => {
   });
 });
 
+// =====================================================================================
+// P2.5 alerts: alerts_list, alert_update, alerts_run, the alerts_tick cron
+// =====================================================================================
+
+const ALERT_IDS = {
+  psp: "aaaa0000-0000-4000-8000-0000000000a1",
+  tenant: "aaaa0000-0000-4000-8000-0000000000a2",
+  resolved: "aaaa0000-0000-4000-8000-0000000000a3",
+} as const;
+
+function alertRow(id: string, overrides: Record<string, unknown>): Record<string, unknown> {
+  return {
+    id, auth_user_id: PH_DATA_KEY, rule_key: "approval_drop", alert_key: `k-${id}`, scope_key: `s-${id}`, severity: "warning", status: "new",
+    scope: {}, affected_funnels: [], metric: "attempt_approval_rate", unit: "rate", current_value: 0.5, baseline_value: 0.7, change_value: -20, sample_size: 400,
+    data_confidence: "high", window_start: "2026-09-24", window_end: "2026-09-30", evidence: {}, explanation: buildAlertExplanation("approval_drop", { account: "x" }),
+    first_seen_at: "2026-10-01T07:40:00.000Z", last_seen_at: "2026-10-05T07:40:00.000Z", resolved_at: null, auto_resolved: false, assignee: null,
+    status_history: [{ at: "2026-10-01T07:40:00.000Z", event: "raised", from: null, to: "new", by: null, auto: true, note: null }], updated_by: null, updated_at: "2026-10-05T07:40:00.000Z",
+    psp_scoped: false, ...overrides,
+  };
+}
+
+/** Three alerts: a PSP-scoped approval drop, a tenant-wide post-ban line (with per-account evidence) and a resolved freshness one. */
+function alertRows(): Array<Record<string, unknown>> {
+  return [
+    alertRow(ALERT_IDS.psp, {
+      severity: "critical", psp_scoped: true,
+      scope: { kind: "account", processor: { key: "STRIPE", label: "Stripe" }, merchant_account: { key: "aaaa0000-0000-4000-8000-00000000a001", label: "Stripe MID #1", processor: "STRIPE", labelled: true }, initiation: "cit" },
+    }),
+    alertRow(ALERT_IDS.tenant, {
+      rule_key: "post_ban_retries", metric: "post_ban_attempts", unit: "count", current_value: 2, baseline_value: null, change_value: null,
+      scope: { kind: "tenant", subject: "post_ban", initiation: "mit" },
+      evidence: { count: 2, by_account: [{ processor: { key: "STRIPE", label: "Stripe" }, merchant_account: { key: "aaaa0000-0000-4000-8000-00000000a001", label: "Stripe MID #1" }, count: 2 }] },
+      explanation: buildAlertExplanation("post_ban_retries", { count: 2 }, "mit"),
+    }),
+    alertRow(ALERT_IDS.resolved, { rule_key: "data_stale", metric: "data_lag_days", unit: "days", status: "resolved", resolved_at: "2026-10-04T07:40:00.000Z", auto_resolved: true, scope: { kind: "tenant", subject: "data_through" }, last_seen_at: "2026-10-04T07:40:00.000Z" }),
+  ];
+}
+
+interface AlertPgOptions {
+  claim?: Record<string, unknown>;
+  updateError?: string;
+  /**
+   * More payment_risk_alerts rows, BEFORE the three of alertRows(): the fake ignores .order(), so table order is
+   * the read order — these stand for rows a newest-first read returns first.
+   */
+  extraRows?: Array<Record<string, unknown>>;
+}
+
+/** The service-role Postgres of the alert actions: the alert tables, the runner's tables, the four SQL functions (recorded). */
+function alertPg(options: AlertPgOptions = {}): StrictFakeSupabase {
+  const rows = [...(options.extraRows ?? []), ...alertRows()];
+  return createStrictFakeSupabase({
+    tenantKey: PH_DATA_KEY,
+    tables: {
+      payment_risk_alerts: { scope: "tenant", owner: "auth_user_id", rows },
+      payment_alert_runs: { scope: "tenant", owner: "auth_user_id", rows: [{ id: "run-1", auth_user_id: PH_DATA_KEY, trigger: "cron", status: "succeeded", started_at: "2026-10-05T07:40:00.000Z", finished_at: "2026-10-05T07:40:20.000Z", data_through: "2026-10-03", summary: { candidates: 2, by_severity: { info: 0, warning: 1, critical: 1 }, applied: { inserted: 2 }, windows: {}, rules: [] }, error: "DB::Exception: secret warehouse text" }] },
+      payment_alert_rules: { scope: "global", rows: DEFAULT_ALERT_RULES.map((rule) => ({ ...rule })) },
+      psp_accounts: { scope: "tenant", owner: "auth_user_id", rows: fixtureAccounts() },
+      clickhouse_cohort_snapshot_state: { scope: "tenant", owner: "auth_user_id", rows: [] },
+      import_batches: { scope: "tenant", owner: "user_id", rows: [] },
+      clickhouse_transaction_sync_state: { scope: "tenant", owner: "auth_user_id", rows: [] },
+    },
+    rpc: {
+      payment_alert_update_status: {
+        tenantParam: "p_data_key",
+        handler: (params) => {
+          if (options.updateError) return { data: null, error: { message: options.updateError } };
+          const row = rows.find((entry) => entry.id === params.p_alert_id)!;
+          return { data: { ...row, status: params.p_status, assignee: params.p_status === "investigating" ? row.assignee ?? params.p_actor : row.assignee, updated_by: params.p_actor }, error: null };
+        },
+      },
+      payment_alerts_claim_run: { tenantParam: "p_data_key", handler: () => ({ data: options.claim ?? { claimed: true, run_id: "run-2", started_at: "2026-10-06T12:00:00.000Z" }, error: null }) },
+      payment_alerts_apply_run: { tenantParam: "p_data_key", handler: () => ({ data: { inserted: 3, updated: 0, carried: 0, reopened: 0, suppressed: 0, auto_resolved: 1 }, error: null }) },
+      payment_alerts_fail_run: { tenantParam: "p_data_key" },
+    },
+  });
+}
+
+/** The index.ts handler, verbatim in behaviour: alert actions to runPaymentAlertsAction (the reader factory, not a reader), the rest to the runner. */
+function indexHandler(pg: StrictFakeSupabase): AccessHandler<string> {
+  return (async ({ ctx, action, body, clickhouse }: AccessRequest<string>) =>
+    isPaymentAlertAction(action)
+      ? runPaymentAlertsAction({ action, tenantKey: ctx.tenantKey, actorUserId: ctx.actor.userId, pspVisible: pspDimensionsVisible(ctx), canManage: alertsManageable(ctx), requestId: ctx.requestId, body, clickhouse, pg: asPg(pg), clock: () => NOW })
+      : runPaymentHealth({ tenantKey: ctx.tenantKey, clickhouse: clickhouse(), pg: asPg(pg), request: { ...RANGE, ...body, action }, pspVisible: pspDimensionsVisible(ctx), clock: () => NOW })) as AccessHandler<string>;
+}
+
+async function alertCall(persona: Persona, body: Record<string, unknown>, options: AlertPgOptions = {}) {
+  const pg = alertPg(options);
+  const gate = gateFor(persona);
+  const writeAudit = vi.fn(async () => ({ data: 1, error: null }));
+  const deps = { ...gate.deps, writeAudit };
+  const result = await callGate(CLICKHOUSE_PAYMENT_HEALTH_POLICY, indexHandler(pg), edgeRequest({ fn: "clickhouse-payment-health", body }).req, deps, { onError: paymentHealthErrorResponse });
+  return { ...result, gate, pg, writeAudit };
+}
+
+const rpcCalls = (pg: StrictFakeSupabase, fn: string) => pg.rpcCalls.filter((call) => call.fn === fn);
+
+describe("P2.5 alerts_list", () => {
+  it("a payment_health.view holder lists the alerts without the PSP-scoped ones or the per-account evidence; no ClickHouse reader is opened", async () => {
+    const listed = await alertCall(viewHolder, { action: "alerts_list" });
+    expect(listed.status, listed.text.slice(0, 300)).toBe(200);
+    const alerts = listed.json?.alerts as Array<Record<string, unknown>>;
+    expect(alerts.map((alert) => alert.id)).toEqual([ALERT_IDS.tenant, ALERT_IDS.resolved]);
+    expect(alerts.every((alert) => alert.psp_scoped === false)).toBe(true);
+    expect((alerts[0].evidence as Record<string, unknown>).by_account).toBeUndefined();
+    expect(listed.json).toMatchObject({
+      ok: true, action: "alerts_list", hidden_psp_scoped: 1,
+      counts: { total: 2, open: 1, by_status: { new: 1, investigating: 0, resolved: 1, dismissed: 0 }, open_by_severity: { info: 0, warning: 1, critical: 0 } },
+      meta: { psp_global_visible: false, can_manage: false, limit: 100, limited: false, run_min_interval_seconds: 300 },
+      last_run: { run_id: "run-1", status: "succeeded", trigger: "cron", data_through: "2026-10-03", counts: { candidates: 2, inserted: 2 } },
+    });
+    expect((listed.json?.rules as unknown[]).length).toBe(8);
+    expect(listed.gate.deps.createClickHouse).not.toHaveBeenCalled();
+    expect(listed.gate.clickhouse.statements).toEqual([]);
+    // The read is filtered on the data key and on psp_scoped in SQL; the run's failure text never leaves the database.
+    expect(listed.pg.violations).toEqual([]);
+    expect(listed.pg.callsTo("payment_risk_alerts").every((call) => call.filters.some(([op, column, value]) => op === "eq" && column === "auth_user_id" && value === PH_DATA_KEY))).toBe(true);
+    expect(listed.pg.callsTo("payment_risk_alerts").find((call) => call.columns !== "id")?.filters).toContainEqual(["eq", "psp_scoped", false]);
+    expect(listed.text).not.toContain("DB::Exception");
+    expect(scanForLeaks(listed.json, { extra: SENTINELS })).toEqual([]);
+  });
+
+  it("the PSP key (and the data owner) see every alert with its per-account evidence; filters narrow the read", async () => {
+    for (const persona of [pspHolder, PERSONAS.owner]) {
+      const listed = await alertCall(persona, { action: "alerts_list" });
+      const alerts = listed.json?.alerts as Array<Record<string, unknown>>;
+      // Open first, then severity: the critical PSP alert leads.
+      expect(alerts.map((alert) => alert.id), persona.name).toEqual([ALERT_IDS.psp, ALERT_IDS.tenant, ALERT_IDS.resolved]);
+      expect((alerts[1].evidence as Record<string, unknown>).by_account, persona.name).toEqual([{ processor: { key: "STRIPE", label: "Stripe" }, merchant_account: { key: "aaaa0000-0000-4000-8000-00000000a001", label: "Stripe MID #1" }, count: 2 }]);
+      expect(listed.json, persona.name).toMatchObject({ hidden_psp_scoped: 0, meta: { psp_global_visible: true, can_manage: persona === PERSONAS.owner } });
+      expect(scanForLeaks(listed.json, { extra: SENTINELS })).toEqual([]);
+    }
+    const filtered = await alertCall(pspHolder, { action: "alerts_list", status: ["new", "investigating"], severity: ["critical"] });
+    expect((filtered.json?.alerts as Array<{ id: string }>).map((alert) => alert.id)).toEqual([ALERT_IDS.psp]);
+    expect(filtered.pg.callsTo("payment_risk_alerts")[0].filters).toEqual(expect.arrayContaining([["in", "status", ["new", "investigating"]], ["in", "severity", ["critical"]]]));
+    const bad = await alertCall(pspHolder, { action: "alerts_list", status: ["open"] });
+    expect(bad.status).toBe(400);
+    expect(bad.json?.error_code).toBe("invalid_request");
+  });
+
+  it("the limit never cuts an open alert in favour of a closed one, whatever their last_seen_at (open first is chosen in the read, not after it)", async () => {
+    // Three dismissed alerts refreshed after the open ones were last seen (a re-run window refreshes a dismissed row;
+    // an open alert whose scope stays inconclusive is not refreshed).
+    const extraRows = ["b1", "b2", "b3"].map((suffix, index) => alertRow(`aaaa0000-0000-4000-8000-0000000000${suffix}`, {
+      status: "dismissed", rule_key: "data_stale", metric: "data_lag_days", unit: "days", scope: { kind: "tenant", subject: "data_through" }, last_seen_at: `2026-10-06T0${index + 1}:00:00.000Z`,
+    }));
+    const listed = await alertCall(pspHolder, { action: "alerts_list", limit: 2 }, { extraRows });
+    expect(listed.status, listed.text.slice(0, 300)).toBe(200);
+    expect((listed.json?.alerts as Array<{ id: string }>).map((alert) => alert.id)).toEqual([ALERT_IDS.psp, ALERT_IDS.tenant]);
+    expect(listed.json).toMatchObject({ counts: { total: 2, open: 2 }, meta: { limit: 2, limited: true } });
+    // Open and closed are read separately, each with the caller's filters.
+    const reads = listed.pg.callsTo("payment_risk_alerts").filter((call) => call.columns !== "id");
+    expect(reads.map((call) => call.filters.find(([op, column]) => op === "in" && column === "status")?.[2])).toEqual([["new", "investigating"], ["resolved", "dismissed"]]);
+    // A closed-only filter reads only the closed statuses.
+    const closedOnly = await alertCall(pspHolder, { action: "alerts_list", status: ["dismissed"], limit: 2 }, { extraRows });
+    expect((closedOnly.json?.alerts as Array<{ id: string }>).map((alert) => alert.id)).toEqual(["aaaa0000-0000-4000-8000-0000000000b3", "aaaa0000-0000-4000-8000-0000000000b2"]);
+    expect(closedOnly.pg.callsTo("payment_risk_alerts").filter((call) => call.columns !== "id")).toHaveLength(1);
+  });
+
+  it("is refused without payment_health.view and to every funnel-restricted context", async () => {
+    const denied = await alertCall(PERSONAS.viewer, { action: "alerts_list" });
+    expect(denied.status).toBe(403);
+    expect(denied.json?.error_code).toBe(ACCESS_ERROR.PERMISSION_DENIED);
+    for (const persona of [withGrant(PERSONAS.buyerA, ENFORCED_PERMISSION_KEYS, { name: "buyer-{A}" }), withScope(PERSONAS.owner, PERSONAS.buyerA.scope, "data-owner@{A}")]) {
+      // The read is refused on scope. The writes: a narrowed MEMBER never holds the privileged payment_health.manage_alerts,
+      // whatever the role lists (permission before scope, so nothing is revealed); the Owner role keeps its keys and is refused on scope.
+      const writeCode = persona.role.isOwner ? ACCESS_ERROR.SCOPE_NOT_SUPPORTED : ACCESS_ERROR.PERMISSION_DENIED;
+      for (const [body, code] of [
+        [{ action: "alerts_list" }, ACCESS_ERROR.SCOPE_NOT_SUPPORTED],
+        [{ action: "alert_update", alert_id: ALERT_IDS.tenant, status: "investigating" }, writeCode],
+        [{ action: "alerts_run" }, writeCode],
+      ] as const) {
+        const restricted = await alertCall(persona, body);
+        expect(restricted.status, `${persona.name} ${body.action}`).toBe(403);
+        expect(restricted.json?.error_code, `${persona.name} ${body.action}`).toBe(code);
+        expect(restricted.pg.calls).toEqual([]);
+        expect(restricted.pg.rpcCalls).toEqual([]);
+      }
+    }
+  });
+});
+
+describe("P2.5 alert_update", () => {
+  const update = (persona: Persona, alertId: string, status: string, extra: Record<string, unknown> = {}, options: AlertPgOptions = {}) =>
+    alertCall(persona, { action: "alert_update", alert_id: alertId, status, ...extra }, options);
+
+  it("is 403 without payment_health.manage_alerts (the view key is not enough), before any read", async () => {
+    for (const persona of [viewHolder, pspHolder]) {
+      const denied = await update(persona, ALERT_IDS.tenant, "investigating");
+      expect(denied.status, persona.name).toBe(403);
+      expect(denied.json?.error_code).toBe(ACCESS_ERROR.PERMISSION_DENIED);
+      expect(denied.pg.calls).toEqual([]);
+      expect(rpcCalls(denied.pg, "payment_alert_update_status")).toEqual([]);
+    }
+  });
+
+  it("200 with manage_alerts: the SQL function changes the status (history + audit row in one transaction) for the data key and the actor; the gate audits the write", async () => {
+    const done = await update(manageHolder, ALERT_IDS.tenant, "investigating", { note: "  checking the dunning schedule " });
+    expect(done.status, done.text.slice(0, 300)).toBe(200);
+    expect(rpcCalls(done.pg, "payment_alert_update_status")).toEqual([{
+      fn: "payment_alert_update_status",
+      params: { p_data_key: PH_DATA_KEY, p_actor: manageHolder.userId, p_alert_id: ALERT_IDS.tenant, p_status: "investigating", p_note: "checking the dunning schedule", p_request_id: "req-security" },
+    }]);
+    expect(done.json).toMatchObject({ ok: true, action: "alert_update", alert: { id: ALERT_IDS.tenant, status: "investigating", assignee: manageHolder.userId, updated_by: manageHolder.userId, psp_scoped: false } });
+    // The caller has no PSP key: the per-account evidence is stripped from the answer too.
+    expect(((done.json?.alert as Record<string, unknown>).evidence as Record<string, unknown>).by_account).toBeUndefined();
+    expect(done.writeAudit).toHaveBeenCalledWith(expect.objectContaining({ fn: "clickhouse-payment-health", action: "alert_update", outcome: "success", actorUserId: manageHolder.userId }));
+    expect(done.gate.clickhouse.statements).toEqual([]);
+    expect(done.pg.violations).toEqual([]);
+  });
+
+  it("a PSP-scoped alert is 404 for a manager without the PSP key (it cannot be listed either) and 200 with it", async () => {
+    const hidden = await update(manageHolder, ALERT_IDS.psp, "dismissed");
+    expect(hidden.status).toBe(404);
+    expect(hidden.json?.error_code).toBe("alert_not_found");
+    expect(rpcCalls(hidden.pg, "payment_alert_update_status")).toEqual([]);
+    const done = await update(fullAlertHolder, ALERT_IDS.psp, "dismissed");
+    expect(done.status).toBe(200);
+    expect(done.json).toMatchObject({ alert: { id: ALERT_IDS.psp, status: "dismissed", scope: { kind: "account", merchant_account: { label: "Stripe MID #1" } } } });
+    expect(scanForLeaks(done.json, { extra: SENTINELS })).toEqual([]);
+  });
+
+  it("an invalid transition is 400 invalid_transition (checked before the write and again in SQL); an unknown id 404; a malformed body 400", async () => {
+    const invalid = await update(fullAlertHolder, ALERT_IDS.resolved, "dismissed");
+    expect(invalid.status).toBe(400);
+    expect(invalid.json?.error_code).toBe("invalid_transition");
+    expect(rpcCalls(invalid.pg, "payment_alert_update_status")).toEqual([]);
+    // A race the pre-check could not see: the function's coded refusal maps the same way (and the error code survives the employee sanitizing).
+    const raced = await update(fullAlertHolder, ALERT_IDS.tenant, "resolved", {}, { updateError: "invalid_transition: dismissed -> resolved" });
+    expect(raced.status).toBe(400);
+    expect(raced.json?.error_code).toBe("invalid_transition");
+    const gone = await update(fullAlertHolder, ALERT_IDS.tenant, "resolved", {}, { updateError: "not_found: alert not found" });
+    expect(gone.status).toBe(404);
+    const unknown = await update(fullAlertHolder, "aaaa0000-0000-4000-8000-0000000000ff", "investigating");
+    expect(unknown.status).toBe(404);
+    expect(unknown.json?.error_code).toBe("alert_not_found");
+    for (const body of [{ alert_id: "x", status: "investigating" }, { alert_id: ALERT_IDS.tenant, status: "open" }, { alert_id: ALERT_IDS.tenant, status: "resolved", note: 7 }]) {
+      const bad = await alertCall(fullAlertHolder, { action: "alert_update", ...body });
+      expect(bad.status, JSON.stringify(body)).toBe(400);
+      expect(bad.json?.error_code).toBe("invalid_request");
+    }
+  });
+});
+
+describe("P2.5 alerts_run and the alerts_tick cron", () => {
+  it("a manager runs the engine now: claim → the runner's own reads over the ScopedReader (tenant bound) → apply; the answer is the run summary", async () => {
+    const run = await alertCall(manageHolder, { action: "alerts_run" });
+    expect(run.status, run.text.slice(0, 400)).toBe(200);
+    expect(run.json).toMatchObject({ ok: true, action: "alerts_run", skipped: null, run: { run_id: "run-2", trigger: "manual", status: "succeeded", data_through: "2026-10-03", counts: { inserted: 3, auto_resolved: 1 } } });
+    expect(rpcCalls(run.pg, "payment_alerts_claim_run")[0].params).toEqual({ p_data_key: PH_DATA_KEY, p_trigger: "manual", p_actor: manageHolder.userId, p_min_interval_seconds: 300 });
+    const applied = rpcCalls(run.pg, "payment_alerts_apply_run")[0].params;
+    expect(applied).toMatchObject({ p_run_id: "run-2", p_data_key: PH_DATA_KEY, p_data_through: "2026-10-03" });
+    expect(run.gate.clickhouse.statements.length).toBeGreaterThan(3);
+    expect(run.gate.clickhouse.boundTenants()).toEqual([PH_DATA_KEY]);
+    expect(run.gate.clickhouse.statements.every((statement) => statement.kind === "query")).toBe(true);
+    // Nothing the engine writes carries a raw MID, descriptor, instrument key, e-mail or transaction id.
+    expect(scanForLeaks(applied, { extra: SENTINELS })).toEqual([]);
+    expect(scanForLeaks(run.json, { extra: SENTINELS })).toEqual([]);
+    expect(run.writeAudit).toHaveBeenCalledWith(expect.objectContaining({ action: "alerts_run", outcome: "success" }));
+  });
+
+  it("inside the interval a person gets 429 rate_limited (retry_after for the data owner, the code for everyone); no read is made", async () => {
+    const claim = { claimed: false, retry_after_seconds: 240, last_status: "succeeded" };
+    const employee = await alertCall(manageHolder, { action: "alerts_run" }, { claim });
+    expect(employee.status).toBe(429);
+    expect(employee.json?.error_code).toBe("rate_limited");
+    expect(employee.gate.clickhouse.statements).toEqual([]);
+    expect(rpcCalls(employee.pg, "payment_alerts_apply_run")).toEqual([]);
+    const owner = await alertCall(PERSONAS.owner, { action: "alerts_run" }, { claim });
+    expect(owner.json).toMatchObject({ error_code: "rate_limited", retry_after_seconds: 240 });
+  });
+
+  it("alerts_run is 403 without manage_alerts", async () => {
+    for (const persona of [viewHolder, pspHolder]) {
+      const denied = await alertCall(persona, { action: "alerts_run" });
+      expect(denied.status).toBe(403);
+      expect(denied.pg.rpcCalls).toEqual([]);
+    }
+  });
+
+  const cronCall = async (headers: Record<string, string>, body: unknown, options: AlertPgOptions = {}) => {
+    const pg = alertPg(options);
+    const gate = gateFor(PERSONAS.owner);
+    const req = new Request("https://edge.test/functions/v1/clickhouse-payment-health", { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body) });
+    const result = await callGate(CLICKHOUSE_PAYMENT_HEALTH_POLICY, indexHandler(pg), req, gate.deps, { onError: paymentHealthErrorResponse });
+    return { ...result, pg, gate };
+  };
+
+  it("the secret-authenticated tick runs the engine for the workspace tenant (cron trigger, 60 s guard); only alerts_tick is callable", async () => {
+    for (const body of [{}, { action: "alerts_tick" }, { auth_user_id: DATA_KEY, action: "alerts_tick" }]) {
+      const tick = await cronCall({ "x-cron-secret": CRON_SECRETS.FB_CRON_SECRET }, body);
+      expect(tick.status, `${JSON.stringify(body)} ${tick.text.slice(0, 300)}`).toBe(200);
+      expect(tick.json).toMatchObject({ ok: true, action: "alerts_tick", run: { trigger: "cron" } });
+      expect(rpcCalls(tick.pg, "payment_alerts_claim_run")[0].params).toEqual({ p_data_key: PH_DATA_KEY, p_trigger: "cron", p_actor: null, p_min_interval_seconds: 60 });
+      expect(tick.gate.clickhouse.boundTenants()).toEqual([PH_DATA_KEY]);
+    }
+    // A double fire is skipped, not run twice.
+    const skipped = await cronCall({ "x-cron-secret": CRON_SECRETS.FB_CRON_SECRET }, { action: "alerts_tick" }, { claim: { claimed: false, retry_after_seconds: 30 } });
+    expect(skipped.json).toEqual({ ok: true, action: "alerts_tick", run: null, skipped: "recent_run" });
+    expect(skipped.gate.clickhouse.statements).toEqual([]);
+  });
+
+  it("a wrong or missing secret is refused; the cron names nothing else; another tenant is refused; a user can never name alerts_tick", async () => {
+    const wrong = await cronCall({ "x-cron-secret": "wrong" }, { action: "alerts_tick" });
+    expect(wrong.status).toBe(401);
+    expect(wrong.json?.error_code).toBe(ACCESS_ERROR.INVALID_CRON_SECRET);
+    expect(wrong.pg.rpcCalls).toEqual([]);
+    for (const body of [{ action: "overview" }, { action: "alerts_run" }, { action: "alert_update", alert_id: ALERT_IDS.tenant, status: "dismissed" }]) {
+      const other = await cronCall({ "x-cron-secret": CRON_SECRETS.FB_CRON_SECRET }, body);
+      expect(other.status, JSON.stringify(body)).toBe(400);
+      expect(other.json?.error_code).toBe(ACCESS_ERROR.UNKNOWN_ACTION);
+      expect(other.pg.rpcCalls).toEqual([]);
+    }
+    const foreign = await cronCall({ "x-cron-secret": CRON_SECRETS.FB_CRON_SECRET }, { auth_user_id: EMPLOYEE, action: "alerts_tick" });
+    expect(foreign.status).toBe(400);
+    expect(foreign.json?.error_code).toBe(ACCESS_ERROR.TENANT_MISMATCH);
+    for (const persona of [PERSONAS.owner, fullAlertHolder]) {
+      const user = await alertCall(persona, { action: "alerts_tick" });
+      expect(user.status).toBe(400);
+      expect(user.json?.error_code).toBe(ACCESS_ERROR.UNKNOWN_ACTION);
+    }
+  });
+});
+
 describe("warehouse probe (clickhouse-summary)", () => {
   // The page keys every react-query entry on the warehouse version from clickhouse-summary
   // (useWarehouseVersion), so a member holding only payment_health.view must be served by that probe.
@@ -324,6 +683,13 @@ describe("index.ts entrypoint", () => {
     expect(source).toContain("pspVisible: pspDimensionsVisible(ctx)");
     expect(source).toContain("paymentHealthErrorResponse");
     expect(source).toContain("QUERY_TIMEOUT_MS = 55_000");
+    // P2.5: the alert actions go to the alert router with the workspace tenant, the member, the two visibility flags
+    // and the reader FACTORY (alerts_list / alert_update never open ClickHouse).
+    expect(source).toMatch(/if \(isPaymentAlertAction\(action\)\)/);
+    expect(source).toContain("runPaymentAlertsAction({");
+    expect(source).toContain("actorUserId: ctx.actor.userId");
+    expect(source).toContain("canManage: alertsManageable(ctx)");
+    expect(source).toMatch(/\n\s+clickhouse,\n/);
     for (const banned of ["requireSupabaseUser", "requireCronSecret", "createClickHouseClient", "clickhouse/client.ts", "Deno.serve(", "auth.id", "parseJsonBody", "body.auth_user_id"]) {
       expect(source).not.toContain(banned);
     }

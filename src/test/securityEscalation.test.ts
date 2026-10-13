@@ -1004,9 +1004,12 @@ describe("V6 — the cron tenant comes from the workspace, never from the body",
       rematch_replies: { internal: true, action: "rematch_replies", mode: "full" },
     },
     "classify-support-requests": { continue: { action: "continue" } },
+    // The exact body public.invoke_payment_alerts_tick posts (migration 202610130002), minus the data key the loop adds.
+    "clickhouse-payment-health": { alerts_tick: { action: "alerts_tick" } },
   };
   const NOT_FOR_CRON: Record<string, Record<string, unknown>> = {
     "clickhouse-cohort-membership": { action: "rebuild", force: true },
+    "clickhouse-payment-health": { action: "alerts_run" },
     "clickhouse-facebook": { action: "report" },
     "funnelfox-subscriptions-sync": { dry_run: true },
     "funnelfox-leads-sync": { dry_run: true },

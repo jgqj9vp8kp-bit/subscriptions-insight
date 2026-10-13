@@ -449,12 +449,15 @@ function openClickHouseCircuit(functionName: string, message: string): void {
 async function clickHouseRequest<T>(
   functionName: string,
   body: Record<string, unknown> = {},
-  options: { breakerGated?: boolean } = {},
+  // warehouseSignal false: the action never reaches ClickHouse (a Postgres-only
+  // action of a warehouse function), so its outcome must not move the breaker.
+  options: { breakerGated?: boolean; warehouseSignal?: boolean } = {},
 ): Promise<T> {
   if (!supabase) throw new Error("Supabase is not configured.");
   if (options.breakerGated && isClickHouseCircuitOpen()) {
     throw new Error(CLICKHOUSE_UNAVAILABLE_MESSAGE);
   }
+  const warehouseSignal = options.warehouseSignal ?? true;
   const token = await sessionToken();
   const { data, error } = await traceRequest(`edge.${functionName}`, `edge:${functionName}:${JSON.stringify(body).length}`, () => supabase.functions.invoke(functionName, {
     body,
@@ -465,7 +468,7 @@ async function clickHouseRequest<T>(
   });
   if (error) {
     const failure = await readFunctionFailure(error);
-    if (shouldOpenClickHouseCircuit(failure)) openClickHouseCircuit(functionName, failure.message);
+    if (warehouseSignal && shouldOpenClickHouseCircuit(failure)) openClickHouseCircuit(functionName, failure.message);
     const message = `ClickHouse Edge Function failed: ${failure.message}`;
     if (failure.status === null) throw new Error(message);
     if (failure.errorCode) traceEvent("clickhouse.edge_error", { edge_function: functionName, status: failure.status, error_code: failure.errorCode });
@@ -479,8 +482,8 @@ async function clickHouseRequest<T>(
   const embedded = (data as { ok?: unknown; error?: unknown }).ok === false ? String((data as { error?: unknown }).error ?? "") : null;
   if (embedded != null) {
     const embeddedCode = nonEmptyText((data as { error_code?: unknown }).error_code);
-    if (!isAccessErrorCode(embeddedCode) && isWarehouseDownError(embedded)) openClickHouseCircuit(functionName, embedded);
-  } else if (functionName !== CLICKHOUSE_HEALTH_FUNCTION) {
+    if (warehouseSignal && !isAccessErrorCode(embeddedCode) && isWarehouseDownError(embedded)) openClickHouseCircuit(functionName, embedded);
+  } else if (warehouseSignal && functionName !== CLICKHOUSE_HEALTH_FUNCTION) {
     noteClickHouseReachable();
   }
   traceEvent(`edge.${functionName}.response`, {
@@ -900,6 +903,17 @@ export async function runClickHouseBankAnalytics<T = unknown>(request: Record<st
 // in-browser engine to fall back to — the page shows the error instead.
 export async function runClickHousePaymentHealth<T = unknown>(request: Record<string, unknown>): Promise<T> {
   return clickHouseRequest<T>(CLICKHOUSE_PAYMENT_HEALTH_FUNCTION, request, { breakerGated: true });
+}
+
+// Payment risk alerts (P2.5; paymentRiskAlertsContract.ts), same function.
+// alerts_list and alert_update read and write Postgres only, never the
+// warehouse: they must stay reachable while the breaker is open (a data_stale
+// alert matters most exactly then), and their answers say nothing about the
+// warehouse, so they neither open nor close the breaker. alerts_run evaluates
+// the rules over the warehouse and is gated like the page's reads.
+export async function runClickHousePaymentHealthAlerts<T = unknown>(request: Record<string, unknown>): Promise<T> {
+  const readsWarehouse = request.action === "alerts_run";
+  return clickHouseRequest<T>(CLICKHOUSE_PAYMENT_HEALTH_FUNCTION, request, { breakerGated: readsWarehouse, warehouseSignal: readsWarehouse });
 }
 
 // --- Support Analytics read path + sync (clickhouse-support) --------------

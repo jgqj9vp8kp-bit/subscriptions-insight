@@ -1,4 +1,5 @@
-// Payment System Health data source (plan sections J, M, N, R, S, X; P2 frontend).
+// Payment System Health data source (plan sections J, M, N, R, S, X; P2 frontend;
+// the alert actions of P2.5, plan Q, at the end).
 //
 // The browser side of the clickhouse-payment-health Edge function: the UI's
 // filter state → one request body per action, the typed response back, and a
@@ -10,7 +11,7 @@
 // value is an aggregate (no emails, ids, card fragments, raw MIDs or
 // descriptors — the server labels them).
 
-import { ClickHouseRequestError, isAccessError, runClickHousePaymentHealth } from "@/services/clickhouse";
+import { ClickHouseRequestError, isAccessError, runClickHousePaymentHealth, runClickHousePaymentHealthAlerts } from "@/services/clickhouse";
 import type {
   DeclinesResponse,
   OptionsResponse,
@@ -23,6 +24,19 @@ import type {
   RetriesResponse,
   SourcesResponse,
 } from "../../supabase/functions/_shared/clickhouse/paymentHealthContract";
+import {
+  ALERT_RULE_KEYS,
+  ALERT_SEVERITIES,
+  ALERT_STATUSES,
+  normalizeAlertUpdateRequest,
+  type AlertRuleKey,
+  type AlertSeverity,
+  type AlertStatus,
+  type AlertUpdateResponse,
+  type AlertsListResponse,
+  type AlertsRunResponse,
+  type PaymentRiskAlert,
+} from "../../supabase/functions/_shared/clickhouse/paymentRiskAlertsContract";
 
 export type {
   PaymentHealthAction,
@@ -35,6 +49,10 @@ export type {
   RefundsSupportResponse,
   SourcesResponse,
   OptionsResponse,
+  AlertsListResponse,
+  AlertUpdateResponse,
+  AlertsRunResponse,
+  PaymentRiskAlert,
 };
 
 /** The response of one action. */
@@ -208,4 +226,120 @@ export function describePaymentHealthError(error: unknown): PaymentHealthError {
   const message = error instanceof Error ? error.message : String(error ?? "Payment health request failed.");
   if (/^Incomplete ClickHouse payment health response/.test(message)) return { kind: "shape", message, status: null, errorCode: null, requestId: null };
   return { kind: "transport", message, status: null, errorCode: null, requestId: null };
+}
+
+// ---- payment risk alerts (P2.5, plan Q) ------------------------------------------
+// Same function, the alert actions of paymentRiskAlertsContract.ts. The list is
+// read through runClickHousePaymentHealthAlerts (Postgres-only on the server:
+// not breaker-gated); the shape check refuses a half answer like the page's
+// actions do, with the same "Incomplete …" message so describePaymentHealthError
+// classifies it as `shape`.
+
+/** The alerts_list filters the page sends (empty = no filter). Canonical: each
+ * list de-duplicated, unknown values dropped, in the contract's order — so two
+ * spellings of one selection build one request and one cache entry. */
+export interface PaymentAlertsFilters {
+  status: AlertStatus[];
+  severity: AlertSeverity[];
+  rule: AlertRuleKey[];
+}
+
+function canonicalList<T extends string>(values: readonly unknown[] | undefined, allowed: readonly T[]): T[] {
+  const wanted = new Set((values ?? []).map((value) => String(value ?? "").trim()));
+  return allowed.filter((value) => wanted.has(value));
+}
+
+export function normalizeAlertsFilters(filters: Partial<PaymentAlertsFilters> | null | undefined): PaymentAlertsFilters {
+  return {
+    status: canonicalList(filters?.status, ALERT_STATUSES),
+    severity: canonicalList(filters?.severity, ALERT_SEVERITIES),
+    rule: canonicalList(filters?.rule, ALERT_RULE_KEYS),
+  };
+}
+
+/** The open alerts (new + investigating): the tab's default view and the tab badge's query (one cache entry). */
+export const OPEN_ALERTS_FILTERS: PaymentAlertsFilters = Object.freeze(normalizeAlertsFilters({ status: ["new", "investigating"] })) as PaymentAlertsFilters;
+
+/** alerts_list body: the action and the non-empty filter lists (the server's default limit, 100). */
+export function buildAlertsListRequest(filters: Partial<PaymentAlertsFilters>): Record<string, unknown> {
+  const clean = normalizeAlertsFilters(filters);
+  const body: Record<string, unknown> = { action: "alerts_list" };
+  if (clean.status.length) body.status = clean.status;
+  if (clean.severity.length) body.severity = clean.severity;
+  if (clean.rule.length) body.rule = clean.rule;
+  return body;
+}
+
+export interface AlertStatusChange {
+  alertId: string;
+  status: AlertStatus;
+  note?: string | null;
+}
+
+/** alert_update body, validated by the contract's own normalizer first: a note
+ * over the limit or a malformed id fails here, before anything is sent. */
+export function buildAlertUpdateRequest(change: AlertStatusChange): Record<string, unknown> {
+  const req = normalizeAlertUpdateRequest({ alert_id: change.alertId, status: change.status, note: change.note ?? null });
+  const body: Record<string, unknown> = { action: "alert_update", alert_id: req.alert_id, status: req.status };
+  if (req.note) body.note = req.note;
+  return body;
+}
+
+const isNumber = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+const isObjectOrNull = (value: unknown) => value === null || isObject(value);
+
+type AlertActionName = "alerts_list" | "alert_update" | "alerts_run";
+
+const ALERT_REQUIRED_FIELDS: Readonly<Record<AlertActionName, ReadonlyArray<[field: string, check: (value: unknown) => boolean]>>> = {
+  alerts_list: [
+    ["alerts", (value) => isArray(value) && value.every(isObject)],
+    ["counts", (value) => isObject(value) && isNumber(value.open) && isObject(value.by_status) && isObject(value.open_by_severity)],
+    ["hidden_psp_scoped", isNumber],
+    ["last_run", isObjectOrNull],
+    ["rules", isArray],
+    ["meta", (value) => isObject(value) && typeof value.psp_global_visible === "boolean" && typeof value.can_manage === "boolean"],
+  ],
+  alert_update: [["alert", (value) => isObject(value) && typeof value.id === "string"]],
+  alerts_run: [["run", isObjectOrNull]],
+};
+
+/** Names the missing / malformed fields of an alert action's response ([] = complete). */
+export function missingAlertsFields(action: AlertActionName, value: unknown): string[] {
+  if (!isObject(value)) return ["body"];
+  const missing: string[] = [];
+  if (value.ok !== true) missing.push("ok");
+  if (value.action !== action) missing.push("action");
+  for (const [field, check] of ALERT_REQUIRED_FIELDS[action]) if (!check(value[field])) missing.push(field);
+  return missing;
+}
+
+export function isCompleteAlertsListResponse(value: unknown): value is AlertsListResponse {
+  return missingAlertsFields("alerts_list", value).length === 0;
+}
+
+async function callAlerts<T>(action: AlertActionName, body: Record<string, unknown>): Promise<T> {
+  const raw = await runClickHousePaymentHealthAlerts<unknown>(body);
+  if (isObject(raw) && raw.ok === false) {
+    const message = typeof raw.error === "string" && raw.error ? raw.error : "Payment alerts request failed.";
+    throw new Error(message);
+  }
+  const missing = missingAlertsFields(action, raw);
+  if (missing.length) throw new Error(`Incomplete ClickHouse payment health response (${action}): missing ${missing.join(", ")}.`);
+  return raw as T;
+}
+
+/** alerts_list (payment_health.view). */
+export async function loadPaymentAlerts(filters: Partial<PaymentAlertsFilters>): Promise<AlertsListResponse> {
+  return callAlerts<AlertsListResponse>("alerts_list", buildAlertsListRequest(filters));
+}
+
+/** alert_update (payment_health.manage_alerts): the alert as stored after the change. */
+export async function updatePaymentAlert(change: AlertStatusChange): Promise<AlertUpdateResponse> {
+  // async: an invalid change (the contract normalizer throws) rejects instead of throwing synchronously.
+  return callAlerts<AlertUpdateResponse>("alert_update", buildAlertUpdateRequest(change));
+}
+
+/** alerts_run (payment_health.manage_alerts): evaluates every rule now; can take a couple of minutes. */
+export async function runPaymentAlerts(): Promise<AlertsRunResponse> {
+  return callAlerts<AlertsRunResponse>("alerts_run", { action: "alerts_run" });
 }

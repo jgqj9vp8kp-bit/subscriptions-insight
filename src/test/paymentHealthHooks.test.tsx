@@ -1,5 +1,6 @@
 // usePaymentHealthQuery: keyed by the access partition, stale-while-revalidate,
-// typed errors, and a 4xx is never asked again (R12).
+// typed errors, and a 4xx is never asked again (R12). The alert hooks (P2.5):
+// the same rules for the list, and both mutations refetch every alert list.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createElement, type ReactNode } from "react";
@@ -9,18 +10,30 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 vi.mock("@/services/supabaseClient", () => ({ supabase: null, isSupabaseConfigured: false }));
 vi.mock("@/services/paymentHealthDataSource", async (importActual) => {
   const actual = await importActual<typeof import("@/services/paymentHealthDataSource")>();
-  return { ...actual, loadPaymentHealth: vi.fn() };
+  return { ...actual, loadPaymentHealth: vi.fn(), loadPaymentAlerts: vi.fn(), updatePaymentAlert: vi.fn(), runPaymentAlerts: vi.fn() };
 });
 
 import { ClickHouseRequestError } from "@/services/clickhouse";
-import { EMPTY_PAYMENT_HEALTH_QUERY, loadPaymentHealth, type PaymentHealthQuery } from "@/services/paymentHealthDataSource";
-import { paymentHealthQueryKey } from "@/services/paymentHealthCache";
-import { usePaymentHealthQuery } from "@/hooks/usePaymentHealth";
+import {
+  EMPTY_PAYMENT_HEALTH_QUERY,
+  OPEN_ALERTS_FILTERS,
+  loadPaymentAlerts,
+  loadPaymentHealth,
+  runPaymentAlerts,
+  updatePaymentAlert,
+  type PaymentHealthQuery,
+} from "@/services/paymentHealthDataSource";
+import { paymentHealthAlertsQueryKey, paymentHealthQueryKey } from "@/services/paymentHealthCache";
+import { useAlertStatusMutation, usePaymentAlertsQuery, usePaymentHealthQuery, useRunAlertsMutation } from "@/hooks/usePaymentHealth";
 import { AccessContext, buildAccessValue } from "@/contexts/accessContext";
 import type { MyAccess } from "@/services/accessClient";
 import { overviewResponse } from "./support/paymentHealthResponses";
+import { ALERT_IDS, alertsListResponse, runSummary, staleAlert } from "./support/paymentHealthAlertResponses";
 
 const load = loadPaymentHealth as unknown as ReturnType<typeof vi.fn>;
+const loadAlerts = loadPaymentAlerts as unknown as ReturnType<typeof vi.fn>;
+const updateAlert = updatePaymentAlert as unknown as ReturnType<typeof vi.fn>;
+const runAlerts = runPaymentAlerts as unknown as ReturnType<typeof vi.fn>;
 const SCOPE = "p-test";
 const WHV = "whv_test";
 const query: PaymentHealthQuery = { ...EMPTY_PAYMENT_HEALTH_QUERY, dateFrom: "2026-09-13", dateTo: "2026-10-12" };
@@ -37,6 +50,9 @@ function mount(enabled = true) {
 beforeEach(() => {
   client = new QueryClient({ defaultOptions: { queries: { retryDelay: 1 } } });
   load.mockReset();
+  loadAlerts.mockReset();
+  updateAlert.mockReset();
+  runAlerts.mockReset();
 });
 afterEach(() => client.clear());
 
@@ -130,5 +146,54 @@ describe("usePaymentHealthQuery", () => {
     // Keyed by the context partition, not the caller's argument.
     expect(client.getQueryData(keyFor("p-ctx"))).toBeDefined();
     expect(client.getQueryData(keyFor("ignored"))).toBeUndefined();
+  });
+});
+
+describe("payment alert hooks (P2.5)", () => {
+  const alertsKey = (partition = SCOPE) => paymentHealthAlertsQueryKey({ userScopeHash: partition, filters: OPEN_ALERTS_FILTERS });
+  const mountAlerts = () => renderHook(() => usePaymentAlertsQuery({ filters: OPEN_ALERTS_FILTERS, userScopeHash: SCOPE, enabled: true }), { wrapper });
+
+  it("loads the list under the partition key; a 403 is never asked again, not even by a second observer of the same key", async () => {
+    loadAlerts.mockResolvedValueOnce(alertsListResponse([staleAlert()]));
+    const first = mountAlerts();
+    await waitFor(() => expect(first.result.current.data?.counts.open).toBe(1));
+    expect(loadAlerts).toHaveBeenCalledWith(OPEN_ALERTS_FILTERS);
+    expect(client.getQueryData(alertsKey())).toBeDefined();
+    first.unmount();
+    client.clear();
+
+    loadAlerts.mockReset();
+    loadAlerts.mockRejectedValue(new ClickHouseRequestError("ClickHouse Edge Function failed: permission_denied", { status: 403, errorCode: "permission_denied" }));
+    const badge = mountAlerts();
+    await waitFor(() => expect(badge.result.current.error?.kind).toBe("access"));
+    // The tab mounts the same key after the badge's refusal.
+    const tab = mountAlerts();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(tab.result.current.error?.kind).toBe("access");
+    expect(loadAlerts).toHaveBeenCalledTimes(1);
+  });
+
+  it("a status change refetches every alert list (on success and on a refusal); a run does too", async () => {
+    loadAlerts.mockResolvedValue(alertsListResponse([staleAlert()]));
+    const list = mountAlerts();
+    await waitFor(() => expect(list.result.current.data).not.toBeNull());
+    expect(loadAlerts).toHaveBeenCalledTimes(1);
+
+    updateAlert.mockResolvedValueOnce({ ok: true, action: "alert_update", alert: staleAlert({ status: "investigating" }) });
+    const status = renderHook(() => useAlertStatusMutation(), { wrapper });
+    await status.result.current.mutateAsync({ alertId: ALERT_IDS.stale, status: "investigating", note: "on it" });
+    expect(updateAlert).toHaveBeenCalledWith({ alertId: ALERT_IDS.stale, status: "investigating", note: "on it" });
+    await waitFor(() => expect(loadAlerts).toHaveBeenCalledTimes(2));
+
+    updateAlert.mockRejectedValueOnce(new ClickHouseRequestError("ClickHouse Edge Function failed: invalid_transition", { status: 400, errorCode: "invalid_transition" }));
+    await expect(status.result.current.mutateAsync({ alertId: ALERT_IDS.stale, status: "new" })).rejects.toThrow(/invalid_transition/);
+    await waitFor(() => expect(loadAlerts).toHaveBeenCalledTimes(3));
+    // A mutation is never retried.
+    expect(updateAlert).toHaveBeenCalledTimes(2);
+
+    runAlerts.mockResolvedValueOnce({ ok: true, action: "alerts_run", run: runSummary({ trigger: "manual" }), skipped: null });
+    const run = renderHook(() => useRunAlertsMutation(), { wrapper });
+    await run.result.current.mutateAsync();
+    await waitFor(() => expect(loadAlerts).toHaveBeenCalledTimes(4));
   });
 });
