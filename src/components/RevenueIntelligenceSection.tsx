@@ -37,6 +37,7 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { KpiCard } from "@/components/KpiCard";
+import { RevenueByFunnelCard } from "@/components/RevenueByFunnelCard";
 import { ChartContainer, ChartTooltip, ChartTooltipContent, type ChartConfig } from "@/components/ui/chart";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
@@ -688,42 +689,19 @@ export function RevenueIntelligenceSection(): JSX.Element {
             </div>
           </Card>
 
-          <Card className="p-4 shadow-card">
-            <div className="mb-2 text-sm font-medium">By funnel (period) · same campaign_path identity as Cohorts</div>
-            <div className="overflow-x-auto">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Funnel</TableHead>
-                    <TableHead className="text-right">Gross</TableHead>
-                    <TableHead className="text-right">Share</TableHead>
-                    <TableHead className="text-right">New</TableHead>
-                    <TableHead className="text-right">Existing</TableHead>
-                    <TableHead className="text-right">Net</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {bundle.by_funnel.map((funnel) => (
-                    <TableRow key={funnel.key}>
-                      <TableCell className="max-w-64 truncate text-xs font-medium" title={funnel.key}>{funnel.key}</TableCell>
-                      <TableCell className="text-right font-mono text-xs">{usd(funnel.gross, 2)}</TableCell>
-                      <TableCell className="text-right text-xs">{pct(funnel.gross, totals.gross)}</TableCell>
-                      <TableCell className="text-right font-mono text-xs">{usd(funnel.gross_new, 2)}</TableCell>
-                      <TableCell className="text-right font-mono text-xs">{usd(funnel.gross_existing, 2)}</TableCell>
-                      <TableCell className="text-right font-mono text-xs">{usd(funnel.net, 2)}</TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </div>
-            {/* Attribution coverage is a project-wide figure: not shown in a funnel-restricted view. */}
-            {!restricted && (
-              <p className="mt-2 text-xs text-muted-foreground">
-                Attribution coverage {bundle.diagnostics.attributed_pct}% · unattributed revenue is listed explicitly, never merged ·
-                New/Existing here follow the selected {displayBucket} grain, same as the KPI cards.
-              </p>
-            )}
-          </Card>
+          <RevenueByFunnelCard
+            rows={bundle.by_funnel}
+            totals={totals}
+            footer={
+              // Attribution coverage is a project-wide figure: not shown in a funnel-restricted view.
+              !restricted ? (
+                <>
+                  Attribution coverage {bundle.diagnostics.attributed_pct}% · unattributed revenue is listed explicitly, never merged ·
+                  New/Existing follow the selected {displayBucket} grain, same as the KPI cards.
+                </>
+              ) : undefined
+            }
+          />
         </>
       )}
     </section>
