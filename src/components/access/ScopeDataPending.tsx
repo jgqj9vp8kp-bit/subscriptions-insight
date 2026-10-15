@@ -17,7 +17,9 @@ export const SCOPE_SNAPSHOT_NOT_READY = "scope_snapshot_not_ready";
 /** How often a page re-asks while its data answers scope_snapshot_not_ready. */
 export const SCOPE_PENDING_POLL_MS = 60_000;
 
-export function ScopeDataPending({ inline = false }: { inline?: boolean }) {
+/** `testId` lets a second waiting state on the same page (the Dashboard's Daily
+ * trials card) keep the page's one "scope-data-pending" unambiguous. */
+export function ScopeDataPending({ inline = false, testId = "scope-data-pending" }: { inline?: boolean; testId?: string }) {
   const content = (
     <span className="inline-flex items-center gap-2">
       <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
@@ -27,10 +29,10 @@ export function ScopeDataPending({ inline = false }: { inline?: boolean }) {
     </span>
   );
   if (inline) {
-    return <span className="text-sm text-muted-foreground" data-testid="scope-data-pending">{content}</span>;
+    return <span className="text-sm text-muted-foreground" data-testid={testId}>{content}</span>;
   }
   return (
-    <Card className="p-4 text-sm text-muted-foreground shadow-card" data-testid="scope-data-pending">
+    <Card className="p-4 text-sm text-muted-foreground shadow-card" data-testid={testId}>
       {content}
     </Card>
   );

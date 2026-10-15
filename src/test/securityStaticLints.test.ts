@@ -534,7 +534,7 @@ describe("3. no entry point takes the tenant from the request", () => {
 
 const CATCH_LINT_FILES = [
   ...[
-    "cohorts", "cohortMembership", "fbCohortStats", "users", "paymentAnalytics", "bankAnalytics", "revenueIntelligence", "support", "facebookStats",
+    "cohorts", "cohortMembership", "fbCohortStats", "users", "paymentAnalytics", "bankAnalytics", "revenueIntelligence", "revenueTrials", "support", "facebookStats",
     // access Phase 2: the scoped builders and the snapshot / campaign-scope / coverage runners.
     "cohortSubscriptions", "campaignScope", "pathCoverage", "cohortSnapshotState", "scopeSql",
     // Payment health P2: the runner (its registry / snapshot / state reads are best effort).
@@ -1046,6 +1046,7 @@ describe("7. restricted SQL reads only the columns its scope fragments project (
       ["clickhouse-cohorts", { action: "details", funnel_key: { campaign_path: FUNNELS.A.path }, date_from: SCOPE_DAYS[0], date_to: SCOPE_DAYS[1], filters: { media_buyer: ["utm:facebook"] } }],
       ["clickhouse-cohorts", { action: "list", filters: { campaign_path_exclude: [FUNNELS.B.path], refund_status: "refunded", platform: ["ios"] } }],
       ["clickhouse-revenue", { action: "bundle", bucket: "week", filters: { campaign_path: [FUNNELS.A.path], country: ["US"] } }],
+      ["clickhouse-revenue", { action: "trials_daily", bucket: "week", filters: { campaign_path: [FUNNELS.A.path], country: ["US"], media_buyer: ["utm:facebook"] } }],
       ["clickhouse-facebook", { action: "report", level: "ad", filters: { buyer: ["Alice"], ad_account_id: ["act_shared"], campaign_id: ["fb_a"] } }],
       ["clickhouse-facebook", { action: "status", level: "adset" }],
     ];

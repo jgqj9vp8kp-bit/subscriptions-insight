@@ -160,6 +160,7 @@ describe("H1 / H2 — crafted filters and options never reach a restricted membe
       "clickhouse-cohorts.list", "clickhouse-cohorts.options", "clickhouse-users.list", "clickhouse-users.options",
       "clickhouse-support.bundle", "clickhouse-support.options", "clickhouse-facebook.report", "clickhouse-facebook.filters",
       "clickhouse-payment-analytics.bundle", "clickhouse-payment-analytics.banks", "clickhouse-revenue.bundle", "clickhouse-revenue.day_breakdown",
+      "clickhouse-revenue.trials_daily",
     ].includes(`${entry.fn}.${entry.action}`),
   );
   const CRAFTED: Array<Record<string, unknown>> = [
@@ -175,9 +176,9 @@ describe("H1 / H2 — crafted filters and options never reach a restricted membe
   const REFUSED_FILTER_READS = FILTER_READS.filter((entry) => entry.rule.scopeReady !== true);
 
   it("has the filter-taking reads (sanity)", () => {
-    expect(FILTER_READS).toHaveLength(12);
-    // Phase 2: cohorts list/options, FB report/filters and RI bundle/day are scopeReady.
-    expect(READY_FILTER_READS).toHaveLength(6);
+    expect(FILTER_READS).toHaveLength(13);
+    // Phase 2: cohorts list/options, FB report/filters and RI bundle/day/trials are scopeReady.
+    expect(READY_FILTER_READS).toHaveLength(7);
   });
 
   it.each(READY_FILTER_READS.map((entry) => [`${entry.fn}.${entry.action}`, entry] as const))("%s (scopeReady): every crafted body reaches the handler bound to paths(A) only", async (_label, entry) => {
@@ -230,6 +231,7 @@ describe("H1 / H2 — crafted filters and options never reach a restricted membe
   it.each([
     ["clickhouse-cohorts", "list", "rows"],
     ["clickhouse-revenue", "bundle", "by_funnel"],
+    ["clickhouse-revenue", "trials_daily", "by_funnel"],
   ] as const)("Phase 2: H1 — %s.%s: include lists are intersected with paths(A) (B dropped and counted), an all-out list matches nothing, exclude lists apply as sent", async (fn, action, rowsKey) => {
     const cases: Array<{ filters: Record<string, string[]>; paths: string[]; dropped: number; include?: string[]; exclude?: string[] }> = [
       { filters: { campaign_path: [A, B] }, paths: [A], dropped: 1, include: [A] },

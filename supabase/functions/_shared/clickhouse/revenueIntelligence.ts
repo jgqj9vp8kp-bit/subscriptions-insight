@@ -611,7 +611,7 @@ export const RESTRICTED_REVENUE_NOTE =
 /** The snapshot versions a runner reads. Restricted: the one the gate already
  * validated for this request (no second state read, no fallback); a missing
  * one is a 409, never the "not ready" body. Otherwise the active snapshot. */
-async function revenueSnapshot(
+export async function revenueSnapshot(
   supabase: SupabaseLikeClient,
   authUserId: string,
   scope: ScopeSql,

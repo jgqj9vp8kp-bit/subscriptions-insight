@@ -74,6 +74,9 @@ vi.mock("@/hooks/useRevenueIntelligence", () => ({
   useRevenueBundle: fns.useRevenueBundle,
   useRevenueDayBreakdown: () => ({ loading: false, error: null, errorCode: null, errorStatus: null, breakdown: null }),
 }));
+vi.mock("@/hooks/useRevenueTrials", () => ({
+  useRevenueTrials: () => ({ data: null, error: null, errorCode: null, errorStatus: null, isInitialLoading: false, isRefreshing: false }),
+}));
 vi.mock("@/services/analyticsAdapters", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   autoLoadWarehouseIntoStore: fns.autoLoadWarehouseIntoStore,

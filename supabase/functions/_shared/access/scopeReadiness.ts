@@ -10,9 +10,9 @@
 // restricted member 403 scope_not_supported.
 
 /** The pages a funnel-restricted member may open: the media-buyer surfaces
- * (Dashboard's Revenue Intelligence section, Cohorts, the read-only Funnels
- * registry, the FB Analytics warehouse tab). Every other ROUTE_ACCESS rule
- * declares restrictedReady: false. */
+ * (Dashboard's Revenue Intelligence section and Daily trials card, Cohorts,
+ * the read-only Funnels registry, the FB Analytics warehouse tab). Every other
+ * ROUTE_ACCESS rule declares restrictedReady: false. */
 export const RESTRICTED_READY_ROUTES: readonly string[] = Object.freeze(["/", "/cohorts", "/funnels", "/fb-analytics"]);
 
 /** The Edge actions each restricted-ready page calls for a restricted member.
@@ -23,6 +23,7 @@ export const RESTRICTED_PAGE_ACTIONS: Readonly<Record<string, ReadonlyArray<{ fn
     { fn: "clickhouse-summary", action: "summary" },
     { fn: "clickhouse-revenue", action: "bundle" },
     { fn: "clickhouse-revenue", action: "day_breakdown" },
+    { fn: "clickhouse-revenue", action: "trials_daily" },
   ]),
   "/cohorts": Object.freeze([
     { fn: "clickhouse-summary", action: "summary" },

@@ -94,6 +94,7 @@ import {
   runRevenueDayBreakdown,
   runRevenueIntelligence,
 } from "../../../supabase/functions/_shared/clickhouse/revenueIntelligence.ts";
+import { runRevenueTrialsDaily } from "../../../supabase/functions/_shared/clickhouse/revenueTrials.ts";
 import {
   buildFbDiagnostics,
   fbWarehouseErrorResponse,
@@ -507,7 +508,7 @@ export const SCOPE_READY_ACTIONS: readonly string[] = Object.freeze([
   "clickhouse-cohorts.details", "clickhouse-cohorts.list", "clickhouse-cohorts.options",
   "clickhouse-facebook.charts", "clickhouse-facebook.filters", "clickhouse-facebook.list", "clickhouse-facebook.report",
   "clickhouse-facebook.status", "clickhouse-facebook.summary",
-  "clickhouse-revenue.bundle", "clickhouse-revenue.day_breakdown",
+  "clickhouse-revenue.bundle", "clickhouse-revenue.day_breakdown", "clickhouse-revenue.trials_daily",
   "clickhouse-summary.summary",
 ]);
 
@@ -569,7 +570,7 @@ export const ACTION_REQUESTS: Readonly<Record<string, Readonly<Record<string, Ac
     ai_pass_rates: post({ action: "analytics", purpose: "ai_pass_rates" }),
   },
   "clickhouse-payment-health": named("overview", "declines", "retries", "refunds_support", "sources", "options"),
-  "clickhouse-revenue": named("bundle", "day_breakdown"),
+  "clickhouse-revenue": named("bundle", "day_breakdown", "trials_daily"),
   "clickhouse-summary": { summary: post({}) },
   "clickhouse-support": {
     ...named("bundle", "options", "status", "list", "unanswered_contacts", "export", "sync"),
@@ -1170,6 +1171,19 @@ export function scopeWarehouse(statement: RecordedStatement): unknown[] {
   // for a restricted member.
   if (sql.includes("snapshot_users AS")) return [{ day: DAY_1, cohort: "unattributed", gross: SENTINEL_SPEND, refunds: 0, net: SENTINEL_SPEND, rows_scanned: 1 }];
   if (sql.includes("toString(stat_date) day, sum(spend) spend")) return [{ day: DAY_1, spend: SENTINEL_SPEND }];
+  // Daily trials (revenueTrials.ts): one anchor per customer, grouped by
+  // (bucket, path); the previous window folds into 'prev'. The import cut-off
+  // statement is owner-only (member filters ignored on purpose).
+  if (sql.includes("uniqExact(fc.canonical_user_id) trials")) {
+    const from = String(statement.params.tr_prev_from);
+    const to = String(statement.params.tr_to);
+    const current = String(statement.params.tr_from);
+    const inWindow = customersOf(statement).filter((entry) => entry.cohortDate >= from && entry.cohortDate <= to);
+    return [...groupBy(inWindow, (entry) => `${entry.cohortDate >= current ? entry.cohortDate : "prev"}|${entry.path}`)].map(([key, list]) => ({
+      bkt: key.slice(0, key.indexOf("|")), cpath: list[0].path, geo: "US", trials: list.length,
+    }));
+  }
+  if (sql.includes("max(fc.trial_event_time)) data_through")) return [{ data_through: "2026-09-02 12:00:00.000", n: customersOf(statement, false).length }];
   if (sql.includes("FROM fin") && sql.includes("GROUP BY day ORDER BY day")) {
     return [...groupBy(customersOf(statement), (entry) => entry.cohortDate)].map(([day, list]) => revenueDay(day, list));
   }
@@ -1399,7 +1413,11 @@ const cohortsRouter: AccessHandler<string> = async ({ ctx, action, body, pg, cli
 const revenueRouter: AccessHandler<string> = async ({ ctx, action, body, pg, clickhouse, scope }) => {
   const shaped = ctx.restricted ? restrictRevenueRequest(scope, body) : { request: body as RevenueIntelligenceRequest, dropped: 0 };
   const common = { authUserId: ctx.tenantKey, supabase: asSupabase(pg), clickhouse: clickhouse(), request: shaped.request, scope };
-  const result = action === "day_breakdown" ? await runRevenueDayBreakdown(common) : await runRevenueIntelligence(common);
+  const result = action === "trials_daily"
+    ? await runRevenueTrialsDaily(common)
+    : action === "day_breakdown"
+      ? await runRevenueDayBreakdown(common)
+      : await runRevenueIntelligence(common);
   return ctx.restricted ? withRestrictedMeta(result, shaped.dropped) : result;
 };
 
@@ -1486,6 +1504,7 @@ export const SCOPE_READY_REQUESTS: Readonly<Record<string, Record<string, unknow
   "clickhouse-cohorts.details": { action: "details", cohort_key: { cohort_date: DAY_1, funnel: FUNNEL_OF[FUNNELS.A.path], campaign_path: FUNNELS.A.path } },
   "clickhouse-revenue.bundle": { action: "bundle", date_from: DAY_1, date_to: "2026-09-30", filters: { media_buyer: ["utm:facebook"] } },
   "clickhouse-revenue.day_breakdown": { action: "day_breakdown", date: DAY_1 },
+  "clickhouse-revenue.trials_daily": { action: "trials_daily", date_from: DAY_1, date_to: DAY_2, filters: { campaign_path: [FUNNELS.A.path] } },
   "clickhouse-summary.summary": {},
   "clickhouse-facebook.report": { action: "report", level: "campaign", filters: { date_from: DAY_1, date_to: DAY_2 } },
   "clickhouse-facebook.list": { action: "list", level: "adset", filters: { date_from: DAY_1, date_to: DAY_2 } },

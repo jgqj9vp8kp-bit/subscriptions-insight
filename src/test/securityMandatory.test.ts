@@ -1,7 +1,7 @@
 // Security regression suite — the 20 mandatory tests of plan §29, in their
 // Milestone-A form (plan D9 / §30 Phase 1: employees exist only with funnel scope
 // `all`; every funnel-restricted context is refused everywhere), narrowed by
-// access Phase 2: exactly the 12 media-buyer actions (SCOPE_READY_ACTIONS)
+// access Phase 2: exactly the 13 media-buyer actions (SCOPE_READY_ACTIONS)
 // serve a restricted context behind the snapshot freshness gate (409 until it
 // is ready) and a restricted ScopedReader; every other action still refuses it.
 //
@@ -215,13 +215,13 @@ describe("#1-#9, #11-#13 (Milestone A): every data action of every policy refuse
     expect(CASES.length).toBeGreaterThanOrEqual(114);
   });
 
-  it("exactly the 12 media-buyer actions are scopeReady (Phase 2 allowlist)", () => {
+  it("exactly the 13 media-buyer actions are scopeReady (Phase 2 allowlist)", () => {
     const ready: string[] = [];
     for (const policy of ALL_POLICIES) {
       for (const [action, rule] of Object.entries(policy.actions)) if (rule.scopeReady === true) ready.push(`${policy.fn}.${action}`);
     }
     expect(ready.sort()).toEqual([...SCOPE_READY_ACTIONS].sort());
-    expect(READY_ROWS).toHaveLength(12);
+    expect(READY_ROWS).toHaveLength(13);
   });
 
   it("the data-action classification is not vacuous (reads of every analytics page are in it)", () => {

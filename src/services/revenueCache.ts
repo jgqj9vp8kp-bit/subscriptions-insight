@@ -35,3 +35,16 @@ export function revenueBundleKey(parts: { userScopeHash: string; warehouseVersio
 export function revenueDayKey(parts: { userScopeHash: string; warehouseVersion: string; request: RevenueIntelligenceRequest }) {
   return [REVENUE_QUERY_ROOT, "day", parts.userScopeHash, parts.warehouseVersion, normalizeRevenueQueryKey(parts.request)] as const;
 }
+
+/** The Daily trials card. Its own "trials" segment: normalizeRevenueQueryKey
+ * folds every action except day_breakdown into "bundle", and the card's bucket
+ * is day | week only. */
+export function revenueTrialsKey(parts: { userScopeHash: string; warehouseVersion: string; request: RevenueIntelligenceRequest }) {
+  return [
+    REVENUE_QUERY_ROOT,
+    "trials",
+    parts.userScopeHash,
+    parts.warehouseVersion,
+    { ...normalizeRevenueQueryKey(parts.request), action: "trials_daily" as const, bucket: parts.request.bucket === "week" ? "week" : "day" },
+  ] as const;
+}

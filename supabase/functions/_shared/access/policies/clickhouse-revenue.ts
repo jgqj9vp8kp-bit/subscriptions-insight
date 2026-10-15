@@ -1,16 +1,17 @@
 // Access policy of the clickhouse-revenue Edge function (plan §7 row "Revenue
-// Intelligence"). Its only caller is the Dashboard's Revenue Intelligence
+// Intelligence"). Its only callers are the Dashboard's Revenue Intelligence
 // section (src/hooks/useRevenueIntelligence.ts → RevenueIntelligenceSection on
-// "/"), so both actions need dashboard.view.
+// "/") and the Daily trials card below it (src/hooks/useRevenueTrials.ts →
+// TrialsDailySection), so every action needs dashboard.view.
 //
-// Funnel-restricted members (access Phase 2, spec §4): both actions are
+// Funnel-restricted members (access Phase 2, spec §4): every action is
 // scopeReady behind the cohort-snapshot freshness gate (scopeSnapshot "cohort"
 // → 409 scope_snapshot_not_ready until it is fresh and validated). The runners
 // then read only the member's scoped users with filtersActive forced, so the
-// unattributed and Facebook-spend streams never run for them;
-// restrictRevenueRequest intersects the campaign_path include list (the only
-// list the endpoint has — no exclude list) and withRestrictedMeta reports how
-// many values were dropped. Pure module.
+// unattributed and Facebook-spend streams (and the trials import cut-off)
+// never run for them; restrictRevenueRequest intersects the campaign_path
+// include list (the only list the endpoint has — no exclude list) and
+// withRestrictedMeta reports how many values were dropped. Pure module.
 
 import type { FunctionPolicy } from "../gate.ts";
 import { ActionNormalizeError } from "../errors.ts";
@@ -18,13 +19,15 @@ import { normalizeRevenueFilters } from "../../clickhouse/revenueIntelligence.ts
 import type { RevenueIntelligenceRequest } from "../../clickhouse/revenueIntelligenceContract.ts";
 import { intersectIncludePaths, type ScopeSql } from "../../clickhouse/scopeSql.ts";
 
-export type ClickHouseRevenueAction = "bundle" | "day_breakdown";
+export type ClickHouseRevenueAction = "bundle" | "day_breakdown" | "trials_daily";
 
-/** The browser always names its action ("bundle" / "day_breakdown"), so the
- * legacy "anything else ⇒ bundle" fallback is not carried over (rule R3). */
+/** The browser always names its action ("bundle" / "day_breakdown" /
+ * "trials_daily"), so the legacy "anything else ⇒ bundle" fallback is not
+ * carried over (rule R3). */
 export function normalizeClickHouseRevenueAction(body: Record<string, unknown>): ClickHouseRevenueAction {
   if (body.action === "bundle") return "bundle";
   if (body.action === "day_breakdown") return "day_breakdown";
+  if (body.action === "trials_daily") return "trials_daily";
   throw new ActionNormalizeError();
 }
 
@@ -34,6 +37,7 @@ export const CLICKHOUSE_REVENUE_POLICY: FunctionPolicy<ClickHouseRevenueAction> 
   actions: {
     bundle: { anyOf: ["dashboard.view"], scopeReady: true, scopeSnapshot: "cohort" },
     day_breakdown: { anyOf: ["dashboard.view"], scopeReady: true, scopeSnapshot: "cohort" },
+    trials_daily: { anyOf: ["dashboard.view"], scopeReady: true, scopeSnapshot: "cohort" },
   },
 };
 
@@ -52,7 +56,7 @@ export function restrictRevenueRequest(scope: ScopeSql, body: Record<string, unk
   return { request: { ...request, filters: { ...(request.filters ?? {}), campaign_path: values } }, dropped };
 }
 
-/** A restricted member's bundle / day_breakdown body plus meta.access. Pure. */
+/** A restricted member's bundle / day_breakdown / trials_daily body plus meta.access. Pure. */
 export function withRestrictedMeta<T extends object>(body: T, dropped: number): T & { meta: RestrictedRevenueMeta } {
   const count = Number(dropped);
   return {

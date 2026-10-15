@@ -58,6 +58,10 @@ vi.mock("@/components/RevenueIntelligenceSection", async () => {
   const React = await import("react");
   return { RevenueIntelligenceSection: () => React.createElement("div", { "data-testid": "revenue-intelligence" }) };
 });
+vi.mock("@/components/TrialsDailySection", async () => {
+  const React = await import("react");
+  return { TrialsDailySection: () => React.createElement("div", { "data-testid": "trials-daily" }) };
+});
 vi.mock("@/components/FbWarehouseAnalytics", async () => {
   const React = await import("react");
   return { FbWarehouseAnalytics: () => React.createElement("div", { "data-testid": "fb-warehouse-analytics" }) };
@@ -313,6 +317,14 @@ afterEach(() => {
 
 // ---- Dashboard ---------------------------------------------------------------
 
+/** The Daily trials card renders once, right below Revenue Intelligence. */
+function expectTrialsBelowRevenue() {
+  const revenue = screen.getByTestId("revenue-intelligence");
+  const trials = screen.getByTestId("trials-daily");
+  expect(revenue.compareDocumentPosition(trials) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  expect(revenue.nextElementSibling).toBe(trials);
+}
+
 describe("Dashboard", () => {
   it("owner and legacy keep the client-compute body and its warehouse auto-load", async () => {
     for (const access of [OWNER(), LEGACY()]) {
@@ -320,6 +332,7 @@ describe("Dashboard", () => {
       expect(screen.getByText("Global Filters")).toBeInTheDocument();
       expect(screen.getByText("Project Metrics")).toBeInTheDocument();
       expect(screen.getByTestId("revenue-intelligence")).toBeInTheDocument();
+      expectTrialsBelowRevenue();
       expect(screen.queryByTestId("dashboard-server-only-note")).toBeNull();
       await waitFor(() => expect(fns.autoLoadWarehouseIntoStoreWithOptions).toHaveBeenCalledTimes(1));
       cleanup();
@@ -330,6 +343,7 @@ describe("Dashboard", () => {
   it("an employee gets Revenue Intelligence and a note — no client compute, no warehouse download", async () => {
     renderWith(<Dashboard />, member(["dashboard.view"]));
     expect(screen.getByTestId("revenue-intelligence")).toBeInTheDocument();
+    expectTrialsBelowRevenue();
     expect(screen.getByTestId("dashboard-server-only-note")).toBeInTheDocument();
     expect(screen.queryByText("Global Filters")).toBeNull();
     expect(screen.queryByText("Project Metrics")).toBeNull();

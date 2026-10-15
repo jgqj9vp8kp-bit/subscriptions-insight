@@ -4,7 +4,8 @@
 // calendar projection ("when did the money arrive, which cohorts produced
 // it") of the same cohort-revenue facts clickhouse-cohorts serves. Runs the
 // parity-proven classifier SQL in ClickHouse over the workspace data
-// (ctx.tenantKey, never the caller); returns aggregates and diagnostics only —
+// (ctx.tenantKey, never the caller); trials_daily counts the Daily trials card's
+// cohort anchors of the same snapshot. Returns aggregates and diagnostics only —
 // never raw payloads, emails, transaction ids, SQL, or credentials. Access is
 // decided by CLICKHOUSE_REVENUE_POLICY (dashboard.view). A funnel-restricted
 // member's request is shaped first (campaign_path include list intersected
@@ -23,6 +24,7 @@ import {
   runRevenueDayBreakdown,
   runRevenueIntelligence,
 } from "../_shared/clickhouse/revenueIntelligence.ts";
+import { runRevenueTrialsDaily } from "../_shared/clickhouse/revenueTrials.ts";
 import type { RevenueIntelligenceRequest } from "../_shared/clickhouse/revenueIntelligenceContract.ts";
 
 const QUERY_TIMEOUT_MS = 25_000;
@@ -43,9 +45,11 @@ serveWithAccess(
     // runners is keyed by the tenant key passed here (restricted requests read
     // the snapshot the gate validated instead).
     const common = { authUserId: ctx.tenantKey, supabase: pg, clickhouse: clickhouse(), request: shaped.request, scope };
-    const result = action === "day_breakdown"
-      ? await withTimeout(runRevenueDayBreakdown(common), QUERY_TIMEOUT_MS)
-      : await withTimeout(runRevenueIntelligence(common), QUERY_TIMEOUT_MS);
+    const result = action === "trials_daily"
+      ? await withTimeout(runRevenueTrialsDaily(common), QUERY_TIMEOUT_MS)
+      : action === "day_breakdown"
+        ? await withTimeout(runRevenueDayBreakdown(common), QUERY_TIMEOUT_MS)
+        : await withTimeout(runRevenueIntelligence(common), QUERY_TIMEOUT_MS);
     return ctx.restricted ? withRestrictedMeta(result, shaped.dropped) : result;
   },
   {

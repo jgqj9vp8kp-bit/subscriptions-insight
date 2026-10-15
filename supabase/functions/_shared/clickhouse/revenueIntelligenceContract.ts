@@ -20,7 +20,7 @@
 export type RevenueBucket = "day" | "week" | "month";
 
 export interface RevenueIntelligenceRequest {
-  action?: "bundle" | "day_breakdown";
+  action?: "bundle" | "day_breakdown" | "trials_daily";
   date_from?: string | null;
   date_to?: string | null;
   bucket?: RevenueBucket;
@@ -163,7 +163,7 @@ export interface RevenueIntelligenceBundle {
 }
 
 /** Access Phase 2: carried only by a funnel-restricted member's bundle /
- * day breakdown (same shape as the cohorts RestrictedAccessMeta). */
+ * day breakdown / trials_daily (same shape as the cohorts RestrictedAccessMeta). */
 export interface RevenueRestrictedMeta {
   access: { scope: "restricted"; dropped_filter_values: number };
 }
@@ -191,4 +191,88 @@ export interface RevenueDayBreakdown {
   error?: string;
 }
 
-export type RevenueIntelligenceResponse = RevenueIntelligenceBundle | RevenueDayBreakdown;
+// ---- trials_daily: the Dashboard "Daily trials" card -------------------------
+//
+// A trial is one row of the ACTIVE fact_user_cohorts snapshot — the user's
+// cohort anchor (first successful payment that is not an upsell or a token
+// pack), counted as uniqExact(canonical_user_id): the same identity as the
+// Cohorts "Trial" column, never analytics_transactions.transaction_type =
+// 'trial'. Day = the anchor's UTC cohort_date; funnel = campaign_path; GEO =
+// the raw user-level fc.country (the column the Cohorts GEO filter matches).
+// Invariants the assembly enforces:
+//   Σ totals.daily = Σ by_funnel.trials = Σ by_country.trials = totals.trials
+//   per axis index i: Σ by_funnel.cells[i] = Σ by_country.cells[i] = totals.daily[i]
+//   Σ by_funnel.prev_trials = Σ by_country.prev_trials = totals.prev_trials
+//   per row: Σ mix + mix_unknown ≤ trials
+
+export type TrialsBucket = "day" | "week";
+export type TrialsBucketState = "complete" | "partial" | "no_data";
+
+export interface RevenueTrialsMix { key: string; trials: number }
+
+export interface RevenueTrialsRow {
+  /** campaign_path ('' / 'unknown' → "Unknown") or raw fc.country ('' → "Unknown"). */
+  key: string;
+  /** Σ cells (current window). */
+  trials: number;
+  /** Trials in the previous equal-length window [prev_from, prev_to]. */
+  prev_trials: number;
+  /** Dense integers aligned to `axis`. */
+  cells: number[];
+  /** Top-3 of the OTHER dimension in the current window (Unknown excluded), trials desc, key asc. */
+  mix: RevenueTrialsMix[];
+  /** Current-window trials whose other-dimension key is Unknown. */
+  mix_unknown: number;
+}
+
+export interface RevenueTrialsTotals {
+  trials: number;
+  prev_trials: number;
+  daily: number[];
+  unknown_funnel: number;
+  unknown_geo: number;
+}
+
+export interface RevenueTrialsDiagnostics {
+  snapshot_warehouse_version: string;
+  snapshot_classification_version: string;
+  /** Σ trials over all returned groups, the previous window included. */
+  trials_scanned: number;
+  /** req.filtersActive || scope.restricted. */
+  filters_active: boolean;
+  /** TRIALS_RESTRICTED_NOTE for restricted members, else "". */
+  note: string;
+}
+
+export interface RevenueTrialsDaily {
+  ok: boolean;
+  source: "clickhouse";
+  action: "trials_daily";
+  generated_at: string;
+  query_duration_ms: number;
+  bucket: TrialsBucket;
+  /** EFFECTIVE window, aligned to whole buckets (bucketStart / bucketEndDay). */
+  date_from: string;
+  date_to: string;
+  /** Previous window of the same length: [date_from − span, date_from − 1]. */
+  prev_from: string;
+  prev_to: string;
+  /** Bucket start days, ascending, zero-filled. */
+  axis: string[];
+  axis_state: TrialsBucketState[];
+  /** ISO UTC of max(fc.trial_event_time) over the snapshot, ignoring member filters.
+   * Non-restricted callers only; ALWAYS null for a funnel-restricted member. */
+  data_through: string | null;
+  totals: RevenueTrialsTotals;
+  /** Every key with trials > 0 OR prev_trials > 0; sorted trials desc,
+   * prev_trials desc, key asc; "Unknown" included (the client pins it). */
+  by_funnel: RevenueTrialsRow[];
+  by_country: RevenueTrialsRow[];
+  diagnostics: RevenueTrialsDiagnostics;
+  /** Restricted only (withRestrictedMeta). */
+  meta?: RevenueRestrictedMeta;
+  /** "cohort_snapshot_not_ready" when ok:false. */
+  error?: string;
+}
+
+export type RevenueIntelligenceResponse = RevenueIntelligenceBundle | RevenueDayBreakdown | RevenueTrialsDaily;

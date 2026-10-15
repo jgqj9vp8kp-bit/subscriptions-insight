@@ -66,6 +66,7 @@ import {
 import { transientRetry, useWarehouseVersion } from "@/hooks/useAnalyticsCache";
 import { prefetchCohortsNav, useCohortsListQuery } from "@/hooks/useCohortsCache";
 import { useRevenueBundle } from "@/hooks/useRevenueIntelligence";
+import { useRevenueTrials } from "@/hooks/useRevenueTrials";
 import { useFbReportQuery } from "@/hooks/useFbWarehouse";
 import type { RevenueIntelligenceRequest } from "@/services/revenueIntelligence";
 import type { FbReportQuery } from "@/services/fbWarehouse";
@@ -88,6 +89,7 @@ import {
   startAnalyticsCachePersistence,
 } from "@/services/analyticsCachePersistence";
 import { cohortsListKey } from "@/services/cohortsCache";
+import { revenueBundleKey, revenueTrialsKey } from "@/services/revenueCache";
 import { registeredPurgeHandlers, runPurge } from "@/services/sessionPurge";
 import { useDataStore } from "@/store/dataStore";
 import { useAiAssistantStore } from "@/store/aiAssistantStore";
@@ -853,6 +855,59 @@ describe("I. the page hooks on a funnel-restricted 409 / 403", () => {
     expect(sb.invoke).toHaveBeenCalledTimes(3);
     expect(isClickHouseCircuitOpen()).toBe(false);
     expect(intervals(client)).toEqual([60_000, 60_000, 60_000]);
+  });
+
+  it("the Daily trials hook: a 409 is the same typed code + status, one request, no breaker, polled every 60 s (key: the partition)", async () => {
+    sb.invoke.mockImplementation(async () => refused(409, "scope_snapshot_not_ready"));
+    const client = new QueryClient();
+    const request: RevenueIntelligenceRequest = { action: "trials_daily", bucket: "day", date_from: "2026-09-16", date_to: "2026-10-15", filters: { campaign_path: [], country: [] } };
+    const { result } = renderHook(
+      () => useRevenueTrials({ request, userScopeHash: "x", warehouseVersion: "whv_x", enabled: true }),
+      { wrapper: hookWrapper(client, restrictedAccess()) },
+    );
+    await waitFor(() => expect(result.current.errorCode).toBe("scope_snapshot_not_ready"));
+    expect(result.current).toMatchObject({ data: null, error: "cohort_snapshot_not_ready", errorStatus: 409 });
+    expect(sb.invoke).toHaveBeenCalledTimes(1);
+    expect(sb.invoke.mock.calls[0][1]).toMatchObject({ body: { action: "trials_daily" } });
+    expect(isClickHouseCircuitOpen()).toBe(false);
+    const [query] = client.getQueryCache().findAll({ queryKey: ["revenue", "trials"] });
+    expect(query.queryKey[2]).toBe("p-buyer");
+    const option = query.observers[0]?.options.refetchInterval;
+    expect(typeof option === "function" ? option(query as never) : option).toBe(60_000);
+  });
+
+  it("the Daily trials hook: the owner's not-ready body (HTTP 200, ok:false) is the card's error, untyped and never polled", async () => {
+    sb.invoke.mockImplementation(async () => ({ data: { ok: false, source: "clickhouse", action: "trials_daily", error: "cohort_snapshot_not_ready" }, error: null }));
+    const client = new QueryClient();
+    const owner = buildAccessValue({ status: "ok", access: okRow({ user_id: "user-a", raw_access: true, is_data_owner: true, partition: "p-owner" }), userId: "user-a" });
+    const request: RevenueIntelligenceRequest = { action: "trials_daily", bucket: "day", date_from: "2026-09-16", date_to: "2026-10-15", filters: { campaign_path: [], country: [] } };
+    const { result } = renderHook(
+      () => useRevenueTrials({ request, userScopeHash: "x", warehouseVersion: "whv_x", enabled: true }),
+      { wrapper: hookWrapper(client, owner) },
+    );
+    await waitFor(() => expect(result.current.error).toBe("cohort_snapshot_not_ready"));
+    expect(result.current).toMatchObject({ errorCode: null, errorStatus: null, isInitialLoading: false });
+    expect(result.current.data).toMatchObject({ ok: false, action: "trials_daily" });
+    expect(sb.invoke).toHaveBeenCalledTimes(1);
+    const [query] = client.getQueryCache().findAll({ queryKey: ["revenue", "trials"] });
+    const option = query.observers[0]?.options.refetchInterval;
+    expect(typeof option === "function" ? option(query as never) : option).toBe(false);
+  });
+
+  it("revenueTrialsKey: its own 'trials' segment, the trials action, and day | week only", () => {
+    const parts = (request: RevenueIntelligenceRequest) => ({ userScopeHash: "p-x", warehouseVersion: "whv_x", request });
+    const request: RevenueIntelligenceRequest = { action: "trials_daily", bucket: "day", date_from: "2026-09-16", date_to: "2026-10-15", filters: { campaign_path: ["b", "a"], country: ["MX"] } };
+    const key = revenueTrialsKey(parts(request));
+    expect(key.slice(0, 4)).toEqual(["revenue", "trials", "p-x", "whv_x"]);
+    expect(key[4]).toMatchObject({ action: "trials_daily", bucket: "day", dateFrom: "2026-09-16", dateTo: "2026-10-15", campaignPath: ["a", "b"], country: ["MX"] });
+    expect(revenueTrialsKey(parts({ ...request, bucket: "week" }))[4].bucket).toBe("week");
+    // The card never sends month; a stray one keys (and is answered) as day.
+    expect(revenueTrialsKey(parts({ ...request, bucket: "month" }))[4].bucket).toBe("day");
+    // Never the bundle's entry for the same request.
+    const bundle = revenueBundleKey(parts(request));
+    expect(bundle[1]).toBe("bundle");
+    expect(JSON.stringify(key)).not.toBe(JSON.stringify(bundle));
+    expect(bundle[4].action).toBe("bundle");
   });
 
   it("403 scope_not_supported is typed but never polled", async () => {

@@ -336,5 +336,14 @@ describe("clickhouse-revenue/index.ts (static: it imports esm.sh)", () => {
     expect(source).toContain("ctx.restricted ? restrictRevenueRequest(scope, body)");
     expect(source).toMatch(/const common = \{[^}]*request: shaped\.request, scope \}/);
     expect(source).toContain("return ctx.restricted ? withRestrictedMeta(result, shaped.dropped) : result;");
+    // trials_daily runs on the same shaped request and scope, and only for its
+    // own action: the three-way dispatch, each runner under the query timeout.
+    expect(source).toMatch(new RegExp([
+      String.raw`const result = action === "trials_daily"`,
+      String.raw`\? await withTimeout\(runRevenueTrialsDaily\(common\), QUERY_TIMEOUT_MS\)`,
+      String.raw`: action === "day_breakdown"`,
+      String.raw`\? await withTimeout\(runRevenueDayBreakdown\(common\), QUERY_TIMEOUT_MS\)`,
+      String.raw`: await withTimeout\(runRevenueIntelligence\(common\), QUERY_TIMEOUT_MS\);`,
+    ].join(String.raw`\s*`)));
   });
 });

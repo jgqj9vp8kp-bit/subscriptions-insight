@@ -201,6 +201,19 @@ function bundle() {
   };
 }
 
+/** The Daily trials card's minimal restricted answer (nothing in the window). */
+function trialsDaily(body: Record<string, unknown>) {
+  return {
+    ok: true, source: "clickhouse", action: "trials_daily", generated_at: "2026-10-06T00:00:00Z", query_duration_ms: 2, bucket: "day",
+    date_from: body.date_from, date_to: body.date_to, prev_from: body.date_from, prev_to: body.date_to,
+    axis: [], axis_state: [], data_through: null,
+    totals: { trials: 0, prev_trials: 0, daily: [], unknown_funnel: 0, unknown_geo: 0 },
+    by_funnel: [], by_country: [],
+    diagnostics: { snapshot_warehouse_version: "wh", snapshot_classification_version: "cls", trials_scanned: 0, filters_active: true, note: "" },
+    meta: { access: { scope: "restricted", dropped_filter_values: 0 } },
+  };
+}
+
 function aggRow(): CohortAggregateRow {
   return {
     cohort_date: "2026-07-14", funnel: "soulmate", campaign_path: PATH_A,
@@ -274,6 +287,8 @@ function okResponder(fn: string, body: Record<string, unknown>): { data: unknown
       return { data: bundle(), error: null };
     case "clickhouse-revenue:day_breakdown":
       return { data: { ok: true, source: "clickhouse", action: "day_breakdown", generated_at: "", query_duration_ms: 1, date: body.date, gross: 120, by_cohort: [], by_funnel: [] }, error: null };
+    case "clickhouse-revenue:trials_daily":
+      return { data: trialsDaily(body), error: null };
     case "clickhouse-cohorts:list":
       return { data: COHORTS_LIST, error: null };
     case "clickhouse-cohorts:details":
@@ -397,7 +412,10 @@ describe("snapshot not ready: the waiting state polls only the same actions", ()
     sb.state.responder = notReadyResponder;
     renderPage(<Dashboard />);
     expect(await screen.findByTestId("scope-data-pending")).toBeInTheDocument();
+    // The Daily trials card waits with its own id, so the page's one stays unique.
+    expect(await screen.findByTestId("trials-scope-pending")).toBeInTheDocument();
     await pollOnce(count("bundle"));
+    await pollOnce(count("trials_daily"));
     expectOnlyListedScopeReadyCalls("/");
   });
 

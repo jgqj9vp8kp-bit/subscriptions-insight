@@ -191,7 +191,11 @@ const MATRIX: Array<{ policy: FunctionPolicy<string>; bodies: Record<string, unk
   },
   {
     policy: CLICKHOUSE_REVENUE_POLICY as FunctionPolicy<string>,
-    bodies: { bundle: { action: "bundle" }, day_breakdown: { action: "day_breakdown", date: "2026-01-01" } },
+    bodies: {
+      bundle: { action: "bundle" },
+      day_breakdown: { action: "day_breakdown", date: "2026-01-01" },
+      trials_daily: { action: "trials_daily", date_from: "2026-01-01", date_to: "2026-01-30" },
+    },
   },
   { policy: DASHBOARD_SUMMARY_POLICY as FunctionPolicy<string>, bodies: { summary: { filters: {} } } },
   { policy: FB_ANALYTICS_SUMMARY_POLICY as FunctionPolicy<string>, bodies: { summary: { filters: {} } } },
@@ -230,6 +234,7 @@ describe("policy tables", () => {
     expect(CLICKHOUSE_REVENUE_POLICY.actions).toEqual({
       bundle: { anyOf: ["dashboard.view"], scopeReady: true, scopeSnapshot: "cohort" },
       day_breakdown: { anyOf: ["dashboard.view"], scopeReady: true, scopeSnapshot: "cohort" },
+      trials_daily: { anyOf: ["dashboard.view"], scopeReady: true, scopeSnapshot: "cohort" },
     });
     expect(DASHBOARD_SUMMARY_POLICY.actions).toEqual({ summary: { rawOnly: true, anyOf: ["dashboard.view"] } });
     expect(FB_ANALYTICS_SUMMARY_POLICY.actions).toEqual({ summary: { rawOnly: true, anyOf: ["facebook_analytics.view"] } });
@@ -276,10 +281,11 @@ describe("canonical action normalizers (rule R3: no silent defaults)", () => {
     }
   });
 
-  it("clickhouse-revenue maps bundle / day_breakdown only", () => {
+  it("clickhouse-revenue maps bundle / day_breakdown / trials_daily only", () => {
     expect(normalizeClickHouseRevenueAction({ action: "bundle" })).toBe("bundle");
     expect(normalizeClickHouseRevenueAction({ action: "day_breakdown" })).toBe("day_breakdown");
-    for (const body of [{}, { action: "rebuild" }]) expect(() => normalizeClickHouseRevenueAction(body)).toThrow(ActionNormalizeError);
+    expect(normalizeClickHouseRevenueAction({ action: "trials_daily" })).toBe("trials_daily");
+    for (const body of [{}, { action: "rebuild" }, { action: "trials" }, { action: "TRIALS_DAILY" }]) expect(() => normalizeClickHouseRevenueAction(body)).toThrow(ActionNormalizeError);
   });
 
   it("the server summaries keep their one documented default (the browser posts only { filters })", () => {
@@ -339,8 +345,8 @@ describe("gate decisions per function", () => {
   });
 
   it("clickhouse-revenue: dashboard.view", async () => {
-    for (const body of [{ action: "bundle" }, { action: "day_breakdown", date: "2026-01-01" }]) {
-      await expectAllowed(CLICKHOUSE_REVENUE_POLICY, body, memberRow(["dashboard.view"]), body.action as "bundle" | "day_breakdown");
+    for (const body of [{ action: "bundle" }, { action: "day_breakdown", date: "2026-01-01" }, { action: "trials_daily", date_from: "2026-01-01", date_to: "2026-01-30" }]) {
+      await expectAllowed(CLICKHOUSE_REVENUE_POLICY, body, memberRow(["dashboard.view"]), body.action as "bundle" | "day_breakdown" | "trials_daily");
       await expectDenied(CLICKHOUSE_REVENUE_POLICY, body, memberRow(["cohorts.view", "reports.view"]), 403, ACCESS_ERROR.PERMISSION_DENIED);
     }
     await expectDenied(CLICKHOUSE_REVENUE_POLICY, {}, memberRow(["dashboard.view"]), 400, ACCESS_ERROR.UNKNOWN_ACTION);
@@ -365,7 +371,7 @@ describe("gate decisions per function", () => {
     for (const scope of ["selected", "none"] as const) {
       for (const [action, body] of Object.entries(MATRIX[2].bodies)) {
         const restricted = memberRow(["dashboard.view"], scope);
-        await expectAllowed(CLICKHOUSE_REVENUE_POLICY, body, restricted, action as "bundle" | "day_breakdown");
+        await expectAllowed(CLICKHOUSE_REVENUE_POLICY, body, restricted, action as "bundle" | "day_breakdown" | "trials_daily");
         const notReady = await call(CLICKHOUSE_REVENUE_POLICY, body, restricted, null);
         expect(notReady.status).toBe(409);
         expect(notReady.body.error_code).toBe(ACCESS_ERROR.SCOPE_SNAPSHOT_NOT_READY);

@@ -35,6 +35,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { KpiCard } from "@/components/KpiCard";
 import { RevenueIntelligenceSection } from "@/components/RevenueIntelligenceSection";
+import { TrialsDailySection } from "@/components/TrialsDailySection";
 import { FunnelScopeBanner } from "@/components/access/FunnelScopeBanner";
 import {
   Select,
@@ -343,11 +344,12 @@ function TrialsUpsellsTooltip({
   );
 }
 
-/** Dashboard (plan §14, §19, D8). Everything below Revenue Intelligence is
- * computed in the browser over the whole downloaded transaction warehouse
- * (plus the auto-load that downloads it), so that body is the data owner's view
- * only (rawAccess; legacy ⇒ true). Everyone else gets the server-computed
- * Revenue Intelligence section. UX only — the Edge gate is authoritative. */
+/** Dashboard (plan §14, §19, D8). Everything below Revenue Intelligence and its
+ * Daily trials card is computed in the browser over the whole downloaded
+ * transaction warehouse (plus the auto-load that downloads it), so that body is
+ * the data owner's view only (rawAccess; legacy ⇒ true). Everyone else gets the
+ * server-computed Revenue Intelligence section and Daily trials card. UX only —
+ * the Edge gate is authoritative. */
 export default function Dashboard() {
   const access = useAccess();
   return access.rawAccess ? <OwnerDashboard /> : <ServerDashboard />;
@@ -365,10 +367,11 @@ function ServerDashboard() {
       ) : (
         <Card className="mb-4 p-3 text-xs text-muted-foreground shadow-card" data-testid="dashboard-server-only-note">
           The cohort KPIs and charts of this page are computed from the full transaction warehouse and are available to the
-          data owner only. Revenue Intelligence below is computed on the server.
+          data owner only. Revenue Intelligence and Daily trials below are computed on the server.
         </Card>
       )}
       <RevenueIntelligenceSection />
+      <TrialsDailySection />
     </AppLayout>
   );
 }
@@ -728,6 +731,7 @@ function OwnerDashboard() {
       {/* Calendar revenue decomposition (server-side, project-wide — the global
           filters above do not apply to it; see the section's own controls). */}
       <RevenueIntelligenceSection />
+      <TrialsDailySection />
 
       <section className="space-y-3">
         <SectionHeader
