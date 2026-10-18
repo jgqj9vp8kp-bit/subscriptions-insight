@@ -1,5 +1,6 @@
 import type { ClickHouseClientLike, ClickHouseEnv } from "./types.ts";
 import { ensureFbWarehouseV2Schema } from "./fbWarehouseV2Schema.ts";
+import { ensureFactSubscriptionsSchema } from "./factSubscriptions.ts";
 
 export const ANALYTICS_TRANSACTIONS_TABLE = "analytics_transactions";
 export const FACT_USER_COHORTS_TABLE = "fact_user_cohorts";
@@ -604,6 +605,8 @@ export async function initializeClickHouseSchema(input: {
   }
   await ensureFactSupportRequestsSchema(client);
   await ensureFactFacebookStatsSchema(client);
+  // FunnelFox subscriptions fact (factSubscriptionsSync.ts writes it).
+  await ensureFactSubscriptionsSchema(client);
   // Warehouse V2 Phase 0: additive, idempotent, zero readers until later phases.
   await ensureFbWarehouseV2Schema(client);
   const database = input.env

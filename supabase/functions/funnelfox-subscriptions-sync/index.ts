@@ -29,6 +29,7 @@
 
 import type { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { serveWithAccess } from "../_shared/clickhouse/http.ts";
+import { syncFactSubscriptions, type SubscriptionSourceClient } from "../_shared/clickhouse/factSubscriptionsSync.ts";
 import { FUNNELFOX_SUBSCRIPTIONS_SYNC_POLICY } from "../_shared/access/policies/funnelfox-subscriptions-sync.ts";
 import {
   detectProfileEmail,
@@ -295,7 +296,7 @@ async function crawlList(
 
 // ---- HTTP entry ------------------------------------------------------------------------------
 
-serveWithAccess(FUNNELFOX_SUBSCRIPTIONS_SYNC_POLICY, async ({ ctx, action, body, url, pg }) => {
+serveWithAccess(FUNNELFOX_SUBSCRIPTIONS_SYNC_POLICY, async ({ ctx, action, body, url, pg, clickhouse }) => {
   const startedAtMs = Date.now();
   const deadline = startedAtMs + SOFT_TIME_BUDGET_MS;
   const isExpired = () => Date.now() > deadline;
@@ -584,6 +585,19 @@ serveWithAccess(FUNNELFOX_SUBSCRIPTIONS_SYNC_POLICY, async ({ ctx, action, body,
       madeProgress = !flags.finalize_completed;
       completionUpdate.finalize_completed = true;
       cursorUpdate.last_full_sync_at = new Date().toISOString();
+      // Refresh the ClickHouse subscription fact (Cohorts cancellations, the
+      // Users page subscription status). Best-effort: a ClickHouse outage must
+      // not fail the FunnelFox sync — the next finalize retries.
+      try {
+        runStats.fact_subscriptions_sync = { ...(await syncFactSubscriptions({
+          pg: db as unknown as SubscriptionSourceClient,
+          clickhouse: clickhouse(),
+          authUserId: tenantKey,
+        })) };
+      } catch (error) {
+        runStats.fact_subscriptions_sync = { error: error instanceof Error ? error.message : String(error) };
+        console.error("funnelfox-subscriptions-sync: fact_subscriptions refresh failed", error instanceof Error ? error.message : error);
+      }
     }
 
     // ---- Coverage counts (recomputed every run) -----------------------------------------------
@@ -702,6 +716,7 @@ serveWithAccess(FUNNELFOX_SUBSCRIPTIONS_SYNC_POLICY, async ({ ctx, action, body,
       next_stage: remainingStage,
       all_stages_completed: allStagesCompleted,
       made_progress: madeProgress,
+      fact_subscriptions_sync: runStats.fact_subscriptions_sync ?? null,
       stopped_reason: stoppedReason,
       persisted_status: persistedStatus,
       parity_check: parity,
