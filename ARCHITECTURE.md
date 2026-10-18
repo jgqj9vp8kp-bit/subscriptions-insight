@@ -115,7 +115,9 @@ by flag.
   zeroed money and are surfaced in FX diagnostics — rows are never dropped).
 - `cohort_date`: calendar date of the user's successful trial.
 - `cohort_id`: `{funnel}_{campaign_path}_{cohort_date}`; campaign_path is the exact
-  normalized landing path, funnel is verbatim from the payload (never derived).
+  normalized landing path, funnel is verbatim from the payload (never derived). The
+  host is dropped, so the Brainza FunnelFox project's paths carry a `brainza-` prefix
+  (palmerTransform.ts `withProjectPathPrefix`; history: migration 202610180001).
 - `campaign_id` **is** `utm_campaign` verbatim — forensically proven (0 exceptions,
   95.1% of spend); `utm_term`/`utm_content` are structurally similar Meta ids but
   never campaign ids.

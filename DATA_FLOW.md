@@ -113,7 +113,7 @@ Each row receives `transaction_type` and `classification_reason`.
 `addCohortFields` finds each user's successful trial and assigns:
 
 - `cohort_date`: date of the trial timestamp
-- `campaign_path`: exact landing path from `ff_campaign_path`, or `unknown`
+- `campaign_path`: exact landing path from `ff_campaign_path`, or `unknown`. The host is dropped, so every path of the Brainza FunnelFox project (`metadata.ff_project_id` `01KKEGM9PVW291BKJKYNC7QPSV`) gets a `brainza-` prefix: `quiz.brainza.app/test-iq` -> `brainza-test-iq`, `f.foxiq.app/test-iq` -> `test-iq`
 - `cohort_id`: `{campaign_path}_{cohort_date}`
 - `transaction_day`: days since trial timestamp
 

@@ -17,6 +17,7 @@ export type RawPalmerRow = Record<string, unknown>;
 
 export interface PalmerMetadata {
   ff_funnel_id?: string;
+  ff_project_id?: string;
   ff_campaign_path?: string;
   ff_billing_reason?: string;
   initialUrl?: string;
@@ -182,6 +183,7 @@ export function parseMetadata(rowOrMetadata: RawPalmerRow | unknown): PalmerMeta
   // flatten marketing fields instead of nesting them under `metadata`.
   for (const key of [
     "ff_funnel_id",
+    "ff_project_id",
     "ff_campaign_path",
     "ff_billing_reason",
     "ff_country_code",
@@ -262,10 +264,28 @@ function normalizeCampaignPath(raw: unknown): string {
   }
 }
 
+// normalizeCampaignPath drops the host, so two FunnelFox projects publishing the
+// same landing path (quiz.brainza.app/test-iq and f.foxiq.app/test-iq) would
+// share one cohort. Every path of a listed project gets a fixed prefix; all other
+// projects keep the bare path. Keyed by metadata.ff_project_id, not the host: a
+// project also serves its default *.fnlfx.com domain. History was rewritten by
+// migration 202610180001 with the same rule — keep the two in lockstep.
+const CAMPAIGN_PATH_PROJECT_PREFIXES: Readonly<Record<string, string>> = {
+  "01KKEGM9PVW291BKJKYNC7QPSV": "brainza", // quiz.brainza.app
+};
+
+function withProjectPathPrefix(path: string, projectId: unknown): string {
+  const prefix = CAMPAIGN_PATH_PROJECT_PREFIXES[String(projectId ?? "").trim()];
+  if (!prefix || path === "unknown" || path.startsWith(`${prefix}-`)) return path;
+  return `${prefix}-${path}`;
+}
+
 function detectCampaignPath(metadata: PalmerMetadata): string {
   const path = normalizeCampaignPath(metadata.ff_campaign_path);
-  if (path !== "unknown") return path;
-  return normalizeCampaignPath(metadata.initialUrl);
+  return withProjectPathPrefix(
+    path !== "unknown" ? path : normalizeCampaignPath(metadata.initialUrl),
+    metadata.ff_project_id,
+  );
 }
 
 function detectTrafficSource(row: RawPalmerRow, metadata: PalmerMetadata): TrafficSource {

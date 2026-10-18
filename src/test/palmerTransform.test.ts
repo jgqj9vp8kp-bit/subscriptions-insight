@@ -597,6 +597,62 @@ describe("Palmer transformation", () => {
     expect(rows[0].cohort_id).toBe("unknown_soulmate-reading_2026-04-26");
   });
 
+  it("prefixes Brainza project paths so the same landing path on another project stays a separate cohort", () => {
+    const BRAINZA = "01KKEGM9PVW291BKJKYNC7QPSV";
+    const FOXIQ = "01M36MDN39CQYEKTPZ92PN2R33";
+    const trial = (id: string, metadata: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({
+      id,
+      user_id: `u_${id}`,
+      email: `${id}@example.com`,
+      created_at: "2026-05-24T10:00:00Z",
+      amount: "100",
+      status: "SETTLED",
+      metadata: JSON.stringify(metadata),
+      ...extra,
+    });
+    const rows = transformPalmerRows([
+      trial("brainza", { ff_campaign_path: "/test-iq", ff_project_id: BRAINZA, initialUrl: "https://quiz.brainza.app/test-iq" }),
+      trial("brainza_default_domain", { ff_campaign_path: "/test-iq", ff_project_id: BRAINZA, initialUrl: "https://bell-them-complex.fnlfx.com/test-iq" }),
+      trial("brainza_url_only", { ff_project_id: BRAINZA, initialUrl: "https://quiz.brainza.app/my-test-iq2?utm_source=fb" }),
+      trial("brainza_column", { ff_campaign_path: "/test-iq" }, { ff_project_id: BRAINZA }),
+      trial("brainza_no_path", { ff_project_id: BRAINZA }),
+      trial("foxiq", { ff_campaign_path: "/test-iq", ff_project_id: FOXIQ, initialUrl: "https://f.foxiq.app/test-iq" }),
+      trial("no_project", { ff_campaign_path: "/test-iq" }),
+    ]);
+    const byId = new Map(rows.map((row) => [row.transaction_id, row]));
+
+    expect(byId.get("brainza")?.campaign_path).toBe("brainza-test-iq");
+    expect(byId.get("brainza")?.cohort_id).toBe("unknown_brainza-test-iq_2026-05-24");
+    expect(byId.get("brainza_default_domain")?.campaign_path).toBe("brainza-test-iq");
+    expect(byId.get("brainza_url_only")?.campaign_path).toBe("brainza-my-test-iq2");
+    expect(byId.get("brainza_column")?.campaign_path).toBe("brainza-test-iq");
+    expect(byId.get("brainza_no_path")?.campaign_path).toBe("unknown");
+    expect(byId.get("foxiq")?.campaign_path).toBe("test-iq");
+    expect(byId.get("foxiq")?.cohort_id).toBe("unknown_test-iq_2026-05-24");
+    expect(byId.get("no_project")?.campaign_path).toBe("test-iq");
+    expect(new Set(computeCohorts(rows).map((cohort) => cohort.cohort_id))).toEqual(new Set([
+      "unknown_brainza-test-iq_2026-05-24",
+      "unknown_brainza-my-test-iq2_2026-05-24",
+      "unknown_unknown_2026-05-24",
+      "unknown_test-iq_2026-05-24",
+    ]));
+  });
+
+  it("never prefixes a Brainza path twice", () => {
+    const rows = transformPalmerRows([
+      {
+        id: "already_prefixed",
+        user_id: "u_prefixed",
+        created_at: "2026-05-24T10:00:00Z",
+        amount: "100",
+        status: "SETTLED",
+        metadata: JSON.stringify({ ff_campaign_path: "/brainza-test-iq", ff_project_id: "01KKEGM9PVW291BKJKYNC7QPSV" }),
+      },
+    ]);
+
+    expect(rows[0].campaign_path).toBe("brainza-test-iq");
+  });
+
   it("aggregates refunded amount from amountRefunded cents regardless of status", () => {
     const rows = transformPalmerRows([
       {
