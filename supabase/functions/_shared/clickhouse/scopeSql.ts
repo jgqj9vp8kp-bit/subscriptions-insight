@@ -69,6 +69,9 @@ export const TX_COLS: readonly string[] = Object.freeze([
   "campaign_path", "utm_source", "media_buyer", "status", "transaction_type", "is_success", "is_trial",
   "is_first_subscription", "currency", "original_amount", "gross_amount_usd", "net_amount_usd", "refund_amount_usd",
   "billing_reason", "product_id", "product_name", "fx_status", "source_updated_at", "clickhouse_synced_at", "row_version",
+  // Normalized decline token (insufficient_funds, …) for the Cohorts payment
+  // failure columns (cohortPaymentFailures.ts) — a category, never a message.
+  "decline_reason",
 ]);
 /** Every column of fact_user_cohorts (schema.ts CREATE_FACT_USER_COHORTS_SQL). */
 export const FC_COLS: readonly string[] = Object.freeze([

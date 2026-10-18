@@ -142,6 +142,7 @@ export function buildFunnelViewRows(input: {
       renewal_users_by_level: { ...t.renewalTotalsByLevel },
       renewal_users: t.totalRenewalUsers,
       refund_users: t.totalRefundUsers,
+      ...t.paymentFailures,
       refunded_user_ids: unionSorted(rows, (c) => c.refunded_user_ids),
       plan_breakdown: [],
       trial_revenue: t.trialRevenue,

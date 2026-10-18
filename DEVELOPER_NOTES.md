@@ -430,6 +430,24 @@ It is not a cohort dimension. Since the Brainza path prefix (migration `20261018
 
 `product_paths` is not scopeReady: it reads `normalized_payload`, which the restricted scope never exposes. A funnel-restricted member gets 403 and the page hides the filter. Product counts are trial users over all time; they do not cascade with the other filters.
 
+## Cohorts: "Users" view and payment-failure columns (2026-10-18)
+
+The built-in "Users" view shows what happened to a cohort's users after the trial: First Sub, the renewal steps, declined charges and refunds.
+
+The declined-charge columns (`cohortPaymentFailures.ts`, hidden by default) reuse the Users page Decline Analytics classification:
+- A failed attempt is a warehouse row with status `failed` from the trial on.
+- Stage = the user's lifecycle level before the attempt (`pre_lvl`): none → after trial, 1 → after the first subscription, ≥2 → after a renewal.
+- Reason = the stored normalized `decline_reason`, grouped into 7 columns (Insufficient Funds, Fraud, Card Not Supported, Do Not Honor / Generic, 3DS, Card Lost / Stolen / Expired, Other).
+- Counts are distinct users. A user declined for several reasons counts in each group.
+
+Engines:
+- Materialized: `dr` / `pre_lvl` are added in `materializedFinxCtes`.
+- Dynamic: they are added in `emailTokenSQL`'s `finx` (a `fdr` lookup plus a window). `classifierSQL` is untouched on purpose, because the snapshot rebuild golden corpus and the Users / Payment pages share it.
+- `TX_COLS` gained `decline_reason` (a token, never a message) so the restricted scope can read it. The owner SQL golden corpus was regenerated for this owner-requested change.
+- Rows cached before the release carry no counts and show "—".
+
+Not done yet (step 2): the cancellation columns (Cancelled / User Cancelled / Auto Cancelled) are still 0 on the ClickHouse path. `fact_subscriptions` has no writer, and the FunnelFox cancel date lives only in `funnelfox_subscriptions.raw_detail` (`cancelled_at`, a mostly empty `cancellation_reason`).
+
 ## Cohorts: shared views (2026-10-18)
 
 Personal saved views live in the author's own `data_snapshots` row (`cohorts_ui_settings`), which RLS keeps to that account. Workspace-wide views live in `public.shared_cohort_views` (migration `202610180002`).

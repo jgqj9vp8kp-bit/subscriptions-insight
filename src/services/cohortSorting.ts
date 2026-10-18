@@ -104,6 +104,8 @@ export function getCohortSortValue(
       return traffic?.spend ? cohort.revenue_d30 / traffic.spend : null;
     case "roas_2m":
       return traffic?.spend ? cohort.revenue_d60 / traffic.spend : null;
+    case "failed_payment_rate":
+      return cohort.failed_payment_users != null && cohort.trial_users ? cohort.failed_payment_users / cohort.trial_users : null;
     default: {
       const value = (cohort as unknown as Record<string, unknown>)[columnId];
       if (typeof value === "number") return Number.isFinite(value) ? value : null;

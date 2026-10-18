@@ -46,6 +46,7 @@ import {
   type RawCohortRow,
   type SupportDataProbe,
 } from "./cohorts.ts";
+import { preLevelSQL } from "./cohortPaymentFailures.ts";
 import {
   filterOptionsFromRows,
   optionBranches,
@@ -853,6 +854,7 @@ base AS (
     multiIf(a.status = 'failed', 'failed_payment', a.status = 'refunded', 'refund', a.status = 'chargeback', 'chargeback', '') statusType,
     a.gross_amount_usd g, floor(a.net_amount_usd * 100 + 0.5) / 100 nn, floor(a.refund_amount_usd * 100 + 0.5) / 100 rr,
     a.currency cur, toFloat64(a.original_amount) amt, a.product_id pid, a.product_name pname,
+    if(a.status = 'failed', if(a.decline_reason = '', 'unknown', a.decline_reason), '') dr,
     toString(fc.cohort_date) c_date, fc.funnel c_funnel, fc.campaign_path c_camp,
     fc.normalized_email u_normalized_email,
     fc.trial_transaction_id trial_transaction_id,
@@ -883,6 +885,7 @@ fin AS (
   SELECT p.uid uid, p.tid tid, p.et et, p.ets ets, p.tprio tprio, p.trial_ts trial_ts,
     p.is_success is_success, p.g g, p.nn nn, p.rr rr, p.d d, p.statusType statusType, p.tokenAmt tokenAmt,
     p.cur cur, p.amt amt, p.pid pid, p.pname pname,
+    p.dr dr, ${preLevelSQL("p", "ifNull(li.lvl, 0)")} pre_lvl,
     p.c_date c_date, p.c_funnel c_funnel, p.c_camp c_camp,
     p.u_normalized_email u_normalized_email,
     ifNull(li.lvl, 0) lvl, ifNull(ui.slot, 0) slot,
@@ -921,6 +924,7 @@ etok AS (
       OR (a.currency = 'EUR' AND abs(toFloat64(a.original_amount) - 4.99) < 0.005)
       OR (a.currency = 'COP' AND abs(toFloat64(a.original_amount) - 17199) < 0.005)) tokenAmt,
     a.currency cur, toFloat64(a.original_amount) amt, a.product_id pid, a.product_name pname,
+    '' dr, 0 pre_lvl,
     toString(fcm.cohort_date) c_date, fcm.funnel c_funnel, fcm.campaign_path c_camp,
     fcm.normalized_email u_normalized_email,
     0 lvl, 0 slot,
@@ -937,11 +941,11 @@ ${fcallExclusion}    AND (a.transaction_type = 'token_purchase' OR (a.status IN 
 ),
 finx AS (
   SELECT uid, tid, et, ets, tprio, trial_ts, is_success, g, nn, rr, d, statusType, tokenAmt,
-    cur, amt, pid, pname, c_date, c_funnel, c_camp, u_normalized_email, lvl, slot, lt, 0 via_email
+    cur, amt, pid, pname, dr, pre_lvl, c_date, c_funnel, c_camp, u_normalized_email, lvl, slot, lt, 0 via_email
   FROM fin
   UNION ALL
   SELECT uid, tid, et, ets, tprio, trial_ts, is_success, g, nn, rr, d, statusType, tokenAmt,
-    cur, amt, pid, pname, c_date, c_funnel, c_camp, u_normalized_email, lvl, slot, lt, 1 via_email
+    cur, amt, pid, pname, dr, pre_lvl, c_date, c_funnel, c_camp, u_normalized_email, lvl, slot, lt, 1 via_email
   FROM etok
 )`;
 }

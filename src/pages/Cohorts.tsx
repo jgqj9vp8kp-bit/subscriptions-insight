@@ -57,6 +57,7 @@ import {
   type SharedCohortView,
 } from "@/services/sharedCohortViews";
 import { listAccessRoles, type AdminRole } from "@/services/accessAdminClient";
+import { COHORT_DECLINE_GROUPS, type CohortPaymentFailureCounts } from "../../supabase/functions/_shared/clickhouse/cohortPaymentFailures";
 import {
   effectiveCampaignPaths,
   productKey,
@@ -291,11 +292,25 @@ const MONETIZATION_COLUMNS = [
 // USD-normalized; these expose the original-currency mix and exclusions.
 const FX_COLUMNS = ["currency_mix", "fx_missing_amount", "fx_missing_transactions"] as const;
 
+// Declined charges after the trial (cohortPaymentFailures.ts: the Users page
+// Decline Analytics stage rule and reasons). Hidden by default; the built-in
+// "Users" view surfaces them.
+const PAYMENT_FAILURE_COLUMNS: readonly CohortColumnId[] = [
+  "failed_payment_users",
+  "failed_payment_rate",
+  "failed_after_trial_users",
+  "failed_after_first_subscription_users",
+  "failed_after_renewal_users",
+  ...COHORT_DECLINE_GROUPS.map((group) => group.column),
+];
+const PAYMENT_FAILURE_COLUMN_SET = new Set<string>(PAYMENT_FAILURE_COLUMNS);
+
 const COLUMN_ORDER_AFTER_RENEWALS = [
   "renewal_users",
   "refund_users",
   "amount_refunded",
   "refund_rate",
+  ...PAYMENT_FAILURE_COLUMNS,
   "gross_revenue",
   "net_revenue",
   "revenue_d0",
@@ -372,6 +387,12 @@ const STATIC_COLUMN_LABELS: Record<string, string> = {
   refund_users: "Refund Users",
   amount_refunded: "Amount Refunded",
   refund_rate: "Refund Rate",
+  failed_payment_users: "Failed Payment Users",
+  failed_payment_rate: "Failed Payment Rate",
+  failed_after_trial_users: "Failed After Trial",
+  failed_after_first_subscription_users: "Failed After First Sub",
+  failed_after_renewal_users: "Failed After Renewal",
+  ...Object.fromEntries(COHORT_DECLINE_GROUPS.map((group) => [group.column, `Decline: ${group.label}`])),
   gross_revenue: "Gross Rev",
   net_revenue: "Net Rev",
   revenue_d0: "Rev D0",
@@ -466,6 +487,12 @@ const COLUMN_MIN_WIDTHS: Record<string, number> = {
   refund_users: 100,
   amount_refunded: 120,
   refund_rate: 100,
+  failed_payment_users: 120,
+  failed_payment_rate: 120,
+  failed_after_trial_users: 120,
+  failed_after_first_subscription_users: 130,
+  failed_after_renewal_users: 130,
+  ...Object.fromEntries(COHORT_DECLINE_GROUPS.map((group) => [group.column, 140])),
   gross_revenue: 110,
   net_revenue: 110,
   revenue_d0: 90,
@@ -577,6 +604,7 @@ const SECTION_DIVIDER_COLUMNS = new Set<CohortColumnId>([
   "trial_to_upsell_cr",
   "renewal_2_users",
   "refund_users",
+  "failed_payment_users",
   "gross_revenue",
   "revenue_d0",
   "trial_revenue",
@@ -595,6 +623,19 @@ function formatRowsCount(value: number | null | undefined): string {
 // Header tooltips for the monetization columns (native title attribute, same
 // mechanism the traffic columns already use).
 const COLUMN_HELP: Partial<Record<CohortColumnId, string>> = {
+  failed_payment_users: "Unique cohort users with at least one declined charge after their trial (same data as Users → Decline Analytics).",
+  failed_payment_rate: "Failed Payment Users / Trial Users.",
+  failed_after_trial_users: "Declined before any subscription payment went through: the first subscription charge (or an upsell) failed.",
+  failed_after_first_subscription_users: "Declined after the first subscription was paid: the second-period renewal failed.",
+  failed_after_renewal_users: "Declined after at least one renewal was paid.",
+  ...Object.fromEntries(
+    COHORT_DECLINE_GROUPS.map((group) => [
+      group.column,
+      group.reasons
+        ? `Unique users with a declined charge after the trial for: ${group.reasons.join(", ")}. A user declined for several reasons counts in each.`
+        : "Unique users with a declined charge after the trial for any other reason (unknown, issuer unavailable, velocity, processing error, …).",
+    ]),
+  ),
   ai_action:
     "Deterministic recommendation from the AI signal engine: CPA, Trial → Paid, payment pass, refunds, retention and observed payback vs funnel benchmarks. Click a chip for the full explanation.",
   active_users: "Unique cohort users with at least one currently active and renewing subscription.",
@@ -677,7 +718,7 @@ function persistColumnOrder(order: CohortColumnId[]) {
 // ---- Column visibility ----
 // Monetization columns stay in the Columns selector but are hidden by default:
 // the table is already wide, and the built-in "Monetization" view surfaces them.
-const DEFAULT_HIDDEN: CohortColumnId[] = [...MONETIZATION_COLUMNS, ...FX_COLUMNS, ...FB_COHORT_OPTIONAL_COLUMNS];
+const DEFAULT_HIDDEN: CohortColumnId[] = [...MONETIZATION_COLUMNS, ...FX_COLUMNS, ...FB_COHORT_OPTIONAL_COLUMNS, ...PAYMENT_FAILURE_COLUMNS];
 
 function defaultColumnVisibility(defaultColumnOrder = DEFAULT_COLUMN_ORDER): Record<CohortColumnId, boolean> {
   return Object.fromEntries(defaultColumnOrder.map((id) => [id, !DEFAULT_HIDDEN.includes(id)])) as Record<
@@ -710,6 +751,23 @@ function persistVisibility(v: Record<CohortColumnId, boolean>) {
   } catch (error) {
     console.warn("Unable to persist cohort column visibility", error);
   }
+}
+
+// Payment-failure cells: counts as stored, the rate over trial users; "—" when
+// the row does not carry them (legacy engine, a response cached before them).
+function paymentFailureDisplay(
+  id: string,
+  row: Partial<CohortPaymentFailureCounts> | null | undefined,
+  trialUsers: number,
+  formatRate: (value: number) => string,
+): string | null {
+  if (id === "failed_payment_rate") {
+    const failed = row?.failed_payment_users;
+    return failed == null ? "—" : formatRate(trialUsers ? (failed / trialUsers) * 100 : 0);
+  }
+  if (!PAYMENT_FAILURE_COLUMN_SET.has(id)) return null;
+  const value = row?.[id as keyof CohortPaymentFailureCounts];
+  return value == null ? "—" : value.toLocaleString("en-US");
 }
 
 // ---- Saved views ----
@@ -811,6 +869,29 @@ function buildBuiltinViews(defaultColumnOrder: readonly string[]): SavedView[] {
       name: "Active Subs",
       order: [...defaultColumnOrder],
       visibility: buildVisibility(["active_subscriptions", "active_subscriptions_rate"], defaultColumnOrder),
+      builtin: true,
+    },
+    {
+      // What happened to the cohort's users after the trial: renewals, declined
+      // charges (stage + reason groups, as Decline Analytics) and refunds.
+      id: "users",
+      name: "Users",
+      order: [...defaultColumnOrder],
+      visibility: buildVisibility(
+        [
+          "trial_users",
+          "first_subscription_users",
+          "trial_to_first_subscription_cr",
+          ...defaultColumnOrder.filter((id) => renewalLevelFromColumnId(id) != null),
+          "first_subscription_to_renewal_2_cr",
+          "renewal_users",
+          ...PAYMENT_FAILURE_COLUMNS,
+          "refund_users",
+          "refund_rate",
+          "amount_refunded",
+        ],
+        defaultColumnOrder,
+      ),
       builtin: true,
     },
   ];
@@ -3105,6 +3186,8 @@ export default function CohortsPage() {
     const trafficComplete = isFunnelViewRow(c) ? c.funnel_has_complete_traffic : true;
     const renewalUsers = renewalUsersForColumn(c, id);
     if (renewalUsers != null) return <TableCell key={id} className={className}>{renewalUsers}</TableCell>;
+    const failure = paymentFailureDisplay(id, c, c.trial_users, formatPct);
+    if (failure != null) return <TableCell key={id} className={className}>{failure}</TableCell>;
     switch (id) {
       case "cohort_date":
         return <TableCell key={id} className={`${className} tabular-nums`}>{c.cohort_date}</TableCell>;
@@ -3313,6 +3396,8 @@ export default function CohortsPage() {
     const traffic = trafficForCohort(cohort, trafficByKey);
     const renewalUsers = renewalUsersForColumn(plan, id);
     if (renewalUsers != null) return <TableCell key={id} className={className}>{renewalUsers}</TableCell>;
+    const failure = paymentFailureDisplay(id, plan, plan.trial_users, formatPct);
+    if (failure != null) return <TableCell key={id} className={className}>{failure}</TableCell>;
     switch (id) {
       case "cohort_date":
       case "campaign_path":
@@ -3467,6 +3552,8 @@ export default function CohortsPage() {
     if (renewalLevel != null) {
       return <TableCell key={id} className={className}>{totals.renewalTotalsByLevel[renewalLevel] ?? 0}</TableCell>;
     }
+    const failure = paymentFailureDisplay(id, totals.paymentFailures, totals.totalTrialUsers, formatPct);
+    if (failure != null) return <TableCell key={id} className={className}>{failure}</TableCell>;
     // FB totals come from the SERVER bundle. Under the per-user allocation
     // model each authoritative user belongs to exactly one cohort row, so
     // Σ(non-null row fb_spend) equals the bundle — the bundle is kept as the

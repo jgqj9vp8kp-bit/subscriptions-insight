@@ -5,6 +5,8 @@
 // normalized_payload / raw emails are ever carried here — only aggregates,
 // bounded id-hash sets where cross-cohort dedup is unavoidable, and diagnostics.
 
+import type { CohortPaymentFailureCounts } from "./cohortPaymentFailures.ts";
+
 export type CohortGroupBy = "day" | "week" | "month";
 export type CohortRefundStatus = "all" | "has" | "none";
 export type CohortSortDirection = "asc" | "desc";
@@ -95,7 +97,9 @@ export interface CohortRequest {
 // CohortRow. User counts are ClickHouse uniqExact() results; the small id-hash
 // arrays exist ONLY so the frontend/Edge can dedup counts ACROSS cohorts for the
 // totals row without shipping raw user ids (values are non-reversible hashes).
-export interface CohortAggregateRow {
+/** Payment-failure counts (cohortPaymentFailures.ts) are optional: rows cached
+ * before they shipped, and engines that do not compute them, leave them out. */
+export interface CohortAggregateRow extends Partial<CohortPaymentFailureCounts> {
   cohort_date: string;
   funnel: string;
   campaign_path: string;
@@ -197,7 +201,7 @@ export interface CohortAggregateRow {
   };
 }
 
-export interface CohortTotals {
+export interface CohortTotals extends Partial<CohortPaymentFailureCounts> {
   trial_users: number;
   first_subscription_users: number;
   active_users: number;

@@ -14,6 +14,7 @@ import { computeCohortsWithDiagnostics, type ComputeCohortsOptions, type Monetiz
 import { buildCohortId } from "@/services/cohortIdentity";
 import { deriveFbBusinessMetrics } from "@/services/fbCohortFormatting";
 import { runClickHouseCohorts, runClickHouseCohortDetails } from "@/services/clickhouse";
+import { presentPaymentFailureCounts } from "../../supabase/functions/_shared/clickhouse/cohortPaymentFailures";
 import { publicRuntimeConfig } from "@/config/publicRuntimeConfig";
 import type { CardType, CohortRow, Funnel, MediaBuyer, PlanBreakdownRow, Transaction } from "@/services/types";
 import type { FxNormalizationDiagnostics } from "@/services/currencyNormalization";
@@ -142,6 +143,7 @@ export function mapAggregateToCohortRow(agg: CohortAggregateRow): CohortRow {
     renewal_users_by_level: { ...byLevel },
     renewal_users: agg.renewal_users,
     refund_users: agg.refund_users,
+    ...presentPaymentFailureCounts(agg as unknown as Record<string, unknown>),
     // Synthetic, cohort-scoped ids so the totals memo's cross-cohort dedup counts
     // correctly (each user is in one cohort). No real user ids are shipped.
     refunded_user_ids: synthIds(cohortId, "r", agg.refund_users),
@@ -339,6 +341,7 @@ export function mapDetailsPlanBreakdown(details: CohortDetailsResponse): PlanBre
       renewal_users_by_level: full.renewal_users_by_level,
       renewal_users: full.renewal_users,
       refund_users: full.refund_users,
+      ...presentPaymentFailureCounts(full as unknown as Record<string, unknown>),
       trial_to_upsell_cr: full.trial_to_upsell_cr,
       trial_to_first_subscription_cr: full.trial_to_first_subscription_cr,
       first_subscription_to_renewal_2_cr: full.first_subscription_to_renewal_2_cr,

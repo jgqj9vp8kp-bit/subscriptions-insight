@@ -1,6 +1,8 @@
 // Types mirror the Google Sheets column schema exactly.
 // When the real Sheets connection is added, the row shape stays identical.
 
+import type { CohortPaymentFailureCounts } from "./cohortPaymentFailures.ts";
+
 export type TransactionType =
   | "trial"
   | "upsell"
@@ -107,7 +109,7 @@ export interface UserAggregate {
   failed_payment_count: number;
 }
 
-export interface PlanBreakdownRow {
+export interface PlanBreakdownRow extends Partial<CohortPaymentFailureCounts> {
   price: number;
   /** Display label ("$7.49", "Unknown"). Absent on the legacy client engine, which keys plans by price alone. */
   plan_name?: string;
@@ -251,7 +253,9 @@ export interface CohortFbFields {
   fb_margin?: number | null;
 }
 
-export interface CohortRow extends CohortMonetizationFields, CohortFbFields {
+/** Payment-failure counts come from the ClickHouse engines only (absent on the
+ * legacy client engine and on rows cached before they shipped → shown as "—"). */
+export interface CohortRow extends CohortMonetizationFields, CohortFbFields, Partial<CohortPaymentFailureCounts> {
   cohort_id: string;
   cohort_date: string;
   funnel: Funnel;

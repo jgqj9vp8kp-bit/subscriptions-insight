@@ -1,4 +1,5 @@
 import type { CohortRow } from "./serviceTypes.ts";
+import { sumPresentPaymentFailureCounts, type CohortPaymentFailureCounts } from "./cohortPaymentFailures.ts";
 import { renewalLevelFromColumnId } from "./renewalColumns.ts";
 import { normalizeCampaignPath, type TrafficMetric } from "./trafficMetric.ts";
 
@@ -56,6 +57,9 @@ export interface CohortReportTotals {
   renewalTotalsByLevel: Record<number, number>;
   totalRenewalUsers: number;
   totalRefundUsers: number;
+  /** Summed payment-failure counts (users sit in one cohort); absent fields
+   * = no row carries them (legacy engine / older cache). */
+  paymentFailures: Partial<CohortPaymentFailureCounts>;
   totalActiveUsers: number;
   totalActiveSubscriptions: number;
   totalCancelledUsers: number;
@@ -353,6 +357,7 @@ export function computeCohortReportTotals(
     renewalTotalsByLevel,
     totalRenewalUsers,
     totalRefundUsers,
+    paymentFailures: sumPresentPaymentFailureCounts(cohorts),
     totalActiveUsers,
     totalActiveSubscriptions,
     totalCancelledUsers,

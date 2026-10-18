@@ -38,6 +38,7 @@ import {
 } from "./cohortSubscriptions.ts";
 import { ANALYTICS_TRANSACTIONS_TABLE, FACT_SUPPORT_REQUESTS_TABLE } from "./schema.ts";
 import { FACT_SUBSCRIPTIONS_TABLE } from "./factSubscriptions.ts";
+import { paymentFailureCountsFromRaw, paymentFailureMeasuresSQL, preLevelSQL, sumPaymentFailureCounts } from "./cohortPaymentFailures.ts";
 import {
   emptyFilterOptions,
   filterOptionsFromRows,
@@ -364,6 +365,7 @@ etok AS (
     floor((b.ets - tr.trial_ts) / 86400000) d,
     b.statusType statusType, b.tokenAmt tokenAmt,
     b.cur cur, b.amt amt, b.pid pid, b.pname pname,
+    '' dr, 0 pre_lvl,
     tr.c_date c_date, tr.c_funnel c_funnel, tr.c_camp c_camp,
     tr.c_campaign_id c_campaign_id, tr.c_traffic_source c_traffic_source,
     ud.u_country u_country, ud.u_card_type u_card_type, ud.u_platform u_platform, ud.u_media_buyer u_media_buyer,
@@ -378,15 +380,28 @@ etok AS (
     AND (b.ttype = 'token_purchase' OR (b.statusType IN ('refund','chargeback') AND b.tokenAmt))
     AND floor((b.ets - tr.trial_ts) / 86400000) >= 0
 ),
+-- Payment-failure columns (cohortPaymentFailures.ts) live here, not in
+-- classifierSQL: the snapshot rebuild and the Users / Payment pages share that
+-- classifier and must not change. dr = the stored decline_reason of a failed
+-- row; pre_lvl = the lifecycle level the user had before the row.
+fdr AS (
+  SELECT transaction_id tid, if(decline_reason = '', 'unknown', decline_reason) dr
+  FROM ${CH} FINAL
+  WHERE auth_user_id = {auth_user_id:String} AND status = 'failed'
+),
 finx AS (
-  SELECT uid, tid, et, ets, tprio, trial_ts, is_success, g, nn, rr, d, statusType, tokenAmt,
-    cur, amt, pid, pname, c_date, c_funnel, c_camp, c_campaign_id, c_traffic_source,
-    u_country, u_card_type, u_platform, u_media_buyer, u_normalized_email, u_source_updated_at,
-    lvl, slot, lt, 0 via_email
-  FROM fin
+  SELECT f.uid uid, f.tid tid, f.et et, f.ets ets, f.tprio tprio, f.trial_ts trial_ts, f.is_success is_success,
+    f.g g, f.nn nn, f.rr rr, f.d d, f.statusType statusType, f.tokenAmt tokenAmt,
+    f.cur cur, f.amt amt, f.pid pid, f.pname pname,
+    if(f.statusType = 'failed_payment', if(fdr.dr = '', 'unknown', fdr.dr), '') dr, ${preLevelSQL("f", "f.lvl")} pre_lvl,
+    f.c_date c_date, f.c_funnel c_funnel, f.c_camp c_camp, f.c_campaign_id c_campaign_id, f.c_traffic_source c_traffic_source,
+    f.u_country u_country, f.u_card_type u_card_type, f.u_platform u_platform, f.u_media_buyer u_media_buyer,
+    f.u_normalized_email u_normalized_email, f.u_source_updated_at u_source_updated_at,
+    f.lvl lvl, f.slot slot, f.lt lt, 0 via_email
+  FROM fin AS f LEFT JOIN fdr ON fdr.tid = f.tid
   UNION ALL
   SELECT uid, tid, et, ets, tprio, trial_ts, is_success, g, nn, rr, d, statusType, tokenAmt,
-    cur, amt, pid, pname, c_date, c_funnel, c_camp, c_campaign_id, c_traffic_source,
+    cur, amt, pid, pname, dr, pre_lvl, c_date, c_funnel, c_camp, c_campaign_id, c_traffic_source,
     u_country, u_card_type, u_platform, u_media_buyer, u_normalized_email, u_source_updated_at,
     lvl, slot, lt, 1 via_email
   FROM etok
@@ -466,7 +481,8 @@ export const AGGREGATE_MEASURES = `uniqExact(uid) trial_users,
     uid,
     lowerUTF8(trim(BOTH ' ' FROM u_normalized_email)) != ''
     AND lowerUTF8(trim(BOTH ' ' FROM u_normalized_email)) IN (SELECT normalized_email FROM support_emails)
-  ) support_users`;
+  ) support_users,
+  ${paymentFailureMeasuresSQL()}`;
 
 // Per-user authoritative first-trial utm_source as an IN-subquery over user ids.
 // argMin picks the utm_source OF the first successful trial (not the first
@@ -607,6 +623,7 @@ function toAggregateRow(r: RawCohortRow): CohortAggregateRow {
     token_gross_revenue: round2(n(r.token_gross_raw)), token_net_revenue: tokenNet,
     addon_revenue: round2(u1 + u2 + u3 + tokenNet),
     fx_missing_transactions: 0, fx_missing_amount: 0,
+    ...paymentFailureCountsFromRaw(r as unknown as Record<string, unknown>),
     dedup: {
       active_user_hashes: [], active_subscription_hashes: [], refunded_user_hashes: [],
       cancelled_user_hashes: [], user_cancelled_user_hashes: [], auto_cancelled_user_hashes: [],
@@ -643,6 +660,8 @@ function computeTotals(rows: CohortAggregateRow[]): CohortTotals {
     token_buyers: sum((r) => r.token_buyers), token_purchases: sum((r) => r.token_purchases),
     token_net_revenue: round2(sum((r) => r.token_net_revenue)),
     addon_revenue: round2(sum((r) => r.addon_revenue)),
+    // Users sit in exactly one cohort, so per-cohort distinct counts add up.
+    ...sumPaymentFailureCounts(rows as unknown as Record<string, unknown>[]),
   };
 }
 
