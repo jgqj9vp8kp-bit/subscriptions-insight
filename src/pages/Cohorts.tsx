@@ -1,5 +1,5 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { ArrowDown, ArrowUp, ArrowUpDown, ChevronDown, ChevronRight, EyeOff, GripVertical, Check, Loader2, Plus, Trash2 } from "lucide-react";
+import { ArrowDown, ArrowUp, ArrowUpDown, ChevronDown, ChevronRight, EyeOff, GripVertical, Check, Loader2, Plus, Trash2, Users } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { AiActionChip } from "@/components/ai/AiActionChip";
 import { AiAnalysisPanel } from "@/components/ai/AiAnalysisPanel";
@@ -45,6 +45,12 @@ import {
 import type { CardType, CohortRow, MediaBuyer, PlanBreakdownRow } from "@/services/types";
 import { cohortsDataSourceMode, loadCohortDetailsFromClickHouse, loadFunnelDetailsFromClickHouse, mapDetailsPlanBreakdown } from "@/services/cohortsDataSource";
 import { ClickHouseRequestError, isClickHouseCircuitOpen, runClickHouseCohortProducts } from "@/services/clickhouse";
+import {
+  deleteSharedCohortView,
+  listSharedCohortViews,
+  publishSharedCohortView,
+  type SharedCohortView,
+} from "@/services/sharedCohortViews";
 import {
   effectiveCampaignPaths,
   productKey,
@@ -708,6 +714,8 @@ interface SavedView {
   visibility: Record<CohortColumnId, boolean>;
   widths?: Record<string, number>;
   builtin?: boolean;
+  /** Workspace-wide view (sharedCohortViews.ts); read-only unless Owner. */
+  shared?: SharedCohortView;
 }
 
 const TRAFFIC_GEO_NOTE = "Traffic spend is not GEO-split";
@@ -1455,6 +1463,26 @@ export default function CohortsPage() {
     try { return localStorage.getItem(ACTIVE_VIEW_STORAGE_KEY); } catch { return null; }
   });
   const [newViewName, setNewViewName] = useState("");
+  // Workspace-wide views: every Cohorts viewer applies them, the Owner
+  // publishes / removes them. Best-effort: a failed load just hides them.
+  const canManageSharedViews = access.status === "ok" && access.access?.role?.is_owner === true;
+  const [sharedViews, setSharedViews] = useState<SharedCohortView[]>([]);
+  const [sharedViewBusy, setSharedViewBusy] = useState<string | null>(null);
+  const [sharedViewError, setSharedViewError] = useState<string | null>(null);
+  useEffect(() => {
+    if (access.status !== "ok") return;
+    let cancelled = false;
+    listSharedCohortViews()
+      .then((views) => {
+        if (!cancelled) setSharedViews(views);
+      })
+      .catch(() => {
+        /* no shared views shown */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [access.status]);
   const dragColRef = useRef<CohortColumnId | null>(null);
   // Drop target highlight for the Columns popover list (the header has its own cursor feedback).
   const [columnDragOverId, setColumnDragOverId] = useState<CohortColumnId | null>(null);
@@ -2585,7 +2613,25 @@ export default function CohortsPage() {
     resetColumnWidths();
   };
 
-  const allViews = useMemo<SavedView[]>(() => [...builtinViews, ...customViews], [builtinViews, customViews]);
+  const sharedSavedViews = useMemo<SavedView[]>(
+    () => sharedViews.map((view) => ({
+      id: view.id,
+      name: view.name,
+      order: view.columnOrder as CohortColumnId[],
+      visibility: view.columnVisibility as Record<CohortColumnId, boolean>,
+      widths: view.columnWidths,
+      shared: view,
+    })),
+    [sharedViews],
+  );
+  const allViews = useMemo<SavedView[]>(
+    () => [...builtinViews, ...sharedSavedViews, ...customViews],
+    [builtinViews, sharedSavedViews, customViews],
+  );
+  const sharedViewByName = useMemo(
+    () => new Map(sharedViews.map((view) => [view.name.toLowerCase(), view])),
+    [sharedViews],
+  );
   const activeView = useMemo(() => allViews.find((v) => v.id === activeViewId) ?? null, [allViews, activeViewId]);
 
   const setVisibility = (id: CohortColumnId, value: boolean) => {
@@ -2642,6 +2688,48 @@ export default function CohortsPage() {
     try { localStorage.setItem(ACTIVE_VIEW_STORAGE_KEY, view.id); } catch { /* noop */ }
     markCohortsUiSettingsUpdated();
     setNewViewName("");
+  };
+
+  // Owner only (RLS enforces it too): publish a personal view for everyone; a
+  // shared view of the same name is updated in place.
+  const shareView = async (view: SavedView) => {
+    setSharedViewBusy(view.id);
+    setSharedViewError(null);
+    try {
+      const published = await publishSharedCohortView(
+        {
+          name: view.name,
+          columnOrder: view.order,
+          columnVisibility: view.visibility,
+          columnWidths: view.widths,
+        },
+        sharedViews,
+      );
+      setSharedViews((current) =>
+        [...current.filter((item) => item.rowId !== published.rowId), published].sort((a, b) => a.name.localeCompare(b.name)),
+      );
+    } catch (error) {
+      setSharedViewError(error instanceof Error ? error.message : "Could not share the view.");
+    } finally {
+      setSharedViewBusy(null);
+    }
+  };
+  const unshareView = async (view: SharedCohortView) => {
+    setSharedViewBusy(view.id);
+    setSharedViewError(null);
+    try {
+      await deleteSharedCohortView(view);
+      setSharedViews((current) => current.filter((item) => item.rowId !== view.rowId));
+      if (activeViewId === view.id) {
+        setActiveViewId(null);
+        try { localStorage.removeItem(ACTIVE_VIEW_STORAGE_KEY); } catch { /* noop */ }
+        markCohortsUiSettingsUpdated();
+      }
+    } catch (error) {
+      setSharedViewError(error instanceof Error ? error.message : "Could not remove the shared view.");
+    } finally {
+      setSharedViewBusy(null);
+    }
   };
 
   const deleteView = (id: string) => {
@@ -4024,8 +4112,36 @@ export default function CohortsPage() {
                         <span className="w-4">{activeViewId === v.id && <Check className="h-3.5 w-3.5 text-primary" />}</span>
                         <span>{v.name}</span>
                         {v.builtin && <span className="text-[10px] uppercase text-muted-foreground">built-in</span>}
+                        {v.shared && (
+                          <span className="inline-flex items-center gap-0.5 text-[10px] uppercase text-primary" title="Shared with every member who can open Cohorts">
+                            <Users className="h-3 w-3" /> shared
+                          </span>
+                        )}
                       </button>
-                      {!v.builtin && (
+                      {sharedViewBusy === v.id && <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />}
+                      {!v.builtin && !v.shared && canManageSharedViews && sharedViewBusy !== v.id && (
+                        <button
+                          type="button"
+                          onClick={() => void shareView(v)}
+                          className={sharedViewByName.has(v.name.toLowerCase()) ? "text-primary hover:text-primary/80" : "text-muted-foreground hover:text-primary"}
+                          aria-label={sharedViewByName.has(v.name.toLowerCase()) ? "Update the shared copy of this view" : "Share this view with all members"}
+                          title={sharedViewByName.has(v.name.toLowerCase()) ? "Update the shared copy" : "Share with all members"}
+                        >
+                          <Users className="h-3.5 w-3.5" />
+                        </button>
+                      )}
+                      {v.shared && canManageSharedViews && sharedViewBusy !== v.id && (
+                        <button
+                          type="button"
+                          onClick={() => void unshareView(v.shared!)}
+                          className="text-muted-foreground hover:text-destructive"
+                          aria-label="Stop sharing this view"
+                          title="Stop sharing (removes it for every member)"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      )}
+                      {!v.builtin && !v.shared && (
                         <button
                           type="button"
                           onClick={() => deleteView(v.id)}
@@ -4038,6 +4154,15 @@ export default function CohortsPage() {
                     </div>
                   ))}
                 </div>
+                {sharedViewError && (
+                  <div className="border-t border-border px-3 py-1.5 text-xs text-destructive">{sharedViewError}</div>
+                )}
+                {canManageSharedViews && (
+                  <div className="border-t border-border px-3 py-1.5 text-[11px] text-muted-foreground">
+                    <Users className="mr-1 inline h-3 w-3" />
+                    shares a view with every member who can open Cohorts
+                  </div>
+                )}
                 <div className="border-t border-border p-2 flex items-center gap-2">
                   <Input
                     placeholder="View name…"

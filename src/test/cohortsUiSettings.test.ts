@@ -90,6 +90,16 @@ describe("cohorts UI settings", () => {
     expect(loaded?.selectedView).toBe("revenue");
   });
 
+  it("keeps a shared view as the selected view but drops an unknown personal one", () => {
+    const build = (selectedView: string) =>
+      buildCohortsUiSettingsPayload(
+        { columnOrder: [], columnWidths: {}, columnVisibility: {}, selectedView, savedViews: [], filters: {}, updatedAt: "2026-10-18T10:00:00.000Z" },
+        defaults,
+      );
+    expect(build("shared:6f1c2d3e-0000-4000-8000-000000000001").selectedView).toBe("shared:6f1c2d3e-0000-4000-8000-000000000001");
+    expect(build("custom_123").selectedView).toBe("default");
+  });
+
   it("persists sorting in local UI settings", () => {
     const payload = buildCohortsUiSettingsPayload(
       {

@@ -3,6 +3,7 @@ import {
   saveCloudSnapshot,
 } from "@/services/dataSnapshots";
 import { principalHash } from "@/services/sessionPurge";
+import { isSharedViewId } from "@/services/sharedCohortViews";
 
 export const COHORTS_UI_SETTINGS_DATASET_TYPE = "cohorts_ui_settings";
 export const COHORTS_UI_STATE_STORAGE_KEY = "ui_state_cohorts";
@@ -165,8 +166,10 @@ export function sanitizeCohortsUiSettingsPayload(
       defaults.defaultColumnVisibility,
       defaults.defaultColumnOrder,
     ),
+    // A shared (workspace) view is not in this payload's lists — it is loaded
+    // separately (sharedCohortViews.ts) — so its id is kept as is.
     selectedView:
-      selectedView && validViewIds.size > 0 && !validViewIds.has(selectedView)
+      selectedView && validViewIds.size > 0 && !validViewIds.has(selectedView) && !isSharedViewId(selectedView)
         ? defaults.defaultSelectedView ?? null
         : selectedView,
     savedViews,

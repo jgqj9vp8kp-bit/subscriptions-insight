@@ -430,6 +430,14 @@ It is not a cohort dimension. Since the Brainza path prefix (migration `20261018
 
 `product_paths` is not scopeReady: it reads `normalized_payload`, which the restricted scope never exposes. A funnel-restricted member gets 403 and the page hides the filter. Product counts are trial users over all time; they do not cascade with the other filters.
 
+## Cohorts: shared views (2026-10-18)
+
+Personal saved views live in the author's own `data_snapshots` row (`cohorts_ui_settings`), which RLS keeps to that account. Workspace-wide views live in `public.shared_cohort_views` (migration `202610180002`).
+- Reads go to every active member with `cohorts.view`, including funnel-restricted ones. A view is only a column layout; the data stays scoped by the gate.
+- Writes are for the workspace Owner only (`app.is_workspace_owner()`). No catalog permission exists for it yet.
+- The Views popover lists them with a "shared" badge. The Owner shares a personal view with the people icon; a shared view of the same name is updated in place. The trash icon on a shared view removes it for everyone.
+- A shared view's page id is `shared:<uuid>`. `sanitizeCohortsUiSettingsPayload` keeps such a `selectedView`, so the "View:" label survives a cloud reload.
+
 ## Cohorts: Funnels view (2026-08)
 
 The Cohorts page has two view modes (persisted `viewMode`, default `cohorts`):
