@@ -39,6 +39,7 @@ import {
 import { ANALYTICS_TRANSACTIONS_TABLE, FACT_SUPPORT_REQUESTS_TABLE } from "./schema.ts";
 import { FACT_SUBSCRIPTIONS_TABLE } from "./factSubscriptions.ts";
 import { paymentFailureCountsFromRaw, paymentFailureMeasuresSQL, preLevelSQL, sumPaymentFailureCounts } from "./cohortPaymentFailures.ts";
+import { cancellationFlagsCTE, cancellationMeasuresSQL } from "./cohortCancellations.ts";
 import {
   emptyFilterOptions,
   filterOptionsFromRows,
@@ -424,6 +425,7 @@ export interface RawCohortRow {
   token_email_purchases: number;
   refund_users: number;
   support_users: number;
+  cancelled_users?: number; user_cancelled_users?: number; auto_cancelled_users?: number; cancelled_active_users?: number;
 }
 
 export function supportEmailsCTE(status: CohortSupportDataStatus = "ready", scope: ScopeSql = ALL_SCOPE_SQL): string {
@@ -482,7 +484,8 @@ export const AGGREGATE_MEASURES = `uniqExact(uid) trial_users,
     lowerUTF8(trim(BOTH ' ' FROM u_normalized_email)) != ''
     AND lowerUTF8(trim(BOTH ' ' FROM u_normalized_email)) IN (SELECT normalized_email FROM support_emails)
   ) support_users,
-  ${paymentFailureMeasuresSQL()}`;
+  ${paymentFailureMeasuresSQL()},
+  ${cancellationMeasuresSQL()}`;
 
 // Per-user authoritative first-trial utm_source as an IN-subquery over user ids.
 // argMin picks the utm_source OF the first successful trial (not the first
@@ -557,6 +560,7 @@ function buildListQuery(nreq: NormalizedCohortRequest, params: Record<string, un
   return `WITH
 ${withKeep}
 ${supportEmailsCTE(supportStatus)},
+${cancellationFlagsCTE(ALL_SCOPE_SQL)},
 ${classifierSQL(baseWhere, joinKeep)}
 , ${emailTokenSQL(memberWhere)}
 , agg AS (${aggregateSelect(memberWhere)})
@@ -605,9 +609,11 @@ function toAggregateRow(r: RawCohortRow): CohortAggregateRow {
     refund_users: n(r.refund_users),
     support_users: supportUsers,
     support_rate: trialUsers ? (supportUsers / trialUsers) * 100 : 0,
-    // Subscription metrics deferred (fact_subscriptions empty) — see Phase 4.
-    active_users: 0, active_subscriptions: 0, cancelled_users: 0,
-    user_cancelled_users: 0, auto_cancelled_users: 0, cancelled_active_users: 0,
+    // Active subscriptions arrive from the Postgres overlay (mergeActiveSubscriptions);
+    // cancellations from the fact_subscriptions flags (cohortCancellations.ts).
+    active_users: 0, active_subscriptions: 0,
+    cancelled_users: n(r.cancelled_users), user_cancelled_users: n(r.user_cancelled_users),
+    auto_cancelled_users: n(r.auto_cancelled_users), cancelled_active_users: n(r.cancelled_active_users),
     trial_revenue: round2(n(r.trial_rev_raw)),
     upsell_revenue: round2(n(r.upsell_rev_raw)),
     first_subscription_revenue: round2(n(r.first_sub_rev_raw)),
@@ -1304,6 +1310,7 @@ export async function runCohortDetails(input: {
     const scopeWhere = key ? cohortKeyWhere(key, params) : funnelKeyWhere(funnelKey!, nreq, params);
     return `WITH
 ${supportEmailsCTE(supportStatus)},
+${cancellationFlagsCTE(ALL_SCOPE_SQL)},
 ${classifierSQL(`a.auth_user_id = {auth_user_id:String}`, "")}
 , ${emailTokenSQL(memberFilterWhere(nreq.filters, params))}
 , scoped AS (SELECT * FROM finx WHERE ${scopeWhere}${memberConds.length ? ` AND ${memberConds.join(" AND ")}` : ""})

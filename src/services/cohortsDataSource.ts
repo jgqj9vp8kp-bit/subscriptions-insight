@@ -111,8 +111,8 @@ export function mapAggregateToCohortRow(agg: CohortAggregateRow): CohortRow {
     support_users: agg.support_users ?? 0,
     support_rate: agg.support_rate ?? 0,
     // Active-subscription metrics come from the server overlay (FunnelFox
-    // subscriptions joined to the cohort snapshot by email); other subscription
-    // metrics (cancellations) are still deferred.
+    // subscriptions joined to the cohort snapshot by email); cancellations from
+    // the fact_subscriptions flags (cohortCancellations.ts).
     active_users: agg.active_users ?? 0,
     active_rate: div(agg.active_users ?? 0, trial),
     active_subscriptions: agg.active_subscriptions ?? 0,
@@ -121,18 +121,20 @@ export function mapAggregateToCohortRow(agg: CohortAggregateRow): CohortRow {
     // can dedup across cohorts (otherwise it unions empty arrays and shows 0).
     active_subscription_user_ids: agg.active_user_ids ?? [],
     active_subscription_ids: agg.active_subscription_ids ?? [],
-    cancelled_users: 0,
-    cancellation_rate: 0,
-    user_cancelled_users: 0,
-    user_cancel_rate: 0,
-    auto_cancelled_users: 0,
-    auto_cancel_rate: 0,
-    cancelled_active_users: 0,
+    cancelled_users: agg.cancelled_users ?? 0,
+    cancellation_rate: div(agg.cancelled_users ?? 0, trial),
+    user_cancelled_users: agg.user_cancelled_users ?? 0,
+    user_cancel_rate: div(agg.user_cancelled_users ?? 0, trial),
+    auto_cancelled_users: agg.auto_cancelled_users ?? 0,
+    auto_cancel_rate: div(agg.auto_cancelled_users ?? 0, trial),
+    cancelled_active_users: agg.cancelled_active_users ?? 0,
     active_user_ids: agg.active_user_ids ?? [],
-    cancelled_user_ids: [],
-    user_cancelled_user_ids: [],
-    auto_cancelled_user_ids: [],
-    cancelled_active_user_ids: [],
+    // Synthetic, cohort-scoped ids (like refunded_user_ids below) so the Total
+    // and Funnels rows, which count id sets, add the cohorts up.
+    cancelled_user_ids: synthIds(cohortId, "c", agg.cancelled_users ?? 0),
+    user_cancelled_user_ids: synthIds(cohortId, "uc", agg.user_cancelled_users ?? 0),
+    auto_cancelled_user_ids: synthIds(cohortId, "ac", agg.auto_cancelled_users ?? 0),
+    cancelled_active_user_ids: synthIds(cohortId, "ca", agg.cancelled_active_users ?? 0),
     upsell_users: agg.upsell_users,
     first_subscription_users: agg.first_subscription_users,
     renewal_2_users: renewalN(2),

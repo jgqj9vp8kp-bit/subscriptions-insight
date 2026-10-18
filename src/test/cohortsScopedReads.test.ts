@@ -16,6 +16,7 @@
 // index.ts imports esm.sh and cannot be loaded here, so its restricted branch
 // is pinned by a static check of its source.
 import { readFileSync } from "node:fs";
+import { cancellationFlagsCTE } from "../../supabase/functions/_shared/clickhouse/cohortCancellations.ts";
 import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { handleWithAccess, type AccessGateDeps, type AccessRequest } from "../../supabase/functions/_shared/access/gate.ts";
@@ -214,6 +215,8 @@ function expectedRestrictedFinx(ownerSql: string, scope: ScopeSql): string {
     return text.split(from).join(to);
   };
   let sql = swap(ownerSql, supportEmailsCTE("ready"), supportEmailsCTE("ready", scope));
+  // The cancellation flags read fact_subscriptions / transactions through the scope helpers.
+  sql = swap(sql, cancellationFlagsCTE(ALL_SCOPE_SQL), cancellationFlagsCTE(scope));
   sql = swap(sql, "  FROM analytics_transactions AS a FINAL\n  INNER JOIN fact_user_cohorts AS fc FINAL\n", `  FROM ${txFrom(scope, "a")}\n  INNER JOIN ${cohortsFrom(scope, "fc")}\n`);
   const fcall = /-- TODO_MONETIZATION[\s\S]*?\nfcall AS \([\s\S]*?\n\),\n(?=fcm AS \()/;
   expect(sql).toMatch(fcall);

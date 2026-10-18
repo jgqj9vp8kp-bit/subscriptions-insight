@@ -872,8 +872,9 @@ function buildBuiltinViews(defaultColumnOrder: readonly string[]): SavedView[] {
       builtin: true,
     },
     {
-      // What happened to the cohort's users after the trial: renewals, declined
-      // charges (stage + reason groups, as Decline Analytics) and refunds.
+      // What happened to the cohort's users after the trial: renewals,
+      // cancellations (user / auto), declined charges (stage + reason groups, as
+      // Decline Analytics) and refunds.
       id: "users",
       name: "Users",
       order: [...defaultColumnOrder],
@@ -885,6 +886,13 @@ function buildBuiltinViews(defaultColumnOrder: readonly string[]): SavedView[] {
           ...defaultColumnOrder.filter((id) => renewalLevelFromColumnId(id) != null),
           "first_subscription_to_renewal_2_cr",
           "renewal_users",
+          "cancelled_users",
+          "cancellation_rate",
+          "user_cancelled_users",
+          "user_cancel_rate",
+          "auto_cancelled_users",
+          "auto_cancel_rate",
+          "cancelled_active_users",
           ...PAYMENT_FAILURE_COLUMNS,
           "refund_users",
           "refund_rate",

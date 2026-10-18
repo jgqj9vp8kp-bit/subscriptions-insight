@@ -39,6 +39,7 @@ import {
   FACT_SUPPORT_REQUESTS_TABLE,
   FACT_USER_COHORTS_TABLE,
 } from "./schema.ts";
+import { FACT_SUBSCRIPTIONS_TABLE } from "./factSubscriptions.ts";
 
 export type ScopeFbLevel = "account" | "campaign" | "adset" | "ad" | "day";
 
@@ -88,6 +89,13 @@ export const FB_COLS: readonly string[] = Object.freeze([
   "link_clicks", "outbound_clicks", "fb_purchases", "purchase_value", "cpp", "cpc", "cpm", "ctr", "outbound_ctr",
   "frequency", "roas", "raw_payload", "fb_stats_to", "source_updated_at", "clickhouse_synced_at", "warehouse_version",
   "row_version",
+]);
+
+/** Columns of the restricted fact_subscriptions subquery: what the Cohorts
+ * cancellation flags read (cohortCancellations.ts) — never the raw email. */
+export const SUB_COLS: readonly string[] = Object.freeze([
+  "auth_user_id", "subscription_id", "normalized_email", "status", "renews", "cancelled_at", "period_ends_at",
+  "cancellation_reason", "row_version",
 ]);
 
 /** Built by campaignScope.ts inside the snapshot rebuild (spec §3.7). */
@@ -354,6 +362,17 @@ export function fbFrom(scope: ScopeSql, level: ScopeFbLevel, alias?: string, all
   return register(scope,
     `(SELECT ${FB_COLS.join(", ")} FROM ${FACT_FACEBOOK_STATS_TABLE} FINAL WHERE ${TENANT}` +
     ` AND level IN ('campaign','adset','ad') AND trim(BOTH ' ' FROM campaign_id) IN ${visible})${as(alias)}`);
+}
+
+/** fact_subscriptions. All: `fact_subscriptions[ AS s] FINAL`. Restricted: the
+ * subscriptions of the scoped users' emails only (the FunnelFox overlay joins
+ * by normalized email, like the support emails below). */
+export function subscriptionsFrom(scope: ScopeSql, alias?: string): string {
+  checkAlias(alias);
+  if (!handle(scope).restricted) return alias ? `${FACT_SUBSCRIPTIONS_TABLE} AS ${alias} FINAL` : `${FACT_SUBSCRIPTIONS_TABLE} FINAL`;
+  return register(scope,
+    `(SELECT ${SUB_COLS.join(", ")} FROM ${FACT_SUBSCRIPTIONS_TABLE} FINAL WHERE ${TENANT}` +
+    ` AND normalized_email IN (SELECT normalized_email FROM ${FACT_USER_COHORTS_TABLE} FINAL WHERE ${scopedUserPredicates(scope)}))${as(alias)}`);
 }
 
 /** Support requests of the scoped users' emails (replaces `fact_support_requests

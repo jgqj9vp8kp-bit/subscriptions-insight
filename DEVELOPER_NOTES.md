@@ -446,7 +446,27 @@ Engines:
 - `TX_COLS` gained `decline_reason` (a token, never a message) so the restricted scope can read it. The owner SQL golden corpus was regenerated for this owner-requested change.
 - Rows cached before the release carry no counts and show "—".
 
-Not done yet (step 2): the cancellation columns (Cancelled / User Cancelled / Auto Cancelled) are still 0 on the ClickHouse path. `fact_subscriptions` has no writer, and the FunnelFox cancel date lives only in `funnelfox_subscriptions.raw_detail` (`cancelled_at`, a mostly empty `cancellation_reason`).
+### Cancellations on the ClickHouse path (step 2, 2026-10-18)
+
+`fact_subscriptions` now has a writer: `factSubscriptionsSync.ts`, called at the end of the FunnelFox subscriptions sync (finalize stage, best-effort).
+- It does a full tenant refresh. Every row carries the run version, older rows are deleted afterwards, and nothing is deleted after an empty read.
+- The cancel date and reason come from `raw_detail` (`cancelled_at`, `cancellation_reason`), because the `cancelled_at` column was never filled. The fallback is `updated_at` for a cancelled subscription, as in `normalizeSubscription`.
+- Sandbox subscriptions are skipped. The raw email is never stored.
+- `ensureFactSubscriptionsSchema` (also run by ClickHouse Init) re-asserts every non-key column, because production holds a copy of the table created by an earlier build.
+
+`cohortCancellations.ts` turns the subscriptions into per-email flags (CTEs `csub` / `cauto` / `cflags`). The measures read them by `IN (SELECT sub_email FROM cflags …)` over `u_normalized_email`, like `support_users`.
+
+The rule is the legacy client engine's, per subscription:
+1. A failed transaction within 48 h before the cancel → auto.
+2. FunnelFox reason "User requested cancellation" → user. This is the one deliberate difference from the legacy engine: an explicit user action wins over a period-end match.
+3. Cancelled at or after the period end → auto.
+4. Otherwise → user.
+
+Per member, the precedence is: auto (failed) > user > auto (period end).
+
+Restricted members read through `subscriptionsFrom(scope)` (`SUB_COLS`, no raw email). Rows ship synthetic cohort-scoped ids so the Total / Funnels id-set counts add up. The Users page subscription status (`users.ts`) reads the same table.
+
+Rollout order: deploy the sync first, run it (finalize), then deploy the cohort SQL. Otherwise the cohort query references `cancellation_reason` before the column exists.
 
 ## Cohorts: shared views (2026-10-18)
 

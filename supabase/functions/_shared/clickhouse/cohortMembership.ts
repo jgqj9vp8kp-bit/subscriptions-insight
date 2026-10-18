@@ -47,6 +47,7 @@ import {
   type SupportDataProbe,
 } from "./cohorts.ts";
 import { preLevelSQL } from "./cohortPaymentFailures.ts";
+import { cancellationFlagsCTE } from "./cohortCancellations.ts";
 import {
   filterOptionsFromRows,
   optionBranches,
@@ -841,6 +842,7 @@ fcall AS (
 `;
 
   return `${supportEmailsCTE(supportStatus, scope)},
+${cancellationFlagsCTE(scope)},
 base AS (
   SELECT a.user_id uid, a.transaction_id tid, a.event_time et, toUnixTimestamp64Milli(a.event_time) ets,
     multiIf(a.transaction_type = 'trial', 0, a.transaction_type = 'upsell', 1, a.transaction_type = 'first_subscription', 2,
