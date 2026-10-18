@@ -1,4 +1,5 @@
-// Executable tests for supabase/migrations/202610180002_shared_cohort_views.sql,
+// Executable tests for supabase/migrations/202610180002_shared_cohort_views.sql
+// and 202610180003_shared_cohort_views_default_roles.sql,
 // run against PGlite through the Supabase stand-in in ./support/pgliteSupabase.ts:
 // every earlier migration (pg_cron / pg_net stubbed) with the workspace
 // bootstrapped before the RLS lockdown, then members on custom roles, then this
@@ -7,7 +8,8 @@
 // Covers: the Owner inserts / updates / deletes; a member with cohorts.view —
 // scope all or a single funnel — reads every view and can write none; a member
 // without cohorts.view, a disabled member, an outsider and anon see nothing;
-// name constraints (trimmed, 1..80, unique case-insensitively); updated_at.
+// name constraints (trimmed, 1..80, unique case-insensitively); updated_at;
+// default_role_keys (default empty, Owner-only, no NULL element).
 //
 // Runs in the default jsdom environment (src/test/setup.ts needs `window`).
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -16,6 +18,7 @@ import { sharedViewFromRow } from "@/services/sharedCohortViews";
 
 const LOCKDOWN = "202610050003_access_rls_lockdown.sql";
 const MIGRATION = "202610180002_shared_cohort_views.sql";
+const DEFAULT_ROLES = "202610180003_shared_cohort_views_default_roles.sql";
 
 type Users = Record<"owner" | "buyer" | "scoped" | "noCohorts" | "disabled" | "outsider", string>;
 
@@ -60,6 +63,7 @@ beforeAll(async () => {
   const disabled = await add("disabled@example.com", buyerRole, "all");
   await db.asService((tx) => tx.query("select public.access_update_member($1, $2, null, 'disabled', null)", [owner, disabled]));
   await db.applyMigration(MIGRATION);
+  await db.applyMigration(DEFAULT_ROLES);
   base = db;
 }, 300_000);
 
@@ -145,5 +149,25 @@ describe("202610180002 shared Cohorts views", () => {
     await expect(h.asUser(users.owner, (tx) => tx.query(INSERT, [" Padded "]))).rejects.toThrow(/shared_cohort_views_name_check/);
     await expect(h.asUser(users.owner, (tx) => tx.query(INSERT, [""]))).rejects.toThrow(/shared_cohort_views_name_check/);
     await expect(h.asUser(users.owner, (tx) => tx.query(INSERT, ["x".repeat(81)]))).rejects.toThrow(/shared_cohort_views_name_check/);
+  });
+
+  it("stores the default roles of a view, written by the Owner only", async () => {
+    const h = await copy();
+    const row = await h.asUser(users.owner, (tx) => one<{ id: string; default_role_keys: string[] }>(tx, INSERT.replace("created_by", "created_by, default_role_keys"), ["Buyer"]));
+    expect(row.default_role_keys).toEqual([]);
+    const updated = await h.asUser(users.owner, (tx) =>
+      one<Record<string, unknown>>(
+        tx,
+        "update public.shared_cohort_views set default_role_keys = array['media_buyer','head_of_marketing'] where id = $1 returning id, name, column_order, column_visibility, column_widths, default_role_keys, updated_at",
+        [row.id],
+      ),
+    );
+    expect(sharedViewFromRow(updated)?.defaultRoleKeys).toEqual(["head_of_marketing", "media_buyer"]);
+    await h.asUser(users.buyer, (tx) => tx.query("update public.shared_cohort_views set default_role_keys = '{}' where id = $1", [row.id]));
+    const seen = await h.asUser(users.buyer, (tx) => one<{ default_role_keys: string[] }>(tx, "select default_role_keys from public.shared_cohort_views where id = $1", [row.id]));
+    expect(seen.default_role_keys).toEqual(["media_buyer", "head_of_marketing"]);
+    await expect(
+      h.asUser(users.owner, (tx) => tx.query("update public.shared_cohort_views set default_role_keys = array['a', null] where id = $1", [row.id])),
+    ).rejects.toThrow(/shared_cohort_views_default_roles_check/);
   });
 });

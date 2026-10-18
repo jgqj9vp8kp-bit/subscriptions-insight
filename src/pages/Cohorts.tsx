@@ -1,5 +1,5 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { ArrowDown, ArrowUp, ArrowUpDown, ChevronDown, ChevronRight, EyeOff, GripVertical, Check, Loader2, Plus, Trash2, Users } from "lucide-react";
+import { ArrowDown, ArrowUp, ArrowUpDown, ChevronDown, ChevronRight, EyeOff, GripVertical, Check, Loader2, Plus, Trash2, UserCheck, Users } from "lucide-react";
 import { AppLayout } from "@/components/AppLayout";
 import { AiActionChip } from "@/components/ai/AiActionChip";
 import { AiAnalysisPanel } from "@/components/ai/AiAnalysisPanel";
@@ -46,11 +46,17 @@ import type { CardType, CohortRow, MediaBuyer, PlanBreakdownRow } from "@/servic
 import { cohortsDataSourceMode, loadCohortDetailsFromClickHouse, loadFunnelDetailsFromClickHouse, mapDetailsPlanBreakdown } from "@/services/cohortsDataSource";
 import { ClickHouseRequestError, isClickHouseCircuitOpen, runClickHouseCohortProducts } from "@/services/clickhouse";
 import {
+  defaultSharedViewForRole,
   deleteSharedCohortView,
+  isSharedViewId,
   listSharedCohortViews,
+  markRoleDefaultApplied,
   publishSharedCohortView,
+  roleDefaultApplied,
+  setSharedCohortViewDefaultRoles,
   type SharedCohortView,
 } from "@/services/sharedCohortViews";
+import { listAccessRoles, type AdminRole } from "@/services/accessAdminClient";
 import {
   effectiveCampaignPaths,
   productKey,
@@ -1467,10 +1473,16 @@ export default function CohortsPage() {
   // publishes / removes them. Best-effort: a failed load just hides them.
   const canManageSharedViews = access.status === "ok" && access.access?.role?.is_owner === true;
   const [sharedViews, setSharedViews] = useState<SharedCohortView[]>([]);
+  // The landing effect waits for this, so a role's default view can land.
+  const [sharedViewsSettled, setSharedViewsSettled] = useState(false);
   const [sharedViewBusy, setSharedViewBusy] = useState<string | null>(null);
   const [sharedViewError, setSharedViewError] = useState<string | null>(null);
   useEffect(() => {
-    if (access.status !== "ok") return;
+    if (access.status === "loading") return;
+    if (access.status !== "ok") {
+      setSharedViewsSettled(true);
+      return;
+    }
     let cancelled = false;
     listSharedCohortViews()
       .then((views) => {
@@ -1478,11 +1490,33 @@ export default function CohortsPage() {
       })
       .catch(() => {
         /* no shared views shown */
+      })
+      .finally(() => {
+        if (!cancelled) setSharedViewsSettled(true);
       });
     return () => {
       cancelled = true;
     };
   }, [access.status]);
+  // Owner: the roles a shared view can be the default for (the Owner role
+  // itself is left out — the Owner keeps their own layout).
+  const [assignableRoles, setAssignableRoles] = useState<AdminRole[]>([]);
+  const [rolesEditorFor, setRolesEditorFor] = useState<string | null>(null);
+  useEffect(() => {
+    if (!canManageSharedViews) return;
+    let cancelled = false;
+    listAccessRoles()
+      .then((roles) => {
+        if (!cancelled) setAssignableRoles(roles.filter((role) => !role.is_owner).sort((a, b) => a.name.localeCompare(b.name)));
+      })
+      .catch(() => {
+        /* the roles editor stays empty */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [canManageSharedViews]);
+  const myRoleKey = access.status === "ok" ? access.access?.role?.key ?? null : null;
   const dragColRef = useRef<CohortColumnId | null>(null);
   // Drop target highlight for the Columns popover list (the header has its own cursor feedback).
   const [columnDragOverId, setColumnDragOverId] = useState<CohortColumnId | null>(null);
@@ -2732,6 +2766,23 @@ export default function CohortsPage() {
     }
   };
 
+  const toggleSharedViewRole = async (view: SharedCohortView, roleKey: string) => {
+    const next = view.defaultRoleKeys.includes(roleKey)
+      ? view.defaultRoleKeys.filter((key) => key !== roleKey)
+      : [...view.defaultRoleKeys, roleKey];
+    setSharedViewBusy(view.id);
+    setSharedViewError(null);
+    try {
+      const updated = await setSharedCohortViewDefaultRoles(view, next);
+      setSharedViews((current) => current.map((item) => (item.rowId === updated.rowId ? updated : item)));
+    } catch (error) {
+      setSharedViewError(error instanceof Error ? error.message : "Could not set the default roles.");
+    } finally {
+      setSharedViewBusy(null);
+    }
+  };
+  const roleNameByKey = useMemo(() => new Map(assignableRoles.map((role) => [role.key, role.name])), [assignableRoles]);
+
   const deleteView = (id: string) => {
     const next = customViews.filter((v) => v.id !== id);
     setCustomViews(next);
@@ -2747,15 +2798,35 @@ export default function CohortsPage() {
   // columns, widths and the "View:" label can never disagree — setting only the id
   // would label the table "My view" while showing whatever layout was last used.
   useEffect(() => {
-    if (!cohortsUiCloudReady) return;
+    if (!cohortsUiCloudReady || !sharedViewsSettled) return;
     if (didLandOnViewRef.current) return;
     didLandOnViewRef.current = true;
+
+    // On a shared view: re-apply it, so the Owner's later edits reach members
+    // who stay on it (a member who edits columns leaves the view first).
+    if (isSharedViewId(activeViewId)) {
+      const shared = sharedSavedViews.find((candidate) => candidate.id === activeViewId);
+      if (shared) applyView(shared);
+      return;
+    }
+    // A member whose role has a default shared view and who has not picked a
+    // layout (no active view, no personal views) lands on it — once per view,
+    // so columns they change afterwards are kept on the next visit.
+    const roleDefault = defaultSharedViewForRole(sharedViews, myRoleKey);
+    if (!activeViewId && customViews.length === 0 && roleDefault && !roleDefaultApplied(authUserId, roleDefault)) {
+      const view = sharedSavedViews.find((candidate) => candidate.id === roleDefault.id);
+      if (view) {
+        applyView(view);
+        markRoleDefaultApplied(authUserId, roleDefault);
+        return;
+      }
+    }
 
     const landing = resolveLandingView(activeViewId, customViews);
     if (!landing || landing === activeViewId) return;
     const view = customViews.find((candidate) => candidate.id === landing);
     if (view) applyView(view);
-  }, [activeViewId, applyView, cohortsUiCloudReady, customViews]);
+  }, [activeViewId, applyView, authUserId, cohortsUiCloudReady, customViews, myRoleKey, sharedSavedViews, sharedViews, sharedViewsSettled]);
 
   const onHeaderDragStart = (id: CohortColumnId) => {
     dragColRef.current = id;
@@ -4103,7 +4174,8 @@ export default function CohortsPage() {
                 <div className="px-3 py-2 border-b border-border text-xs font-medium text-muted-foreground">Saved views</div>
                 <div className="max-h-64 overflow-auto">
                   {allViews.map((v) => (
-                    <div key={v.id} className="flex items-center justify-between gap-2 px-3 py-1.5 hover:bg-muted/50">
+                    <Fragment key={v.id}>
+                    <div className="flex items-center justify-between gap-2 px-3 py-1.5 hover:bg-muted/50">
                       <button
                         type="button"
                         onClick={() => applyView(v)}
@@ -4133,6 +4205,17 @@ export default function CohortsPage() {
                       {v.shared && canManageSharedViews && sharedViewBusy !== v.id && (
                         <button
                           type="button"
+                          onClick={() => setRolesEditorFor((current) => (current === v.id ? null : v.id))}
+                          className={v.shared.defaultRoleKeys.length ? "text-primary hover:text-primary/80" : "text-muted-foreground hover:text-primary"}
+                          aria-label="Default view for roles"
+                          title="Default view for roles"
+                        >
+                          <UserCheck className="h-3.5 w-3.5" />
+                        </button>
+                      )}
+                      {v.shared && canManageSharedViews && sharedViewBusy !== v.id && (
+                        <button
+                          type="button"
                           onClick={() => void unshareView(v.shared!)}
                           className="text-muted-foreground hover:text-destructive"
                           aria-label="Stop sharing this view"
@@ -4152,6 +4235,28 @@ export default function CohortsPage() {
                         </button>
                       )}
                     </div>
+                    {v.shared && canManageSharedViews && v.shared.defaultRoleKeys.length > 0 && rolesEditorFor !== v.id && (
+                      <div className="px-3 pb-1.5 pl-9 text-[11px] text-muted-foreground">
+                        Default for {v.shared.defaultRoleKeys.map((key) => roleNameByKey.get(key) ?? key).join(", ")}
+                      </div>
+                    )}
+                    {v.shared && canManageSharedViews && rolesEditorFor === v.id && (
+                      <div className="mx-3 mb-1.5 rounded-md border border-border px-2 py-1.5">
+                        <div className="pb-1 text-[11px] text-muted-foreground">Opens by default for members of these roles who have not picked a view yet</div>
+                        {assignableRoles.length === 0 && <div className="py-1 text-xs text-muted-foreground">No roles loaded</div>}
+                        {assignableRoles.map((role) => (
+                          <label key={role.key} className="flex cursor-pointer items-center gap-2 py-0.5 text-xs">
+                            <Checkbox
+                              checked={v.shared!.defaultRoleKeys.includes(role.key)}
+                              disabled={sharedViewBusy === v.id}
+                              onCheckedChange={() => void toggleSharedViewRole(v.shared!, role.key)}
+                            />
+                            <span>{role.name}</span>
+                          </label>
+                        ))}
+                      </div>
+                    )}
+                    </Fragment>
                   ))}
                 </div>
                 {sharedViewError && (

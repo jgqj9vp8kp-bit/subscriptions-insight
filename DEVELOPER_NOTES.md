@@ -437,6 +437,11 @@ Personal saved views live in the author's own `data_snapshots` row (`cohorts_ui_
 - Writes are for the workspace Owner only (`app.is_workspace_owner()`). No catalog permission exists for it yet.
 - The Views popover lists them with a "shared" badge. The Owner shares a personal view with the people icon; a shared view of the same name is updated in place. The trash icon on a shared view removes it for everyone.
 - A shared view's page id is `shared:<uuid>`. `sanitizeCohortsUiSettingsPayload` keeps such a `selectedView`, so the "View:" label survives a cloud reload.
+- Default view per role (migration `202610180003`, column `default_role_keys` = `access_roles.key`): the Owner ticks roles with the person-check icon on a shared view.
+  - A member of such a role lands on the view when they have no active view and no personal views. If several views name the role, the most recently updated wins.
+  - It lands once per member and view. The marker `cohorts_role_default_applied:<principal hash>` lives in localStorage; members have no cloud copy of their Cohorts settings. Columns they change afterwards are kept.
+  - A member whose active view is a shared view gets it re-applied on every load, so the Owner's later edits reach them.
+  - The frontend selects `default_role_keys`, so `202610180003` must be applied BEFORE the frontend ships. Otherwise the shared-view list fails to load and shows nothing.
 
 ## Cohorts: Funnels view (2026-08)
 
