@@ -6,7 +6,11 @@
 //               hover prefetch), Reports (reportCollect), Forecasting Plan and
 //               Project (PlanMode, projectForecastSeeding);
 //   * details — Cohorts expanded cohort / funnel rows;
-//   * options — no current caller; kept for the Cohorts page it belongs to.
+//   * options — no current caller; kept for the Cohorts page it belongs to;
+//   * product_paths — the Cohorts Product filter (cohortProducts.ts). Never
+//               scopeReady: it reads normalized_payload, which a restricted
+//               scope never exposes, so restricted members get 403 and the
+//               page hides the filter.
 //
 // The `fb_allocation_diagnostics` request block maps to its own canonical action
 // so the registry sees it. The Cohorts page sends that block only when the
@@ -33,7 +37,7 @@ import { CohortRequestError, normalizeCohortRequest } from "../../clickhouse/coh
 import type { CohortRequest } from "../../clickhouse/cohortContract.ts";
 import { assertKeyPathInScope, intersectIncludePaths, type ScopeSql } from "../../clickhouse/scopeSql.ts";
 
-export type ClickHouseCohortsAction = "list" | "list_fb_allocation_diagnostics" | "details" | "options";
+export type ClickHouseCohortsAction = "list" | "list_fb_allocation_diagnostics" | "details" | "options" | "product_paths";
 
 /** Every page that renders cohort rows from `list`. */
 export const COHORT_LIST_VIEW_PERMISSIONS: readonly string[] = Object.freeze(["cohorts.view", "reports.view", "forecasting.view"]);
@@ -57,6 +61,8 @@ export function normalizeClickHouseCohortsAction({ body }: NormalizeActionInput)
     case "options":
     case "filter_options":
       return "options";
+    case "product_paths":
+      return "product_paths";
     default:
       throw new ActionNormalizeError();
   }
@@ -74,6 +80,7 @@ export const CLICKHOUSE_COHORTS_POLICY: FunctionPolicy<ClickHouseCohortsAction> 
     list_fb_allocation_diagnostics: { anyOf: [...COHORT_LIST_VIEW_PERMISSIONS] },
     details: { anyOf: ["cohorts.view"], scopeReady: true, scopeSnapshot: "cohort" },
     options: { anyOf: ["cohorts.view"], scopeReady: true, scopeSnapshot: "cohort" },
+    product_paths: { anyOf: ["cohorts.view"] },
   },
 };
 

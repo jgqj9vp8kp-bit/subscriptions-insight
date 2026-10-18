@@ -5,6 +5,7 @@ import type {
   CohortResponse,
   CohortDetailsResponse,
 } from "../../supabase/functions/_shared/clickhouse/cohortContract";
+import type { CohortProductsResponse } from "../../supabase/functions/_shared/clickhouse/cohortProducts";
 import type {
   UsersRequest,
   UsersResponse,
@@ -833,6 +834,11 @@ export async function runClickHouseRevenue<T extends import("../../supabase/func
 
 export async function runClickHouseCohorts(request: CohortRequest): Promise<CohortResponse> {
   return clickHouseRequest<CohortResponse>(CLICKHOUSE_COHORTS_FUNCTION, request as Record<string, unknown>, { breakerGated: true });
+}
+
+/** The Cohorts Product filter's path -> FunnelFox project map (full scope only). */
+export async function runClickHouseCohortProducts(): Promise<CohortProductsResponse> {
+  return clickHouseRequest<CohortProductsResponse>(CLICKHOUSE_COHORTS_FUNCTION, { action: "product_paths" }, { breakerGated: true });
 }
 
 export async function runClickHouseCohortDetails(request: CohortRequest): Promise<CohortDetailsResponse> {

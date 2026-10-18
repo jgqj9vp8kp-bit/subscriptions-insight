@@ -422,6 +422,14 @@ tab first.
 - IndexedDB is the fast local cache, while Supabase `data_snapshots` is the cross-device source of truth for imported Palmer data, FunnelFox subscription snapshots, Facebook traffic data, and forecasting default settings.
 - localStorage is only for small UI state such as filters, column settings, selected views, and forecast assumptions.
 
+## Cohorts: Product filter (2026-10-18)
+
+A product is a FunnelFox project (`metadata.ff_project_id`), labelled by its landing domain (`azora-astro.com`, `brainza.app`, `foxiq.app`, …; metadata-less cohorts form `Unknown`).
+
+It is not a cohort dimension. Since the Brainza path prefix (migration `202610180001`), every campaign_path belongs to one project. The `clickhouse-cohorts` action `product_paths` (`cohortProducts.ts`) returns the path -> project map, read from successful `analytics_transactions` rows. The page (`cohortProductFilter.ts`) turns the selected products into the campaign_path filter: the picked paths narrowed to the products, or all of the products' paths. An empty overlap sends the `NO_PRODUCT_PATH` sentinel, so the report is empty instead of widening. Snapshot, scope and fallback engines are therefore unchanged. The path picker only offers the selected products' paths.
+
+`product_paths` is not scopeReady: it reads `normalized_payload`, which the restricted scope never exposes. A funnel-restricted member gets 403 and the page hides the filter. Product counts are trial users over all time; they do not cascade with the other filters.
+
 ## Cohorts: Funnels view (2026-08)
 
 The Cohorts page has two view modes (persisted `viewMode`, default `cohorts`):

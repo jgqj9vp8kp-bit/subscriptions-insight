@@ -44,7 +44,14 @@ import {
 } from "@/services/funnelfoxSubscriptionsSync";
 import type { CardType, CohortRow, MediaBuyer, PlanBreakdownRow } from "@/services/types";
 import { cohortsDataSourceMode, loadCohortDetailsFromClickHouse, loadFunnelDetailsFromClickHouse, mapDetailsPlanBreakdown } from "@/services/cohortsDataSource";
-import { ClickHouseRequestError, isClickHouseCircuitOpen } from "@/services/clickhouse";
+import { ClickHouseRequestError, isClickHouseCircuitOpen, runClickHouseCohortProducts } from "@/services/clickhouse";
+import {
+  effectiveCampaignPaths,
+  productKey,
+  productPathSet,
+  productSummary,
+  type CohortProductOption,
+} from "@/services/cohortProductFilter";
 import { FunnelScopeBanner } from "@/components/access/FunnelScopeBanner";
 import { ScopeDataPending, SCOPE_SNAPSHOT_NOT_READY } from "@/components/access/ScopeDataPending";
 import { ACCESS_ERROR } from "../../supabase/functions/_shared/access/errors";
@@ -173,6 +180,9 @@ const DEFAULT_COHORTS_UI_STATE = {
   // shape as selectedCampaignIds / campaignIdFilter below).
   selectedFunnels: [] as string[],
   selectedCampaignPaths: [] as string[],
+  // FunnelFox projects (cohortProductFilter.ts productKey). Not a server
+  // dimension: they resolve to campaign paths before the request is built.
+  selectedProducts: [] as string[],
   // Funnels switched OFF: their campaign_paths are removed from every number
   // on this page (rows, Total, AI, exports) in BOTH view modes. A hygiene
   // switch, not a view filter — it survives "Reset filters" deliberately.
@@ -1219,6 +1229,7 @@ export default function CohortsPage() {
   const {
     selectedFunnels: rawSelectedFunnels,
     selectedCampaignPaths: rawSelectedCampaignPaths,
+    selectedProducts: rawSelectedProducts,
     excludedCampaignPaths: rawExcludedCampaignPaths,
     funnelFilter: legacyFunnelFilter,
     campaignPathFilter: legacyCampaignPathFilter,
@@ -1303,6 +1314,61 @@ export default function CohortsPage() {
     () => mergeLegacySelection(rawSelectedCampaignPaths, legacyCampaignPathFilter),
     [rawSelectedCampaignPaths, legacyCampaignPathFilter],
   );
+  const selectedProducts = useMemo(
+    () => mergeLegacySelection(rawSelectedProducts, null),
+    [rawSelectedProducts],
+  );
+  // Product filter (FunnelFox project): the server's path -> project map,
+  // fetched once. Full scope only — a funnel-restricted member gets no list,
+  // so the filter is hidden and never applied.
+  const productsAvailable = cohortsSource === "clickhouse" && !access.restricted;
+  const [cohortProducts, setCohortProducts] = useState<CohortProductOption[] | null>(null);
+  const [cohortProductsSettled, setCohortProductsSettled] = useState(false);
+  useEffect(() => {
+    if (!productsAvailable) {
+      setCohortProducts(null);
+      setCohortProductsSettled(true);
+      return;
+    }
+    let cancelled = false;
+    setCohortProductsSettled(false);
+    runClickHouseCohortProducts()
+      .then((response) => {
+        if (!cancelled) setCohortProducts(Array.isArray(response.products) ? response.products : []);
+      })
+      .catch(() => {
+        /* the filter is hidden; the report simply runs without it */
+      })
+      .finally(() => {
+        if (!cancelled) setCohortProductsSettled(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [productsAvailable]);
+  // A persisted product that no longer exists (or is out of reach) is dropped
+  // once the list is known, like any other stale option.
+  useEffect(() => {
+    if (!cohortProducts || !selectedProducts.length) return;
+    const known = new Set(cohortProducts.map(productKey));
+    const kept = selectedProducts.filter((key) => known.has(key));
+    if (kept.length === selectedProducts.length) return;
+    markCohortsUiSettingsUpdated();
+    setUiState((current) => ({ ...current, selectedProducts: kept }));
+  }, [cohortProducts, selectedProducts, setUiState]);
+  const selectedProductPaths = useMemo(
+    () => productPathSet(cohortProducts, selectedProducts),
+    [cohortProducts, selectedProducts],
+  );
+  // What the report filters by: the picked paths narrowed to the selected
+  // products. The picker itself keeps showing (and editing) the picked paths.
+  const reportCampaignPaths = useMemo(
+    () => effectiveCampaignPaths(selectedCampaignPaths, selectedProductPaths),
+    [selectedCampaignPaths, selectedProductPaths],
+  );
+  // A selected product only filters once its paths are known: hold the first
+  // fetch until then instead of loading (and caching) the unfiltered report.
+  const productFilterSettled = selectedProducts.length === 0 || cohortProductsSettled;
   const selectedCampaignIds = useMemo(() => {
     const ids = new Set<string>();
     if (Array.isArray(rawSelectedCampaignIds)) {
@@ -1710,7 +1776,7 @@ export default function CohortsPage() {
       date_to: cohortDateTo || null,
       filters: {
         funnel: selectedFunnels,
-        campaign_path: selectedCampaignPaths,
+        campaign_path: reportCampaignPaths,
         // Switched-off funnels recompute SERVER-side too: the fb_totals bundle
         // (full-funnel Spend (FB)/CPP (FB)/FB Purchases) is not derivable from
         // rows, so the exclusion must reach its allocation scope. The client
@@ -1751,7 +1817,7 @@ export default function CohortsPage() {
         }
         : {}),
     }),
-    [cohortDateFrom, cohortDateTo, selectedFunnels, selectedCampaignPaths, excludedCampaignPaths, appliedSelectedCampaignIds, appliedTrafficSourceFilter, effectiveSelectedMediaBuyers, appliedSelectedCountries, effectiveSelectedCardTypes, effectiveSelectedPlatforms, selectedCurrencies, refundFilter, maxRenewalColumns, fbAllocationDiagnosticsUi, canViewFbAllocationDiagnostics],
+    [cohortDateFrom, cohortDateTo, selectedFunnels, reportCampaignPaths, excludedCampaignPaths, appliedSelectedCampaignIds, appliedTrafficSourceFilter, effectiveSelectedMediaBuyers, appliedSelectedCountries, effectiveSelectedCardTypes, effectiveSelectedPlatforms, selectedCurrencies, refundFilter, maxRenewalColumns, fbAllocationDiagnosticsUi, canViewFbAllocationDiagnostics],
   );
   const {
     chResult,
@@ -1769,7 +1835,7 @@ export default function CohortsPage() {
     fbWarehouseVersion,
     // Gate on the warehouse version being settled so the key is stable on the
     // first fetch (avoids a wasted re-key/double fetch on the first-ever visit).
-    enabled: cohortsSource === "clickhouse" && warehouseVersionReady,
+    enabled: cohortsSource === "clickhouse" && warehouseVersionReady && productFilterSettled,
   });
 
   // Legacy is needed (and thus transactions are scanned) only when NOT driving
@@ -1999,12 +2065,12 @@ export default function CohortsPage() {
     () =>
       filterCohortsWithDiagnostics(allCohorts, {
         funnelFilter: selectedFunnels,
-        campaignPathFilter: selectedCampaignPaths,
+        campaignPathFilter: reportCampaignPaths,
         refundFilter,
         cohortDateFrom,
         cohortDateTo,
       }),
-    [allCohorts, selectedFunnels, selectedCampaignPaths, refundFilter, cohortDateFrom, cohortDateTo],
+    [allCohorts, selectedFunnels, reportCampaignPaths, refundFilter, cohortDateFrom, cohortDateTo],
   );
   const filteredCohorts = filteredCohortResult.cohorts;
 
@@ -2023,12 +2089,12 @@ export default function CohortsPage() {
   const cohortRowFilters = useMemo(
     () => ({
       funnelFilter: selectedFunnels,
-      campaignPathFilter: selectedCampaignPaths,
+      campaignPathFilter: reportCampaignPaths,
       refundFilter,
       cohortDateFrom,
       cohortDateTo,
     }),
-    [selectedFunnels, selectedCampaignPaths, refundFilter, cohortDateFrom, cohortDateTo],
+    [selectedFunnels, reportCampaignPaths, refundFilter, cohortDateFrom, cohortDateTo],
   );
   const campaignIdOptions = useMemo(
     () =>
@@ -2317,7 +2383,7 @@ export default function CohortsPage() {
   const aiContextKey = useMemo(
     () => stableJson({
       funnels: [...selectedFunnels].sort(),
-      paths: [...selectedCampaignPaths].sort(),
+      paths: [...reportCampaignPaths].sort(),
       excluded: excludedCampaignPaths,
       currency: currencyFilter,
       campaignIds: [...appliedSelectedCampaignIds].sort(),
@@ -2326,7 +2392,7 @@ export default function CohortsPage() {
       platforms: [...appliedSelectedPlatforms].sort(),
       mediaBuyers: [...appliedSelectedMediaBuyers].sort(),
     }),
-    [selectedFunnels, selectedCampaignPaths, excludedCampaignPaths, currencyFilter, appliedSelectedCampaignIds, appliedSelectedCountries, appliedSelectedCardTypes, appliedSelectedPlatforms, appliedSelectedMediaBuyers],
+    [selectedFunnels, reportCampaignPaths, excludedCampaignPaths, currencyFilter, appliedSelectedCampaignIds, appliedSelectedCountries, appliedSelectedCardTypes, appliedSelectedPlatforms, appliedSelectedMediaBuyers],
   );
   const aiSignals = useAiCohortSignals({
     rows: effectiveFilteredCohorts,
@@ -2738,6 +2804,20 @@ export default function CohortsPage() {
     updateUiState({ selectedCampaignPaths: next, campaignPathFilter: "all" });
   };
   const clearCampaignPaths = () => updateUiState({ selectedCampaignPaths: [], campaignPathFilter: "all" });
+  // Picking products drops picked paths of other products, so the two
+  // selections never contradict each other (an empty report).
+  const toggleProduct = (key: string) => {
+    const next = selectedProducts.includes(key)
+      ? selectedProducts.filter((value) => value !== key)
+      : [...selectedProducts, key].sort();
+    const nextPaths = productPathSet(cohortProducts, next);
+    updateUiState({
+      selectedProducts: next,
+      ...(nextPaths ? { selectedCampaignPaths: selectedCampaignPaths.filter((path) => nextPaths.has(path)), campaignPathFilter: "all" } : {}),
+    });
+  };
+  const clearProducts = () => updateUiState({ selectedProducts: [] });
+  const productFilterSummary = productSummary(cohortProducts, selectedProducts);
   // The funnel on/off switch (see excludedCampaignPaths on the default state).
   const toggleExcludedPath = (path: string) => {
     const next = excludedPathSet.has(path)
@@ -2759,22 +2839,28 @@ export default function CohortsPage() {
     setPathTagFilter((current) => (current.includes(name) ? current.filter((tag) => tag !== name) : [...current, name]));
   // Tags actually present among the campaign paths currently in scope, so the
   // chip row never offers a tag that would match nothing here.
+  // The picker offers only the selected products' paths (all paths without a
+  // product selection).
+  const productCampaignPathOptions = useMemo(
+    () => (selectedProductPaths ? campaignPathOptions.filter((path) => selectedProductPaths.has(path)) : campaignPathOptions),
+    [campaignPathOptions, selectedProductPaths],
+  );
   const campaignPathTagOptions = useMemo(() => {
     const tags = new Set<string>();
-    for (const path of campaignPathOptions) (funnelTagsByPath.get(path) ?? []).forEach((tag) => tags.add(tag));
+    for (const path of productCampaignPathOptions) (funnelTagsByPath.get(path) ?? []).forEach((tag) => tags.add(tag));
     return [...tags].sort((a, b) => a.localeCompare(b));
-  }, [campaignPathOptions, funnelTagsByPath]);
+  }, [productCampaignPathOptions, funnelTagsByPath]);
   // The path list after the tag filter (all-of: a path shows only if its funnel
   // carries EVERY selected tag). No tags selected = all paths.
   const visibleCampaignPathOptions = useMemo(() => {
-    if (!pathTagFilter.length) return campaignPathOptions;
-    return campaignPathOptions.filter((path) => {
+    if (!pathTagFilter.length) return productCampaignPathOptions;
+    return productCampaignPathOptions.filter((path) => {
       const tags = funnelTagsByPath.get(path);
       if (!tags) return false;
       const tagSet = new Set(tags);
       return pathTagFilter.every((tag) => tagSet.has(tag));
     });
-  }, [campaignPathOptions, pathTagFilter, funnelTagsByPath]);
+  }, [productCampaignPathOptions, pathTagFilter, funnelTagsByPath]);
   // "Select active" only offers the paths the user could otherwise pick by hand,
   // i.e. active AND currently visible under the tag filter.
   const activeCampaignPathOptions = useMemo(
@@ -3464,6 +3550,54 @@ export default function CohortsPage() {
               <Loader2 className="h-3 w-3 animate-spin" />
               Updating results…
             </span>
+          )}
+          {productsAvailable && (
+            <Popover>
+              <PopoverTrigger asChild>
+                <Button type="button" variant="outline" size="sm" className="h-9 max-w-[250px] justify-between gap-2">
+                  <span className="text-xs text-muted-foreground">Product</span>
+                  <span className="truncate">{productFilterSummary}</span>
+                  <ChevronDown className="h-3.5 w-3.5 shrink-0 opacity-60" />
+                </Button>
+              </PopoverTrigger>
+              <PopoverContent align="start" className="w-72 p-0">
+                <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
+                  <div>
+                    <div className="text-xs font-medium text-muted-foreground">Product</div>
+                    <div className="text-xs text-muted-foreground">FunnelFox project · all products by default</div>
+                  </div>
+                  <Button type="button" variant="ghost" size="sm" className="h-7 text-xs" onClick={clearProducts} disabled={!selectedProducts.length}>
+                    Clear
+                  </Button>
+                </div>
+                <div className="max-h-72 overflow-auto py-1">
+                  {!cohortProductsSettled && (
+                    <div className="flex items-center gap-2 px-3 py-3 text-sm text-muted-foreground">
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading products…
+                    </div>
+                  )}
+                  {cohortProductsSettled && !cohortProducts?.length && (
+                    <div className="px-3 py-3 text-sm text-muted-foreground">
+                      {cohortProducts ? "No product data" : "Products are unavailable right now"}
+                    </div>
+                  )}
+                  {(cohortProducts ?? []).map((product) => {
+                    const key = productKey(product);
+                    return (
+                      <label
+                        key={key}
+                        className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted/50"
+                        title={`${product.host || "No FunnelFox metadata"} · ${product.campaign_paths.length} campaign path${product.campaign_paths.length === 1 ? "" : "s"}`}
+                      >
+                        <Checkbox checked={selectedProducts.includes(key)} onCheckedChange={() => toggleProduct(key)} />
+                        <span className="truncate">{product.label}</span>
+                        <span className="ml-auto text-xs tabular-nums text-muted-foreground">{product.trial_count}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+              </PopoverContent>
+            </Popover>
           )}
           <Popover>
             <PopoverTrigger asChild>

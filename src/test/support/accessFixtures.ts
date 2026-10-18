@@ -88,6 +88,7 @@ import {
   runMaterializedCohortOptions,
 } from "../../../supabase/functions/_shared/clickhouse/cohortMembership.ts";
 import { runCohortDetails, runCohortList, runCohortOptions } from "../../../supabase/functions/_shared/clickhouse/cohorts.ts";
+import { runCohortProducts } from "../../../supabase/functions/_shared/clickhouse/cohortProducts.ts";
 import { createKeyedHasher, pseudonymizeActiveIdentities } from "../../../supabase/functions/_shared/clickhouse/cohortSubscriptions.ts";
 import {
   RevenueRequestError,
@@ -550,6 +551,7 @@ export const ACTION_REQUESTS: Readonly<Record<string, Readonly<Record<string, Ac
     list_fb_allocation_diagnostics: post({ action: "list", filters: {}, fb_allocation_diagnostics: { enabled: true } }),
     details: post({ action: "details", cohort_key: { cohort_date: "2026-09-01", funnel: FUNNELS.A.path, campaign_path: FUNNELS.A.path } }),
     options: post({ action: "options" }),
+    product_paths: post({ action: "product_paths" }),
   },
   "clickhouse-facebook": {
     ...named(
@@ -1385,6 +1387,7 @@ const cohortsRouter: AccessHandler<string> = async ({ ctx, action, body, pg, cli
   const ch = clickhouse();
   const supabase = asSupabase(pg);
   if (ctx.restricted) {
+    if (action === "product_paths") throw new Error("product_paths is not served to funnel-restricted members.");
     const { request, dropped } = restrictCohortRequest(scope, body);
     if (action === "details") {
       return projectCohortsResponseForRestricted(await runMaterializedCohortDetails({ authUserId, clickhouse: ch, request, scope, detailedErrors: false }), dropped);
@@ -1397,6 +1400,7 @@ const cohortsRouter: AccessHandler<string> = async ({ ctx, action, body, pg, cli
     return projectCohortsResponseForRestricted(result, dropped);
   }
   const request = body as CohortRequest;
+  if (action === "product_paths") return runCohortProducts({ authUserId, clickhouse: ch, scope });
   if (action === "options") {
     return (await runMaterializedCohortOptions({ authUserId, supabase, clickhouse: ch, request })) ?? await runCohortOptions({ authUserId, clickhouse: ch, request });
   }

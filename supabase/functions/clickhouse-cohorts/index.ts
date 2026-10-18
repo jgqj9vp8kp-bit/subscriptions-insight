@@ -6,7 +6,8 @@
 // ids, SQL, or credentials.
 //
 // Access (policies/clickhouse-cohorts.ts): list / details / options per the
-// pages that call them. Two parts of a list response are stripped, not denied:
+// pages that call them; product_paths (the Product filter's path -> FunnelFox
+// project map) for full-scope viewers only. Two parts of a list response are stripped, not denied:
 //   * fb_allocation_diagnostics — computed only with raw access or
 //     admin.diagnostics.view (and the FB_COHORT_ALLOCATION_DIAGNOSTICS_ENABLED
 //     flag, as before);
@@ -32,6 +33,7 @@ import {
   runMaterializedCohortList,
   runMaterializedCohortOptions,
 } from "../_shared/clickhouse/cohortMembership.ts";
+import { runCohortProducts } from "../_shared/clickhouse/cohortProducts.ts";
 import { ScopeSnapshotNotReadyError, type ScopeSql } from "../_shared/clickhouse/scopeSql.ts";
 import type { CohortRequest } from "../_shared/clickhouse/cohortContract.ts";
 import type { ClickHouseClientLike, SupabaseAuthClient } from "../_shared/clickhouse/types.ts";
@@ -68,6 +70,8 @@ async function restrictedCohorts(input: {
   scope: ScopeSql;
 }): Promise<unknown> {
   const { authUserId, pg, ch, scope } = input;
+  // The gate already refuses it (not scopeReady); never fall through to `list`.
+  if (input.action === "product_paths") throw new Error("product_paths is not served to funnel-restricted members.");
   // Keys asserted and includes intersected BEFORE any SQL.
   const { request, dropped } = restrictCohortRequest(scope, input.body);
   if (input.action === "details") {
@@ -94,6 +98,9 @@ serveWithAccess(CLICKHOUSE_COHORTS_POLICY, async ({ ctx, action, body, pg, click
 
   if (ctx.restricted) return await restrictedCohorts({ action, body, authUserId, pg, ch, scope });
 
+  if (action === "product_paths") {
+    return await withTimeout(runCohortProducts({ authUserId, clickhouse: ch, scope }), QUERY_TIMEOUT_MS);
+  }
   if (action === "options") {
     const materialized = await withTimeout(
       runMaterializedCohortOptions({ authUserId, supabase: pg, clickhouse: ch, request }),
