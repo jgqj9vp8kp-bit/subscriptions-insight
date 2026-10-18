@@ -409,6 +409,7 @@ tab first.
 
 - Missing metadata: funnel becomes `unknown`.
 - Missing campaign path: campaign_path becomes `unknown`.
+- Same landing path in two FunnelFox projects (`quiz.brainza.app/test-iq` and `f.foxiq.app/test-iq`): `normalizeCampaignPath` drops the host, so `withProjectPathPrefix` in `palmerTransform.ts` prefixes every path of a listed project (`CAMPAIGN_PATH_PROJECT_PREFIXES`, keyed by `metadata.ff_project_id`; only Brainza -> `brainza-`, owner decision 2026-10-18). Migration `202610180001` rewrote the stored history with the same rule (the campaign_path column and payload, plus the user-scoped cohort_id). Adding a project to the map needs the same kind of history migration. Sources that carry no project id still see the bare path: Google Sheet traffic typed by media buyers, the FunnelFox registry alias, and `recompute_funnel_active_status`, which reads the raw `ff_campaign_path`.
 - Unknown funnels: stay `unknown`; do not default to `past_life`.
 - Users without email: Palmer import keeps email empty and uses customerId, metadata email, or a unique `unknown_user_N` as user_id.
 - Users without a successful trial: cohort fields are incomplete and `transaction_day` is `null`.
