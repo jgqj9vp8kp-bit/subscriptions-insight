@@ -57,7 +57,15 @@ import {
   type SharedCohortView,
 } from "@/services/sharedCohortViews";
 import { listAccessRoles, type AdminRole } from "@/services/accessAdminClient";
-import { COHORT_DECLINE_GROUPS, type CohortPaymentFailureCounts } from "../../supabase/functions/_shared/clickhouse/cohortPaymentFailures";
+import {
+  COHORT_DECLINE_GROUPS,
+  DECLINE_STAGES,
+  DEFAULT_DECLINE_STAGE,
+  isDeclineStage,
+  projectDeclineStage,
+  type CohortPaymentFailureCounts,
+  type DeclineStage,
+} from "../../supabase/functions/_shared/clickhouse/cohortPaymentFailures";
 import {
   effectiveCampaignPaths,
   productKey,
@@ -196,6 +204,9 @@ const DEFAULT_COHORTS_UI_STATE = {
   // FunnelFox projects (cohortProductFilter.ts productKey). Not a server
   // dimension: they resolve to campaign paths before the request is built.
   selectedProducts: [] as string[],
+  // Stage the "Decline: …" reason columns show (cohortPaymentFailures.ts
+  // DECLINE_STAGES); a display switch, the server returns every stage.
+  declineStage: DEFAULT_DECLINE_STAGE as DeclineStage,
   // Funnels switched OFF: their campaign_paths are removed from every number
   // on this page (rows, Total, AI, exports) in BOTH view modes. A hygiene
   // switch, not a view filter — it survives "Reset filters" deliberately.
@@ -632,8 +643,8 @@ const COLUMN_HELP: Partial<Record<CohortColumnId, string>> = {
     COHORT_DECLINE_GROUPS.map((group) => [
       group.column,
       group.reasons
-        ? `Unique users with a declined charge after the trial for: ${group.reasons.join(", ")}. A user declined for several reasons counts in each.`
-        : "Unique users with a declined charge after the trial for any other reason (unknown, issuer unavailable, velocity, processing error, …).",
+        ? `Unique users declined at the stage picked in the Declines switch (after trial / after first sub / after renewal / all) for: ${group.reasons.join(", ")}. A user declined for several reasons counts in each.`
+        : "Unique users declined at the stage picked in the Declines switch for any other reason (unknown, issuer unavailable, velocity, processing error, …).",
     ]),
   ),
   ai_action:
@@ -1333,6 +1344,7 @@ export default function CohortsPage() {
     selectedFunnels: rawSelectedFunnels,
     selectedCampaignPaths: rawSelectedCampaignPaths,
     selectedProducts: rawSelectedProducts,
+    declineStage: rawDeclineStage,
     excludedCampaignPaths: rawExcludedCampaignPaths,
     funnelFilter: legacyFunnelFilter,
     campaignPathFilter: legacyCampaignPathFilter,
@@ -1421,6 +1433,7 @@ export default function CohortsPage() {
     () => mergeLegacySelection(rawSelectedProducts, null),
     [rawSelectedProducts],
   );
+  const declineStage: DeclineStage = isDeclineStage(rawDeclineStage) ? rawDeclineStage : DEFAULT_DECLINE_STAGE;
   // Product filter (FunnelFox project): the server's path -> project map,
   // fetched once. Full scope only — a funnel-restricted member gets no list,
   // so the filter is hidden and never applied.
@@ -2231,11 +2244,14 @@ export default function CohortsPage() {
   // engines: every downstream derive (funnel pseudo-rows, Total, AI signals,
   // exports, assistant context) reads this memo, so one filter covers them all
   // — and the server contract stays untouched.
+  // The Declines stage switch is applied here too: each "Decline: …" column of
+  // every row then holds the chosen stage's count, so the cells, Total, Funnels,
+  // sorting and exports all follow it (projectDeclineStage).
   const effectiveFilteredCohorts = useMemo(() => {
     const rows = clickHouseDriving && chResult ? chResult.cohorts : filteredCohorts;
-    if (excludedPathSet.size === 0) return rows;
-    return rows.filter((row) => !excludedPathSet.has(row.campaign_path));
-  }, [clickHouseDriving, chResult, filteredCohorts, excludedPathSet]);
+    const kept = excludedPathSet.size === 0 ? rows : rows.filter((row) => !excludedPathSet.has(row.campaign_path));
+    return declineStage === DEFAULT_DECLINE_STAGE ? kept : kept.map((row) => projectDeclineStage(row, declineStage));
+  }, [clickHouseDriving, chResult, filteredCohorts, excludedPathSet, declineStage]);
 
   const cohortRowFilters = useMemo(
     () => ({
@@ -3404,7 +3420,7 @@ export default function CohortsPage() {
     const traffic = trafficForCohort(cohort, trafficByKey);
     const renewalUsers = renewalUsersForColumn(plan, id);
     if (renewalUsers != null) return <TableCell key={id} className={className}>{renewalUsers}</TableCell>;
-    const failure = paymentFailureDisplay(id, plan, plan.trial_users, formatPct);
+    const failure = paymentFailureDisplay(id, projectDeclineStage(plan, declineStage), plan.trial_users, formatPct);
     if (failure != null) return <TableCell key={id} className={className}>{failure}</TableCell>;
     switch (id) {
       case "cohort_date":
@@ -4253,6 +4269,21 @@ export default function CohortsPage() {
                 </div>
               </PopoverContent>
             </Popover>
+            {COHORT_DECLINE_GROUPS.some((group) => columnVisibility[group.column] !== false && columnVisibility[group.column] !== undefined) && (
+              <div className="flex items-center gap-1.5" title="Which failed charges the Decline: … columns count">
+                <span className="text-xs text-muted-foreground">Declines</span>
+                <Select value={declineStage} onValueChange={(value) => updateUiState({ declineStage: isDeclineStage(value) ? value : DEFAULT_DECLINE_STAGE })}>
+                  <SelectTrigger className="h-9 w-[150px] text-sm" aria-label="Decline reasons stage">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {DECLINE_STAGES.map((entry) => (
+                      <SelectItem key={entry.stage} value={entry.stage}>{entry.label}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
             <Button type="button" variant="ghost" size="sm" className="h-9" onClick={resetCohortFilters}>
               Reset filters
             </Button>

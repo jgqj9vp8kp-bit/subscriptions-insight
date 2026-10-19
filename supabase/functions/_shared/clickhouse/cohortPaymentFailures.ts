@@ -11,32 +11,45 @@
 //     1 → after the first subscription, >= 2 → after a renewal;
 //   * reason = the stored normalized decline_reason ('' → unknown), grouped
 //     below.
+// The reason groups are computed for every stage (DECLINE_STAGES) and the page
+// shows one stage at a time (a switch, default "after trial" — owner decision
+// 2026-10-19), so switching never refetches.
 // Counts are distinct cohort users. A user with declines of several groups is
 // counted in each group — as Decline Analytics counts users per reason — so the
-// groups can add up to more than failed_payment_users.
+// groups can add up to more than the stage's failed users.
 //
 // The cohort CTEs expose `dr` (reason of a failed row, '' otherwise) and
-// `pre_lvl` on every finx row (cohorts.ts classifierSQL / emailTokenSQL,
+// `pre_lvl` on every finx row (cohorts.ts emailTokenSQL,
 // cohortMembership.ts materializedFinxCtes).
 
-export interface CohortPaymentFailureCounts {
-  failed_payment_users: number;
-  failed_after_trial_users: number;
-  failed_after_first_subscription_users: number;
-  failed_after_renewal_users: number;
-  decline_insufficient_funds_users: number;
-  decline_fraud_users: number;
-  decline_card_not_supported_users: number;
-  decline_do_not_honor_users: number;
-  decline_3ds_users: number;
-  decline_card_lost_users: number;
-  decline_other_users: number;
-}
+export type DeclineGroupColumn =
+  | "decline_insufficient_funds_users"
+  | "decline_fraud_users"
+  | "decline_card_not_supported_users"
+  | "decline_do_not_honor_users"
+  | "decline_3ds_users"
+  | "decline_card_lost_users"
+  | "decline_other_users";
 
-export type CohortPaymentFailureField = keyof CohortPaymentFailureCounts;
+export type DeclineStage = "trial" | "first_sub" | "renewal" | "all";
+
+/** Field suffix per stage: "after trial" keeps the bare column name. */
+const STAGE_SUFFIX = { trial: "", first_sub: "_first_sub", renewal: "_renewal", all: "_all" } as const;
+type DeclineStageSuffix = (typeof STAGE_SUFFIX)[DeclineStage];
+
+export type DeclineGroupField = `${DeclineGroupColumn}${DeclineStageSuffix}`;
+
+export type CohortPaymentFailureField =
+  | "failed_payment_users"
+  | "failed_after_trial_users"
+  | "failed_after_first_subscription_users"
+  | "failed_after_renewal_users"
+  | DeclineGroupField;
+
+export type CohortPaymentFailureCounts = Record<CohortPaymentFailureField, number>;
 
 export interface CohortDeclineGroup {
-  column: CohortPaymentFailureField;
+  column: DeclineGroupColumn;
   label: string;
   /** Normalized reasons of the group; null = every reason not listed elsewhere. */
   reasons: readonly string[] | null;
@@ -52,12 +65,31 @@ export const COHORT_DECLINE_GROUPS: readonly CohortDeclineGroup[] = Object.freez
   { column: "decline_other_users", label: "Other Decline", reasons: null },
 ]);
 
+/** Stages the reason groups are split by, in switch order (labels for the page). */
+export const DECLINE_STAGES: ReadonlyArray<{ stage: DeclineStage; label: string; condition: string | null }> = Object.freeze([
+  { stage: "trial", label: "After trial", condition: "pre_lvl = 0" },
+  { stage: "first_sub", label: "After first sub", condition: "pre_lvl = 1" },
+  { stage: "renewal", label: "After renewal", condition: "pre_lvl >= 2" },
+  { stage: "all", label: "All stages", condition: null },
+]);
+
+export const DEFAULT_DECLINE_STAGE: DeclineStage = "trial";
+
+export function isDeclineStage(value: unknown): value is DeclineStage {
+  return typeof value === "string" && DECLINE_STAGES.some((entry) => entry.stage === value);
+}
+
+/** The data field holding a reason group's count for a stage. */
+export function declineGroupField(column: DeclineGroupColumn, stage: DeclineStage): DeclineGroupField {
+  return `${column}${STAGE_SUFFIX[stage]}` as DeclineGroupField;
+}
+
 export const COHORT_PAYMENT_FAILURE_FIELDS: readonly CohortPaymentFailureField[] = Object.freeze([
   "failed_payment_users",
   "failed_after_trial_users",
   "failed_after_first_subscription_users",
   "failed_after_renewal_users",
-  ...COHORT_DECLINE_GROUPS.map((group) => group.column),
+  ...DECLINE_STAGES.flatMap(({ stage }) => COHORT_DECLINE_GROUPS.map((group) => declineGroupField(group.column, stage))),
 ]);
 
 const FAILED = "statusType = 'failed_payment'";
@@ -74,11 +106,12 @@ export function paymentFailureMeasuresSQL(): string {
     `uniqExactIf(uid, ${FAILED} AND pre_lvl = 0) failed_after_trial_users`,
     `uniqExactIf(uid, ${FAILED} AND pre_lvl = 1) failed_after_first_subscription_users`,
     `uniqExactIf(uid, ${FAILED} AND pre_lvl >= 2) failed_after_renewal_users`,
-    ...COHORT_DECLINE_GROUPS.map((group) =>
-      group.reasons
-        ? `uniqExactIf(uid, ${FAILED} AND dr IN (${sqlList(group.reasons)})) ${group.column}`
-        : `uniqExactIf(uid, ${FAILED} AND dr NOT IN (${sqlList(listed)})) ${group.column}`,
-    ),
+    ...DECLINE_STAGES.flatMap(({ stage, condition }) =>
+      COHORT_DECLINE_GROUPS.map((group) => {
+        const scope = condition ? `${FAILED} AND ${condition}` : FAILED;
+        const reason = group.reasons ? `dr IN (${sqlList(group.reasons)})` : `dr NOT IN (${sqlList(listed)})`;
+        return `uniqExactIf(uid, ${scope} AND ${reason}) ${declineGroupField(group.column, stage)}`;
+      })),
   ].join(",\n  ");
 }
 
@@ -131,4 +164,19 @@ export function sumPresentPaymentFailureCounts(rows: readonly Partial<CohortPaym
     if (seen) out[field] = total;
   }
   return out;
+}
+
+/** The row with each reason-group column holding the chosen stage's count —
+ * the page projects its rows once, so cells, Total / Funnels sums, sorting and
+ * exports all follow the stage switch. "After trial" is the stored shape; a
+ * stage the row does not carry (older cache) leaves the column absent ("—"). */
+export function projectDeclineStage<T extends Partial<CohortPaymentFailureCounts>>(row: T, stage: DeclineStage): T {
+  if (stage === "trial") return row;
+  const out: Partial<CohortPaymentFailureCounts> = { ...row };
+  for (const group of COHORT_DECLINE_GROUPS) {
+    const value = row[declineGroupField(group.column, stage)];
+    if (typeof value === "number") out[group.column] = value;
+    else delete out[group.column];
+  }
+  return out as T;
 }

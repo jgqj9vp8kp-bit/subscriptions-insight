@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   COHORT_DECLINE_GROUPS,
+  DECLINE_STAGES,
+  DEFAULT_DECLINE_STAGE,
+  declineGroupField,
+  isDeclineStage,
+  projectDeclineStage,
   COHORT_PAYMENT_FAILURE_FIELDS,
   paymentFailureCountsFromRaw,
   paymentFailureMeasuresSQL,
@@ -22,6 +27,44 @@ describe("cohort payment-failure metrics", () => {
     expect(sql).toContain("uniqExactIf(uid, statusType = 'failed_payment' AND pre_lvl >= 2) failed_after_renewal_users");
     expect(sql).toContain("dr IN ('do_not_honor', 'generic_decline')) decline_do_not_honor_users");
     expect(AGGREGATE_MEASURES).toContain(sql);
+  });
+
+  it("splits every reason group by stage; the bare column is the after-trial stage", () => {
+    const sql = paymentFailureMeasuresSQL();
+    const measures = sql.split(",\n  ");
+    const measureOf = (field: string) => measures.find((measure) => measure.endsWith(` ${field}`)) ?? "";
+    for (const group of COHORT_DECLINE_GROUPS) {
+      expect(measureOf(group.column)).toContain("statusType = 'failed_payment' AND pre_lvl = 0 AND dr ");
+      expect(measureOf(declineGroupField(group.column, "first_sub"))).toContain("AND pre_lvl = 1 AND dr ");
+      expect(measureOf(declineGroupField(group.column, "renewal"))).toContain("AND pre_lvl >= 2 AND dr ");
+      expect(measureOf(declineGroupField(group.column, "all"))).not.toContain("pre_lvl");
+      expect(sql).toContain(`) ${declineGroupField(group.column, "first_sub")}`);
+      expect(sql).toContain(`) ${declineGroupField(group.column, "renewal")}`);
+      expect(sql).toContain(`) ${declineGroupField(group.column, "all")}`);
+    }
+    expect(sql).toContain("uniqExactIf(uid, statusType = 'failed_payment' AND pre_lvl = 0 AND dr IN ('insufficient_funds')) decline_insufficient_funds_users");
+    expect(sql).toContain("uniqExactIf(uid, statusType = 'failed_payment' AND pre_lvl = 1 AND dr IN ('insufficient_funds')) decline_insufficient_funds_users_first_sub");
+    expect(sql).toContain("uniqExactIf(uid, statusType = 'failed_payment' AND pre_lvl >= 2 AND dr IN ('insufficient_funds')) decline_insufficient_funds_users_renewal");
+    expect(sql).toContain("uniqExactIf(uid, statusType = 'failed_payment' AND dr IN ('insufficient_funds')) decline_insufficient_funds_users_all");
+    expect(COHORT_PAYMENT_FAILURE_FIELDS).toHaveLength(4 + COHORT_DECLINE_GROUPS.length * DECLINE_STAGES.length);
+    expect(DECLINE_STAGES.map((entry) => entry.stage)).toEqual(["trial", "first_sub", "renewal", "all"]);
+    expect(DEFAULT_DECLINE_STAGE).toBe("trial");
+  });
+
+  it("projects a row onto the chosen stage for every reason column", () => {
+    const row = {
+      trial_users: 10,
+      decline_fraud_users: 4, decline_fraud_users_first_sub: 1, decline_fraud_users_renewal: 0, decline_fraud_users_all: 5,
+      decline_insufficient_funds_users: 2,
+    };
+    expect(projectDeclineStage(row, "trial")).toBe(row);
+    expect(projectDeclineStage(row, "first_sub")).toMatchObject({ trial_users: 10, decline_fraud_users: 1 });
+    expect(projectDeclineStage(row, "all").decline_fraud_users).toBe(5);
+    // A stage the row does not carry (older cache) leaves the column absent → "—".
+    expect("decline_insufficient_funds_users" in projectDeclineStage(row, "renewal")).toBe(false);
+    expect(row.decline_fraud_users).toBe(4);
+    expect(isDeclineStage("renewal")).toBe(true);
+    expect(isDeclineStage("weekly")).toBe(false);
   });
 
   it("files every known decline reason into exactly one named group, the rest into Other", () => {

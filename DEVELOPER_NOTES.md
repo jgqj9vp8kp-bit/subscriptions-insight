@@ -438,6 +438,10 @@ The declined-charge columns (`cohortPaymentFailures.ts`, hidden by default) reus
 - A failed attempt is a warehouse row with status `failed` from the trial on.
 - Stage = the user's lifecycle level before the attempt (`pre_lvl`): none → after trial, 1 → after the first subscription, ≥2 → after a renewal.
 - Reason = the stored normalized `decline_reason`, grouped into 7 columns (Insufficient Funds, Fraud, Card Not Supported, Do Not Honor / Generic, 3DS, Card Lost / Stolen / Expired, Other).
+- The reason groups are split by stage (2026-10-19). The server returns every stage, `DECLINE_STAGES`:
+  - the bare column = after trial;
+  - `_first_sub`, `_renewal` and `_all` = the other stages.
+- The page's "Declines" switch (`uiState.declineStage`, default after trial) projects the rows once at `effectiveFilteredCohorts` (`projectDeclineStage`). Cells, Total, Funnels, sorting and exports therefore follow it without a refetch.
 - Counts are distinct users. A user declined for several reasons counts in each group.
 
 Engines:
