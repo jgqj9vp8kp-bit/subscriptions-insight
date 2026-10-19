@@ -177,7 +177,14 @@ function flag(value: unknown): boolean | null {
 // Maps a Supabase funnelfox_subscriptions row -> ClickHouse fact row, with the
 // same rules as normalizeSubscription (subscriptionTransform.ts): cancelled =
 // status contains "cancel" OR renews = false; the cancel time is the FunnelFox
-// cancelled_at, else updated_at for a cancelled subscription. Sandbox (test)
+// cancelled_at, else updated_at for a cancelled subscription.
+// The detail card (raw_detail) is fetched once, about the trial purchase, and
+// never refreshed (2026-10-19: every card of the Oct 7-14 palm-reading-month-web
+// cohort still says "trialing"). Its updated_at is the cancel time only when the
+// card already shows the cancel (renewal off or a cancel status); a subscription
+// cancelled after the card was taken uses the list's updated_at, which every
+// sync refreshes — otherwise the cancel lands at the purchase and a declined
+// first charge three days later never falls in the 48 h window. Sandbox (test)
 // subscriptions are skipped (null), like the active-subscription overlay. The
 // raw email is never stored — joins use normalized_email. row_version is the
 // sync run's version when given (a full refresh supersedes every older row),
@@ -190,8 +197,11 @@ export function normalizeSubscriptionForClickHouse(row: SupabaseSubscriptionSour
   const status = (text(row.status) || text(row.detail_status)).toLowerCase();
   const renews = flag(row.renews) ?? flag(row.detail_renews);
   const isCancelled = status.includes("cancel") || renews === false;
-  const updatedAt = text(row.detail_updated_at) || text(row.updated_at);
-  const cancelledAt = text(row.detail_cancelled_at) || text(row.cancelled_at) || (isCancelled ? updatedAt : "");
+  const cardShowsCancel = text(row.detail_status).toLowerCase().includes("cancel") || flag(row.detail_renews) === false;
+  const cancelMoment = cardShowsCancel
+    ? text(row.detail_updated_at) || text(row.updated_at)
+    : text(row.updated_at) || text(row.detail_updated_at);
+  const cancelledAt = text(row.detail_cancelled_at) || text(row.cancelled_at) || (isCancelled ? cancelMoment : "");
   const updatedMs = row.updated_at ? new Date(String(row.updated_at)).getTime() : Number.NaN;
   return {
     auth_user_id: authUserId,

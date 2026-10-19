@@ -455,6 +455,10 @@ Engines:
 `fact_subscriptions` now has a writer: `factSubscriptionsSync.ts`, called at the end of the FunnelFox subscriptions sync (finalize stage, best-effort).
 - It does a full tenant refresh. Every row carries the run version, older rows are deleted afterwards, and nothing is deleted after an empty read.
 - The cancel date and reason come from `raw_detail` (`cancelled_at`, `cancellation_reason`), because the `cancelled_at` column was never filled. The fallback is `updated_at` for a cancelled subscription, as in `normalizeSubscription`.
+- `raw_detail` is a card fetched once, about the purchase, and never refreshed. FunnelFox gives no `cancelled_at` in it, so the fallback decides the cancel date. Since 2026-10-19 the card's `updated_at` is used only when the card already shows the cancel (renewal off, or a cancel status). Otherwise the list's `updated_at` is used, which every sync refreshes.
+  - Before the fix, a subscription cancelled after its card was taken got a cancel date at the purchase. A declined first charge three days later then fell outside the 48 h window.
+  - Example: the palm-reading-month-web cohort of Oct 7–14 showed 192 user / 0 auto cancels. With the fix, about 117 / 75.
+  - The fix moves 1,410 of 14,545 cancelled subscriptions, by about 10.7 days on average.
 - Sandbox subscriptions are skipped. The raw email is never stored.
 - `ensureFactSubscriptionsSchema` (also run by ClickHouse Init) re-asserts every non-key column, because production holds a copy of the table created by an earlier build.
 
@@ -470,7 +474,7 @@ Per member, the precedence is: user reason > auto (failed) > user > auto (period
 
 Why the checkout bound: with a 3-day trial the 48 h window covered most of the trial, so an upsell declined right after the purchase turned a user's own cancel into "auto". Data for July–October 2026: checkout declines land before the start or in its first 2 h, period charges 60 h or more after it, with almost nothing between. `period_ends_at` cannot serve as the bound: for a paid trial on a monthly plan, FunnelFox shows the period end at day 14 while the first charge runs at day 7. The subscription start is `fact_subscriptions.started_at` (FunnelFox `created_at`, added 2026-10-19). A row without it keeps the plain 48 h window. The legacy client engine (`cohortAnalytics.ts`) still uses the old rule.
 
-Measured on September 2026 cohorts (Postgres approximation): user 899 → 1,029, auto 652 → 522. The reason rule alone moves about 50 users; the checkout bound moves about 80 more.
+Measured on September 2026 cohorts (Postgres approximation): user 899 → 1,029, auto 652 → 522. The reason rule alone moves about 50 users; the checkout bound moves about 80 more. Those figures still used the stale card date. With the cancel-date fix the estimate is user 629, auto 922.
 
 Restricted members read through `subscriptionsFrom(scope)` (`SUB_COLS`, no raw email). Rows ship synthetic cohort-scoped ids so the Total / Funnels id-set counts add up. The Users page subscription status (`users.ts`) reads the same table.
 

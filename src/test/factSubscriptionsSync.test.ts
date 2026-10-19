@@ -56,8 +56,20 @@ describe("fact_subscriptions rows", () => {
   });
 
   it("falls back to updated_at for a cancelled subscription without a cancel date, like normalizeSubscription", () => {
+    // The card already shows the cancel (renewal off / a cancel status): its updated_at.
+    const offOnCard = normalizeSubscriptionForClickHouse(source({ detail_cancelled_at: null, detail_status: "trialing", detail_renews: "false" }))!;
+    expect(offOnCard.cancelled_at).toBe("2026-10-11T08:00:00.000");
+    const cancelOnCard = normalizeSubscriptionForClickHouse(source({ detail_cancelled_at: null, detail_status: "cancelled", detail_renews: "true" }))!;
+    expect(cancelOnCard.cancelled_at).toBe("2026-10-11T08:00:00.000");
+    // The card was taken before the cancel (still trialing, renewal on): the list's updated_at.
+    const cancelledLater = normalizeSubscriptionForClickHouse(source({ detail_cancelled_at: null, detail_status: "trialing", detail_renews: "true" }))!;
+    expect(cancelledLater.cancelled_at).toBe("2026-10-12T08:00:00.000");
+    const noCard = normalizeSubscriptionForClickHouse(source({ detail_cancelled_at: null, detail_updated_at: null }))!;
+    expect(noCard.cancelled_at).toBe("2026-10-12T08:00:00.000");
+    const noListDate = normalizeSubscriptionForClickHouse(source({ detail_cancelled_at: null, detail_renews: "true", updated_at: null }))!;
+    expect(noListDate.cancelled_at).toBe("2026-10-11T08:00:00.000");
     const cancelled = normalizeSubscriptionForClickHouse(source({ detail_cancelled_at: null }))!;
-    expect(cancelled.cancelled_at).toBe("2026-10-11T08:00:00.000");
+    expect(cancelled.cancelled_at).toBe("2026-10-12T08:00:00.000");
     const active = normalizeSubscriptionForClickHouse(source({ status: "active", renews: true, detail_cancelled_at: null }))!;
     expect(active.cancelled_at).toBeNull();
     expect(active.renews).toBe(1);
