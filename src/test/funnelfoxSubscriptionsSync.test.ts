@@ -4,7 +4,13 @@ import {
   LIST_STAGE_ENRICHMENT_COLUMNS,
   countEmailCoverage,
   crawlList,
+  detailOutcome,
+  detailWrite,
   funnelAliasFromSubscriptionRaw,
+  isDetailCardStale,
+  refreshedDetailCard,
+  staleDetailCardIds,
+  computeCoverageWarning,
   subscriptionListUpsertColumns,
   determineStopReason,
   enrichPool,
@@ -314,5 +320,104 @@ describe("enrichment must survive the list stage (found live 2026-09-21)", () =>
 
   it("the daily full refresh re-opens only rows without a detail or an email", () => {
     expect(FULL_RESET_DETAIL_REOPEN_FILTER).toBe("raw_detail.is.null,normalized_email.is.null");
+  });
+});
+
+describe("stale detail cards are re-fetched (found live 2026-10-19)", () => {
+  // The list row as the list stage upserts it: lowercased status, boolean renews.
+  const listRow = (id: string, status: string | null, renews: boolean | null) => ({ subscription_id: id, status, renews });
+
+  it("a card is stale when the list's status or renews no longer matches it", () => {
+    // The Oct 7-14 cohort: the list says cancelled, the card still says trialing with renewal on.
+    expect(isDetailCardStale(listRow("s", "cancelled", false), { card_status: "trialing", card_renews: "true" })).toBe(true);
+    // A trial that converted: status moved, renews did not.
+    expect(isDetailCardStale(listRow("s", "active", true), { card_status: "trialing", card_renews: "true" })).toBe(true);
+    // Renewal switched off while the status stays: the reason shows up on the card only now.
+    expect(isDetailCardStale(listRow("s", "trialing", false), { card_status: "trialing", card_renews: "true" })).toBe(true);
+    // The card status is compared case-insensitively; renews may come as text or a boolean.
+    expect(isDetailCardStale(listRow("s", "cancelled", false), { card_status: "Cancelled", card_renews: "false" })).toBe(false);
+    expect(isDetailCardStale(listRow("s", "active", true), { card_status: "active", card_renews: true })).toBe(false);
+  });
+
+  it("nothing to compare is never stale: no card, a stored 404 body, or an unknown list value", () => {
+    expect(isDetailCardStale(listRow("s", "cancelled", false), { card_status: null, card_renews: null })).toBe(false);
+    expect(isDetailCardStale(listRow("s", "cancelled", false), { card_status: "", card_renews: "true" })).toBe(false);
+    expect(isDetailCardStale(listRow("s", null, null), { card_status: "trialing", card_renews: "true" })).toBe(false);
+    expect(isDetailCardStale(listRow("s", "trialing", null), { card_status: "trialing", card_renews: "true" })).toBe(false);
+    expect(isDetailCardStale(listRow("s", "trialing", false), { card_status: "trialing", card_renews: null })).toBe(false);
+  });
+
+  it("the list stage re-opens only checked, stale cards of its batch, each once", () => {
+    const batch = [
+      listRow("stale", "cancelled", false),
+      listRow("fresh", "cancelled", false),
+      listRow("queued", "cancelled", false),
+      listRow("new", "trialing", true),
+      listRow("no_card", "cancelled", false),
+      listRow("stale", "cancelled", false),
+    ];
+    const stored = [
+      { subscription_id: "stale", detail_checked: true, card_status: "trialing", card_renews: "true" },
+      { subscription_id: "fresh", detail_checked: true, card_status: "cancelled", card_renews: "false" },
+      // Already in the detail queue (never fetched, or re-opened by the full reset).
+      { subscription_id: "queued", detail_checked: false, card_status: "trialing", card_renews: "true" },
+      { subscription_id: "no_card", detail_checked: true, card_status: null, card_renews: null },
+    ];
+    expect(staleDetailCardIds(batch, stored)).toEqual(["stale"]);
+    expect(staleDetailCardIds([], stored)).toEqual([]);
+  });
+
+  it("a re-fetch keeps the reason FunnelFox drops once the scheduled cancel completes", () => {
+    const fresh = { id: "s", status: "cancelled", renews: false, cancellation_reason: null, updated_at: "2026-10-17T09:00:00Z" };
+    const kept = refreshedDetailCard(fresh, "User requested cancellation");
+    expect(kept).toMatchObject({
+      status: "cancelled",
+      updated_at: "2026-10-17T09:00:00Z",
+      cancellation_reason: "User requested cancellation",
+      cancellation_reason_source: "previous_card",
+    });
+    // A reason on the fresh card wins; no stored reason leaves the fresh card untouched.
+    const own = { ...fresh, cancellation_reason: "Payment failed" };
+    expect(refreshedDetailCard(own, "User requested cancellation")).toBe(own);
+    expect(refreshedDetailCard(fresh, null)).toBe(fresh);
+    expect(refreshedDetailCard(fresh, "  ")).toBe(fresh);
+    // Renewal back on: the cancel was undone, so a later cancel must not inherit the old reason.
+    const resumed = { ...fresh, status: "active", renews: true };
+    expect(refreshedDetailCard(resumed, "User requested cancellation")).toBe(resumed);
+    // Still scheduled (renewal off, not yet cancelled) also keeps it.
+    expect(refreshedDetailCard({ ...fresh, status: "active", renews: false }, "User requested cancellation").cancellation_reason)
+      .toBe("User requested cancellation");
+  });
+
+  it("a 404 on a re-fetch keeps the stored card; a first fetch stores it as before", () => {
+    expect(detailWrite(detailOutcome(true, 200), true)).toBe("store_card");
+    expect(detailWrite(detailOutcome(false, 404), true)).toBe("keep_card");
+    expect(detailWrite(detailOutcome(false, 410), false)).toBe("store_card");
+    expect(detailWrite(detailOutcome(false, 500), true)).toBe("retry");
+    expect(detailWrite(detailOutcome(false, 429), false)).toBe("retry");
+  });
+
+  it("a 429 stops the detail pool and leaves the rest unchecked for the next tick", async () => {
+    const items = Array.from({ length: 10 }, (_, i) => ({ id: `s${i}` }));
+    let calls = 0;
+    const out = await enrichPool(items, {
+      concurrency: 1,
+      isExpired: never,
+      fetchOne: async () => {
+        calls += 1;
+        return calls === 3 ? { ok: false, status: 429, value: null } : { ok: true, status: 200, value: {} };
+      },
+    });
+    expect(out.rateLimited).toBe(true);
+    expect(out.attempted).toBe(3);
+    expect(out.fetched).toBe(2);
+    expect(out.failed).toBe(1);
+    expect(out.timeoutSkipped).toBe(7);
+    expect(enrichStopReason(out.timeoutSkipped, false, out.rateLimited)).toBe("rate_limited");
+    expect(statusFromStopReason("rate_limited")).toBe("partial");
+    expect(enrichStageComplete(out.timeoutSkipped, 8)).toBe(false);
+    expect(computeCoverageWarning({
+      stoppedReason: "rate_limited", stage: "subscription_details", hasPendingDetails: true, hasPendingProfiles: false, missingEmailAfterEnrichment: 0,
+    }).coverage_warning_message).toMatch(/429/);
   });
 });

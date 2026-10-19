@@ -25,6 +25,7 @@ export type SyncStoppedReason =
   | "completed"
   | "soft_timeout"
   | "max_pages_reached"
+  | "rate_limited"
   | "api_error"
   | "user_cancelled"
   | "unknown";
@@ -75,8 +76,10 @@ export function statusFromStopReason(reason: SyncStoppedReason): "ok" | "partial
 // A cursor-less enrichment stage (details / profiles) is only fully done when
 // nothing was timed-out-skipped AND no candidate rows remain. Transient API
 // failures leave rows unchecked → stage stays incomplete → Continue resumes it.
-export function enrichStopReason(timeoutSkipped: number, apiError = false): SyncStoppedReason {
+// A FunnelFox 429 stops the run (the rest stays unchecked for the next tick).
+export function enrichStopReason(timeoutSkipped: number, apiError = false, rateLimited = false): SyncStoppedReason {
   if (apiError) return "api_error";
+  if (rateLimited) return "rate_limited";
   return timeoutSkipped > 0 ? "soft_timeout" : "completed";
 }
 
@@ -122,6 +125,12 @@ export function computeCoverageWarning(input: {
     return {
       coverage_warning: true,
       coverage_warning_message: "Sync stopped at the soft time budget. Click Continue Sync to resume from the last cursor.",
+    };
+  }
+  if (input.stoppedReason === "rate_limited") {
+    return {
+      coverage_warning: true,
+      coverage_warning_message: "FunnelFox rate-limited the detail requests (HTTP 429); the next run resumes them.",
     };
   }
   if (input.stoppedReason === "api_error") {
@@ -301,6 +310,91 @@ export function needsSubscriptionDetail(columns: SubscriptionListColumns): boole
   );
 }
 
+// ---- stale detail cards (2026-10-19) -----------------------------------------
+
+/** A stored row as the list stage reads it: its card's status / renews come as
+ * text (`raw_detail->>status`, `raw_detail->>renews`). */
+export interface StoredDetailCard {
+  subscription_id: string;
+  detail_checked?: boolean | null;
+  card_status?: string | null;
+  card_renews?: string | boolean | null;
+}
+
+function flagOrNull(value: unknown): boolean | null {
+  if (value === true || value === "true") return true;
+  if (value === false || value === "false") return false;
+  return null;
+}
+
+/**
+ * The detail card is a snapshot taken at the first fetch (about the trial
+ * purchase); the list is re-crawled every day. The card is stale when the
+ * list's status or renews flag no longer matches it (2026-10-19: 2,603 of
+ * 16,725 cards, among them 1,411 cancels the card still showed as renewing).
+ * A row without a card status (never fetched, or a stored 404 body) has
+ * nothing to refresh, and an unknown value on either side is no difference.
+ */
+export function isDetailCardStale(
+  list: { status: string | null; renews: boolean | null },
+  card: Pick<StoredDetailCard, "card_status" | "card_renews">,
+): boolean {
+  const cardStatus = str(card.card_status).toLowerCase();
+  if (!cardStatus) return false;
+  const listStatus = str(list.status).toLowerCase();
+  if (listStatus && listStatus !== cardStatus) return true;
+  const cardRenews = flagOrNull(card.card_renews);
+  return list.renews != null && cardRenews != null && list.renews !== cardRenews;
+}
+
+/** Ids of a list batch whose checked card is stale: the list stage re-opens
+ * them (detail_checked = false) and the detail stage re-fetches them. New rows
+ * and rows already queued are left alone. The list is crawled once per daily
+ * cycle, so a card is re-fetched at most once a day even if FunnelFox's list
+ * and card keep disagreeing. */
+export function staleDetailCardIds(
+  listRows: Array<{ subscription_id: string; status: string | null; renews: boolean | null }>,
+  stored: StoredDetailCard[],
+): string[] {
+  const byId = new Map(stored.map((row) => [row.subscription_id, row]));
+  const ids = new Set<string>();
+  for (const row of listRows) {
+    const card = byId.get(row.subscription_id);
+    if (!card || card.detail_checked === false) continue;
+    if (isDetailCardStale(row, card)) ids.add(row.subscription_id);
+  }
+  return Array.from(ids);
+}
+
+/**
+ * The card a re-fetch stores. FunnelFox keeps the cancellation reason only
+ * while the cancel is scheduled ("User requested cancellation", renewal off)
+ * and drops it once the subscription is cancelled (2026-10-19: 582 scheduled
+ * cards carry one, 0 of 12,556 cancelled ones do). A reason the stored card
+ * had is kept when the fresh one has none — otherwise the refresh would turn
+ * a user's own cancel at the period end into "auto". Only while the fresh card
+ * still shows a cancel: a renewing card means the cancel was undone, and a
+ * later cancel must not inherit the old reason.
+ */
+export function refreshedDetailCard(fresh: JsonRecord, priorReason: string | null | undefined): JsonRecord {
+  const reason = str(priorReason);
+  const showsCancel = str(fresh.status).toLowerCase().includes("cancel") || flagOrNull(fresh.renews) === false;
+  if (!showsCancel || str(fresh.cancellation_reason) || !reason) return fresh;
+  return { ...fresh, cancellation_reason: reason, cancellation_reason_source: "previous_card" };
+}
+
+export type DetailWrite = "store_card" | "keep_card" | "retry";
+
+/** What a detail response does to the row. A 404/410 on a re-fetch keeps the
+ * stored card (it holds the email, product, funnel and reason) and only marks
+ * the row checked; a first fetch stores the body as before. Anything transient
+ * leaves the row unchecked for the next run. */
+export function detailWrite(kind: DetailOutcome, hadCard: boolean): DetailWrite {
+  if (kind === "transient_unchecked") return "retry";
+  if (kind === "gone_checked" && hadCard) return "keep_card";
+  return "store_card";
+}
+
 export function countEmailCoverage(rows: Array<{ email?: string | null; normalized_email?: string | null }>): {
   withEmail: number;
   withoutEmail: number;
@@ -417,6 +511,8 @@ export interface EnrichResult<T> {
   failed: number;
   gone: number;
   timeoutSkipped: number;
+  /** A 429 stopped the pool; the items not attempted count as timeoutSkipped. */
+  rateLimited: boolean;
   values: Array<{ id: string; ok: boolean; status: number; value: T | null }>;
 }
 
@@ -428,18 +524,19 @@ export async function enrichPool<T>(
     fetchOne: (id: string) => Promise<{ ok: boolean; status: number; value: T | null }>;
   },
 ): Promise<EnrichResult<T>> {
-  const result: EnrichResult<T> = { attempted: 0, fetched: 0, failed: 0, gone: 0, timeoutSkipped: 0, values: [] };
+  const result: EnrichResult<T> = { attempted: 0, fetched: 0, failed: 0, gone: 0, timeoutSkipped: 0, rateLimited: false, values: [] };
   let index = 0;
 
   const worker = async () => {
     while (index < items.length) {
-      if (opts.isExpired()) return;
+      if (opts.isExpired() || result.rateLimited) return;
       const current = items[index];
       index += 1;
       result.attempted += 1;
       try {
         const outcome = await opts.fetchOne(current.id);
         result.values.push({ id: current.id, ...outcome });
+        if (outcome.status === 429) result.rateLimited = true;
         const kind = detailOutcome(outcome.ok, outcome.status);
         if (kind === "checked") result.fetched += 1;
         else if (kind === "gone_checked") result.gone += 1;

@@ -7,8 +7,8 @@
 // via /profiles/{id} for large accounts. So the sync is split into four
 // RESUMABLE stages, and one invocation runs ONE stage:
 //
-//   subscriptions_list   → crawl /public/v1/subscriptions, upsert basic rows
-//   subscription_details → /subscriptions/{id} for rows missing detail (concurrency-limited)
+//   subscriptions_list   → crawl /public/v1/subscriptions, upsert basic rows, re-open stale cards
+//   subscription_details → /subscriptions/{id} for rows missing detail or with a stale card (concurrency-limited)
 //   profile_enrichment   → /profiles/{id} for rows still missing an email (deduped by profile_id)
 //   finalize             → recompute coverage counters, mark completed
 //
@@ -56,7 +56,7 @@ const UPSERT_BATCH = 500;
 // ---- pure helpers (mirror funnelfoxSubscriptionsSyncCore.ts) ---------------------------------
 
 type SyncStage = "subscriptions_list" | "subscription_details" | "profile_enrichment" | "finalize";
-type SyncStoppedReason = "completed" | "soft_timeout" | "max_pages_reached" | "api_error" | "user_cancelled" | "unknown";
+type SyncStoppedReason = "completed" | "soft_timeout" | "max_pages_reached" | "rate_limited" | "api_error" | "user_cancelled" | "unknown";
 
 interface StageCompletion {
   list_completed: boolean;
@@ -178,8 +178,9 @@ function statusFromStopReason(reason: SyncStoppedReason): "ok" | "partial" | "er
   if (reason === "api_error") return "error";
   return "partial";
 }
-function enrichStopReason(timeoutSkipped: number, apiError = false): SyncStoppedReason {
+function enrichStopReason(timeoutSkipped: number, apiError = false, rateLimited = false): SyncStoppedReason {
   if (apiError) return "api_error";
+  if (rateLimited) return "rate_limited";
   return timeoutSkipped > 0 ? "soft_timeout" : "completed";
 }
 function enrichStageComplete(timeoutSkipped: number, remainingUnchecked: number): boolean {
@@ -206,6 +207,60 @@ function detailOutcome(ok: boolean, status: number): DetailOutcome {
   if (ok) return "checked";
   if (status === 404 || status === 410) return "gone_checked";
   return "transient_unchecked";
+}
+
+// Stale detail cards (2026-10-19). The card is a snapshot from the first fetch
+// (about the trial purchase); the list is re-crawled daily. A card the list's
+// status / renews no longer matches is re-opened by the list stage and
+// re-fetched by the detail stage (2,603 of 16,725 cards were stale, 1,411 of
+// them cancels the card still showed as renewing).
+interface StoredDetailCard {
+  subscription_id: string;
+  detail_checked?: boolean | null;
+  card_status?: string | null;
+  card_renews?: string | boolean | null;
+}
+function flagOrNull(value: unknown): boolean | null {
+  if (value === true || value === "true") return true;
+  if (value === false || value === "false") return false;
+  return null;
+}
+function isDetailCardStale(list: { status: string | null; renews: boolean | null }, card: Pick<StoredDetailCard, "card_status" | "card_renews">): boolean {
+  const cardStatus = str(card.card_status).toLowerCase();
+  if (!cardStatus) return false;
+  const listStatus = str(list.status).toLowerCase();
+  if (listStatus && listStatus !== cardStatus) return true;
+  const cardRenews = flagOrNull(card.card_renews);
+  return list.renews != null && cardRenews != null && list.renews !== cardRenews;
+}
+function staleDetailCardIds(
+  listRows: Array<{ subscription_id: string; status: string | null; renews: boolean | null }>,
+  stored: StoredDetailCard[],
+): string[] {
+  const byId = new Map(stored.map((row) => [row.subscription_id, row]));
+  const ids = new Set<string>();
+  for (const row of listRows) {
+    const card = byId.get(row.subscription_id);
+    if (!card || card.detail_checked === false) continue;
+    if (isDetailCardStale(row, card)) ids.add(row.subscription_id);
+  }
+  return Array.from(ids);
+}
+// FunnelFox drops the cancellation reason once a scheduled cancel completes
+// (582 scheduled cards carry one, 0 of 12,556 cancelled ones): a re-fetch keeps
+// the stored card's reason when the fresh card has none and still shows a
+// cancel (a renewing card means the cancel was undone).
+function refreshedDetailCard(fresh: JsonRecord, priorReason: string | null | undefined): JsonRecord {
+  const reason = str(priorReason);
+  const showsCancel = str(fresh.status).toLowerCase().includes("cancel") || flagOrNull(fresh.renews) === false;
+  if (!showsCancel || str(fresh.cancellation_reason) || !reason) return fresh;
+  return { ...fresh, cancellation_reason: reason, cancellation_reason_source: "previous_card" };
+}
+type DetailWrite = "store_card" | "keep_card" | "retry";
+function detailWrite(kind: DetailOutcome, hadCard: boolean): DetailWrite {
+  if (kind === "transient_unchecked") return "retry";
+  if (kind === "gone_checked" && hadCard) return "keep_card";
+  return "store_card";
 }
 
 type ParityCheck = "pass" | "fail" | "unknown";
@@ -439,16 +494,28 @@ serveWithAccess(FUNNELFOX_SUBSCRIPTIONS_SYNC_POLICY, async ({ ctx, action, body,
         }));
       const skippedNoId = crawl.rows.length - rows.length;
 
-      let inserted = 0, updated = 0;
+      let inserted = 0, updated = 0, staleReopened = 0;
       for (let i = 0; i < rows.length; i += UPSERT_BATCH) {
         const batch = rows.slice(i, i + UPSERT_BATCH);
-        // Distinguish insert vs update by checking which ids already exist (Phase 5 report).
+        // Distinguish insert vs update by checking which ids already exist (Phase 5 report),
+        // and read their card's status / renews to find the cards the list no longer matches.
         const { data: existing } = await db.from("funnelfox_subscriptions")
-          .select("subscription_id").eq("auth_user_id", tenantKey).in("subscription_id", batch.map((b) => b.subscription_id));
-        const existingIds = new Set((existing ?? []).map((e: { subscription_id: string }) => e.subscription_id));
+          .select("subscription_id, detail_checked, card_status:raw_detail->>status, card_renews:raw_detail->>renews")
+          .eq("auth_user_id", tenantKey).in("subscription_id", batch.map((b) => b.subscription_id));
+        const stored = (existing ?? []) as StoredDetailCard[];
+        const existingIds = new Set(stored.map((e) => e.subscription_id));
         for (const b of batch) { if (existingIds.has(b.subscription_id)) updated += 1; else inserted += 1; }
         const { error } = await db.from("funnelfox_subscriptions").upsert(batch, { onConflict: "auth_user_id,subscription_id" });
         if (error) throw new Error(`subscriptions upsert failed: ${error.message}`);
+        // A stale card goes back to the detail queue (detail_checked = false, the
+        // detail_pending index); the detail stage of this cycle re-fetches it.
+        const staleIds = staleDetailCardIds(batch, stored);
+        if (staleIds.length > 0) {
+          const { error: reopenError } = await db.from("funnelfox_subscriptions").update({ detail_checked: false })
+            .eq("auth_user_id", tenantKey).in("subscription_id", staleIds);
+          if (reopenError) throw new Error(`stale detail re-open failed: ${reopenError.message}`);
+          staleReopened += staleIds.length;
+        }
       }
 
       scannedTotal += rows.length;
@@ -459,45 +526,63 @@ serveWithAccess(FUNNELFOX_SUBSCRIPTIONS_SYNC_POLICY, async ({ ctx, action, body,
       // Accumulate inserted/updated across resumable list runs (Phase 5 report).
       const priorInserted = Number(priorStats.subscriptions_inserted ?? 0);
       const priorUpdated = Number(priorStats.subscriptions_updated ?? 0);
+      // Stale cards re-opened over this daily cycle (a full reset starts it).
+      const priorStaleReopened = fullReset ? 0 : Number(priorStats.stale_details_reopened ?? 0);
       Object.assign(runStats, {
         list_pages_processed: crawl.pages,
         list_has_more_on_last_page: crawl.hasMoreOnLastPage,
         list_last_cursor: crawl.lastCursor,
         subscriptions_inserted: priorInserted + inserted,
         subscriptions_updated: priorUpdated + updated,
+        stale_details_reopened: priorStaleReopened + staleReopened,
         subscriptions_scanned_this_run: rows.length,
         subscriptions_saved_this_run: inserted + updated,
         subscriptions_skipped_no_id: skippedNoId,
       });
     } else if (stage === "subscription_details") {
-      // --- Stage 2: /subscriptions/{id} for rows missing detail (concurrency-limited) ----------
+      // --- Stage 2: /subscriptions/{id} for rows missing detail or with a stale card -------------
+      // (concurrency-limited; the list stage re-opens stale cards into the same queue)
       const { data: candidates } = await db.from("funnelfox_subscriptions")
-        .select("subscription_id, raw_list").eq("auth_user_id", tenantKey).eq("detail_checked", false).limit(ENRICH_CANDIDATE_BATCH);
+        .select("subscription_id, raw_list, prior_status:raw_detail->>status, prior_reason:raw_detail->>cancellation_reason")
+        .eq("auth_user_id", tenantKey).eq("detail_checked", false).limit(ENRICH_CANDIDATE_BATCH);
       const list = candidates ?? [];
       madeProgress = list.length > 0;
 
-      let attempted = 0, fetched = 0, failed = 0, gone = 0, shortcut = 0;
+      let attempted = 0, fetched = 0, failed = 0, gone = 0, shortcut = 0, refreshed = 0, reasonsKept = 0;
       const apiError = false;
+      let rateLimited = false;
       let index = 0;
       const worker = async () => {
         while (index < list.length) {
-          if (isExpired()) return;
-          const row = list[index] as { subscription_id: string; raw_list: JsonRecord };
+          if (isExpired() || rateLimited) return;
+          const row = list[index] as { subscription_id: string; raw_list: JsonRecord; prior_status: string | null; prior_reason: string | null };
           index += 1;
           attempted += 1;
+          // A row that already has a card was re-opened (stale card, or no email at the full reset): always re-fetch.
+          const hadCard = Boolean(str(row.prior_status));
           const columns = subscriptionColumns(readRecord(row.raw_list));
-          if (!needsSubscriptionDetail(columns)) {
+          if (!hadCard && !needsSubscriptionDetail(columns)) {
             // List row already complete — mark checked without paying for a fetch.
             shortcut += 1;
             await db.from("funnelfox_subscriptions").update({ detail_checked: true }).eq("auth_user_id", tenantKey).eq("subscription_id", row.subscription_id);
             continue;
           }
           const { ok, status, payload } = await fetchFunnelFox(`/subscriptions/${encodeURIComponent(row.subscription_id)}`, secret);
+          // A 429 stops every worker; the rest stays unchecked for the next tick.
+          if (status === 429) rateLimited = true;
           const kind = detailOutcome(ok, status);
-          if (kind === "transient_unchecked") { failed += 1; continue; }
-          const detailRaw = readRecord(readRecord(payload).data ?? payload);
-          const detailColumns = subscriptionColumns(detailRaw);
+          const write = detailWrite(kind, hadCard);
+          if (write === "retry") { failed += 1; continue; }
           if (kind === "checked") fetched += 1; else gone += 1;
+          if (write === "keep_card") {
+            await db.from("funnelfox_subscriptions").update({ detail_checked: true }).eq("auth_user_id", tenantKey).eq("subscription_id", row.subscription_id);
+            continue;
+          }
+          const freshRaw = readRecord(readRecord(payload).data ?? payload);
+          const detailRaw = hadCard ? refreshedDetailCard(freshRaw, row.prior_reason) : freshRaw;
+          if (hadCard) refreshed += 1;
+          if (detailRaw !== freshRaw) reasonsKept += 1;
+          const detailColumns = subscriptionColumns(detailRaw);
           const patch: JsonRecord = { detail_checked: true, raw_detail: detailRaw, synced_at: new Date().toISOString() };
           if (detailColumns.email) { patch.email = detailColumns.email; patch.normalized_email = detailColumns.normalized_email; }
           if (detailColumns.profile_id) patch.profile_id = detailColumns.profile_id;
@@ -519,11 +604,14 @@ serveWithAccess(FUNNELFOX_SUBSCRIPTIONS_SYNC_POLICY, async ({ ctx, action, body,
 
       const { count: remainingUnchecked } = await db.from("funnelfox_subscriptions")
         .select("*", { count: "exact", head: true }).eq("auth_user_id", tenantKey).eq("detail_checked", false);
-      stoppedReason = enrichStopReason(timeoutSkipped, apiError);
+      stoppedReason = enrichStopReason(timeoutSkipped, apiError, rateLimited);
+      // Rate-limited: stop a manual Continue loop; the 15-minute tick resumes.
+      if (rateLimited) madeProgress = false;
       completionUpdate.details_completed = enrichStageComplete(timeoutSkipped, remainingUnchecked ?? 0);
       Object.assign(runStats, {
         details_attempted: attempted, details_fetched: fetched, details_failed: failed,
         details_gone: gone, details_shortcut_complete: shortcut, details_timeout_skipped: timeoutSkipped,
+        details_refreshed: refreshed, details_reason_kept: reasonsKept, details_rate_limited: rateLimited,
         remaining_detail_unchecked: remainingUnchecked ?? 0,
       });
     } else if (stage === "profile_enrichment") {
@@ -637,13 +725,15 @@ serveWithAccess(FUNNELFOX_SUBSCRIPTIONS_SYNC_POLICY, async ({ ctx, action, body,
           ? "Sync stopped because max_pages was reached. Click Continue Sync."
           : stoppedReason === "soft_timeout"
             ? "Sync stopped at the soft time budget. Click Continue Sync to resume from the last cursor."
-            : stoppedReason === "api_error"
-              ? "Sync stopped because the FunnelFox API returned an error before finishing."
-              : (pendingDetails ?? 0) > 0
-                ? "Subscription details are incomplete. Click Continue Sync."
-                : (pendingProfiles ?? 0) > 0
-                  ? "Email enrichment is incomplete. Click Continue Sync."
-                  : `${missingEmail} subscriptions still have no email after enrichment.`;
+            : stoppedReason === "rate_limited"
+              ? "FunnelFox rate-limited the detail requests (HTTP 429); the next run resumes them."
+              : stoppedReason === "api_error"
+                ? "Sync stopped because the FunnelFox API returned an error before finishing."
+                : (pendingDetails ?? 0) > 0
+                  ? "Subscription details are incomplete. Click Continue Sync."
+                  : (pendingProfiles ?? 0) > 0
+                    ? "Email enrichment is incomplete. Click Continue Sync."
+                    : `${missingEmail} subscriptions still have no email after enrichment.`;
 
     const stats: JsonRecord = {
       ...priorStats,

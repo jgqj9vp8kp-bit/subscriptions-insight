@@ -77,6 +77,20 @@ describe("fact_subscriptions rows", () => {
     expect(fromDetail).toMatchObject({ status: "active", renews: 1 });
   });
 
+  it("a re-fetched card dates the cancel from itself and keeps the stored reason", () => {
+    // Before the re-fetch: the card from the purchase still renews, so the list's updated_at dates the cancel.
+    const stale = normalizeSubscriptionForClickHouse(source({
+      detail_cancelled_at: null, detail_cancellation_reason: null, detail_status: "trialing", detail_renews: "true",
+    }))!;
+    expect(stale).toMatchObject({ cancelled_at: "2026-10-12T08:00:00.000", cancellation_reason: "" });
+    // After it: the fresh card shows the cancel; the reason FunnelFox dropped was kept by the sync.
+    const refreshed = normalizeSubscriptionForClickHouse(source({
+      detail_cancelled_at: null, detail_status: "cancelled", detail_renews: "false",
+      detail_updated_at: "2026-10-12T07:59:00Z", detail_cancellation_reason: "User requested cancellation",
+    }))!;
+    expect(refreshed).toMatchObject({ status: "cancelled", renews: 0, cancelled_at: "2026-10-12T07:59:00.000", cancellation_reason: "User requested cancellation" });
+  });
+
   it("adds the reason and start columns at the tail of the table", () => {
     expect(CREATE_FACT_SUBSCRIPTIONS_SQL.trim().endsWith("row_version UInt64,\n    cancellation_reason String DEFAULT '',\n    started_at Nullable(DateTime64(3, 'UTC'))\n)\nENGINE = ReplacingMergeTree(row_version)\nORDER BY (auth_user_id, subscription_id)")).toBe(true);
     expect(ALTER_FACT_SUBSCRIPTIONS_COLUMNS_SQL.slice(-2)).toEqual([

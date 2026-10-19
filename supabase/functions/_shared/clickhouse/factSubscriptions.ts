@@ -178,13 +178,16 @@ function flag(value: unknown): boolean | null {
 // same rules as normalizeSubscription (subscriptionTransform.ts): cancelled =
 // status contains "cancel" OR renews = false; the cancel time is the FunnelFox
 // cancelled_at, else updated_at for a cancelled subscription.
-// The detail card (raw_detail) is fetched once, about the trial purchase, and
-// never refreshed (2026-10-19: every card of the Oct 7-14 palm-reading-month-web
-// cohort still says "trialing"). Its updated_at is the cancel time only when the
-// card already shows the cancel (renewal off or a cancel status); a subscription
-// cancelled after the card was taken uses the list's updated_at, which every
-// sync refreshes — otherwise the cancel lands at the purchase and a declined
-// first charge three days later never falls in the 48 h window. Sandbox (test)
+// The detail card (raw_detail) is first fetched about the trial purchase; since
+// 2026-10-19 the sync re-fetches it once the list's status / renews no longer
+// match it (funnelfox-subscriptions-sync, stale cards), before finalize runs
+// this. A re-fetched card keeps the stored cancellation reason when FunnelFox
+// drops it on the final cancel. Its updated_at is the cancel time only when the
+// card already shows the cancel (renewal off or a cancel status); a card still
+// taken before the cancel (re-fetch pending or failed) falls back to the list's
+// updated_at, which every sync refreshes — otherwise the cancel lands at the
+// purchase and a declined first charge three days later never falls in the
+// 48 h window. Sandbox (test)
 // subscriptions are skipped (null), like the active-subscription overlay. The
 // raw email is never stored — joins use normalized_email. row_version is the
 // sync run's version when given (a full refresh supersedes every older row),

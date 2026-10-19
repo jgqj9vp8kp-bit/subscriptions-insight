@@ -455,7 +455,7 @@ Engines:
 `fact_subscriptions` now has a writer: `factSubscriptionsSync.ts`, called at the end of the FunnelFox subscriptions sync (finalize stage, best-effort).
 - It does a full tenant refresh. Every row carries the run version, older rows are deleted afterwards, and nothing is deleted after an empty read.
 - The cancel date and reason come from `raw_detail` (`cancelled_at`, `cancellation_reason`), because the `cancelled_at` column was never filled. The fallback is `updated_at` for a cancelled subscription, as in `normalizeSubscription`.
-- `raw_detail` is a card fetched once, about the purchase, and never refreshed. FunnelFox gives no `cancelled_at` in it, so the fallback decides the cancel date. Since 2026-10-19 the card's `updated_at` is used only when the card already shows the cancel (renewal off, or a cancel status). Otherwise the list's `updated_at` is used, which every sync refreshes.
+- `raw_detail` is a card first fetched about the purchase; since 2026-10-19 the sync re-fetches it when the list no longer matches it (see "Stale detail cards" below). FunnelFox gives no `cancelled_at` in it, so the fallback decides the cancel date. Since 2026-10-19 the card's `updated_at` is used only when the card already shows the cancel (renewal off, or a cancel status). Otherwise the list's `updated_at` is used, which every sync refreshes.
   - Before the fix, a subscription cancelled after its card was taken got a cancel date at the purchase. A declined first charge three days later then fell outside the 48 h window.
   - Example: the palm-reading-month-web cohort of Oct 7–14 showed 192 user / 0 auto cancels. With the fix, about 117 / 75.
   - The fix moves 1,410 of 14,545 cancelled subscriptions, by about 10.7 days on average.
@@ -706,6 +706,53 @@ dead: `empty_source`, 0 active for every recent cohort):
   ~1,000-details-per-run budget chase 14.6k rows daily and never finish.
 - `campaign_path`/`funnel` come from the DETAIL's `funnel.alias` (byte-identical
   to campaign_path elsewhere); nothing else writes them.
+- Stale detail cards are re-fetched (2026-10-19), see below.
+
+### Stale detail cards (2026-10-19)
+
+The detail card (`raw_detail`) used to be fetched once, about the trial
+purchase, and never again. On 2026-10-19, 2,603 of 16,725 cards no longer
+matched the list: 1,411 cancels still showed renewal on, 566 converted trials
+still said "trialing". The cancellation reason of those cancels was unknown.
+
+How it works now:
+- The list stage reads each existing row's card status / renews
+  (`raw_detail->>status`, `raw_detail->>renews`) in the query it already makes
+  per upsert batch. A checked row whose list status or renews differs from its
+  card (`isDetailCardStale` / `staleDetailCardIds`) goes back to the detail
+  queue: `detail_checked = false`, the same `detail_pending` partial index.
+  Stat: `stale_details_reopened` (per daily cycle).
+- The detail stage always re-fetches a row that already has a card (no
+  list-row shortcut). Stats: `details_refreshed`, `details_reason_kept`.
+- Nothing to compare is never stale: a row without a card status (never
+  fetched, or a stored 404 body) or an unknown list value.
+- The list is crawled once per daily cycle, so a card is re-fetched at most
+  once a day, even if FunnelFox's list and card keep disagreeing.
+- Rate limits: the re-fetches share the detail stage's pool (5 at a time,
+  2,000 candidates and a 50 s budget per run). A 429 now stops the pool; the
+  run ends `rate_limited` (status partial, `made_progress` false so a manual
+  Continue loop stops) and the 15-minute tick resumes. The first cycle after
+  the deploy re-fetches the ~2.6k backlog in about three ticks.
+- A 404/410 on a re-fetch keeps the stored card and only marks the row checked
+  (`detailWrite`); a first fetch stores the body as before.
+- FunnelFox keeps `cancellation_reason` only while a cancel is scheduled
+  (renewal off, status still trialing / active): 582 such cards carry "User
+  requested cancellation", 0 of 12,556 cancelled cards carry any reason. A
+  re-fetch keeps the stored reason when the fresh card has none and still
+  shows a cancel (`refreshedDetailCard`, marked
+  `cancellation_reason_source: "previous_card"` inside `raw_detail`). A
+  renewing card means the cancel was undone, so its old reason is dropped. Without that, the refresh would turn the users' own
+  cancels at the period end into "auto" (528 stale cards with a reason today).
+- The cancel date of a re-fetched cancel comes from the fresh card, like the
+  other cancelled cards: its `cancelled_at` when filled, else its `updated_at`.
+  Every cancelled card carries a `cancelled_at` key; whether it holds the
+  request or the final cancel was not checked. If it is the final cancel, a
+  user who scheduled the cancel during the trial moves from the request day to
+  the period end. The classification does not change (the reason wins), but
+  Dashboard per-day cancellations would.
+- `normalizeSubscriptionForClickHouse` is unchanged: finalize runs after the
+  detail stage, so the cards it reads are fresh. The list `updated_at`
+  fallback still covers a card whose re-fetch is pending or failed.
 - An `api_error` stop persists its diagnostic into `last_error`.
 - Downstream: the Cohorts overlay reads the RPC `active_funnelfox_subscription_emails`
   (Supabase columns: normalized_email/renews/status/period_ends_at, sandbox from
