@@ -455,7 +455,7 @@ Engines:
 `fact_subscriptions` now has a writer: `factSubscriptionsSync.ts`, called at the end of the FunnelFox subscriptions sync (finalize stage, best-effort).
 - It does a full tenant refresh. Every row carries the run version, older rows are deleted afterwards, and nothing is deleted after an empty read.
 - The cancel date and reason come from `raw_detail` (`cancelled_at`, `cancellation_reason`), because the `cancelled_at` column was never filled. The fallback is `updated_at` for a cancelled subscription, as in `normalizeSubscription`.
-- `raw_detail` is a card first fetched about the purchase; since 2026-10-19 the sync re-fetches it when the list no longer matches it (see "Stale detail cards" below). FunnelFox gives no `cancelled_at` in it, so the fallback decides the cancel date. Since 2026-10-19 the card's `updated_at` is used only when the card already shows the cancel (renewal off, or a cancel status). Otherwise the list's `updated_at` is used, which every sync refreshes.
+- `raw_detail` is a card first fetched about the purchase; since 2026-10-19 the sync re-fetches it when the list no longer matches it (see "Stale detail cards" below). A card taken after the cancel has `cancelled_at` (all 12,556 cancelled cards; the moment the status turned "cancelled", equal to the card's `updated_at` in 12,529); a card taken before it has none, so the fallback decides the cancel date. Since 2026-10-19 the card's `updated_at` is used only when the card already shows the cancel (renewal off, or a cancel status). Otherwise the list's `updated_at` is used, which every sync refreshes.
   - Before the fix, a subscription cancelled after its card was taken got a cancel date at the purchase. A declined first charge three days later then fell outside the 48 h window.
   - Example: the palm-reading-month-web cohort of Oct 7–14 showed 192 user / 0 auto cancels. With the fix, about 117 / 75.
   - The fix moves 1,410 of 14,545 cancelled subscriptions, by about 10.7 days on average.
@@ -741,15 +741,17 @@ How it works now:
   re-fetch keeps the stored reason when the fresh card has none and still
   shows a cancel (`refreshedDetailCard`, marked
   `cancellation_reason_source: "previous_card"` inside `raw_detail`). A
-  renewing card means the cancel was undone, so its old reason is dropped. Without that, the refresh would turn the users' own
-  cancels at the period end into "auto" (528 stale cards with a reason today).
+  renewing card means the cancel was undone, so its old reason is dropped.
+  Without the carry, the refresh would turn the users' own cancels into
+  "auto": of the 528 stale cards with a reason, 210 end exactly at the period
+  end (±1 h), 318 shortly before it.
 - The cancel date of a re-fetched cancel comes from the fresh card, like the
-  other cancelled cards: its `cancelled_at` when filled, else its `updated_at`.
-  Every cancelled card carries a `cancelled_at` key; whether it holds the
-  request or the final cancel was not checked. If it is the final cancel, a
-  user who scheduled the cancel during the trial moves from the request day to
-  the period end. The classification does not change (the reason wins), but
-  Dashboard per-day cancellations would.
+  other cancelled cards: its `cancelled_at`, which is the moment the status
+  turned "cancelled" (equal to the card's `updated_at` in 12,529 of 12,556),
+  not the moment the user asked. For a cancel scheduled during the trial the
+  date moves from the request to the final cancel, a median of ~70 h later
+  (the 528 above). The classification does not change (the reason wins), but
+  Dashboard per-day cancellations do.
 - `normalizeSubscriptionForClickHouse` is unchanged: finalize runs after the
   detail stage, so the cards it reads are fresh. The list `updated_at`
   fallback still covers a card whose re-fetch is pending or failed.
