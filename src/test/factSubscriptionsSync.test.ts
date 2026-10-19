@@ -26,6 +26,7 @@ const source = (over: Record<string, unknown> = {}) => ({
   price: "29.99",
   currency: "usd",
   updated_at: "2026-10-12T08:00:00Z",
+  created_at: "2026-10-07T09:00:00Z",
   detail_cancelled_at: "2026-10-10T09:30:00Z",
   detail_cancellation_reason: "User requested cancellation",
   detail_sandbox: "false",
@@ -44,9 +45,12 @@ describe("fact_subscriptions rows", () => {
       cancelled_at: "2026-10-10T09:30:00.000",
       period_ends_at: "2026-10-20T10:00:00.000",
       cancellation_reason: "User requested cancellation",
+      started_at: "2026-10-07T09:00:00.000",
       currency: "USD",
       row_version: "1700000000000",
     });
+    expect(normalizeSubscriptionForClickHouse(source({ detail_created_at: "2026-10-07T08:59:00Z" }))!.started_at).toBe("2026-10-07T08:59:00.000");
+    expect(normalizeSubscriptionForClickHouse(source({ created_at: null }))!.started_at).toBeNull();
     expect(normalizeSubscriptionForClickHouse(source({ detail_sandbox: "true" }))).toBeNull();
     expect(normalizeSubscriptionForClickHouse(source({ subscription_id: "" }))).toBeNull();
   });
@@ -61,9 +65,12 @@ describe("fact_subscriptions rows", () => {
     expect(fromDetail).toMatchObject({ status: "active", renews: 1 });
   });
 
-  it("adds the reason column at the tail of the table", () => {
-    expect(CREATE_FACT_SUBSCRIPTIONS_SQL.trim().endsWith("row_version UInt64,\n    cancellation_reason String DEFAULT ''\n)\nENGINE = ReplacingMergeTree(row_version)\nORDER BY (auth_user_id, subscription_id)")).toBe(true);
-    expect(ALTER_FACT_SUBSCRIPTIONS_COLUMNS_SQL.at(-1)).toBe("ALTER TABLE fact_subscriptions ADD COLUMN IF NOT EXISTS cancellation_reason String DEFAULT ''");
+  it("adds the reason and start columns at the tail of the table", () => {
+    expect(CREATE_FACT_SUBSCRIPTIONS_SQL.trim().endsWith("row_version UInt64,\n    cancellation_reason String DEFAULT '',\n    started_at Nullable(DateTime64(3, 'UTC'))\n)\nENGINE = ReplacingMergeTree(row_version)\nORDER BY (auth_user_id, subscription_id)")).toBe(true);
+    expect(ALTER_FACT_SUBSCRIPTIONS_COLUMNS_SQL.slice(-2)).toEqual([
+      "ALTER TABLE fact_subscriptions ADD COLUMN IF NOT EXISTS cancellation_reason String DEFAULT ''",
+      "ALTER TABLE fact_subscriptions ADD COLUMN IF NOT EXISTS started_at Nullable(DateTime64(3, 'UTC'))",
+    ]);
     // Key / version columns are never re-asserted (an ALTER cannot change them).
     expect(ALTER_FACT_SUBSCRIPTIONS_COLUMNS_SQL.join(" ")).not.toMatch(/IF NOT EXISTS (auth_user_id|subscription_id|row_version) /);
     expect(ALTER_FACT_SUBSCRIPTIONS_COLUMNS_SQL).toContain("ALTER TABLE fact_subscriptions ADD COLUMN IF NOT EXISTS normalized_email String DEFAULT ''");

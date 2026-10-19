@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS ${FACT_SUBSCRIPTIONS_TABLE}
     currency String,
     synced_at DateTime64(3, 'UTC') DEFAULT now64(3),
     row_version UInt64,
-    cancellation_reason String DEFAULT ''
+    cancellation_reason String DEFAULT '',
+    started_at Nullable(DateTime64(3, 'UTC'))
 )
 ENGINE = ReplacingMergeTree(row_version)
 ORDER BY (auth_user_id, subscription_id)
@@ -58,6 +59,7 @@ const FACT_SUBSCRIPTIONS_TAIL_COLUMNS: ReadonlyArray<readonly [string, string]> 
   ["currency", "String DEFAULT ''"],
   ["synced_at", "DateTime64(3, 'UTC') DEFAULT now64(3)"],
   ["cancellation_reason", "String DEFAULT ''"],
+  ["started_at", "Nullable(DateTime64(3, 'UTC'))"],
 ];
 export const ALTER_FACT_SUBSCRIPTIONS_COLUMNS_SQL: readonly string[] = FACT_SUBSCRIPTIONS_TAIL_COLUMNS.map(
   ([name, type]) => `ALTER TABLE ${FACT_SUBSCRIPTIONS_TABLE} ADD COLUMN IF NOT EXISTS ${name} ${type}`,
@@ -110,18 +112,21 @@ export interface FactSubscriptionRow {
   currency: string;
   row_version: string;
   cancellation_reason: string;
+  /** Subscription start (the trial purchase) — bounds the cancellation decline window. */
+  started_at: string | null;
 }
 
 // Columns to read from Supabase public.funnelfox_subscriptions (durable source of
 // truth). Raw payloads are never read whole — only the FunnelFox detail fields
 // the columns lack: the cancel date and reason (the cancelled_at COLUMN is empty
 // on production: the sync never filled it), the sandbox flag and the fallbacks
-// normalizeSubscription (subscriptionTransform.ts) uses.
+// normalizeSubscription (subscriptionTransform.ts) uses. created_at is the
+// FunnelFox subscription start (= period_starts_at of the first period).
 export const FUNNELFOX_SUBSCRIPTION_SYNC_SELECT =
-  "auth_user_id,subscription_id,profile_id,psp_id,normalized_email,funnel,campaign_path,status,renews,cancelled_at,period_ends_at,product_name,product_id,price,currency,updated_at," +
+  "auth_user_id,subscription_id,profile_id,psp_id,normalized_email,funnel,campaign_path,status,renews,cancelled_at,period_ends_at,product_name,product_id,price,currency,updated_at,created_at," +
   "detail_cancelled_at:raw_detail->>cancelled_at,detail_cancellation_reason:raw_detail->>cancellation_reason," +
   "detail_sandbox:raw_detail->>sandbox,detail_updated_at:raw_detail->>updated_at,detail_period_ends_at:raw_detail->>period_ends_at," +
-  "detail_status:raw_detail->>status,detail_renews:raw_detail->>renews";
+  "detail_status:raw_detail->>status,detail_renews:raw_detail->>renews,detail_created_at:raw_detail->>created_at";
 
 export interface SupabaseSubscriptionSourceRow {
   auth_user_id?: string | null;
@@ -141,6 +146,7 @@ export interface SupabaseSubscriptionSourceRow {
   price?: number | string | null;
   currency?: string | null;
   updated_at?: string | null;
+  created_at?: string | null;
   detail_cancelled_at?: string | null;
   detail_cancellation_reason?: string | null;
   detail_sandbox?: string | boolean | null;
@@ -148,6 +154,7 @@ export interface SupabaseSubscriptionSourceRow {
   detail_period_ends_at?: string | null;
   detail_status?: string | null;
   detail_renews?: string | boolean | null;
+  detail_created_at?: string | null;
 }
 
 function text(value: unknown): string {
@@ -205,6 +212,7 @@ export function normalizeSubscriptionForClickHouse(row: SupabaseSubscriptionSour
     currency: text(row.currency).toUpperCase(),
     row_version: runVersion != null ? String(runVersion) : Number.isFinite(updatedMs) ? String(updatedMs) : "0",
     cancellation_reason: text(row.detail_cancellation_reason),
+    started_at: dateTimeOrNull(text(row.detail_created_at) || text(row.created_at)),
   };
 }
 
