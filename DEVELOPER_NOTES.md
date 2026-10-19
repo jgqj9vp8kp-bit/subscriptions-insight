@@ -460,17 +460,21 @@ Engines:
 
 `cohortCancellations.ts` turns the subscriptions into per-email flags (CTEs `csub` / `cauto` / `cflags`). The measures read them by `IN (SELECT sub_email FROM cflags …)` over `u_normalized_email`, like `support_users`.
 
-The rule is the legacy client engine's, per subscription:
-1. A failed transaction within 48 h before the cancel → auto.
-2. FunnelFox reason "User requested cancellation" → user. This is the one deliberate difference from the legacy engine: an explicit user action wins over a period-end match.
+The rule started as the legacy client engine's. Since 2026-10-19 (owner decision) it is, per subscription:
+1. FunnelFox reason "User requested cancellation" → user, always, even after a declined charge.
+2. A failed transaction within 48 h before the cancel → auto, unless it belongs to the checkout: declines before the subscription start or in its first 2 h (`CANCELLATION_PURCHASE_WINDOW_MS`) do not count.
 3. Cancelled at or after the period end → auto.
 4. Otherwise → user.
 
-Per member, the precedence is: auto (failed) > user > auto (period end).
+Per member, the precedence is: user reason > auto (failed) > user > auto (period end).
+
+Why the checkout bound: with a 3-day trial the 48 h window covered most of the trial, so an upsell declined right after the purchase turned a user's own cancel into "auto". Data for July–October 2026: checkout declines land before the start or in its first 2 h, period charges 60 h or more after it, with almost nothing between. `period_ends_at` cannot serve as the bound: for a paid trial on a monthly plan, FunnelFox shows the period end at day 14 while the first charge runs at day 7. The subscription start is `fact_subscriptions.started_at` (FunnelFox `created_at`, added 2026-10-19). A row without it keeps the plain 48 h window. The legacy client engine (`cohortAnalytics.ts`) still uses the old rule.
+
+Measured on September 2026 cohorts (Postgres approximation): user 899 → 1,029, auto 652 → 522. The reason rule alone moves about 50 users; the checkout bound moves about 80 more.
 
 Restricted members read through `subscriptionsFrom(scope)` (`SUB_COLS`, no raw email). Rows ship synthetic cohort-scoped ids so the Total / Funnels id-set counts add up. The Users page subscription status (`users.ts`) reads the same table.
 
-Rollout order: deploy the sync first, run it (finalize), then deploy the cohort SQL. Otherwise the cohort query references `cancellation_reason` before the column exists.
+Rollout order: deploy the sync first, run it (finalize), then deploy the cohort SQL. Otherwise the cohort query references `cancellation_reason` before the column exists. The 2026-10-19 change follows the same order for `started_at`.
 
 ## Cohorts: shared views (2026-10-18)
 

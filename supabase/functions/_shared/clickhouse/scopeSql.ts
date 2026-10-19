@@ -95,7 +95,7 @@ export const FB_COLS: readonly string[] = Object.freeze([
  * cancellation flags read (cohortCancellations.ts) — never the raw email. */
 export const SUB_COLS: readonly string[] = Object.freeze([
   "auth_user_id", "subscription_id", "normalized_email", "status", "renews", "cancelled_at", "period_ends_at",
-  "cancellation_reason", "row_version",
+  "cancellation_reason", "started_at", "row_version",
 ]);
 
 /** Built by campaignScope.ts inside the snapshot rebuild (spec §3.7). */
