@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   COHORT_DECLINE_GROUPS,
+  DECLINE_CHECKOUT_WINDOW_MS,
   DECLINE_STAGES,
   DEFAULT_DECLINE_STAGE,
   declineGroupField,
@@ -46,9 +47,38 @@ describe("cohort payment-failure metrics", () => {
     expect(sql).toContain("uniqExactIf(uid, statusType = 'failed_payment' AND pre_lvl = 1 AND dr IN ('insufficient_funds')) decline_insufficient_funds_users_first_sub");
     expect(sql).toContain("uniqExactIf(uid, statusType = 'failed_payment' AND pre_lvl >= 2 AND dr IN ('insufficient_funds')) decline_insufficient_funds_users_renewal");
     expect(sql).toContain("uniqExactIf(uid, statusType = 'failed_payment' AND dr IN ('insufficient_funds')) decline_insufficient_funds_users_all");
-    expect(COHORT_PAYMENT_FAILURE_FIELDS).toHaveLength(4 + COHORT_DECLINE_GROUPS.length * DECLINE_STAGES.length);
-    expect(DECLINE_STAGES.map((entry) => entry.stage)).toEqual(["trial", "first_sub", "renewal", "all"]);
+    expect(COHORT_PAYMENT_FAILURE_FIELDS).toHaveLength(6 + COHORT_DECLINE_GROUPS.length * DECLINE_STAGES.length);
+    expect(DECLINE_STAGES.map((entry) => entry.stage)).toEqual(["trial", "checkout", "first_charge", "first_sub", "renewal", "all"]);
     expect(DEFAULT_DECLINE_STAGE).toBe("trial");
+  });
+
+  it("splits the after-trial stage at the trial purchase + 2 h: checkout vs the first charge", () => {
+    const sql = paymentFailureMeasuresSQL();
+    const measures = sql.split(",\n  ");
+    const measureOf = (field: string) => measures.find((measure) => measure.endsWith(` ${field}`)) ?? "";
+    expect(DECLINE_CHECKOUT_WINDOW_MS).toBe(7_200_000);
+    expect(measureOf("failed_at_checkout_users")).toBe(
+      "uniqExactIf(uid, statusType = 'failed_payment' AND pre_lvl = 0 AND ets < trial_ts + 7200000) failed_at_checkout_users",
+    );
+    expect(measureOf("failed_first_charge_users")).toBe(
+      "uniqExactIf(uid, statusType = 'failed_payment' AND pre_lvl = 0 AND ets >= trial_ts + 7200000) failed_first_charge_users",
+    );
+    for (const group of COHORT_DECLINE_GROUPS) {
+      expect(measureOf(declineGroupField(group.column, "checkout"))).toContain("AND pre_lvl = 0 AND ets < trial_ts + 7200000 AND dr ");
+      expect(measureOf(declineGroupField(group.column, "first_charge"))).toContain("AND pre_lvl = 0 AND ets >= trial_ts + 7200000 AND dr ");
+    }
+    expect(declineGroupField("decline_fraud_users", "checkout")).toBe("decline_fraud_users_checkout");
+    expect(declineGroupField("decline_fraud_users", "first_charge")).toBe("decline_fraud_users_first_charge");
+    // Both engines' finx rows carry the row and trial times the split reads.
+    const request = { action: "list" as const, filters: {} };
+    for (const query of [
+      buildMaterializedCohortListQuery(request, { warehouse_version: "wh_1", classification_version: "cv_1" }, { auth_user_id: "u" }),
+      buildListQuery(normalizeCohortRequest(request), { auth_user_id: "u" }),
+    ]) {
+      const finx = query.slice(query.indexOf("finx AS ("));
+      expect(finx).toMatch(/SELECT [^\n]*\bets\b[^\n]*\btrial_ts\b/);
+      expect(query).toContain("failed_at_checkout_users");
+    }
   });
 
   it("projects a row onto the chosen stage for every reason column", () => {
@@ -60,6 +90,10 @@ describe("cohort payment-failure metrics", () => {
     expect(projectDeclineStage(row, "trial")).toBe(row);
     expect(projectDeclineStage(row, "first_sub")).toMatchObject({ trial_users: 10, decline_fraud_users: 1 });
     expect(projectDeclineStage(row, "all").decline_fraud_users).toBe(5);
+    expect(projectDeclineStage({ ...row, decline_fraud_users_checkout: 3, decline_fraud_users_first_charge: 2 }, "checkout").decline_fraud_users).toBe(3);
+    expect(projectDeclineStage({ ...row, decline_fraud_users_checkout: 3, decline_fraud_users_first_charge: 2 }, "first_charge").decline_fraud_users).toBe(2);
+    expect(isDeclineStage("checkout")).toBe(true);
+    expect(isDeclineStage("first_charge")).toBe(true);
     // A stage the row does not carry (older cache) leaves the column absent → "—".
     expect("decline_insufficient_funds_users" in projectDeclineStage(row, "renewal")).toBe(false);
     expect(row.decline_fraud_users).toBe(4);

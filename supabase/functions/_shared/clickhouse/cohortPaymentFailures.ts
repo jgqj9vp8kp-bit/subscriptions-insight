@@ -14,13 +14,20 @@
 // The reason groups are computed for every stage (DECLINE_STAGES) and the page
 // shows one stage at a time (a switch, default "after trial" — owner decision
 // 2026-10-19), so switching never refetches.
+// "After trial" splits by moment (owner decision 2026-10-19): "at checkout" =
+// declined within 2 h after the trial purchase (mostly an upsell declined
+// right after the $1 trial), "first charge" = later (the first subscription
+// charge at the trial end and its retries). Rows before the purchase never
+// reach these CTEs (d >= 0), so a first card declined just before the trial
+// is not counted. Data 2026-10 (azora-astro.com, Oct 1-14): checkout declines
+// land in the first 2 h, first charges 60 h+ after the purchase.
 // Counts are distinct cohort users. A user with declines of several groups is
 // counted in each group — as Decline Analytics counts users per reason — so the
 // groups can add up to more than the stage's failed users.
 //
-// The cohort CTEs expose `dr` (reason of a failed row, '' otherwise) and
-// `pre_lvl` on every finx row (cohorts.ts emailTokenSQL,
-// cohortMembership.ts materializedFinxCtes).
+// The cohort CTEs expose `dr` (reason of a failed row, '' otherwise),
+// `pre_lvl`, and the row / trial times `ets` / `trial_ts` (epoch ms) on every
+// finx row (cohorts.ts emailTokenSQL, cohortMembership.ts materializedFinxCtes).
 
 export type DeclineGroupColumn =
   | "decline_insufficient_funds_users"
@@ -31,10 +38,17 @@ export type DeclineGroupColumn =
   | "decline_card_lost_users"
   | "decline_other_users";
 
-export type DeclineStage = "trial" | "first_sub" | "renewal" | "all";
+export type DeclineStage = "trial" | "checkout" | "first_charge" | "first_sub" | "renewal" | "all";
 
 /** Field suffix per stage: "after trial" keeps the bare column name. */
-const STAGE_SUFFIX = { trial: "", first_sub: "_first_sub", renewal: "_renewal", all: "_all" } as const;
+const STAGE_SUFFIX = {
+  trial: "",
+  checkout: "_checkout",
+  first_charge: "_first_charge",
+  first_sub: "_first_sub",
+  renewal: "_renewal",
+  all: "_all",
+} as const;
 type DeclineStageSuffix = (typeof STAGE_SUFFIX)[DeclineStage];
 
 export type DeclineGroupField = `${DeclineGroupColumn}${DeclineStageSuffix}`;
@@ -42,6 +56,8 @@ export type DeclineGroupField = `${DeclineGroupColumn}${DeclineStageSuffix}`;
 export type CohortPaymentFailureField =
   | "failed_payment_users"
   | "failed_after_trial_users"
+  | "failed_at_checkout_users"
+  | "failed_first_charge_users"
   | "failed_after_first_subscription_users"
   | "failed_after_renewal_users"
   | DeclineGroupField;
@@ -65,9 +81,18 @@ export const COHORT_DECLINE_GROUPS: readonly CohortDeclineGroup[] = Object.freez
   { column: "decline_other_users", label: "Other Decline", reasons: null },
 ]);
 
-/** Stages the reason groups are split by, in switch order (labels for the page). */
+/** Declines up to this long after the trial purchase belong to the checkout —
+ * the same 2 h bound as the cancellation rule (cohortCancellations.ts). */
+export const DECLINE_CHECKOUT_WINDOW_MS = 2 * 60 * 60 * 1000;
+const AT_CHECKOUT = `pre_lvl = 0 AND ets < trial_ts + ${DECLINE_CHECKOUT_WINDOW_MS}`;
+const AFTER_CHECKOUT = `pre_lvl = 0 AND ets >= trial_ts + ${DECLINE_CHECKOUT_WINDOW_MS}`;
+
+/** Stages the reason groups are split by, in switch order (labels for the page).
+ * "At checkout" + "First charge" = "After trial" (a user can be in both). */
 export const DECLINE_STAGES: ReadonlyArray<{ stage: DeclineStage; label: string; condition: string | null }> = Object.freeze([
   { stage: "trial", label: "After trial", condition: "pre_lvl = 0" },
+  { stage: "checkout", label: "At checkout", condition: AT_CHECKOUT },
+  { stage: "first_charge", label: "First charge", condition: AFTER_CHECKOUT },
   { stage: "first_sub", label: "After first sub", condition: "pre_lvl = 1" },
   { stage: "renewal", label: "After renewal", condition: "pre_lvl >= 2" },
   { stage: "all", label: "All stages", condition: null },
@@ -87,6 +112,8 @@ export function declineGroupField(column: DeclineGroupColumn, stage: DeclineStag
 export const COHORT_PAYMENT_FAILURE_FIELDS: readonly CohortPaymentFailureField[] = Object.freeze([
   "failed_payment_users",
   "failed_after_trial_users",
+  "failed_at_checkout_users",
+  "failed_first_charge_users",
   "failed_after_first_subscription_users",
   "failed_after_renewal_users",
   ...DECLINE_STAGES.flatMap(({ stage }) => COHORT_DECLINE_GROUPS.map((group) => declineGroupField(group.column, stage))),
@@ -98,12 +125,14 @@ function sqlList(values: readonly string[]): string {
   return values.map((value) => `'${value.replace(/'/g, "''")}'`).join(", ");
 }
 
-/** Measures appended to AGGREGATE_MEASURES (finx columns uid/statusType/dr/pre_lvl). */
+/** Measures appended to AGGREGATE_MEASURES (finx columns uid/statusType/dr/pre_lvl/ets/trial_ts). */
 export function paymentFailureMeasuresSQL(): string {
   const listed = COHORT_DECLINE_GROUPS.flatMap((group) => group.reasons ?? []);
   return [
     `uniqExactIf(uid, ${FAILED}) failed_payment_users`,
     `uniqExactIf(uid, ${FAILED} AND pre_lvl = 0) failed_after_trial_users`,
+    `uniqExactIf(uid, ${FAILED} AND ${AT_CHECKOUT}) failed_at_checkout_users`,
+    `uniqExactIf(uid, ${FAILED} AND ${AFTER_CHECKOUT}) failed_first_charge_users`,
     `uniqExactIf(uid, ${FAILED} AND pre_lvl = 1) failed_after_first_subscription_users`,
     `uniqExactIf(uid, ${FAILED} AND pre_lvl >= 2) failed_after_renewal_users`,
     ...DECLINE_STAGES.flatMap(({ stage, condition }) =>

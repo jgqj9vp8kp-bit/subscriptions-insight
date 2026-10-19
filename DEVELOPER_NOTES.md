@@ -440,7 +440,11 @@ The declined-charge columns (`cohortPaymentFailures.ts`, hidden by default) reus
 - Reason = the stored normalized `decline_reason`, grouped into 7 columns (Insufficient Funds, Fraud, Card Not Supported, Do Not Honor / Generic, 3DS, Card Lost / Stolen / Expired, Other).
 - The reason groups are split by stage (2026-10-19). The server returns every stage, `DECLINE_STAGES`:
   - the bare column = after trial;
-  - `_first_sub`, `_renewal` and `_all` = the other stages.
+  - `_first_sub`, `_renewal` and `_all` = the other stages;
+  - `_checkout` and `_first_charge` split "after trial" by moment (2026-10-19). "At checkout" = declined within 2 h after the trial purchase (`ets < trial_ts + DECLINE_CHECKOUT_WINDOW_MS`), mostly an upsell declined right after the $1 trial. "First charge" = later: the first subscription charge at the trial end, and its retries.
+    - A user can be in both. Matching user counts are `failed_at_checkout_users` and `failed_first_charge_users`.
+    - Rows before the trial purchase never reach the cohort CTEs (`d >= 0`), so a first card declined just before the trial is not counted.
+    - Postgres check for azora-astro.com, Oct 1–14 cohorts: checkout 273, first charge 388, after trial 481.
 - The page's "Declines" switch (`uiState.declineStage`, default after trial) projects the rows once at `effectiveFilteredCohorts` (`projectDeclineStage`). Cells, Total, Funnels, sorting and exports therefore follow it without a refetch.
 - Counts are distinct users. A user declined for several reasons counts in each group.
 

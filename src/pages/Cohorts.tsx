@@ -310,6 +310,8 @@ const PAYMENT_FAILURE_COLUMNS: readonly CohortColumnId[] = [
   "failed_payment_users",
   "failed_payment_rate",
   "failed_after_trial_users",
+  "failed_at_checkout_users",
+  "failed_first_charge_users",
   "failed_after_first_subscription_users",
   "failed_after_renewal_users",
   ...COHORT_DECLINE_GROUPS.map((group) => group.column),
@@ -401,6 +403,8 @@ const STATIC_COLUMN_LABELS: Record<string, string> = {
   failed_payment_users: "Failed Payment Users",
   failed_payment_rate: "Failed Payment Rate",
   failed_after_trial_users: "Failed After Trial",
+  failed_at_checkout_users: "Failed At Checkout",
+  failed_first_charge_users: "Failed First Charge",
   failed_after_first_subscription_users: "Failed After First Sub",
   failed_after_renewal_users: "Failed After Renewal",
   ...Object.fromEntries(COHORT_DECLINE_GROUPS.map((group) => [group.column, `Decline: ${group.label}`])),
@@ -501,6 +505,8 @@ const COLUMN_MIN_WIDTHS: Record<string, number> = {
   failed_payment_users: 120,
   failed_payment_rate: 120,
   failed_after_trial_users: 120,
+  failed_at_checkout_users: 120,
+  failed_first_charge_users: 120,
   failed_after_first_subscription_users: 130,
   failed_after_renewal_users: 130,
   ...Object.fromEntries(COHORT_DECLINE_GROUPS.map((group) => [group.column, 140])),
@@ -636,14 +642,16 @@ function formatRowsCount(value: number | null | undefined): string {
 const COLUMN_HELP: Partial<Record<CohortColumnId, string>> = {
   failed_payment_users: "Unique cohort users with at least one declined charge after their trial (same data as Users → Decline Analytics).",
   failed_payment_rate: "Failed Payment Users / Trial Users.",
-  failed_after_trial_users: "Declined before any subscription payment went through: the first subscription charge (or an upsell) failed.",
+  failed_after_trial_users: "Declined before any subscription payment went through: the first subscription charge (or an upsell) failed. Failed At Checkout + Failed First Charge (a user can be in both).",
+  failed_at_checkout_users: "Declined within 2 h after the trial purchase, mostly an upsell declined at checkout. A first card declined just before the trial is not counted.",
+  failed_first_charge_users: "Declined later than 2 h after the trial purchase and before any subscription payment went through: the first subscription charge at the trial end, or its retries.",
   failed_after_first_subscription_users: "Declined after the first subscription was paid: the second-period renewal failed.",
   failed_after_renewal_users: "Declined after at least one renewal was paid.",
   ...Object.fromEntries(
     COHORT_DECLINE_GROUPS.map((group) => [
       group.column,
       group.reasons
-        ? `Unique users declined at the stage picked in the Declines switch (after trial / after first sub / after renewal / all) for: ${group.reasons.join(", ")}. A user declined for several reasons counts in each.`
+        ? `Unique users declined at the stage picked in the Declines switch (after trial, split into at checkout / first charge; after first sub / after renewal / all) for: ${group.reasons.join(", ")}. A user declined for several reasons counts in each.`
         : "Unique users declined at the stage picked in the Declines switch for any other reason (unknown, issuer unavailable, velocity, processing error, …).",
     ]),
   ),
