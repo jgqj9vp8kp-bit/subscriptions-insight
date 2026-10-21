@@ -4278,8 +4278,11 @@ export default function CohortsPage() {
               </PopoverContent>
             </Popover>
             {COHORT_DECLINE_GROUPS.some((group) => columnVisibility[group.column] !== false && columnVisibility[group.column] !== undefined) && (
-              <div className="flex items-center gap-1.5" title="Which failed charges the Decline: … columns count">
-                <span className="text-xs text-muted-foreground">Declines</span>
+              <div
+                className="flex items-center gap-1.5"
+                title="Changes only the Decline: … columns: which failed charges they count (after trial — split into at checkout / first charge — after first sub, after renewal, or all stages). The Failed … columns always count every stage."
+              >
+                <span className="text-xs text-muted-foreground">Decline reasons</span>
                 <Select value={declineStage} onValueChange={(value) => updateUiState({ declineStage: isDeclineStage(value) ? value : DEFAULT_DECLINE_STAGE })}>
                   <SelectTrigger className="h-9 w-[150px] text-sm" aria-label="Decline reasons stage">
                     <SelectValue />
