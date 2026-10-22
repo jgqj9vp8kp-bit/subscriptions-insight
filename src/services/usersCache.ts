@@ -5,7 +5,7 @@
 // dependent option branches are computed over.
 
 import { sortUniq } from "@/services/analyticsCache";
-import type { UsersDeclineQuery, UsersQuery } from "@/services/usersDataSource";
+import { campaignPathList, type UsersDeclineQuery, type UsersQuery } from "@/services/usersDataSource";
 
 export const USERS_QUERY_ROOT = "users" as const;
 
@@ -18,7 +18,7 @@ export interface NormalizedUsersRequest {
   payment_failed: string;
   failed_attempts: string;
   active_subscription: string;
-  campaign_path: string | null;
+  campaign_path: string[];
   country: string | null;
   card_type: string[];
   platform: string[];
@@ -44,7 +44,8 @@ export function normalizeUsersRequest(q: UsersQuery, opts: { includePage?: boole
     payment_failed: q.paymentFailed ?? "all",
     failed_attempts: q.failedAttempts ?? "all",
     active_subscription: q.activeSubscription ?? "all",
-    campaign_path: single(q.campaignPath),
+    // Order-insensitive like every list filter: [b, a] and [a, b] share a key.
+    campaign_path: sortUniq(campaignPathList(q.campaignPath)),
     country: single(q.country),
     card_type: sortUniq(q.cardTypes),
     platform: sortUniq(q.platform),
@@ -91,7 +92,7 @@ export interface UsersOptionsScope {
   payment_failed: string;
   failed_attempts: string;
   active_subscription: string;
-  campaign_path: string | null;
+  campaign_path: string[];
   country: string | null;
   cohort_ids: string[];
   card_type: string[];

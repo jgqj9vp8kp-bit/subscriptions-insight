@@ -34,6 +34,9 @@ export interface UseUsersDataResult {
   chUsers: UsersSourceResult | null;
   chSummary: UsersSummary | null;
   chOptions: UsersFilterOptions | null;
+  /** The country list of `countryOptionsQuery` (the previous list while it
+   * loads); null without one: the caller then uses `chOptions.country`. */
+  chCountryOptions: UsersFilterOptions["country"] | null;
   chStatus: UsersStatus;
   isBackgroundRefreshing: boolean;
   isInitialLoading: boolean;
@@ -48,19 +51,37 @@ export function useUsersData(params: {
   enabled: boolean;
   /** Options can stay live (e.g. on the Decline tab) while list/summary are off. */
   optionsEnabled?: boolean;
+  /** The options request's query (defaults to `query`). The Users page leaves
+   * campaign_path out of it, so the cohort list, and the product/funnel counts
+   * derived from it, cover every funnel. */
+  optionsQuery?: UsersQuery;
+  /** A second options request, read for its country list only. The Users page
+   * sends it, with the product/funnel paths, while a path is picked: the
+   * path-free options above would not narrow the countries by them. */
+  countryOptionsQuery?: UsersQuery | null;
 }): UseUsersDataResult {
   const { query, warehouseVersion } = params;
+  const optionsQuery = params.optionsQuery ?? query;
+  const countryOptionsQuery = params.countryOptionsQuery ?? null;
   const userScopeHash = useCacheScope(params.userScopeHash);
   const enabled = params.enabled && userScopeHash !== "";
   const optionsEnabled = (params.optionsEnabled ?? params.enabled) && userScopeHash !== "";
 
   const listKey = useMemo(() => usersListKey({ userScopeHash, warehouseVersion, request: query }), [userScopeHash, warehouseVersion, query]);
   const summaryKey = useMemo(() => usersSummaryKey({ userScopeHash, warehouseVersion, request: query }), [userScopeHash, warehouseVersion, query]);
-  const optionsKey = useMemo(() => usersOptionsKey({ userScopeHash, warehouseVersion, request: query }), [userScopeHash, warehouseVersion, query]);
+  const optionsKey = useMemo(() => usersOptionsKey({ userScopeHash, warehouseVersion, request: optionsQuery }), [userScopeHash, warehouseVersion, optionsQuery]);
+  // Same key space as the options: an identical request shares one cache entry.
+  // Without a country query it watches the options entry (disabled, no fetch),
+  // so the switch to one keeps that list on screen until its own answer lands.
+  const countryKey = useMemo(
+    () => (countryOptionsQuery ? usersOptionsKey({ userScopeHash, warehouseVersion, request: countryOptionsQuery }) : optionsKey),
+    [userScopeHash, warehouseVersion, countryOptionsQuery, optionsKey],
+  );
   const activeKey = useMemo(() => JSON.stringify(normalizeUsersRequest(query, { includePage: true })), [query]);
   const listHash = useMemo(() => traceHash(listKey), [listKey]);
   const summaryHash = useMemo(() => traceHash(summaryKey), [summaryKey]);
   const optionsHash = useMemo(() => traceHash(optionsKey), [optionsKey]);
+  const countryHash = useMemo(() => traceHash(countryKey), [countryKey]);
   const requestHash = useMemo(() => traceHash(normalizeUsersRequest(query, { includePage: true })), [query]);
 
   const common = { enabled, staleTime: STALE_MS, gcTime: GC_MS, retry: transientRetry, refetchOnWindowFocus: false, refetchOnReconnect: true } as const;
@@ -97,20 +118,35 @@ export function useUsersData(params: {
     queryFn: () => traceRequest(
       "users.options_request",
       `users:options:${optionsHash}`,
-      () => loadUserOptionsFromClickHouse(query),
+      () => loadUserOptionsFromClickHouse(optionsQuery),
       { query_hash: optionsHash, edge_function: "clickhouse-users" },
     ),
     placeholderData: keepPreviousData,
     ...common,
     enabled: optionsEnabled,
   });
+  const countryQ = useQuery({
+    queryKey: countryKey,
+    queryFn: () => traceRequest(
+      "users.options_request",
+      `users:options:${countryHash}`,
+      () => loadUserOptionsFromClickHouse(countryOptionsQuery ?? optionsQuery),
+      { query_hash: countryHash, edge_function: "clickhouse-users" },
+    ),
+    placeholderData: keepPreviousData,
+    ...common,
+    enabled: optionsEnabled && countryOptionsQuery !== null,
+  });
 
   const chUsers = (listQ.data as UsersSourceResult | undefined) ?? null;
   const chSummary = (summaryQ.data as UsersSummary | null | undefined) ?? null;
   const chOptions = (optionsQ.data as UsersFilterOptions | null | undefined) ?? null;
-  const anyFetching = enabled && (listQ.isFetching || summaryQ.isFetching || optionsQ.isFetching);
+  const chCountryOptions = countryOptionsQuery
+    ? ((countryQ.data as UsersFilterOptions | null | undefined)?.country ?? null)
+    : null;
+  const anyFetching = enabled && (listQ.isFetching || summaryQ.isFetching || optionsQ.isFetching || countryQ.isFetching);
 
-  const erroring = [listQ, summaryQ, optionsQ].find((q) => q.isError);
+  const erroring = [listQ, summaryQ, optionsQ, countryQ].find((q) => q.isError);
   const error = erroring
     ? (erroring.error instanceof Error ? erroring.error.message : "ClickHouse users request failed")
     : null;
@@ -139,6 +175,7 @@ export function useUsersData(params: {
     chUsers,
     chSummary,
     chOptions,
+    chCountryOptions,
     chStatus: { loading: anyFetching, error },
     isBackgroundRefreshing: listQ.isFetching && chUsers != null,
     isInitialLoading: listQ.isFetching && chUsers == null,

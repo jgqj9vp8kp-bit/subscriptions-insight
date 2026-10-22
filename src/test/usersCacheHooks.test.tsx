@@ -109,4 +109,56 @@ describe("useUsersData — SWR", () => {
     expect(loadList).not.toHaveBeenCalled();
     expect(result.current.chUsers).toBeNull();
   });
+
+  it("an optionsQuery drives the options request alone (the Users panel sends it without campaign paths)", async () => {
+    loadList.mockResolvedValue(listResult([{ user_id: "x" }]));
+    loadOptions.mockResolvedValue({ funnel: ["a"] });
+    const { rerender } = renderHook(
+      (props: { query: UsersQuery }) => useUsersData({
+        query: props.query,
+        optionsQuery: { ...props.query, campaignPath: [] },
+        userScopeHash: SCOPE,
+        warehouseVersion: WHV,
+        enabled: true,
+      }),
+      { wrapper, initialProps: { query: q({ campaignPath: ["p1"] }) } },
+    );
+    await waitFor(() => expect(loadOptions).toHaveBeenCalledTimes(1));
+    expect(loadList.mock.calls[0][0]).toMatchObject({ campaignPath: ["p1"] });
+    expect(loadOptions.mock.calls[0][0]).toMatchObject({ campaignPath: [] });
+
+    // A path change refetches the list but not the path-free options.
+    rerender({ query: q({ campaignPath: ["p2"] }) });
+    await waitFor(() => expect(loadList).toHaveBeenCalledTimes(2));
+    expect(loadOptions).toHaveBeenCalledTimes(1);
+  });
+
+  it("a countryOptionsQuery adds a second options request whose country list replaces the main one", async () => {
+    loadList.mockResolvedValue(listResult([{ user_id: "x" }]));
+    loadOptions.mockImplementation(async (query: UsersQuery) => ({
+      country: [{ country_code: Array.isArray(query.campaignPath) && query.campaignPath.length ? "DE" : "US", user_count: 1 }],
+    }));
+    const { result, rerender } = renderHook(
+      (props: { query: UsersQuery; withCountry: boolean }) => useUsersData({
+        query: props.query,
+        optionsQuery: { ...props.query, campaignPath: [] },
+        countryOptionsQuery: props.withCountry ? props.query : null,
+        userScopeHash: SCOPE,
+        warehouseVersion: WHV,
+        enabled: true,
+      }),
+      { wrapper, initialProps: { query: q({ campaignPath: [] }), withCountry: false } },
+    );
+    // Without one: a single options request, and no separate country list.
+    await waitFor(() => expect(result.current.chOptions?.country[0].country_code).toBe("US"));
+    expect(loadOptions).toHaveBeenCalledTimes(1);
+    expect(result.current.chCountryOptions).toBeNull();
+
+    rerender({ query: q({ campaignPath: ["p1"] }), withCountry: true });
+    await waitFor(() => expect(result.current.chCountryOptions?.[0].country_code).toBe("DE"));
+    expect(loadOptions).toHaveBeenCalledTimes(2);
+    expect(loadOptions.mock.calls[1][0]).toMatchObject({ campaignPath: ["p1"] });
+    // The path-free options are untouched (same key, no refetch).
+    expect(result.current.chOptions?.country[0].country_code).toBe("US");
+  });
 });

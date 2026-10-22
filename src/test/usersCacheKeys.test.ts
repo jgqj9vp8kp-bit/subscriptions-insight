@@ -97,6 +97,18 @@ describe("users cache keys", () => {
       .toEqual(normalizeUsersRequest(q({ platform: ["ios", "android"] })));
   });
 
+  it("campaign paths are order-insensitive in every key and match the single-value form", () => {
+    const ba = q({ campaignPath: ["b", "a"] });
+    const ab = q({ campaignPath: ["a", "b"] });
+    expect(hashKey(usersListKey(parts(ba)))).toBe(hashKey(usersListKey(parts(ab))));
+    expect(hashKey(usersSummaryKey(parts(ba)))).toBe(hashKey(usersSummaryKey(parts(ab))));
+    expect(hashKey(usersOptionsKey(parts(ba)))).toBe(hashKey(usersOptionsKey(parts(ab))));
+    expect(hashKey(usersListKey(parts(ab)))).not.toBe(hashKey(usersListKey(parts(q()))));
+    expect(normalizeUsersRequest(q({ campaignPath: "x" })).campaign_path).toEqual(["x"]);
+    expect(normalizeUsersRequest(q({ campaignPath: ["x"] }))).toEqual(normalizeUsersRequest(q({ campaignPath: "x" })));
+    expect(normalizeUsersRequest(q({ campaignPath: [] }))).toEqual(normalizeUsersRequest(q({ campaignPath: "all" })));
+  });
+
   it("isolated by user; busted by warehouse version", () => {
     const a = { userScopeHash: hashUserScope("a"), warehouseVersion: "whv_x", request: q() };
     const b = { userScopeHash: hashUserScope("b"), warehouseVersion: "whv_x", request: q() };

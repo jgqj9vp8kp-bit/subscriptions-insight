@@ -433,11 +433,10 @@ describe("Users page", () => {
     });
   }
 
-  function clickCohort(campaignPath: string, options: MouseEventInit = {}) {
-    const label = screen.getAllByText(campaignPath)[0];
-    const button = label.closest('[role="button"]');
-    if (!button) throw new Error(`Could not find cohort button for ${campaignPath}`);
-    fireEvent.click(button, options);
+  // The panel groups cohorts by funnel (campaign path); in these fixtures each
+  // path has one cohort, so ticking its group selects exactly that cohort.
+  function clickCohort(campaignPath: string) {
+    fireEvent.click(screen.getByRole("checkbox", { name: `Select all cohorts of ${campaignPath}` }));
   }
 
   function switchToDeclineAnalytics() {
@@ -481,9 +480,11 @@ describe("Users page", () => {
     renderPage();
 
     expect(screen.getByText("Cohorts")).toBeInTheDocument();
-    expect(screen.getAllByText("campaign-a").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("campaign-b").length).toBeGreaterThan(0);
-    expect(screen.getAllByText(/1 trials/).length).toBeGreaterThanOrEqual(2);
+    for (const path of ["campaign-a", "campaign-b"]) {
+      const row = screen.getByRole("checkbox", { name: `Select all cohorts of ${path}` }).parentElement as HTMLElement;
+      expect(within(row).getByText(path)).toBeInTheDocument();
+      expect(within(row).getByText("1")).toBeInTheDocument(); // the group's trial users
+    }
   });
 
   it("selects one cohort and filters users", () => {
@@ -598,7 +599,7 @@ describe("Users page", () => {
     expect(screen.queryByText("a@example.com")).not.toBeInTheDocument();
     expect(screen.queryByText("b@example.com")).not.toBeInTheDocument();
     expect(screen.getByText(/Фильтр Platform работает только на серверном пути/)).toBeInTheDocument();
-    expect(screen.getByText(/Active filters:.*Platform: iOS/)).toBeInTheDocument();
+    expect(within(screen.getByRole("list", { name: "Active filters" })).getByText("Platform: iOS")).toBeInTheDocument();
   });
 
   it("resets the platform and media buyer filters with the others", () => {
@@ -612,10 +613,12 @@ describe("Users page", () => {
 
     renderPage();
 
-    expect(screen.getByText(/Active filters:.*Platform: iOS.*Media Buyer: Ivan/)).toBeInTheDocument();
+    const chips = screen.getByRole("list", { name: "Active filters" });
+    expect(within(chips).getByText("Platform: iOS")).toBeInTheDocument();
+    expect(within(chips).getByText("Media Buyer: Ivan")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Reset user filters" }));
 
-    expect(screen.queryByText(/Active filters:/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "Active filters" })).toBeNull();
     expect(screen.getByText("a@example.com")).toBeInTheDocument();
   });
 
@@ -651,7 +654,8 @@ describe("Users page", () => {
 
     expect(screen.getByText("No users match selected cohorts and filters.")).toBeInTheDocument();
     expect(screen.getByText(/First sub: Has First Sub/)).toBeInTheDocument();
-    expect(screen.getByText(/First trial to: 14.04.2026/)).toBeInTheDocument();
+    // The old main-row "First trial to" lives on as the panel period.
+    expect(screen.getByText(/Period: to 14\.04\.2026/)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Reset filters" }));
 
@@ -759,10 +763,10 @@ describe("Users page", () => {
     // Served by the server read path, not computed from the browser warehouse.
     expect(leadsMocks.runClickHouseLeads).toHaveBeenCalledWith(expect.objectContaining({ action: "leads_list" }));
     expect(screen.getByRole("tab", { name: "Leads" })).toHaveAttribute("aria-selected", "true");
-    expect(screen.queryByPlaceholderText("Search campaign…")).toBeNull();
+    expect(screen.queryByRole("group", { name: "Period" })).toBeNull();
 
     fireEvent.mouseDown(screen.getByRole("tab", { name: "Users Table" }));
-    expect(await screen.findByPlaceholderText("Search campaign…")).toBeInTheDocument();
+    expect(await screen.findByRole("group", { name: "Period" })).toBeInTheDocument();
   });
 
   it("switches from the users table to decline analytics", () => {
@@ -1027,5 +1031,241 @@ describe("Users page", () => {
     fireEvent.click(screen.getAllByRole("button", { name: /Decline Reason/ }).at(-1)!);
     rows = within(reasonTable).getAllByRole("row");
     expect(rows[1]).toHaveTextContent("insufficient_funds");
+  });
+
+  // --- Cohort panel: period, funnel picker, grouping, selection, chips ------
+
+  // Three cohorts on three paths: 31.12.2025 (a), 02.01.2026 (b), 08.01.2026 (c).
+  function threeCohorts() {
+    return [
+      cohortTx({ user_id: "a", email: "a@example.com", campaign_path: "campaign-a", event_time: "2025-12-31T10:00:00.000Z" }),
+      cohortTx({ user_id: "b", email: "b@example.com", campaign_path: "campaign-b", event_time: "2026-01-02T10:00:00.000Z" }),
+      cohortTx({ user_id: "c", email: "c@example.com", campaign_path: "campaign-c", event_time: "2026-01-08T10:00:00.000Z" }),
+    ];
+  }
+
+  const groupBox = (label: string) => screen.queryByRole("checkbox", { name: `Select all cohorts of ${label}` });
+  const shownUsers = () => ["a", "b", "c"].filter((id) => screen.queryByText(`${id}@example.com`) !== null);
+
+  it("a period preset narrows the users and the cohort list together (UTC days)", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-01-10T12:00:00Z"));
+    try {
+      vi.mocked(useTransactions).mockReturnValue(threeCohorts());
+      renderPage();
+      const period = screen.getByRole("group", { name: "Period" });
+
+      fireEvent.click(within(period).getByRole("button", { name: "7d" }));
+      expect(within(period).getByRole("button", { name: "7d" })).toHaveAttribute("aria-pressed", "true");
+      expect(shownUsers()).toEqual(["c"]);
+      expect(groupBox("campaign-a")).toBeNull();
+      expect(groupBox("campaign-c")).not.toBeNull();
+      // The inputs show the preset's resolved window.
+      expect(screen.getByLabelText("Period from")).toHaveValue("2026-01-04");
+      expect(screen.getByLabelText("Period to")).toHaveValue("2026-01-10");
+      expect(screen.getByText("Period: Last 7 days")).toBeInTheDocument();
+
+      fireEvent.click(within(period).getByRole("button", { name: "Month" }));
+      expect(shownUsers()).toEqual(["b", "c"]);
+      expect(groupBox("campaign-b")).not.toBeNull();
+      expect(groupBox("campaign-a")).toBeNull();
+
+      fireEvent.click(within(period).getByRole("button", { name: "All" }));
+      expect(shownUsers()).toEqual(["a", "b", "c"]);
+      expect(screen.queryByText(/^Period:/)).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a custom range from the period inputs scopes the users and shows a chip", () => {
+    vi.mocked(useTransactions).mockReturnValue(threeCohorts());
+    renderPage();
+
+    fireEvent.change(screen.getByLabelText("Period from"), { target: { value: "2026-01-02" } });
+    expect(shownUsers()).toEqual(["b", "c"]);
+    expect(screen.getByText("Period: from 02.01.2026")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Period to"), { target: { value: "2026-01-05" } });
+    expect(shownUsers()).toEqual(["b"]);
+    expect(screen.getByText("Period: 02.01.2026 – 05.01.2026")).toBeInTheDocument();
+    expect(groupBox("campaign-c")).toBeNull();
+    // No preset is lit while a custom range is active.
+    const period = screen.getByRole("group", { name: "Period" });
+    expect(within(period).getAllByRole("button").filter((button) => button.getAttribute("aria-pressed") === "true")).toHaveLength(0);
+  });
+
+  it("the funnel picker searches and multi-selects funnels, which filter the users", () => {
+    vi.mocked(useTransactions).mockReturnValue(threeCohorts());
+    renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Funnel filter: All funnels" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Search funnels" }), { target: { value: "IGN-B" } });
+    expect(screen.queryByRole("checkbox", { name: "campaign-a" })).toBeNull();
+    fireEvent.click(screen.getByRole("checkbox", { name: "campaign-b" }));
+
+    expect(shownUsers()).toEqual(["b"]);
+    expect(screen.getByRole("button", { name: "Funnel filter: campaign-b" })).toBeInTheDocument();
+    expect(screen.getByText("Funnel: campaign-b")).toBeInTheDocument();
+    // Only that funnel's cohorts stay in the panel.
+    expect(groupBox("campaign-a")).toBeNull();
+    expect(groupBox("campaign-b")).not.toBeNull();
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Search funnels" }), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("checkbox", { name: "campaign-c" }));
+    expect(shownUsers()).toEqual(["b", "c"]);
+    expect(screen.getByRole("button", { name: "Funnel filter: 2 funnels" })).toBeInTheDocument();
+    // A full-page render with many interactions: the default 5 s timeout flakes
+    // under the parallel full-suite run.
+  }, 20_000);
+
+  it("the funnel picker opens on its search box, also when a funnel is picked", () => {
+    localStorage.setItem("ui_state_users", JSON.stringify({ selectedCampaignPaths: ["campaign-a"] }));
+    vi.mocked(useTransactions).mockReturnValue(threeCohorts());
+    renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Funnel filter: campaign-a" }));
+    // Not the (now enabled) "All funnels" button, which Enter would trigger.
+    expect(screen.getByRole("textbox", { name: "Search funnels" })).toHaveFocus();
+    expect(screen.getByRole("button", { name: "All funnels" })).toBeEnabled();
+  }, 20_000);
+
+  it("migrates a saved single campaign path into the funnel multi-select", () => {
+    localStorage.setItem("ui_state_users", JSON.stringify({ campaignPathFilter: "campaign-a" }));
+    vi.mocked(useTransactions).mockReturnValue(threeCohorts());
+    const view = renderPage();
+
+    expect(shownUsers()).toEqual(["a"]);
+    fireEvent.click(screen.getByRole("button", { name: "Funnel filter: campaign-a" }));
+    expect(screen.getByRole("checkbox", { name: "campaign-a" })).toBeChecked();
+    fireEvent.click(screen.getByRole("checkbox", { name: "campaign-b" }));
+    expect(shownUsers()).toEqual(["a", "b"]);
+
+    view.unmount(); // flushes the debounced UI state
+    const stored = JSON.parse(localStorage.getItem("ui_state_users") ?? "{}");
+    expect(stored.campaignPathFilter).toBe("all");
+    expect(stored.selectedCampaignPaths).toEqual(["campaign-a", "campaign-b"]);
+  });
+
+  it("groups the cohort list by date", () => {
+    vi.mocked(useTransactions).mockReturnValue(threeCohorts());
+    renderPage();
+
+    expect(groupBox("campaign-a")).not.toBeNull();
+    fireEvent.click(within(screen.getByRole("group", { name: "Group by" })).getByRole("button", { name: "Date" }));
+
+    expect(groupBox("campaign-a")).toBeNull();
+    for (const day of ["31.12.2025", "02.01.2026", "08.01.2026"]) expect(groupBox(day)).not.toBeNull();
+    // Children of a date group are its funnels.
+    const group = groupBox("02.01.2026")!.parentElement!.parentElement as HTMLElement;
+    expect(within(group).getByText("campaign-b")).toBeInTheDocument();
+  });
+
+  it("a funnel group's checkbox is partially checked when some of its cohorts are selected", () => {
+    vi.mocked(useTransactions).mockReturnValue([
+      cohortTx({ user_id: "a", email: "a@example.com", campaign_path: "campaign-a", event_time: "2026-01-01T10:00:00.000Z" }),
+      cohortTx({ user_id: "b", email: "b@example.com", campaign_path: "campaign-a", event_time: "2026-01-02T10:00:00.000Z" }),
+    ]);
+    renderPage();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select cohort soulmate_campaign-a_2026-01-01" }));
+    expect(groupBox("campaign-a")).toBePartiallyChecked();
+    expect(shownUsers()).toEqual(["a"]);
+
+    fireEvent.click(groupBox("campaign-a")!);
+    expect(groupBox("campaign-a")).toBeChecked();
+    expect(shownUsers()).toEqual(["a", "b"]);
+    expect(screen.getByText("2 cohorts selected")).toBeInTheDocument();
+
+    fireEvent.click(groupBox("campaign-a")!);
+    expect(groupBox("campaign-a")).not.toBeChecked();
+    expect(screen.getByText("All visible users")).toBeInTheDocument();
+  });
+
+  it("selects every shown cohort at once", () => {
+    vi.mocked(useTransactions).mockReturnValue(threeCohorts());
+    renderPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Select all shown (3)" }));
+
+    expect(screen.getByText("3 cohorts selected")).toBeInTheDocument();
+    expect(screen.getByText("3 selected")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Select all shown (3)" })).toBeDisabled();
+    expect(screen.getByText("Cohorts: 3 selected")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Remove filter Cohorts: 3 selected" }));
+    expect(screen.getByText("All cohorts")).toBeInTheDocument();
+  }, 20_000);
+
+  it("ticking a collapsed group keeps it collapsed (the groups below do not move)", () => {
+    vi.mocked(useTransactions).mockReturnValue([
+      ...threeCohorts(),
+      cohortTx({ user_id: "d", email: "d@example.com", campaign_path: "campaign-d", event_time: "2026-01-09T10:00:00.000Z" }),
+    ]);
+    renderPage();
+    const expandButton = (path: string) => screen.getByRole("button", { name: new RegExp(`^(Expand|Collapse) ${path}$`) });
+    const childBoxes = () => screen.queryAllByRole("checkbox", { name: /^Select cohort / });
+
+    // More than three groups: all start collapsed.
+    expect(expandButton("campaign-b")).toHaveAttribute("aria-expanded", "false");
+    expect(childBoxes()).toHaveLength(0);
+
+    fireEvent.click(groupBox("campaign-b")!);
+    expect(groupBox("campaign-b")).toBeChecked();
+    expect(shownUsers()).toEqual(["b"]);
+    expect(expandButton("campaign-b")).toHaveAttribute("aria-expanded", "false");
+    expect(childBoxes()).toHaveLength(0);
+
+    // Expanded by hand, it stays open when unticked.
+    fireEvent.click(expandButton("campaign-b"));
+    expect(childBoxes()).toHaveLength(1);
+    fireEvent.click(groupBox("campaign-b")!);
+    expect(groupBox("campaign-b")).not.toBeChecked();
+    expect(expandButton("campaign-b")).toHaveAttribute("aria-expanded", "true");
+    expect(childBoxes()).toHaveLength(1);
+  }, 20_000);
+
+  it("shows net revenue in whole dollars, the exact value on hover", () => {
+    vi.mocked(useTransactions).mockReturnValue([
+      cohortTx({ user_id: "a", email: "a@example.com", campaign_path: "campaign-a", amount_usd: 1234.56, gross_amount_usd: 1234.56, net_amount_usd: 1234.56 }),
+    ]);
+    renderPage();
+
+    const row = groupBox("campaign-a")!.parentElement as HTMLElement;
+    expect(within(row).getByText("$1,235")).toHaveAttribute("title", "$1,234.56");
+  });
+
+  it("the Decline-only analytics filters get no chip above the users table", () => {
+    localStorage.setItem("ui_state_users", JSON.stringify({ declineAnalyticsStages: ["after_renewal"] }));
+    vi.mocked(useTransactions).mockReturnValue(threeCohorts());
+    renderPage();
+
+    expect(shownUsers()).toEqual(["a", "b", "c"]);
+    expect(screen.queryByRole("list", { name: "Active filters" })).toBeNull();
+
+    switchToDeclineAnalytics();
+    expect(within(screen.getByRole("list", { name: "Active filters" })).getByText(/^Analytics Decline Stage:/)).toBeInTheDocument();
+  }, 20_000);
+
+  it("removes the period from its chip", () => {
+    localStorage.setItem("ui_state_users", JSON.stringify({ periodPreset: "custom", periodTo: "2026-01-01" }));
+    vi.mocked(useTransactions).mockReturnValue(threeCohorts());
+    renderPage();
+
+    expect(shownUsers()).toEqual(["a"]);
+    fireEvent.click(screen.getByRole("button", { name: "Remove filter Period: to 01.01.2026" }));
+
+    expect(shownUsers()).toEqual(["a", "b", "c"]);
+    expect(screen.queryByRole("list", { name: "Active filters" })).toBeNull();
+  });
+
+  it("migrates a saved panel cohort-date range into the period (it now scopes the users too)", () => {
+    localStorage.setItem("ui_state_users", JSON.stringify({ cohortDateFrom: "2026-01-02" }));
+    vi.mocked(useTransactions).mockReturnValue(threeCohorts());
+    renderPage();
+
+    expect(screen.getByLabelText("Period from")).toHaveValue("2026-01-02");
+    expect(screen.getByText("Period: from 02.01.2026")).toBeInTheDocument();
+    expect(shownUsers()).toEqual(["b", "c"]);
+    expect(groupBox("campaign-a")).toBeNull();
   });
 });

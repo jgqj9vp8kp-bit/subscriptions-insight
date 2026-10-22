@@ -29,6 +29,30 @@ import { UNKNOWN_COUNTRY, buildLegacyCountryOptions, usersDataSourceMode, type U
 import { useAccess } from "@/hooks/useAccess";
 import { useWarehouseVersion } from "@/hooks/useAnalyticsCache";
 import { useUsersData, useUsersDeclineData } from "@/hooks/useUsersCache";
+import { useCohortProducts } from "@/hooks/useCohortProducts";
+import { UsersCohortPanel } from "@/components/users/UsersCohortPanel";
+import { ActiveFilterChips, type ActiveFilterChip } from "@/components/users/ActiveFilterChips";
+import { todayUtc } from "@/components/payment-health/format";
+import { effectiveCampaignPaths, productKey, productPathSet } from "@/services/cohortProductFilter";
+import {
+  filterRowsByPaths,
+  filterRowsByPeriod,
+  funnelOptions as buildFunnelOptions,
+  mergeLegacySelection,
+  migratePeriodSelection,
+  pathScope,
+  periodLabel,
+  periodPatch,
+  productTrialCounts,
+  pruneCohortSelection,
+  resolvePeriodRange,
+  usersCampaignPaths,
+  type CohortExplorerRow,
+  type CohortExplorerSortKey,
+  type CohortGroupBy,
+  type PeriodPreset,
+  type PeriodSelection,
+} from "@/services/usersCohortPanel";
 import { formatUpdatedAgo } from "@/services/analyticsProgress";
 import { Progress } from "@/components/ui/progress";
 import { formatDateKey, toDateKey } from "@/services/dateKeys";
@@ -72,18 +96,6 @@ type FirstSubFilter = "all" | "has" | "none";
 type RefundFilter = "all" | "has" | "none";
 type PaymentFailedFilter = "all" | "has" | "none";
 type FailedAttemptsFilter = "all" | "gte1" | "gte3" | "gte5";
-type CohortExplorerSortKey = "date" | "trial_users" | "net_revenue";
-
-/** What the cohort explorer needs from a cohort, whichever engine produced it —
- * the server option list and the legacy CohortRow both satisfy it. */
-interface CohortExplorerRow {
-  cohort_id: string;
-  cohort_date: string;
-  funnel: string;
-  campaign_path: string;
-  trial_users: number;
-  net_revenue: number;
-}
 type UsersPageMode = "users_table" | "decline_analytics" | "leads";
 
 // The Leads tab pulls in its server read path and the FunnelFox sync card only when opened.
@@ -163,7 +175,6 @@ interface DeclineStageBreakdownRow {
 
 const DEFAULT_USERS_UI_STATE = {
   search: "",
-  campaignPathFilter: "all",
   countryFilter: "all",
   selectedCardTypes: [] as CardType[],
   selectedPlatforms: [] as string[],
@@ -172,9 +183,25 @@ const DEFAULT_USERS_UI_STATE = {
   selectedDeclineReasons: [] as DeclineReason[],
   failedAttemptsFilter: "all" as FailedAttemptsFilter,
   selectedCohortIds: [] as string[],
-  cohortSearch: "",
+  // Cohort panel: products (FunnelFox projects), funnels (campaign paths) and
+  // ONE period that scopes both the cohort list and the users (first-trial
+  // date). periodPreset "" = not written yet: the period is then read from
+  // the legacy keys below (migratePeriodSelection).
+  selectedProducts: [] as string[],
+  selectedCampaignPaths: [] as string[],
+  periodPreset: "" as "" | PeriodPreset,
+  periodFrom: "",
+  periodTo: "",
+  cohortGroupBy: "funnel" as CohortGroupBy,
+  // Legacy keys, read only to migrate a saved selection: the single campaign
+  // path (merged into selectedCampaignPaths), the panel's cohort-date range
+  // and the main row's first-trial range (both folded into the period). Every
+  // write of their dimension blanks them.
+  campaignPathFilter: "all",
   cohortDateFrom: "",
   cohortDateTo: "",
+  firstTrialFrom: "",
+  firstTrialTo: "",
   cohortSortKey: "date" as CohortExplorerSortKey,
   cohortSortDir: "desc" as "asc" | "desc",
   mode: "users_table" as UsersPageMode,
@@ -186,8 +213,6 @@ const DEFAULT_USERS_UI_STATE = {
   declineCountrySortDir: "desc" as "asc" | "desc",
   firstSubFilter: "all" as FirstSubFilter,
   refundFilter: "all" as RefundFilter,
-  firstTrialFrom: "",
-  firstTrialTo: "",
   sortKey: "first_trial_date" as SortKey,
   sortDir: "desc" as "asc" | "desc",
 };
@@ -423,9 +448,8 @@ export default function UsersPage() {
     selectedDeclineReasons: rawSelectedDeclineReasons,
     failedAttemptsFilter,
     selectedCohortIds: rawSelectedCohortIds,
-    cohortSearch,
-    cohortDateFrom,
-    cohortDateTo,
+    selectedProducts: rawSelectedProducts,
+    selectedCampaignPaths: rawSelectedCampaignPaths,
     cohortSortKey,
     cohortSortDir,
     mode: persistedMode,
@@ -437,8 +461,6 @@ export default function UsersPage() {
     declineCountrySortDir,
     firstSubFilter,
     refundFilter,
-    firstTrialFrom,
-    firstTrialTo,
     sortKey,
     sortDir,
   } = uiState;
@@ -493,6 +515,40 @@ export default function UsersPage() {
         : [],
     [rawDeclineAnalyticsStages],
   );
+  // Cohort panel selections. Nothing is migrated at mount: the legacy keys
+  // keep being read through these fallbacks until the first write of their
+  // dimension blanks them (idempotent, no effect needed).
+  const selectedProductsRaw = useMemo(() => mergeLegacySelection(rawSelectedProducts, null), [rawSelectedProducts]);
+  const selectedFunnels = useMemo(
+    () => mergeLegacySelection(rawSelectedCampaignPaths, campaignPathFilter),
+    [rawSelectedCampaignPaths, campaignPathFilter],
+  );
+  const {
+    periodPreset: rawPeriodPreset,
+    periodFrom: rawPeriodFrom,
+    periodTo: rawPeriodTo,
+    firstTrialFrom: legacyFirstTrialFrom,
+    firstTrialTo: legacyFirstTrialTo,
+    cohortDateFrom: legacyCohortDateFrom,
+    cohortDateTo: legacyCohortDateTo,
+  } = uiState;
+  const periodSelection = useMemo(
+    () => migratePeriodSelection({
+      periodPreset: rawPeriodPreset,
+      periodFrom: rawPeriodFrom,
+      periodTo: rawPeriodTo,
+      firstTrialFrom: legacyFirstTrialFrom,
+      firstTrialTo: legacyFirstTrialTo,
+      cohortDateFrom: legacyCohortDateFrom,
+      cohortDateTo: legacyCohortDateTo,
+    }),
+    [rawPeriodPreset, rawPeriodFrom, rawPeriodTo, legacyFirstTrialFrom, legacyFirstTrialTo, legacyCohortDateFrom, legacyCohortDateTo],
+  );
+  // Rolling presets end on the current UTC day (the server's cohort and
+  // first-trial dates are UTC days), re-resolved on every render.
+  const today = todayUtc();
+  const periodRange = useMemo(() => resolvePeriodRange(periodSelection, today), [periodSelection, today]);
+  const cohortGroupBy: CohortGroupBy = uiState.cohortGroupBy === "date" ? "date" : "funnel";
 
   // --- ClickHouse Users read path (Phase 9-11) --------------------------
   // clickhouse (default): the Edge Function drives the table AND the Decline
@@ -527,6 +583,40 @@ export default function UsersPage() {
   // The access partition (plan §20): the cache key is per principal, role and scope.
   const userScopeHash = partition;
   const { version: warehouseVersion, ready: warehouseVersionReady } = useWarehouseVersion(usersSource === "clickhouse");
+  // Product filter (FunnelFox project → its campaign paths), the Cohorts
+  // page's map. Requested only where it can be answered (clickhouse mode, full
+  // scope, cohorts.view); otherwise — or when it fails — the product row is
+  // hidden and a saved product stays stored but is not applied.
+  const { products, settled: productsSettled } = useCohortProducts({
+    userScopeHash,
+    warehouseVersion,
+    enabled: usersSource === "clickhouse" && warehouseVersionReady && mode !== "leads",
+  });
+  const effectiveSelectedProducts = useMemo(() => {
+    if (!products) return [];
+    const known = new Set(products.map(productKey));
+    return selectedProductsRaw.filter((key) => known.has(key));
+  }, [products, selectedProductsRaw]);
+  // null = no product filter.
+  const productPaths = useMemo(() => productPathSet(products, effectiveSelectedProducts), [products, effectiveSelectedProducts]);
+  // The panel's path scope: [] = every path; [NO_PRODUCT_PATH] = the product
+  // and funnel selections do not overlap (an empty panel, not "every path").
+  const panelPaths = useMemo(() => effectiveCampaignPaths(selectedFunnels, productPaths), [selectedFunnels, productPaths]);
+  // A cohort selection wins over the product/funnel paths for the users, like
+  // the single campaign path did before; the period still ANDs with it.
+  const usersPaths = useMemo(() => usersCampaignPaths(selectedCohortIds, panelPaths), [selectedCohortIds, panelPaths]);
+  // A saved product filters only once its paths are known: hold the users
+  // requests until then instead of loading (and caching) the unfiltered set.
+  const productFilterSettled = selectedProductsRaw.length === 0 || productsSettled;
+  // A persisted product that no longer exists (or is out of reach) is dropped
+  // once the map is known, like any other stale option.
+  useEffect(() => {
+    if (!products || selectedProductsRaw.length === 0) return;
+    const known = new Set(products.map(productKey));
+    const kept = selectedProductsRaw.filter((key) => known.has(key));
+    if (kept.length === selectedProductsRaw.length) return;
+    setUiState((current) => ({ ...current, selectedProducts: kept }));
+  }, [products, selectedProductsRaw, setUiState]);
   const [appliedSearch] = useDebouncedValue(search, 300);
   const [page, setPage] = useState(1);
   // Which decline reasons are expanded to their raw-message breakdown.
@@ -542,13 +632,15 @@ export default function UsersPage() {
   const usersQuery = useMemo<UsersQuery>(
     () => ({
       search: appliedSearch,
-      firstTrialFrom,
-      firstTrialTo,
+      // The panel period: cohort date = first-trial date (one UTC day on the
+      // server), so one range scopes the cohort list and the users alike.
+      firstTrialFrom: periodRange.from,
+      firstTrialTo: periodRange.to,
       firstSub: firstSubFilter,
       refund: refundFilter,
       paymentFailed: paymentFailedFilter,
       failedAttempts: failedAttemptsFilter,
-      campaignPath: campaignPathFilter,
+      campaignPath: usersPaths,
       country: countryFilter,
       cardTypes: selectedCardTypes,
       platform: selectedPlatforms,
@@ -560,8 +652,17 @@ export default function UsersPage() {
       page,
       pageSize: USERS_PAGE_SIZE,
     }),
-    [appliedSearch, firstTrialFrom, firstTrialTo, firstSubFilter, refundFilter, paymentFailedFilter, failedAttemptsFilter, campaignPathFilter, countryFilter, selectedCardTypes, selectedPlatforms, selectedMediaBuyers, selectedDeclineReasons, selectedCohortIds, sortKey, sortDir, page],
+    [appliedSearch, periodRange, firstSubFilter, refundFilter, paymentFailedFilter, failedAttemptsFilter, usersPaths, countryFilter, selectedCardTypes, selectedPlatforms, selectedMediaBuyers, selectedDeclineReasons, selectedCohortIds, sortKey, sortDir, page],
   );
+  // The options request (country list + the cohort list behind the panel)
+  // goes out WITHOUT campaign_path: the server's cohort branch respects every
+  // filter but the cohort selection, so a path filter would zero every other
+  // funnel and product in the panel. Product/funnel narrowing of the panel
+  // happens in the browser below. The country list still narrows by them: while
+  // a path is picked (and a saved product's paths are known), a second options
+  // request with the paths supplies it. No path = one request, as before.
+  const panelOptionsQuery = useMemo<UsersQuery>(() => ({ ...usersQuery, campaignPath: [] }), [usersQuery]);
+  const countryOptionsQuery = usersPaths.length > 0 && productFilterSettled ? usersQuery : null;
   const hasSelectedCohortsRaw = Array.isArray(rawSelectedCohortIds) && rawSelectedCohortIds.length > 0;
   // Cohort selections used to force the legacy client path. That path computes
   // from the transaction store, which this route deliberately never hydrates, so
@@ -576,13 +677,13 @@ export default function UsersPage() {
   const declineQuery = useMemo<UsersDeclineQuery>(
     () => ({
       search: appliedSearch,
-      firstTrialFrom,
-      firstTrialTo,
+      firstTrialFrom: periodRange.from,
+      firstTrialTo: periodRange.to,
       firstSub: firstSubFilter,
       refund: refundFilter,
       paymentFailed: paymentFailedFilter,
       failedAttempts: failedAttemptsFilter,
-      campaignPath: campaignPathFilter,
+      campaignPath: usersPaths,
       country: countryFilter,
       cardTypes: selectedCardTypes,
       platform: selectedPlatforms,
@@ -594,12 +695,13 @@ export default function UsersPage() {
       countrySortField: declineCountrySortKey,
       countrySortDir: declineCountrySortDir,
     }),
-    [appliedSearch, firstTrialFrom, firstTrialTo, firstSubFilter, refundFilter, paymentFailedFilter, failedAttemptsFilter, campaignPathFilter, countryFilter, selectedCardTypes, selectedPlatforms, selectedMediaBuyers, selectedDeclineReasons, selectedCohortIds, declineAnalyticsReasons, declineAnalyticsStages, declineCountrySortKey, declineCountrySortDir],
+    [appliedSearch, periodRange, firstSubFilter, refundFilter, paymentFailedFilter, failedAttemptsFilter, usersPaths, countryFilter, selectedCardTypes, selectedPlatforms, selectedMediaBuyers, selectedDeclineReasons, selectedCohortIds, declineAnalyticsReasons, declineAnalyticsStages, declineCountrySortKey, declineCountrySortDir],
   );
   const {
     chUsers,
     chSummary,
     chOptions,
+    chCountryOptions,
     chStatus,
     isBackgroundRefreshing,
     isInitialLoading,
@@ -607,11 +709,14 @@ export default function UsersPage() {
     dataUpdatedAt,
   } = useUsersData({
     query: usersQuery,
+    optionsQuery: panelOptionsQuery,
+    countryOptionsQuery,
     userScopeHash,
     warehouseVersion,
-    enabled: usersServerEligible && warehouseVersionReady,
+    enabled: usersServerEligible && warehouseVersionReady && productFilterSettled,
     // Filter options (incl. the dependent country list) stay live on the
-    // Decline tab, where list/summary queries are not needed.
+    // Decline tab, where list/summary queries are not needed. The main one
+    // carries no product paths, so it never waits for the product map.
     optionsEnabled: (usersServerEligible || declineServerEligible) && warehouseVersionReady,
   });
   const {
@@ -624,7 +729,7 @@ export default function UsersPage() {
     query: declineQuery,
     userScopeHash,
     warehouseVersion,
-    enabled: declineServerEligible && warehouseVersionReady,
+    enabled: declineServerEligible && warehouseVersionReady && productFilterSettled,
   });
   // Legacy fallback (unchanged emergency path): legacy flag, a cohort selection
   // (not reproduced server-side), or a ClickHouse error WITH no cached data to
@@ -700,13 +805,6 @@ export default function UsersPage() {
     [users, cohortByUser, campaignPathByUser, userSubscriptionFlags]
   );
   const usersAnyServerDriving = usersClickHouseDriving || declineClickHouseDriving;
-  const campaignPathOptions = useMemo(
-    () =>
-      usersAnyServerDriving && chOptions
-        ? chOptions.campaign_path
-        : Array.from(new Set(usersWithCampaignPath.map((user) => user.campaign_path || "unknown"))).sort(),
-    [usersAnyServerDriving, chOptions, usersWithCampaignPath]
-  );
   // Country options: server mode returns the dependent list (scoped by every
   // active filter except Country) WITH unique-user counts and the Unknown
   // bucket; the legacy fallback derives codes client-side and appends Unknown
@@ -732,26 +830,34 @@ export default function UsersPage() {
         : cohorts,
     [usersAnyServerDriving, chOptions, cohorts],
   );
-  const visibleCohorts = useMemo(() => {
-    const q = cohortSearch.trim().toLowerCase();
-    const fromDateKey = toDateKey(cohortDateFrom);
-    const toDateKeyValue = toDateKey(cohortDateTo);
-    const list = explorerCohorts.filter((cohort) => {
-      if (campaignPathFilter !== "all" && cohort.campaign_path !== campaignPathFilter) return false;
-      if (q && !`${cohort.campaign_path} ${cohort.funnel}`.toLowerCase().includes(q)) return false;
-      const cohortDateKey = toDateKey(cohort.cohort_date);
-      if (fromDateKey && cohortDateKey < fromDateKey) return false;
-      if (toDateKeyValue && cohortDateKey > toDateKeyValue) return false;
-      return true;
-    });
-    list.sort((a, b) => {
-      const av = cohortSortKey === "date" ? toDateKey(a.cohort_date) : a[cohortSortKey];
-      const bv = cohortSortKey === "date" ? toDateKey(b.cohort_date) : b[cohortSortKey];
-      const cmp = av < bv ? -1 : av > bv ? 1 : 0;
-      return cohortSortDir === "asc" ? cmp : -cmp;
-    });
-    return list;
-  }, [explorerCohorts, campaignPathFilter, cohortSearch, cohortDateFrom, cohortDateTo, cohortSortKey, cohortSortDir]);
+  // Everything the panel lists derives from this one cohort list. On the
+  // server path it already follows the period and every other filter (but no
+  // campaign path, see panelOptionsQuery); the legacy list is all-time, so the
+  // period is applied here too (a no-op on the server path).
+  const periodCohorts = useMemo(() => filterRowsByPeriod(explorerCohorts, periodRange), [explorerCohorts, periodRange]);
+  const cohortPathById = useMemo(
+    () => new Map(explorerCohorts.map((cohort) => [cohort.cohort_id, cohort.campaign_path])),
+    [explorerCohorts],
+  );
+  // Product counts wait for the cohort list itself: before its first answer
+  // every product would read 0.
+  const cohortsReady = (usersAnyServerDriving && chOptions != null) || usersNeedLegacy;
+  const productCounts = useMemo(
+    () => (products && cohortsReady ? productTrialCounts(periodCohorts, products) : null),
+    [products, cohortsReady, periodCohorts],
+  );
+  const funnelOptions = useMemo(
+    () => buildFunnelOptions(periodCohorts, productPaths, selectedFunnels),
+    [periodCohorts, productPaths, selectedFunnels],
+  );
+  const visibleCohorts = useMemo(() => filterRowsByPaths(periodCohorts, pathScope(panelPaths)), [periodCohorts, panelPaths]);
+  // Exact-id match: a legacy-format id that the list no longer carries counts
+  // as hidden, like any other selected cohort the filters leave out.
+  const hiddenSelectedCount = useMemo(() => {
+    const visible = new Set(visibleCohorts.map((cohort) => cohort.cohort_id));
+    return selectedCohortIds.filter((id) => !visible.has(id)).length;
+  }, [visibleCohorts, selectedCohortIds]);
+  const usersPathSet = useMemo(() => pathScope(usersPaths), [usersPaths]);
 
   const cohortScopedUserCount = useMemo(
     () => usersWithCampaignPath.filter((user) => userMatchesSelectedCohorts(user, selectedCohortMatchIdSet, cohortMembership)).length,
@@ -773,14 +879,15 @@ export default function UsersPage() {
     // above unfiltered totals.
     if (platformFilterUnavailable) return [];
     const q = appliedSearch.trim().toLowerCase();
-    const fromDateKey = toDateKey(firstTrialFrom);
-    const toDateKeyValue = toDateKey(firstTrialTo);
+    const fromDateKey = toDateKey(periodRange.from);
+    const toDateKeyValue = toDateKey(periodRange.to);
     const hasFirstTrialFilter = Boolean(fromDateKey || toDateKeyValue);
     const failedAttemptsThreshold = failedAttemptsFilter === "gte5" ? 5 : failedAttemptsFilter === "gte3" ? 3 : failedAttemptsFilter === "gte1" ? 1 : 0;
     return usersWithCampaignPath.filter((u) => {
       if (!userMatchesSelectedCohorts(u, selectedCohortMatchIdSet, cohortMembership)) return false;
       if (q && !u.email.toLowerCase().includes(q) && !u.user_id.toLowerCase().includes(q)) return false;
-      if (!hasSelectedCohorts && campaignPathFilter !== "all" && u.campaign_path !== campaignPathFilter) return false;
+      // A cohort selection wins over the panel's product/funnel paths (D4).
+      if (!hasSelectedCohorts && usersPathSet && !usersPathSet.has(u.campaign_path)) return false;
       if (selectedCardTypes.length > 0 && !selectedCardTypes.includes(u.card_type)) return false;
       if (selectedMediaBuyers.length > 0 && !selectedMediaBuyers.includes(u.media_buyer)) return false;
       if (paymentFailedFilter === "has" && !u.has_failed_payment) return false;
@@ -800,7 +907,7 @@ export default function UsersPage() {
       }
       return true;
     });
-  }, [usersWithCampaignPath, hasSelectedCohorts, selectedCohortMatchIdSet, cohortMembership, appliedSearch, campaignPathFilter, selectedCardTypes, selectedMediaBuyers, platformFilterUnavailable, paymentFailedFilter, selectedDeclineReasons, failedAttemptsFilter, firstSubFilter, refundFilter, firstTrialFrom, firstTrialTo]);
+  }, [usersWithCampaignPath, hasSelectedCohorts, selectedCohortMatchIdSet, cohortMembership, appliedSearch, usersPathSet, selectedCardTypes, selectedMediaBuyers, platformFilterUnavailable, paymentFailedFilter, selectedDeclineReasons, failedAttemptsFilter, firstSubFilter, refundFilter, periodRange]);
 
   const filtered = useMemo(() => {
     const list = filteredExceptCountry.filter((u) => {
@@ -828,14 +935,15 @@ export default function UsersPage() {
   // Country options (both tabs): only countries of the CURRENTLY SCOPED users
   // (every active filter except Country — including a cohort selection), with
   // TRIAL-user counts, exactly like the Cohorts page country filter. The server
-  // path returns the same shape from the dependent options action; the legacy
-  // path derives it from the scoped client set.
+  // path returns the same shape from the dependent options action (from the
+  // with-paths request while a product or funnel is picked, see
+  // countryOptionsQuery); the legacy path derives it from the scoped client set.
   const countryOptions = useMemo(
     () =>
       usersAnyServerDriving && chOptions
-        ? chOptions.country
+        ? chCountryOptions ?? chOptions.country
         : buildLegacyCountryOptions(filteredExceptCountry),
-    [usersAnyServerDriving, chOptions, filteredExceptCountry],
+    [usersAnyServerDriving, chOptions, chCountryOptions, filteredExceptCountry],
   );
 
   // Render the user table one page at a time so the DOM stays bounded for large accounts. Summary,
@@ -1091,8 +1199,6 @@ export default function UsersPage() {
   // unchanged fallback (cohort selections, legacy flag, or a server error).
   const declineAnalytics = declineServerAnalytics ?? legacyDeclineAnalytics;
 
-  const hasFirstTrialFilter = Boolean(firstTrialFrom || firstTrialTo);
-
   const toggleSort = (key: SortKey) => {
     if (sortKey === key) updateUiState({ sortDir: sortDir === "asc" ? "desc" : "asc" });
     else updateUiState({ sortKey: key, sortDir: "desc" });
@@ -1167,14 +1273,39 @@ export default function UsersPage() {
     declineCountrySortDir === "asc" ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />;
   // Rates are fractions (0..1) or null when the denominator is 0 — never NaN.
   const formatRate = (value: number | null) => (value == null ? "—" : formatPct(value * 100));
-  const toggleCohortSelection = (cohortId: string) => {
-    const next = selectedCohortIds.includes(cohortId)
-      ? selectedCohortIds.filter((value) => value !== cohortId)
-      : [...selectedCohortIds, cohortId];
-    updateUiState({ selectedCohortIds: next });
-  };
+  const setCohortSelection = (ids: string[]) => updateUiState({ selectedCohortIds: ids });
   const clearCohortSelection = () => updateUiState({ selectedCohortIds: [] });
   const toggleCohortSortDirection = () => updateUiState({ cohortSortDir: cohortSortDir === "asc" ? "desc" : "asc" });
+  // Product / funnel writers. Narrowing the path scope prunes the cohort
+  // selection to it, so a stale selection never pins the users to cohorts the
+  // panel no longer offers. Each is a single patch that also blanks the legacy
+  // single campaign path.
+  const setFunnels = (next: string[]) => updateUiState({
+    selectedCampaignPaths: [...next].sort(),
+    campaignPathFilter: "all",
+    selectedCohortIds: pruneCohortSelection(selectedCohortIds, pathScope(effectiveCampaignPaths(next, productPaths)), cohortPathById),
+  });
+  const toggleFunnel = (path: string) =>
+    setFunnels(selectedFunnels.includes(path) ? selectedFunnels.filter((value) => value !== path) : [...selectedFunnels, path]);
+  // Picking products drops picked funnels of other products, so the two
+  // selections never contradict each other (Cohorts page rule).
+  const toggleProduct = (key: string) => {
+    const next = effectiveSelectedProducts.includes(key)
+      ? effectiveSelectedProducts.filter((value) => value !== key)
+      : [...effectiveSelectedProducts, key].sort();
+    const nextPaths = productPathSet(products, next);
+    const nextFunnels = nextPaths ? selectedFunnels.filter((path) => nextPaths.has(path)) : selectedFunnels;
+    updateUiState({
+      selectedProducts: next,
+      selectedCampaignPaths: nextFunnels,
+      campaignPathFilter: "all",
+      selectedCohortIds: pruneCohortSelection(selectedCohortIds, pathScope(effectiveCampaignPaths(nextFunnels, nextPaths)), cohortPathById),
+    });
+  };
+  // Clearing only widens the scope, so nothing is pruned.
+  const clearProducts = () => updateUiState({ selectedProducts: [] });
+  // The period ANDs with a cohort selection on the server, so it prunes nothing.
+  const setPeriod = (selection: PeriodSelection) => updateUiState(periodPatch(selection));
   const summaryCards = [
     { label: "Users", value: String(summary.users) },
     { label: "Trial Users", value: String(summary.trial_users) },
@@ -1206,23 +1337,58 @@ export default function UsersPage() {
     { label: "Declines After Renewal", value: String(declineAnalytics.stageTotals.after_renewal) },
   ];
   const maxDeclineReasonTransactions = Math.max(1, ...declineAnalytics.rows.map((row) => row.failed_transactions));
-  const activeUserFilterLabels = [
-    search.trim() ? `Search: ${search.trim()}` : null,
-    selectedCohortIdSet.size === 0 && campaignPathFilter !== "all" ? `Campaign: ${campaignPathFilter}` : null,
-    countryFilter !== "all" ? `Country: ${countryFilter}` : null,
-    selectedCardTypes.length ? `Card Type: ${selectedCardTypes.map(cardTypeLabel).join(", ")}` : null,
-    selectedPlatforms.length ? `Platform: ${selectedPlatforms.map(platformLabel).join(", ")}` : null,
-    selectedMediaBuyers.length ? `Media Buyer: ${selectedMediaBuyers.join(", ")}` : null,
-    paymentFailedFilter !== "all" ? `Payment Failed: ${paymentFailedFilter === "has" ? "Has failed payments" : "No failed payments"}` : null,
-    selectedDeclineReasons.length ? `Decline Reason: ${selectedDeclineReasons.join(", ")}` : null,
-    failedAttemptsFilter !== "all" ? `Failed Attempts: ${failedAttemptsFilter.replace("gte", ">= ")}` : null,
-    firstSubFilter !== "all" ? `First sub: ${firstSubFilter === "has" ? "Has First Sub" : "No First Sub"}` : null,
-    refundFilter !== "all" ? `Refund: ${refundFilter === "has" ? "Has refund" : "No refund"}` : null,
-    firstTrialFrom ? `First trial from: ${formatDateKey(firstTrialFrom)}` : null,
-    firstTrialTo ? `First trial to: ${formatDateKey(firstTrialTo)}` : null,
-    declineAnalyticsReasons.length ? `Analytics Decline Reason: ${declineAnalyticsReasons.join(", ")}` : null,
-    declineAnalyticsStages.length ? `Analytics Decline Stage: ${declineAnalyticsStages.map(declineStageLabel).join(", ")}` : null,
-  ].filter((label): label is string => Boolean(label));
+  // Every active filter as a removable chip (above the users table and the
+  // Decline tab). The panel's product, funnel and cohort selection have their
+  // own chips but are not part of "Reset filters", which keeps them.
+  const currentPeriodLabel = periodLabel(periodSelection, periodRange);
+  const productLabels = products
+    ? effectiveSelectedProducts.map((key) => products.find((product) => productKey(product) === key)?.label ?? key)
+    : [];
+  const activeFilterChips = ([
+    productLabels.length ? { id: "product", label: `Product: ${productLabels.join(", ")}`, onRemove: clearProducts } : null,
+    selectedFunnels.length
+      ? {
+          id: "funnel",
+          label: `Funnel: ${selectedFunnels.length > 2 ? `${selectedFunnels.length} selected` : selectedFunnels.join(", ")}`,
+          onRemove: () => setFunnels([]),
+        }
+      : null,
+    currentPeriodLabel ? { id: "period", label: `Period: ${currentPeriodLabel}`, onRemove: () => setPeriod({ preset: "all", from: "", to: "" }) } : null,
+    selectedCohortIds.length ? { id: "cohorts", label: `Cohorts: ${selectedCohortIds.length} selected`, onRemove: clearCohortSelection } : null,
+    search.trim() ? { id: "search", label: `Search: ${search.trim()}`, onRemove: () => updateUiState({ search: "" }) } : null,
+    countryFilter !== "all" ? { id: "country", label: `Country: ${countryFilter}`, onRemove: () => updateUiState({ countryFilter: "all" }) } : null,
+    selectedCardTypes.length ? { id: "card_type", label: `Card Type: ${selectedCardTypes.map(cardTypeLabel).join(", ")}`, onRemove: clearCardTypes } : null,
+    selectedPlatforms.length ? { id: "platform", label: `Platform: ${selectedPlatforms.map(platformLabel).join(", ")}`, onRemove: clearPlatforms } : null,
+    selectedMediaBuyers.length ? { id: "media_buyer", label: `Media Buyer: ${selectedMediaBuyers.join(", ")}`, onRemove: clearMediaBuyers } : null,
+    paymentFailedFilter !== "all"
+      ? { id: "payment_failed", label: `Payment Failed: ${paymentFailedFilter === "has" ? "Has failed payments" : "No failed payments"}`, onRemove: () => updateUiState({ paymentFailedFilter: "all" }) }
+      : null,
+    selectedDeclineReasons.length ? { id: "decline_reason", label: `Decline Reason: ${selectedDeclineReasons.join(", ")}`, onRemove: clearDeclineReasons } : null,
+    failedAttemptsFilter !== "all"
+      ? { id: "failed_attempts", label: `Failed Attempts: ${failedAttemptsFilter.replace("gte", ">= ")}`, onRemove: () => updateUiState({ failedAttemptsFilter: "all" }) }
+      : null,
+    firstSubFilter !== "all"
+      ? { id: "first_sub", label: `First sub: ${firstSubFilter === "has" ? "Has First Sub" : "No First Sub"}`, onRemove: () => updateUiState({ firstSubFilter: "all" }) }
+      : null,
+    refundFilter !== "all"
+      ? { id: "refund", label: `Refund: ${refundFilter === "has" ? "Has refund" : "No refund"}`, onRemove: () => updateUiState({ refundFilter: "all" }) }
+      : null,
+    declineAnalyticsReasons.length
+      ? { id: "analytics_reason", label: `Analytics Decline Reason: ${declineAnalyticsReasons.join(", ")}`, onRemove: clearDeclineAnalyticsReasons }
+      : null,
+    declineAnalyticsStages.length
+      ? { id: "analytics_stage", label: `Analytics Decline Stage: ${declineAnalyticsStages.map(declineStageLabel).join(", ")}`, onRemove: clearDeclineAnalyticsStages }
+      : null,
+  ] as Array<ActiveFilterChip | null>).filter((chip): chip is ActiveFilterChip => chip !== null);
+  // The Decline-only analytics filters (reason/stage rows) do not touch the
+  // users table, so its chips leave them out.
+  const usersTableChips = activeFilterChips.filter((chip) => chip.id !== "analytics_reason" && chip.id !== "analytics_stage");
+  // What "Reset user filters" can clear (everything but the panel selections).
+  const resettableCount = (chips: ActiveFilterChip[]) => chips.filter((chip) => !["product", "funnel", "cohorts"].includes(chip.id)).length;
+  const resettableChipCount = resettableCount(activeFilterChips);
+  const usersTableResettableChipCount = resettableCount(usersTableChips);
+  // The main-row filters plus the period; product, funnel and the cohort
+  // selection are cleared by their own controls and chips.
   const clearUserFilters = () => updateUiState({
     search: "",
     countryFilter: "all",
@@ -1234,125 +1400,55 @@ export default function UsersPage() {
     failedAttemptsFilter: "all",
     firstSubFilter: "all",
     refundFilter: "all",
-    firstTrialFrom: "",
-    firstTrialTo: "",
+    ...periodPatch({ preset: "all", from: "", to: "" }),
     declineAnalyticsReasons: [],
     declineAnalyticsStages: [],
   });
+  // The panel shows "Loading cohorts…" until the server's first cohort list
+  // (also while a saved product's map is still pending).
+  const cohortsLoading =
+    (usersServerEligible || declineServerEligible) &&
+    !usersNeedLegacy &&
+    !(usersAnyServerDriving && chOptions) &&
+    !chStatus.error &&
+    !chDeclineStatus.error;
+  // A saved product holds the users requests until its paths are known: show
+  // that wait as loading, not as "No users match".
+  const usersTableLoading = isInitialLoading || (usersServerEligible && !productFilterSettled && chUsers == null);
+  const declineHeldByProducts = declineServerEligible && !productFilterSettled && chDecline == null;
 
   return (
     <AppLayout title="Users" description={`${displayTotal} users`}>
       <div className={mode === "leads" ? "grid gap-4" : "grid gap-4 lg:grid-cols-[320px_minmax(0,1fr)]"}>
         {/* Leads have no cohort (it starts with the first payment), so the cohort explorer is hidden on that tab. */}
         {mode !== "leads" && (
-        <Card className="p-4 shadow-card lg:sticky lg:top-4 lg:self-start">
-          <div className="space-y-3">
-            <div className="flex items-center justify-between gap-2">
-              <div>
-                <div className="text-sm font-medium">Cohorts</div>
-                <div className="text-xs text-muted-foreground">{selectedCohortIds.length ? `${selectedCohortIds.length} selected` : "All cohorts"}</div>
-              </div>
-              <Button type="button" variant="ghost" size="sm" onClick={clearCohortSelection} disabled={!selectedCohortIds.length}>
-                Clear
-              </Button>
-            </div>
-            <div className="relative">
-              <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                placeholder="Search campaign…"
-                value={cohortSearch}
-                onChange={(e) => updateUiState({ cohortSearch: e.target.value })}
-                className="h-9 pl-8"
-              />
-            </div>
-            <Select value={campaignPathFilter} onValueChange={(value) => updateUiState({ campaignPathFilter: value })}>
-              <SelectTrigger className="h-9 w-full"><SelectValue placeholder="Campaign path" /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">All campaign paths</SelectItem>
-                {campaignPathOptions.map((path) => (
-                  <SelectItem key={path} value={path}>{path}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <div className="grid grid-cols-2 gap-2">
-              <Input
-                type="date"
-                value={cohortDateFrom}
-                onChange={(e) => updateUiState({ cohortDateFrom: e.target.value })}
-                className="h-9"
-                aria-label="Cohort date from"
-              />
-              <Input
-                type="date"
-                value={cohortDateTo}
-                onChange={(e) => updateUiState({ cohortDateTo: e.target.value })}
-                className="h-9"
-                aria-label="Cohort date to"
-              />
-            </div>
-            <div className="flex items-center gap-2">
-              <Select value={cohortSortKey} onValueChange={(value: CohortExplorerSortKey) => updateUiState({ cohortSortKey: value })}>
-                <SelectTrigger className="h-9 flex-1"><SelectValue placeholder="Sort cohorts" /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="date">Date</SelectItem>
-                  <SelectItem value="trial_users">Trial users</SelectItem>
-                  <SelectItem value="net_revenue">Net revenue</SelectItem>
-                </SelectContent>
-              </Select>
-              <Button type="button" variant="outline" size="icon" className="h-9 w-9" onClick={toggleCohortSortDirection} aria-label="Toggle cohort sort direction">
-                {cohortSortDir === "asc" ? <ArrowUp className="h-4 w-4" /> : <ArrowDown className="h-4 w-4" />}
-              </Button>
-            </div>
-            <div className="max-h-[620px] space-y-1 overflow-y-auto pr-1">
-              {visibleCohorts.map((cohort) => {
-                const selected = selectedCohortIdSet.has(cohort.cohort_id);
-                return (
-                  <div
-                    key={cohort.cohort_id}
-                    role="button"
-                    tabIndex={0}
-                    onClick={() => toggleCohortSelection(cohort.cohort_id)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter" || event.key === " ") {
-                        event.preventDefault();
-                        toggleCohortSelection(cohort.cohort_id);
-                      }
-                    }}
-                    className={cn(
-                      "w-full cursor-pointer rounded-md border px-3 py-2 text-left transition-colors hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                      selected ? "border-primary bg-primary/10" : "border-border bg-background",
-                    )}
-                  >
-                    <div className="flex items-start gap-2">
-                      <Checkbox
-                        checked={selected}
-                        onClick={(event) => event.stopPropagation()}
-                        onCheckedChange={() => toggleCohortSelection(cohort.cohort_id)}
-                        aria-label={`Select cohort ${cohort.cohort_id}`}
-                      />
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-sm font-medium tabular-nums">{formatDateKey(cohort.cohort_date)}</span>
-                          <span className="text-xs text-muted-foreground tabular-nums">{cohort.trial_users} trials</span>
-                        </div>
-                        <div className="mt-1 truncate text-xs text-muted-foreground">{cohort.campaign_path}</div>
-                        <div className="mt-1 flex items-center justify-between gap-2 text-xs">
-                          <span className="capitalize text-muted-foreground">{cohort.funnel.replace("_", " ")}</span>
-                          <span className="font-medium tabular-nums">{formatCurrency(cohort.net_revenue)}</span>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-              {visibleCohorts.length === 0 && (
-                <div className="rounded-md border border-dashed border-border px-3 py-8 text-center text-sm text-muted-foreground">
-                  No cohorts match your filters.
-                </div>
-              )}
-            </div>
-          </div>
-        </Card>
+          <UsersCohortPanel
+            products={products}
+            productCounts={productCounts}
+            selectedProducts={effectiveSelectedProducts}
+            onToggleProduct={toggleProduct}
+            onClearProducts={clearProducts}
+            funnelOptions={funnelOptions}
+            selectedFunnels={selectedFunnels}
+            onToggleFunnel={toggleFunnel}
+            onClearFunnels={() => setFunnels([])}
+            periodSelection={periodSelection}
+            periodRange={periodRange}
+            onPeriod={setPeriod}
+            groupBy={cohortGroupBy}
+            onGroupBy={(value) => updateUiState({ cohortGroupBy: value })}
+            sortKey={cohortSortKey}
+            sortDir={cohortSortDir}
+            onSortKey={(value) => updateUiState({ cohortSortKey: value })}
+            onToggleSortDir={toggleCohortSortDirection}
+            rows={visibleCohorts}
+            selectedIds={selectedCohortIdSet}
+            selectedCount={selectedCohortIds.length}
+            hiddenSelectedCount={hiddenSelectedCount}
+            onSetCohorts={setCohortSelection}
+            onClearSelection={clearCohortSelection}
+            loading={cohortsLoading}
+          />
         )}
 
         <Card className="min-w-0 p-4 shadow-card">
@@ -1557,38 +1653,17 @@ export default function UsersPage() {
               </SelectContent>
             </Select>
           </label>
-          <label className="flex items-center gap-2 text-sm text-muted-foreground">
-            First trial from
-            <Input
-              type="date"
-              value={firstTrialFrom}
-              onChange={(e) => updateUiState({ firstTrialFrom: e.target.value })}
-              className="h-9 w-[150px]"
-            />
-          </label>
-          <label className="flex items-center gap-2 text-sm text-muted-foreground">
-            First trial to
-            <Input
-              type="date"
-              value={firstTrialTo}
-              onChange={(e) => updateUiState({ firstTrialTo: e.target.value })}
-              className="h-9 w-[150px]"
-            />
-          </label>
-          {hasFirstTrialFilter && (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => updateUiState({ firstTrialFrom: "", firstTrialTo: "" })}
-            >
-              Clear date filter
-            </Button>
-          )}
+          {/* The first-trial range lives in the cohort panel's Period now: it
+              scopes the cohort list and the users together. */}
           <Button type="button" variant="ghost" size="sm" onClick={clearUserFilters}>
             Reset filters
           </Button>
         </div>
+        {usersTableChips.length > 0 && (
+          <div className="mt-3">
+            <ActiveFilterChips chips={usersTableChips} />
+          </div>
+        )}
 
         <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-5">
           {summaryCards.map((card) => (
@@ -1775,7 +1850,7 @@ export default function UsersPage() {
                 </TableRow>
               ))}
               {/* Initial load (no cached rows yet): progress row, never the empty-state. */}
-              {isInitialLoading && tableRows.length === 0 && (
+              {usersTableLoading && tableRows.length === 0 && (
                 <TableRow>
                   <TableCell colSpan={19} className="py-10">
                     <div className="flex flex-col items-center gap-3 text-muted-foreground">
@@ -1785,7 +1860,7 @@ export default function UsersPage() {
                   </TableCell>
                 </TableRow>
               )}
-              {tableRows.length === 0 && !isInitialLoading && (
+              {tableRows.length === 0 && !usersTableLoading && (
                 <TableRow>
                   <TableCell colSpan={19} className="text-center text-sm text-muted-foreground py-10">
                     <div className="space-y-3">
@@ -1794,12 +1869,7 @@ export default function UsersPage() {
                           ? "Фильтр Platform работает только на серверном пути (ClickHouse). Легаси-расчёт в браузере не знает ОС пользователя, поэтому строки не показываются — снимите фильтр Platform или дождитесь ClickHouse."
                           : selectedCohortIds.length ? "No users match selected cohorts and filters." : "No users match your filters."}
                       </div>
-                      {activeUserFilterLabels.length > 0 && (
-                        <div className="mx-auto max-w-2xl text-xs">
-                          Active filters: {activeUserFilterLabels.join("; ")}
-                        </div>
-                      )}
-                      {activeUserFilterLabels.length > 0 && (
+                      {usersTableResettableChipCount > 0 && (
                         <Button type="button" variant="outline" size="sm" onClick={clearUserFilters}>
                           Reset user filters
                         </Button>
@@ -1901,6 +1971,7 @@ export default function UsersPage() {
                 </SelectContent>
               </Select>
             </div>
+            <ActiveFilterChips chips={activeFilterChips} />
 
             {usersSource === "clickhouse" && (
               <div className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-md border border-border bg-muted/20 px-3 py-2 text-xs">
@@ -1943,7 +2014,7 @@ export default function UsersPage() {
               </div>
             )}
 
-            {declineServerEligible && isDeclineInitialLoading && chDecline == null ? (
+            {declineServerEligible && (isDeclineInitialLoading || declineHeldByProducts) && chDecline == null ? (
               <div className="rounded-md border border-dashed border-border px-4 py-10">
                 <div className="flex flex-col items-center gap-3 text-muted-foreground">
                   <Progress value={declineProgressPercent} className="h-2 w-full max-w-xs" />
@@ -1960,12 +2031,7 @@ export default function UsersPage() {
                         ? "No users match selected cohorts and filters."
                         : "No users selected."}
                   </div>
-                  {activeUserFilterLabels.length > 0 && (
-                    <div className="mx-auto max-w-2xl text-xs">
-                      Active filters: {activeUserFilterLabels.join("; ")}
-                    </div>
-                  )}
-                  {activeUserFilterLabels.length > 0 && (
+                  {resettableChipCount > 0 && (
                     <Button type="button" variant="outline" size="sm" onClick={clearUserFilters}>
                       Reset user filters
                     </Button>
