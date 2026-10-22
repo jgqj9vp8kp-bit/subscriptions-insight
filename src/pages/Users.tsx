@@ -1419,7 +1419,7 @@ export default function UsersPage() {
 
   return (
     <AppLayout title="Users" description={`${displayTotal} users`}>
-      <div className={mode === "leads" ? "grid gap-4" : "grid gap-4 lg:grid-cols-[320px_minmax(0,1fr)]"}>
+      <div className={mode === "leads" ? "grid gap-4" : "grid gap-4 lg:grid-cols-[360px_minmax(0,1fr)]"}>
         {/* Leads have no cohort (it starts with the first payment), so the cohort explorer is hidden on that tab. */}
         {mode !== "leads" && (
           <UsersCohortPanel

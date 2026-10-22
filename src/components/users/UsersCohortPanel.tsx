@@ -365,8 +365,8 @@ export function UsersCohortPanel(props: UsersCohortPanelProps) {
           {groups.length > 0 && (
             <div className="sticky top-0 z-10 flex items-center gap-1.5 bg-card py-1 text-[11px] text-muted-foreground">
               <span className="min-w-0 flex-1 pl-[48px]">{groupBy === "funnel" ? "Funnel" : "Date"}</span>
-              <span className="w-12 text-right">Trials</span>
-              <span className="w-16 text-right">Net</span>
+              <span className="w-9 text-right">Trials</span>
+              <span className="w-12 text-right">Net</span>
             </div>
           )}
           {groups.map((group) => {
@@ -398,14 +398,14 @@ export function UsersCohortPanel(props: UsersCohortPanelProps) {
                     }}
                   />
                   <span
-                    className="min-w-0 flex-1 cursor-pointer truncate text-sm font-medium"
+                    className="min-w-0 flex-1 cursor-pointer truncate text-xs font-medium"
                     title={group.label}
                     onClick={() => toggleExpanded(group.key, expanded)}
                   >
                     {group.label}
                   </span>
-                  <span className="w-12 text-right text-xs tabular-nums">{count(group.trialUsers)}</span>
-                  <span className="w-16 text-right text-xs tabular-nums" title={formatCurrency(group.netRevenue)}>{money(group.netRevenue)}</span>
+                  <span className="w-9 text-right text-xs tabular-nums">{count(group.trialUsers)}</span>
+                  <span className="w-12 text-right text-xs tabular-nums" title={formatCurrency(group.netRevenue)}>{money(group.netRevenue)}</span>
                 </div>
                 {expanded && group.children.map((child) => {
                   const cohortId = child.cohort.cohort_id;
@@ -437,8 +437,8 @@ export function UsersCohortPanel(props: UsersCohortPanelProps) {
                         <span className="truncate text-xs tabular-nums">{child.label}</span>
                         {child.note && <span className="shrink-0 text-[11px] capitalize text-muted-foreground">{child.note}</span>}
                       </span>
-                      <span className="w-12 text-right text-xs tabular-nums text-muted-foreground">{count(child.cohort.trial_users)}</span>
-                      <span className="w-16 text-right text-xs tabular-nums text-muted-foreground" title={formatCurrency(child.cohort.net_revenue)}>{money(child.cohort.net_revenue)}</span>
+                      <span className="w-9 text-right text-xs tabular-nums text-muted-foreground">{count(child.cohort.trial_users)}</span>
+                      <span className="w-12 text-right text-xs tabular-nums text-muted-foreground" title={formatCurrency(child.cohort.net_revenue)}>{money(child.cohort.net_revenue)}</span>
                     </div>
                   );
                 })}
