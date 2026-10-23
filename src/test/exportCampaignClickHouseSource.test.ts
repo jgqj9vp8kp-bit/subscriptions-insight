@@ -74,6 +74,8 @@ describe("query shape", () => {
       "gross_amount_usd", "net_amount_usd", "refund_amount_usd", "is_refund", "status",
       "transaction_type", "funnel", "campaign_path", "campaign_id", "utm_source",
       "classification_reason", "billing_reason", "product_name", "currency", "source", "import_batch_id",
+      // The FunnelFox price id of the read-time token / in-product upsell split.
+      "price_point",
     ]) {
       expect(EXPORT_TRANSACTIONS_SELECT).toContain(column);
     }
@@ -187,6 +189,14 @@ describe("mapExportSourceRow", () => {
     expect(blankOptionals.billing_reason).toBeUndefined();
     expect(blankOptionals.product).toBeUndefined();
     expect(blankOptionals.utm_source).toBeNull();
+  });
+
+  it("carries the price id as metadata.ff_price_point (the one key the classifier reads); none when blank", () => {
+    const withPrice = mapExportSourceRow(warehouseRow({ price_point: "price_01M3P1WF72Y5FBFV1SKKCF12TX" }))!;
+    expect(withPrice.metadata).toEqual({ ff_price_point: "price_01M3P1WF72Y5FBFV1SKKCF12TX" });
+    expect(withPrice.raw).toEqual({});
+    expect(mapExportSourceRow(warehouseRow({ price_point: "" }))!.metadata).toBeUndefined();
+    expect(mapExportSourceRow(warehouseRow())!.metadata).toBeUndefined();
   });
 
   it("drops a row with no id or no timestamp rather than inventing one", () => {

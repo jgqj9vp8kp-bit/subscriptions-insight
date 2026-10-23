@@ -17,6 +17,7 @@
 // is pinned by a static check of its source.
 import { readFileSync } from "node:fs";
 import { cancellationFlagsCTE } from "../../supabase/functions/_shared/clickhouse/cohortCancellations.ts";
+import { upsellPricePointsCte } from "../../supabase/functions/_shared/clickhouse/monetizationTyping.ts";
 import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { handleWithAccess, type AccessGateDeps, type AccessRequest } from "../../supabase/functions/_shared/access/gate.ts";
@@ -217,6 +218,9 @@ function expectedRestrictedFinx(ownerSql: string, scope: ScopeSql): string {
   let sql = swap(ownerSql, supportEmailsCTE("ready"), supportEmailsCTE("ready", scope));
   // The cancellation flags read fact_subscriptions / transactions through the scope helpers.
   sql = swap(sql, cancellationFlagsCTE(ALL_SCOPE_SQL), cancellationFlagsCTE(scope));
+  // The ever-marked price ids of the upsell split (monetizationTyping.ts): only
+  // the scoped users' marks for a restricted member (documented divergence).
+  sql = swap(sql, upsellPricePointsCte(ALL_SCOPE_SQL), upsellPricePointsCte(scope));
   sql = swap(sql, "  FROM analytics_transactions AS a FINAL\n  INNER JOIN fact_user_cohorts AS fc FINAL\n", `  FROM ${txFrom(scope, "a")}\n  INNER JOIN ${cohortsFrom(scope, "fc")}\n`);
   const fcall = /-- TODO_MONETIZATION[\s\S]*?\nfcall AS \([\s\S]*?\n\),\n(?=fcm AS \()/;
   expect(sql).toMatch(fcall);
@@ -259,6 +263,10 @@ describe("restricted materialized list", () => {
     expectRestrictedTransport(recording);
     // The snapshot is the gate's: no second state read.
     expect(tables).not.toContain("clickhouse_cohort_snapshot_state");
+    // The price-id diagnostics of the upsell split are the data owner's only.
+    expect(recording.statements.filter((statement) => statement.query.includes("'unknown_price' kind"))).toEqual([]);
+    expect(response!.token_diagnostics?.unknown_products).toEqual([]);
+    expect(response!.token_diagnostics?.price_signals).toBeUndefined();
 
     const list = recording.statements.find((statement) => statement.query.includes("FROM agg"));
     expect(list).toBeDefined();

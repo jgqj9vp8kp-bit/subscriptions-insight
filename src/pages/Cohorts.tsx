@@ -272,8 +272,8 @@ const COLUMN_ORDER_BEFORE_RENEWALS = [
   "renewal_5_to_renewal_6_cr",
 ] as const;
 
-// Multi-upsell + token/minute pack monetization columns (hidden by default,
-// surfaced together by the built-in "Monetization" view).
+// Multi-upsell + token/minute pack + in-product upsell monetization columns
+// (hidden by default, surfaced together by the built-in "Monetization" view).
 const MONETIZATION_COLUMNS = [
   "trial_revenue",
   "upsell_1_users",
@@ -296,6 +296,12 @@ const MONETIZATION_COLUMNS = [
   "token_net_revenue",
   "avg_token_revenue_per_trial",
   "avg_token_revenue_per_buyer",
+  // In-product upsells (token / in-product upsell split, 2026-10-23).
+  "app_upsell_buyers",
+  "app_upsell_buyer_cr",
+  "app_upsell_purchases",
+  "app_upsell_gross_revenue",
+  "app_upsell_net_revenue",
   "addon_revenue",
 ] as const;
 
@@ -436,6 +442,11 @@ const STATIC_COLUMN_LABELS: Record<string, string> = {
   token_net_revenue: "Token Net Rev",
   avg_token_revenue_per_trial: "Avg Token Rev / Trial",
   avg_token_revenue_per_buyer: "Avg Token Rev / Buyer",
+  app_upsell_buyers: "In-product Upsell Buyers",
+  app_upsell_buyer_cr: "In-product Upsell CR",
+  app_upsell_purchases: "In-product Upsell Purchases",
+  app_upsell_gross_revenue: "In-product Upsell Gross Rev",
+  app_upsell_net_revenue: "In-product Upsell Net Rev",
   addon_revenue: "Total Add-on Rev",
   currency_mix: "Currency Mix",
   fx_missing_amount: "FX Missing Amount",
@@ -538,6 +549,11 @@ const COLUMN_MIN_WIDTHS: Record<string, number> = {
   token_net_revenue: 110,
   avg_token_revenue_per_trial: 130,
   avg_token_revenue_per_buyer: 130,
+  app_upsell_buyers: 150,
+  app_upsell_buyer_cr: 130,
+  app_upsell_purchases: 160,
+  app_upsell_gross_revenue: 160,
+  app_upsell_net_revenue: 150,
   addon_revenue: 120,
   currency_mix: 150,
   fx_missing_amount: 130,
@@ -686,14 +702,21 @@ const COLUMN_HELP: Partial<Record<CohortColumnId, string>> = {
   upsell_extra_revenue: "Gross revenue of 4th+ funnel upsell purchases.",
   funnel_upsell_users: "Unique users with at least one successful funnel upsell of any slot.",
   funnel_upsell_revenue: "Gross revenue of all successful funnel upsells (slots 1-3 + extra).",
-  token_buyers: "Unique users with at least one successful web-app token/minute pack purchase.",
-  token_buyer_cr: "Token Buyers / Trial Users.",
-  token_purchases: "Count of successful token/minute pack purchases.",
+  token_buyers: "Unique users with at least one successful web-app token/minute pack purchase (excludes in-product and funnel upsells).",
+  token_buyer_cr: "Token Buyers / Trial Users (excludes in-product and funnel upsells).",
+  token_purchases: "Count of successful token/minute pack purchases (excludes in-product and funnel upsells).",
   token_gross_revenue: "Sum of successful token purchase gross amounts.",
   token_net_revenue: "Token Gross Rev minus refunds detectably related to token purchases; equals gross when no token refund is detectable.",
   avg_token_revenue_per_trial: "Token Net Rev / Trial Users.",
   avg_token_revenue_per_buyer: "Token Net Rev / Token Buyers.",
-  addon_revenue: "Add-on revenue: net upsell revenue + Token Net Rev (everything beyond the subscription lifecycle).",
+  app_upsell_buyers:
+    "Unique users with ≥1 successful in-product upsell: offered in the product right after the funnel checkout, matched by FunnelFox price id, or an unknown unmarked charge ≤ 2 min after the trial.",
+  app_upsell_buyer_cr: "In-product Upsell Buyers / Trial Users.",
+  app_upsell_purchases: "Count of successful in-product upsell purchases.",
+  app_upsell_gross_revenue: "Sum of successful in-product upsell gross amounts.",
+  app_upsell_net_revenue: "In-product Upsell Gross Rev minus in-product upsell refunds.",
+  addon_revenue:
+    "Add-on revenue: net upsell revenue + Token Net Rev + In-product Upsell Net Rev (everything beyond the subscription lifecycle).",
 };
 
 function heatStyle(value: number, max: number): React.CSSProperties {
@@ -867,6 +890,10 @@ function buildBuiltinViews(defaultColumnOrder: readonly string[]): SavedView[] {
           "token_purchases",
           "token_net_revenue",
           "avg_token_revenue_per_trial",
+          "app_upsell_buyers",
+          "app_upsell_buyer_cr",
+          "app_upsell_purchases",
+          "app_upsell_net_revenue",
           "addon_revenue",
           "gross_revenue",
           "net_revenue",
@@ -981,6 +1008,34 @@ function fromCloudSavedView(view: CohortsUiSavedView): SavedView {
   };
 }
 
+/** Plain-language names of the one-off typing rules (monetizationTyping.ts) for
+ * the unknown-products diagnostics. */
+const ONE_OFF_RULE_LABELS: Record<string, string> = {
+  upmark: "Upsell mark",
+  trial: "Trial anchor",
+  app_id: "Listed in-product upsell id",
+  token_id: "Listed token id",
+  price_marked: "Price id seen with the upsell mark",
+  token_amount: "Known token amount",
+  common_up: "Common upsell amount ≤ 1 h after trial",
+  fallback_app_2m: "Unknown price ≤ 2 min after trial",
+  fallback_token_48h: "Unknown price ≤ 48 h after trial",
+  email_token: "Email-matched token purchase",
+  lifecycle: "Subscription lifecycle",
+};
+
+const ONE_OFF_TYPE_LABELS: Record<string, string> = {
+  token_purchase: "Token",
+  app_upsell: "In-product upsell",
+  upsell: "Funnel upsell",
+};
+
+/** A pack's price: in its own currency when the server says which (packs are
+ * priced in the original currency since the token / in-product upsell split). */
+function formatPackPrice(pack: TokenPackRow): string {
+  return pack.currency ? `${pack.price.toFixed(2)} ${pack.currency}` : formatCurrency(pack.price);
+}
+
 function TokenPackTable({ packs }: { packs: TokenPackRow[] }) {
   if (!packs.length) {
     return <div className="text-xs italic text-muted-foreground">No token purchases</div>;
@@ -1000,10 +1055,10 @@ function TokenPackTable({ packs }: { packs: TokenPackRow[] }) {
       </thead>
       <tbody>
         {packs.map((pack) => (
-          <tr key={`${pack.product}-${pack.price}`}>
-            <td className="pr-4 py-0.5 text-muted-foreground">{pack.product_id ?? "—"}</td>
+          <tr key={`${pack.product_id ?? ""}-${pack.product}-${pack.currency ?? ""}-${pack.price}`}>
+            <td className="pr-4 py-0.5 text-muted-foreground">{pack.product_id || "—"}</td>
             <td className="pr-4 py-0.5">{pack.product}</td>
-            <td className="pr-4 py-0.5 text-right">{formatCurrency(pack.price)}</td>
+            <td className="pr-4 py-0.5 text-right">{formatPackPrice(pack)}</td>
             <td className="pr-4 py-0.5 text-right">{pack.purchases}</td>
             <td className="pr-4 py-0.5 text-right">{pack.buyers}</td>
             <td className="pr-4 py-0.5 text-right">{formatCurrency(pack.gross_revenue)}</td>
@@ -1056,6 +1111,8 @@ function CohortMonetizationDetails({ cohort, nowMs }: { cohort: CohortRow; nowMs
   ];
   const tokenPurchases = cohort.token_purchases ?? 0;
   const tokenGross = cohort.token_gross_revenue ?? 0;
+  const appPurchases = cohort.app_upsell_purchases ?? 0;
+  const appGross = cohort.app_upsell_gross_revenue ?? 0;
   return (
     <div className="flex flex-wrap gap-8 py-1">
       <CohortLtv1mDetails cohort={cohort} nowMs={nowMs} />
@@ -1099,6 +1156,23 @@ function CohortMonetizationDetails({ cohort, nowMs }: { cohort: CohortRow; nowMs
           <span className="text-right">{tokenPurchases ? formatCurrency(tokenGross / tokenPurchases) : "—"}</span>
         </div>
         <TokenPackTable packs={cohort.token_pack_breakdown ?? []} />
+      </div>
+      <div>
+        <div className="mb-1 text-xs font-semibold text-muted-foreground" title={COLUMN_HELP.app_upsell_buyers}>In-product upsells</div>
+        <div className="grid grid-cols-2 gap-x-6 gap-y-0.5 text-xs tabular-nums">
+          <span className="text-muted-foreground">Buyers</span>
+          <span className="text-right">{cohort.app_upsell_buyers ?? 0}</span>
+          <span className="text-muted-foreground">CR</span>
+          <span className="text-right">{formatPct(cohort.app_upsell_buyer_cr ?? 0)}</span>
+          <span className="text-muted-foreground">Purchases</span>
+          <span className="text-right">{appPurchases}</span>
+          <span className="text-muted-foreground">Gross revenue</span>
+          <span className="text-right">{formatCurrency(appGross)}</span>
+          <span className="text-muted-foreground">Net revenue</span>
+          <span className="text-right">{formatCurrency(cohort.app_upsell_net_revenue ?? 0)}</span>
+          <span className="text-muted-foreground">Avg purchase</span>
+          <span className="text-right">{appPurchases ? formatCurrency(appGross / appPurchases) : "—"}</span>
+        </div>
       </div>
       <div>
         <div className="mb-1 text-xs font-semibold text-muted-foreground">Currency Breakdown</div>
@@ -2985,6 +3059,7 @@ export default function CohortsPage() {
   const maxUpsell2CR = Math.max(0, ...cohorts.map((c) => c.upsell_2_cr ?? 0));
   const maxUpsell3CR = Math.max(0, ...cohorts.map((c) => c.upsell_3_cr ?? 0));
   const maxTokenBuyerCR = Math.max(0, ...cohorts.map((c) => c.token_buyer_cr ?? 0));
+  const maxAppUpsellBuyerCR = Math.max(0, ...cohorts.map((c) => c.app_upsell_buyer_cr ?? 0));
   // The single metric-definition path: the same engine builds the Total row
   // here, the Funnels-view rows (buildFunnelViewRows) and the weekly report.
   // Traffic is deduplicated per (date, path) inside it, so a campaign path
@@ -3380,6 +3455,16 @@ export default function CohortsPage() {
         return <TableCell key={id} className={className}>{formatCurrency(c.avg_token_revenue_per_trial ?? 0)}</TableCell>;
       case "avg_token_revenue_per_buyer":
         return <TableCell key={id} className={className}>{formatCurrency(c.avg_token_revenue_per_buyer ?? 0)}</TableCell>;
+      case "app_upsell_buyers":
+        return <TableCell key={id} className={className}>{c.app_upsell_buyers ?? 0}</TableCell>;
+      case "app_upsell_buyer_cr":
+        return <TableCell key={id} className={`${className} font-medium`} style={heatStyle(c.app_upsell_buyer_cr ?? 0, maxAppUpsellBuyerCR)}>{formatPct(c.app_upsell_buyer_cr ?? 0)}</TableCell>;
+      case "app_upsell_purchases":
+        return <TableCell key={id} className={className}>{c.app_upsell_purchases ?? 0}</TableCell>;
+      case "app_upsell_gross_revenue":
+        return <TableCell key={id} className={className}>{formatCurrency(c.app_upsell_gross_revenue ?? 0)}</TableCell>;
+      case "app_upsell_net_revenue":
+        return <TableCell key={id} className={className}>{formatCurrency(c.app_upsell_net_revenue ?? 0)}</TableCell>;
       case "addon_revenue":
         return <TableCell key={id} className={className}>{formatCurrency(c.addon_revenue ?? 0)}</TableCell>;
       case "currency_mix":
@@ -3536,6 +3621,11 @@ export default function CohortsPage() {
       case "token_net_revenue":
       case "avg_token_revenue_per_trial":
       case "avg_token_revenue_per_buyer":
+      case "app_upsell_buyers":
+      case "app_upsell_buyer_cr":
+      case "app_upsell_purchases":
+      case "app_upsell_gross_revenue":
+      case "app_upsell_net_revenue":
       case "addon_revenue":
       case "currency_mix":
       case "fx_missing_amount":
@@ -3758,6 +3848,16 @@ export default function CohortsPage() {
         return <TableCell key={id} className={className}>{formatCurrency(totals.monetization.avgTokenRevenuePerTrial)}</TableCell>;
       case "avg_token_revenue_per_buyer":
         return <TableCell key={id} className={className}>{formatCurrency(totals.monetization.avgTokenRevenuePerBuyer)}</TableCell>;
+      case "app_upsell_buyers":
+        return <TableCell key={id} className={className}>{totals.monetization.appUpsellBuyers}</TableCell>;
+      case "app_upsell_buyer_cr":
+        return <TableCell key={id} className={className}>{formatPct(totals.monetization.appUpsellBuyerCr)}</TableCell>;
+      case "app_upsell_purchases":
+        return <TableCell key={id} className={className}>{totals.monetization.appUpsellPurchases}</TableCell>;
+      case "app_upsell_gross_revenue":
+        return <TableCell key={id} className={className}>{formatCurrency(totals.monetization.appUpsellGrossRevenue)}</TableCell>;
+      case "app_upsell_net_revenue":
+        return <TableCell key={id} className={className}>{formatCurrency(totals.monetization.appUpsellNetRevenue)}</TableCell>;
       case "addon_revenue":
         return <TableCell key={id} className={className}>{formatCurrency(totals.monetization.addonRevenue)}</TableCell>;
       case "currency_mix":
@@ -4949,7 +5049,9 @@ export default function CohortsPage() {
             )}
           </div>
         )}
-        {(tokenDiagnostics.token_purchases_total > 0 || tokenDiagnostics.unknown_products.length > 0) && (
+        {(tokenDiagnostics.token_purchases_total > 0 ||
+          (tokenDiagnostics.app_upsell_purchases_total ?? 0) > 0 ||
+          tokenDiagnostics.unknown_products.length > 0) && (
           <div className="mb-3 space-y-1 text-xs text-muted-foreground">
             <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
               <span className="font-medium text-foreground">Token purchases</span>
@@ -4962,12 +5064,38 @@ export default function CohortsPage() {
               <span className={tokenDiagnostics.token_purchases_unmatched > 0 ? "text-destructive" : undefined}>
                 {tokenDiagnostics.token_purchases_unmatched} unmatched · {formatCurrency(tokenDiagnostics.token_unmatched_amount)} excluded from cohort metrics
               </span>
+              {(tokenDiagnostics.app_upsell_purchases_total ?? 0) > 0 && (
+                <span title={COLUMN_HELP.app_upsell_buyers}>In-product upsells {tokenDiagnostics.app_upsell_purchases_total}</span>
+              )}
               {tokenDiagnostics.unknown_addon_revenue > 0 && (
-                <span className="text-warning">
+                <span
+                  className="text-warning"
+                  title={
+                    tokenDiagnostics.price_signals
+                      ? "Already counted in the Token / In-product / Funnel upsell columns: typed by an amount or timing rule because the price id is not listed (the rows below, top 500)."
+                      : undefined
+                  }
+                >
                   Unknown add-on revenue: {formatCurrency(tokenDiagnostics.unknown_addon_revenue)}
                 </span>
               )}
             </div>
+            {tokenDiagnostics.price_signals && (
+              <div
+                className={tokenDiagnostics.price_signals.config_marked_overlap.length > 0 ? "text-destructive" : undefined}
+                title="Listed price ids on cohort anchors (an anchor rule that excluded them would move these cohorts) and on subscription rows beyond 48 h (a wider price-id window would re-type them). The overlap lists configured app / token ids also seen with the upsell mark and must be empty."
+              >
+                Price-id check: anchors with a listed id — token {tokenDiagnostics.price_signals.anchors_with_listed_price.token_purchase} ·
+                in-product {tokenDiagnostics.price_signals.anchors_with_listed_price.app_upsell} · funnel upsell{" "}
+                {tokenDiagnostics.price_signals.anchors_with_listed_price.upsell}; lifecycle rows — token{" "}
+                {tokenDiagnostics.price_signals.lifecycle_rows_with_listed_price.token_purchase} · in-product{" "}
+                {tokenDiagnostics.price_signals.lifecycle_rows_with_listed_price.app_upsell} · funnel upsell{" "}
+                {tokenDiagnostics.price_signals.lifecycle_rows_with_listed_price.upsell}; marked config ids{" "}
+                {tokenDiagnostics.price_signals.config_marked_overlap.length > 0
+                  ? tokenDiagnostics.price_signals.config_marked_overlap.join(", ")
+                  : "none"}
+              </div>
+            )}
             {aggregatedTokenPacks.length > 0 && (
               <details>
                 <summary className="cursor-pointer select-none hover:text-foreground">
@@ -4986,31 +5114,39 @@ export default function CohortsPage() {
                 <table className="mt-2 text-xs tabular-nums">
                   <thead>
                     <tr className="text-muted-foreground">
-                      <th className="pr-4 pb-1 text-left font-medium">Product ID</th>
+                      <th className="pr-4 pb-1 text-left font-medium">Price / Product ID</th>
                       <th className="pr-4 pb-1 text-left font-medium">Product Name</th>
                       <th className="pr-4 pb-1 text-right font-medium">Amount</th>
                       <th className="pr-4 pb-1 text-right font-medium">Count</th>
                       <th className="pr-4 pb-1 text-right font-medium">Users</th>
+                      <th className="pr-4 pb-1 text-left font-medium">Classified as</th>
+                      <th className="pr-4 pb-1 text-left font-medium">Rule</th>
+                      <th className="pr-4 pb-1 text-right font-medium">Median min</th>
                       <th className="pr-4 pb-1 text-left font-medium">Example TX</th>
                       <th className="pb-1 text-left font-medium">Suggested</th>
                     </tr>
                   </thead>
                   <tbody>
                     {tokenDiagnostics.unknown_products.map((p) => (
-                      <tr key={`${p.product_name}-${p.amount}-${p.currency}`}>
-                        <td className="pr-4 py-0.5">{p.product_id ?? "—"}</td>
+                      <tr key={`${p.product_id ?? ""}-${p.product_name}-${p.amount}-${p.currency}-${p.rule ?? ""}-${p.classified_as ?? ""}-${p.suggested_category}`}>
+                        <td className="pr-4 py-0.5 font-mono">{p.product_id || "—"}</td>
                         <td className="pr-4 py-0.5">{p.product_name}</td>
                         <td className="pr-4 py-0.5 text-right">{p.amount.toFixed(2)} {p.currency}</td>
                         <td className="pr-4 py-0.5 text-right">{p.count}</td>
                         <td className="pr-4 py-0.5 text-right">{p.users}</td>
-                        <td className="pr-4 py-0.5 font-mono">{p.example_transaction_id.slice(0, 14)}</td>
+                        <td className="pr-4 py-0.5">{p.classified_as ? (ONE_OFF_TYPE_LABELS[p.classified_as] ?? p.classified_as) : "—"}</td>
+                        <td className="pr-4 py-0.5">{p.rule ? (ONE_OFF_RULE_LABELS[p.rule] ?? p.rule) : "—"}</td>
+                        <td className="pr-4 py-0.5 text-right">{p.median_minutes_after_trial != null ? p.median_minutes_after_trial.toFixed(1) : "—"}</td>
+                        <td className="pr-4 py-0.5 font-mono">{p.example_transaction_id ? p.example_transaction_id.slice(0, 14) : "—"}</td>
                         <td className="py-0.5">{p.suggested_category}</td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
                 <div className="mt-1">
-                  Add matching entries to <span className="font-mono">src/services/monetizationProductMap.ts</span> to classify these.
+                  Add their price ids to <span className="font-mono">knownTokenPriceIds</span> /{" "}
+                  <span className="font-mono">knownAppUpsellPriceIds</span> in{" "}
+                  <span className="font-mono">monetizationProductMap.ts</span> to classify these.
                 </div>
               </details>
             )}

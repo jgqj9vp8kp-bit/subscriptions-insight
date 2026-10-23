@@ -79,7 +79,9 @@ export interface RevenueByType {
   trial: number;
   first_subscription: number;
   renewals: number;
+  /** Funnel upsells plus in-product upsells (token / in-product upsell split, 2026-10-23). */
   upsells: number;
+  /** Token packs only. */
   tokens: number;
 }
 

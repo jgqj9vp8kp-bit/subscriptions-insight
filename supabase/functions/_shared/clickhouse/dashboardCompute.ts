@@ -200,6 +200,8 @@ const CASH_REVENUE_TRANSACTION_TYPES = new Set<Transaction["transaction_type"]>(
   "renewal_3",
   "renewal",
   "token_purchase",
+  // In-product upsells (read-time split, 2026-10-23): cash like the rest.
+  "app_upsell",
 ]);
 
 function isCashRevenueTransaction(transaction: Transaction): boolean {

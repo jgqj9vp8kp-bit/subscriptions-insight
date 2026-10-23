@@ -1,12 +1,20 @@
 import { describe, expect, it } from "vitest";
 import { computeCohorts, computeKpis, computeUsers } from "@/services/analytics";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import {
+  classifyUserTransactions,
   getPalmerImportDiagnostics,
   normalizeAmount,
+  normalizePalmerRows,
   normalizeStatus,
   parseMetadata,
   transformPalmerRows,
 } from "@/services/palmerTransform";
+import { isKnownTokenAmount, knownAppUpsellPriceIds, knownTokenPriceIds } from "@/services/monetizationProductMap";
+import { classifyOneOff, priceSignal, pricePointForTransaction } from "../../supabase/functions/_shared/clickhouse/monetizationTyping.ts";
+import { mapSupabaseTransactionToClickHouse } from "../../supabase/functions/_shared/clickhouse/transactionMapper.ts";
+import type { Transaction } from "@/services/types";
 
 describe("Palmer transformation", () => {
   it("converts Palmer cents into USD amounts", () => {
@@ -863,5 +871,116 @@ describe("Palmer transformation", () => {
     expect(cohort.revenue_d7).toBe(45.97);
     expect(cohort.revenue_d30).toBe(45.97);
     expect(cohort.revenue_d60).toBe(45.97);
+  });
+});
+
+// ---- Read-time token / in-product / funnel upsell split (typing "price_point") ----
+
+describe("classifyUserTransactions typing price_point (read-time split)", () => {
+  const T0 = Date.parse("2026-09-29T10:00:00.000Z");
+  const MIN = 60_000;
+  const HOUR = 3_600_000;
+  const APP_ID = knownAppUpsellPriceIds[0];
+  const TOKEN_ID = knownTokenPriceIds[0];
+  const MARKED_ID = "price_01M3BW7TT3TXZRHCRY4BFGS8M7";
+  const UNKNOWN_ID = "price_01UNKNOWN0000000000000000";
+  const row = (id: string, user: string, offsetMs: number, amount: string, currency: string, meta: Record<string, unknown> = {}, status = "SETTLED") => ({
+    id,
+    customerId: user,
+    email: `${user}@example.com`,
+    createdAt: new Date(T0 + offsetMs).toISOString(),
+    amount,
+    currencyCode: currency,
+    status,
+    metadata: JSON.stringify({ ff_campaign_path: "/soulmate-reading", ...meta }),
+  });
+  const RAW = [
+    row("a01", "A", 0, "100", "USD", { ff_price_point: "price_trial_a" }),
+    row("a02", "A", 30_000, "2400", "JPY", { ff_price_point: MARKED_ID, ff_billing_reason: "upsell" }),
+    row("a03", "A", MIN, "299", "USD", { ff_price_point: APP_ID }),
+    row("a04", "A", 5 * MIN, "499", "USD", { ff_price_point: TOKEN_ID }),
+    row("a05", "A", 8 * MIN, "349", "USD", { ff_price_point: UNKNOWN_ID }),
+    row("a06", "A", 70 * HOUR, "2999", "USD", { ff_price_point: "price_sub" }),
+    row("b01", "B", 0, "99", "EUR", { ff_price_point: "price_trial_b" }),
+    row("b02", "B", MIN, "199", "EUR", { ff_price_point: UNKNOWN_ID }),
+    row("b03", "B", 90_000, "2400", "JPY", { ff_price_point: MARKED_ID }),
+    row("b04", "B", 30 * HOUR, "2400", "JPY", { ff_price_point: MARKED_ID }),
+    row("b05", "B", 49 * HOUR, "2400", "JPY", { ff_price_point: MARKED_ID }),
+    row("c01", "C", 0, "50", "USD", { ff_price_point: "price_trial_c" }),
+    row("c02", "C", MIN, "150", "USD"),
+    row("c03", "C", 2 * MIN, "125", "USD", { ff_price_point: UNKNOWN_ID }),
+    row("c04", "C", 2 * MIN + 1000, "125", "USD", { ff_price_point: UNKNOWN_ID }),
+    row("c05", "C", 3 * MIN, "499", "USD", { ff_price_point: APP_ID }),
+    row("c06", "C", 4 * MIN, "699", "USD", { ff_price_point: "price_web_tokens_100" }),
+    row("c07", "C", 71 * HOUR, "2999", "USD", { ff_price_point: "price_sub" }),
+    // An anchor that carries a listed token id stays the trial.
+    row("d01", "D", 0, "399", "EUR", { ff_price_point: TOKEN_ID }),
+    row("d02", "D", 70 * HOUR, "2999", "EUR", { ff_price_point: "price_sub" }),
+  ];
+  const normalized = normalizePalmerRows(RAW);
+  const legacy = classifyUserTransactions(normalized);
+  const split = classifyUserTransactions(normalized, { typing: "price_point" });
+  const typeOf = (rows: Transaction[]) => Object.fromEntries(rows.map((tx) => [tx.transaction_id, tx.transaction_type]));
+
+  it("the default (import) typing is unchanged and never emits app_upsell", () => {
+    expect(typeOf(classifyUserTransactions(normalized, { typing: "legacy" }))).toEqual(typeOf(legacy));
+    expect(typeOf(transformPalmerRows(RAW))).toEqual(typeOf(legacy));
+    expect(legacy.some((tx) => tx.transaction_type === "app_upsell")).toBe(false);
+    expect(typeOf(legacy)).toMatchObject({ a03: "token_purchase", b02: "token_purchase", b03: "token_purchase", b04: "token_purchase", c03: "token_purchase", c05: "token_purchase" });
+  });
+
+  it("re-types only the one-offs; trials, lifecycle levels and cohorts stay", () => {
+    const types = typeOf(split);
+    expect(types).toMatchObject({
+      a01: "trial", a02: "upsell", a03: "app_upsell", a04: "token_purchase", a05: "token_purchase", a06: "first_subscription",
+      b01: "trial", b02: "app_upsell", b03: "upsell", b04: "upsell", b05: "first_subscription",
+      c01: "trial", c02: "token_purchase", c03: "app_upsell", c04: "token_purchase", c05: "app_upsell", c06: "token_purchase", c07: "first_subscription",
+      d01: "trial", d02: "first_subscription",
+    });
+    const legacyTypes = typeOf(legacy);
+    const moved = Object.keys(types).filter((id) => types[id] !== legacyTypes[id]).sort();
+    expect(moved).toEqual(["a03", "b02", "b03", "b04", "c03", "c05"]);
+    const cohortOf = (rows: Transaction[]) => Object.fromEntries(rows.map((tx) => [tx.transaction_id, tx.cohort_id]));
+    expect(cohortOf(split)).toEqual(cohortOf(legacy));
+  });
+
+  it("mirrors the shared rule table (classifyOneOff) on every successful member row", () => {
+    const marked = new Set(split.filter((tx) => /upsell/i.test(tx.billing_reason ?? "")).map((tx) => pricePointForTransaction(tx)).filter(Boolean));
+    const trialAt = new Map(split.filter((tx) => tx.transaction_type === "trial").map((tx) => [tx.user_id, Date.parse(tx.event_time)]));
+    const asCategory = (type: string) => (["first_subscription", "renewal_2", "renewal_3", "renewal"].includes(type) ? "lifecycle" : type);
+    let checked = 0;
+    for (const tx of split) {
+      const trial = trialAt.get(tx.user_id);
+      if (trial == null || tx.status !== "success") continue;
+      const pricePoint = pricePointForTransaction(tx);
+      const expected = classifyOneOff({
+        upmark: /upsell/i.test(tx.billing_reason ?? ""),
+        isAnchor: tx.transaction_type === "trial",
+        ageMs: Date.parse(tx.event_time) - trial,
+        pricePoint,
+        psig: priceSignal(pricePoint, marked),
+        tokenAmt: isKnownTokenAmount(tx.amount_usd, tx.currency),
+        commonUp: Math.abs(tx.amount_usd - 14.98) < 0.01,
+      }).category;
+      expect(asCategory(tx.transaction_type), tx.transaction_id).toBe(expected);
+      checked += 1;
+    }
+    expect(checked).toBe(RAW.length);
+  });
+
+  it("nothing outside the read-time path stores app_upsell (import VALID_TYPES map it to unknown)", () => {
+    const mapped = mapSupabaseTransactionToClickHouse({
+      authUserId: "owner-1",
+      row: {
+        transaction_id: "tx-app",
+        event_time: new Date(T0).toISOString(),
+        status: "success",
+        transaction_type: "app_upsell",
+        normalized_payload: { transaction_id: "tx-app", event_time: new Date(T0).toISOString(), status: "success", transaction_type: "app_upsell", user_id: "A", amount_usd: 2.99 },
+      },
+    });
+    expect(mapped?.transaction_type).toBe("unknown");
+    const importSource = readFileSync(resolve(process.cwd(), "src/services/import.ts"), "utf8");
+    expect(importSource.slice(importSource.indexOf("const VALID_TYPES"), importSource.indexOf("];", importSource.indexOf("const VALID_TYPES")))).not.toContain("app_upsell");
   });
 });

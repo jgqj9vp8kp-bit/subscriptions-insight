@@ -1,6 +1,11 @@
 // Warehouse row -> analytics Transaction hydration, shared by the browser loader
 // (src/services/transactionWarehouse.ts) and server-side summary Edge Functions.
 // Both sides MUST map rows identically — this module is that single definition.
+//
+// Read-time typing: the token / in-product / funnel upsell split of the
+// ClickHouse classifiers (classifyUserTransactions typing "price_point"), so the
+// Dashboard, FB Analytics and the legacy Cohorts fallback count the same
+// in-product upsells. The stored (import-time) type keeps the legacy typing.
 
 import { addCohortFields, backfillTransactionCardTypesFromRawRows, classifyUserTransactions } from "./palmerTransform.ts";
 import { declineDetailsForTransaction } from "./paymentFailures.ts";
@@ -47,7 +52,7 @@ export function hydrateWarehouseTransactionsForAnalytics(records: WarehouseLoade
   }
 
   return [
-    ...classifyUserTransactions(palmerRows),
+    ...classifyUserTransactions(palmerRows, { typing: "price_point" }),
     ...addCohortFields(otherRows),
   ].sort((a, b) => (a.event_time < b.event_time ? 1 : a.event_time > b.event_time ? -1 : a.transaction_id.localeCompare(b.transaction_id)));
 }

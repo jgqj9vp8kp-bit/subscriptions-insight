@@ -422,6 +422,92 @@ tab first.
 - IndexedDB is the fast local cache, while Supabase `data_snapshots` is the cross-device source of truth for imported Palmer data, FunnelFox subscription snapshots, Facebook traffic data, and forecasting default settings.
 - localStorage is only for small UI state such as filters, column settings, selected views, and forecast assumptions.
 
+## Token / in-product / funnel upsell split (2026-10-23)
+
+Owner-approved. Before it, every successful unmarked payment within 48 h of the trial was a token purchase. The in-product upsells (offered in the product right after the funnel checkout, never marked) therefore inflated Token Buyers / Token Buyer CR. Post-trial one-off payments now have three types:
+- `token_purchase`: token / minute packs;
+- `app_upsell`: in-product upsells (new);
+- `upsell`: funnel upsells.
+
+Signals:
+- The FunnelFox price id every Primer row carries: `metadata.ff_price_point`, ClickHouse `analytics_transactions.price_point`.
+- The config in `monetizationProductMap.ts`: `knownTokenPriceIds` (90 ids), `knownAppUpsellPriceIds` (7 ids, batch 2026-09-29), `knownFunnelUpsellPriceIds` (empty) and the `price_web_tokens*` prefix. Each id is validated at module load (`PRICE_ID_RE`, no id in two lists), which keeps the inline SQL literals safe.
+- "Ever marked" (`upp`): every price id the tenant has ever seen with the upsell mark. It is read from the table, never from the filtered `base`.
+
+`monetizationTyping.ts` holds ONE rule table. The SQL (`oneOffTypingSql`) and the TS evaluator (`classifyOneOff`) are both built from it. Precedence:
+0. status (failed / refunded / chargeback). `ocat` is still computed for these rows, so a refund is attributed to the category its payment would have had.
+1. `upmark` (billing_reason contains "upsell") → upsell.
+2. `trial`: the cohort anchor.
+3. `app_id`: ≤ 48 h and a listed in-product upsell id → app_upsell.
+4. `token_id`: ≤ 48 h and a listed token id or `price_web_tokens*` → token.
+5. `price_marked`: ≤ 48 h and an ever-marked id → upsell. Example: the JPY 2400 upsell, 2 of 26 rows unmarked.
+6. `token_amount`: the known token amounts, any age (legacy) → token.
+7. `common_up`: ≤ 1 h and 14.98 (legacy) → upsell.
+8. `fallback_app_2m`: ≤ 2 min and a price id present → app_upsell.
+9. `fallback_token_48h`: ≤ 48 h → token.
+Otherwise the row is lifecycle.
+
+Decisions:
+- Config beats the inferred mark.
+- The id rules apply inside the 48 h window only (D3). Lifecycle rows, levels, first subscription / renewals, `pre_lvl` and the decline split are therefore unchanged.
+- The 2-minute fallback needs a price id (D5). A row without one keeps today's typing.
+
+Anchors do not move:
+- `lifeelig` / `tr` and the snapshot are untouched, and the trial test runs before the id rules.
+- `classifierSQL(where, keep)` defaults to the byte-identical legacy text. It is used by the snapshot INSERT, `validateCohortMembership`, the dynamic filter options and the dynamic email overlay. The owner rebuild golden is unchanged.
+- No `classification_version` bump and no rebuild.
+- `knownTokenAmounts` must NOT gain the in-product upsell amounts. 6 of 7 equal token amounts, and `tokenAmt` is part of `lifeelig`. A test pins this.
+- `tokenAmountSql` now renders the SQL `tokenAmt` from that list. Changing the list moves anchors and needs a version bump.
+
+Where the split applies:
+- Dynamic Cohorts list and details (`classifierSQL(…, "price_point")` with `emailTokenSQL`).
+- The materialized chain (`materializedFinxCtes`, anchored on `trial_transaction_id`).
+- Revenue Intelligence: in-product upsells count in `by_type.upsells`, and tokens are token packs only.
+- Users / Payment Analytics (`classifier.ts`):
+  - an `app_upsell` row gets stage `unknown`, like a token;
+  - an ever-marked unmarked row moves to `upsell`.
+- Cohorts metrics:
+  - new `app_upsell_buyers / _purchases / _gross_revenue / _net_revenue` (optional contract fields);
+  - `addon_revenue` = upsell slots 1-3 + token net + in-product upsell net;
+  - funnel Upsell metrics stay `lt = 'upsell'` (they now include the ever-marked rows);
+  - the plan rule excludes `app_upsell`.
+- Token refunds are attributed by `ocat = 'token_purchase'` instead of `tokenAmt`, and in-product upsell refunds by `ocat = 'app_upsell'`. A refunded row with a token amount and an app id inside the window is now an in-product upsell refund.
+- Token packs are keyed by price id and priced in their original currency.
+- Restricted members: `upp` reads `txFrom(scope)`, so only their scoped users' marks count (documented divergence). `price_point` was added to `TX_COLS`.
+
+Diagnostics:
+- The materialized list runs one extra best-effort statement (`buildMaterializedPriceDiagnosticsQuery`). It runs for the data owner and scope-all members only; restricted members get none, and the dynamic fallback keeps `[]`.
+- It fills `token_diagnostics.unknown_products`: unlisted price ids a fallback or amount rule typed, with the rule and the median minutes after the trial. No transaction id is sent.
+- It fills `price_signals`:
+  - `anchors_with_listed_price`: anchors carrying a listed / ever-marked id. This is what an anchor rule excluding them would move.
+  - `lifecycle_rows_with_listed_price`: rows beyond 48 h with such an id. This is what widening D3 would re-type.
+  - `config_marked_overlap`: listed app / token ids also seen marked. It must be empty.
+- The cohort-level `refund_status` post-filter is not applied to it. The check rows sort first, so `LIMIT 500` only trims unknown prices.
+
+TS read-time engine:
+- `classifyUserTransactions(rows, { typing: "price_point" })` is used by `warehouseHydration` (Dashboard, FB Analytics, the legacy Cohorts fallback) and the Export API. The Export API source now selects `price_point` into `metadata.ff_price_point`.
+- Import keeps the legacy default. Nothing stores `app_upsell`: `VALID_TYPES` map it to `unknown`.
+- `CASH_REVENUE_TRANSACTION_TYPES` and the export `REVENUE_TRANSACTION_TYPES` include `app_upsell`, so the cash stays.
+- Dashboard Token Buyers, FB Analytics token metrics and the forecast token ARPU become tokens-only. Dashboard "Token / Add-on Rev" stays token net (owner to confirm).
+- Pre-existing TS/SQL divergences stay: `commonUp` on `amount_usd`, `isKnownTokenAmount` matching a missing currency, product-name patterns.
+- TS refund / chargeback rows follow the same ocat rule (classifyOneOff) as the SQL. The hydration stores it as `one_off_category` on status rows after the trial; rows without it keep the token amount / product rule.
+- The client unknown-products diagnostics never list a token row whose price id is listed (or matches `price_web_tokens*`): it is mapped already.
+- The forecast's in-product upsell revenue is in neither the token ARPU nor the funnel upsell value any more (owner to confirm whether it should join the token ARPU).
+
+Not done: the anchor follow-up.
+- What it means: also excluding listed / ever-marked ids from `lifeelig`.
+- What it would move: web-app buyers under a separate customer id whose first pack is not a known amount (today pseudo-members), and users whose checkout failed while a later listed payment succeeded.
+- What it needs: a `classification_version` bump, a rebuild, a psig-based `etok` predicate, the TS anchor rule and a rebuild-golden change.
+- After deploy, `price_signals.anchors_with_listed_price` gives the count.
+
+The owner SQL golden was regenerated (owner-approved). 103 of 315 scenarios changed:
+- materialized list 26: the list statement, plus the diagnostics statement;
+- dynamic list 25;
+- details 19 × 4;
+- Revenue Intelligence 28 × 4;
+- day breakdown 5.
+Options and FB are unchanged. The analytics cache schema went to 17.
+
 ## Cohorts: Product filter (2026-10-18)
 
 A product is a FunnelFox project (`metadata.ff_project_id`), labelled by its landing domain (`azora-astro.com`, `brainza.app`, `foxiq.app`, …; metadata-less cohorts form `Unknown`).

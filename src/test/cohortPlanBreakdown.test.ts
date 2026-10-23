@@ -78,8 +78,10 @@ describe("plan query shape", () => {
   it("keys the plan by the membership snapshot's rule, not an ad-hoc one", async () => {
     const { planQuery } = await runDetails([]);
     expect(planQuery).toBeDefined();
+    // Every one-off type is excluded (the token / in-product upsell split adds
+    // app_upsell); the anchor is still the earliest successful eligible row.
     expect(planQuery!.query).toContain(
-      "argMinIf(round(g, 2), (ets, tprio, tid), is_success = 1 AND lt NOT IN ('upsell','token_purchase'))",
+      "argMinIf(round(g, 2), (ets, tprio, tid), is_success = 1 AND lt NOT IN ('upsell','token_purchase','app_upsell'))",
     );
     expect(planQuery!.query).toContain("if(plan_candidates = 0, 'Unknown', concat('$', toString(plan_price)))");
   });

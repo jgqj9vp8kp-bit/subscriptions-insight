@@ -60,7 +60,7 @@ function coerceTransactionsMode(mode: unknown, allowed: readonly TransactionsMod
   return allowed.includes(mode as TransactionsMode) ? (mode as TransactionsMode) : allowed[0] ?? null;
 }
 
-const TYPES: TransactionType[] = ["trial", "upsell", "first_subscription", "renewal_2", "renewal_3", "renewal", "token_purchase", "failed_payment", "refund", "chargeback", "unknown"];
+const TYPES: TransactionType[] = ["trial", "upsell", "first_subscription", "renewal_2", "renewal_3", "renewal", "token_purchase", "app_upsell", "failed_payment", "refund", "chargeback", "unknown"];
 const STATUSES: TransactionStatus[] = ["success", "failed", "refunded", "chargeback"];
 const FUNNELS = ["past_life", "soulmate", "starseed", "unknown"] as const;
 

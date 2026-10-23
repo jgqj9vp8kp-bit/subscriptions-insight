@@ -51,7 +51,10 @@ import type { ClickHouseSummary } from "@/services/clickhouse";
 // v16 (2026-10, access control): keys carry the access partition instead of the
 // FNV user hash, the persisted envelope is stored per partition and no longer
 // holds Users rows / Support messages. Discard every v15 envelope.
-export const ANALYTICS_CACHE_SCHEMA_VERSION = 16;
+// v17 (2026-10-23): token vs in-product upsell split — token metrics no longer
+// include in-product upsells, which got their own columns. A v16 bundle would
+// show the inflated token numbers next to empty In-product Upsell columns.
+export const ANALYTICS_CACHE_SCHEMA_VERSION = 17;
 
 // Prefixes: the hooks append the access partition (warehouseVersionKey), and
 // invalidation / persistence match on these two leading segments.

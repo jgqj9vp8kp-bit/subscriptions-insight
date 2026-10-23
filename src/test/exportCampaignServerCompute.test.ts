@@ -61,6 +61,23 @@ describe("export campaign performance — server-side compute", () => {
     expect(row.net_revenue).toBeCloseTo(1 + 29 + 4.99, 2);
   });
 
+  it("applies the read-time token / in-product upsell split: ever-marked price ids are funnel upsells, in-product upsells stay cash", () => {
+    const MARKED_ID = "price_01M3BW7TT3TXZRHCRY4BFGS8M7";
+    const APP_ID = "price_01M3P1WF72Y5FBFV1SKKCF12TX";
+    const txs: ComputeTxn[] = [
+      wtx({ user_id: "u1", transaction_id: "u1-t", event_time: "2026-05-01T10:00:00Z", gross_amount_usd: 1 }),
+      wtx({ user_id: "u1", transaction_id: "u1-u", event_time: "2026-05-01T10:00:30Z", gross_amount_usd: 20, billing_reason: "upsell", metadata: { ff_price_point: MARKED_ID } }),
+      wtx({ user_id: "u2", transaction_id: "u2-t", event_time: "2026-05-01T11:00:00Z", gross_amount_usd: 1 }),
+      wtx({ user_id: "u2", transaction_id: "u2-app", event_time: "2026-05-01T11:01:00Z", gross_amount_usd: 2.99, currency: "USD", metadata: { ff_price_point: APP_ID } }),
+      // Unmarked, but the tenant saw this price id with the upsell mark (u1).
+      wtx({ user_id: "u2", transaction_id: "u2-u", event_time: "2026-05-01T11:01:30Z", gross_amount_usd: 20, metadata: { ff_price_point: MARKED_ID } }),
+    ];
+    const [row] = buildCampaignPerformanceRows({ txs });
+    expect(row.trial_users).toBe(2);
+    expect(row.upsell_users).toBe(2);
+    expect(row.net_revenue).toBeCloseTo(1 + 20 + 1 + 2.99 + 20, 2);
+  });
+
   it("1. computes metrics from warehouse rows alone (no frontend cache)", () => {
     const txs = [...userRows("u1", { upsell: true, sub: true }), ...userRows("u2")];
     const [row] = buildCampaignPerformanceRows({ txs });

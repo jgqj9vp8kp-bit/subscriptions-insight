@@ -253,6 +253,25 @@ describe("invariant A/B: funnel rows are projections of the Total engine", () =>
 });
 
 describe("aggregation semantics", () => {
+  it("rolls up in-product upsells: sums, a deduped buyer union, CR from the summed trials", () => {
+    const rows = [
+      cohort({ cohort_date: "2026-08-01", campaign_path: "path-x", trial_users: 100, app_upsell_buyers: 3, app_upsell_purchases: 4, app_upsell_gross_revenue: 11.96, app_upsell_net_revenue: 8.97, app_upsell_buyer_user_ids: ["c1:au0", "c1:au1", "c1:au2"], addon_revenue: 20 }),
+      cohort({ cohort_date: "2026-08-02", campaign_path: "path-x", trial_users: 50, app_upsell_buyers: 1, app_upsell_purchases: 1, app_upsell_gross_revenue: 2.99, app_upsell_net_revenue: 2.99, app_upsell_buyer_user_ids: ["c2:au0"], addon_revenue: 5 }),
+      // A row cached before the split carries none of the fields.
+      cohort({ cohort_date: "2026-08-03", campaign_path: "path-x", trial_users: 50 }),
+    ];
+    const row = buildFunnelViewRows({ cohorts: rows, trafficByKey: new Map() }).find((r) => r.campaign_path === "path-x")!;
+    expect(row).toMatchObject({ app_upsell_buyers: 4, app_upsell_purchases: 5, addon_revenue: 25 });
+    expect(row.app_upsell_gross_revenue).toBeCloseTo(14.95, 8);
+    expect(row.app_upsell_net_revenue).toBeCloseTo(11.96, 8);
+    expect(row.app_upsell_buyer_cr).toBeCloseTo((4 / 200) * 100, 6);
+    expect(row.app_upsell_buyer_user_ids).toEqual(["c1:au0", "c1:au1", "c1:au2", "c2:au0"]);
+    const totals = computeCohortReportTotals(rows).monetization;
+    expect(totals).toMatchObject({ appUpsellBuyers: 4, appUpsellPurchases: 5 });
+    expect(totals.appUpsellNetRevenue).toBeCloseTo(11.96, 8);
+    expect(totals.appUpsellBuyerCr).toBeCloseTo(2, 6);
+  });
+
   it("dedups overlapping active users/subscriptions inside a path", () => {
     const { rows, trafficByKey } = fixture();
     const row = buildFunnelViewRows({ cohorts: rows, trafficByKey }).find((r) => r.campaign_path === "path-a")!;

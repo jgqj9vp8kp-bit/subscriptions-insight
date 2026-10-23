@@ -73,6 +73,9 @@ export const TX_COLS: readonly string[] = Object.freeze([
   // Normalized decline token (insufficient_funds, …) for the Cohorts payment
   // failure columns (cohortPaymentFailures.ts) — a category, never a message.
   "decline_reason",
+  // FunnelFox price id (metadata.ff_price_point) for the token / in-product /
+  // funnel upsell split (monetizationTyping.ts) — a catalog id, never personal data.
+  "price_point",
 ]);
 /** Every column of fact_user_cohorts (schema.ts CREATE_FACT_USER_COHORTS_SQL). */
 export const FC_COLS: readonly string[] = Object.freeze([

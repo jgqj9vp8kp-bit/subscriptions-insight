@@ -136,6 +136,12 @@ export interface CohortMonetizationTotals {
   tokenNetRevenue: number;
   avgTokenRevenuePerTrial: number;
   avgTokenRevenuePerBuyer: number;
+  /** In-product upsells (token / in-product upsell split, 2026-10-23). */
+  appUpsellBuyers: number;
+  appUpsellBuyerCr: number;
+  appUpsellPurchases: number;
+  appUpsellGrossRevenue: number;
+  appUpsellNetRevenue: number;
   addonRevenue: number;
 }
 
@@ -148,6 +154,9 @@ export function computeCohortMonetizationTotals(cohorts: CohortRow[], totalTrial
   // Token buyers are deduped by user id across cohorts, mirroring refund/active users.
   const tokenBuyers = new Set(cohorts.flatMap((c) => c.token_buyer_user_ids ?? [])).size;
   const tokenNetRevenue = sum((c) => c.token_net_revenue);
+  // In-product upsell buyers dedup the same way (synthetic "au" ids on the
+  // ClickHouse rows, real user ids from the client engine).
+  const appUpsellBuyers = new Set(cohorts.flatMap((c) => c.app_upsell_buyer_user_ids ?? [])).size;
   return {
     upsell1Users,
     upsell2Users,
@@ -169,6 +178,11 @@ export function computeCohortMonetizationTotals(cohorts: CohortRow[], totalTrial
     tokenNetRevenue,
     avgTokenRevenuePerTrial: totalTrialUsers ? tokenNetRevenue / totalTrialUsers : 0,
     avgTokenRevenuePerBuyer: tokenBuyers ? tokenNetRevenue / tokenBuyers : 0,
+    appUpsellBuyers,
+    appUpsellBuyerCr: totalTrialUsers ? (appUpsellBuyers / totalTrialUsers) * 100 : 0,
+    appUpsellPurchases: sum((c) => c.app_upsell_purchases),
+    appUpsellGrossRevenue: sum((c) => c.app_upsell_gross_revenue),
+    appUpsellNetRevenue: sum((c) => c.app_upsell_net_revenue),
     addonRevenue: sum((c) => c.addon_revenue),
   };
 }

@@ -174,8 +174,16 @@ export function mapAggregateToCohortRow(agg: CohortAggregateRow): CohortRow {
     token_net_revenue: agg.token_net_revenue,
     avg_token_revenue_per_trial: trial ? round2(agg.token_net_revenue / trial) : 0,
     avg_token_revenue_per_buyer: agg.token_buyers ? round2(agg.token_net_revenue / agg.token_buyers) : 0,
+    // In-product upsells: optional on the contract (absent on responses cached
+    // before the token / in-product upsell split), so default to 0.
+    app_upsell_buyers: agg.app_upsell_buyers ?? 0,
+    app_upsell_buyer_cr: div(agg.app_upsell_buyers ?? 0, trial),
+    app_upsell_purchases: agg.app_upsell_purchases ?? 0,
+    app_upsell_gross_revenue: agg.app_upsell_gross_revenue ?? 0,
+    app_upsell_net_revenue: agg.app_upsell_net_revenue ?? 0,
     addon_revenue: agg.addon_revenue,
     token_buyer_user_ids: synthIds(cohortId, "t", agg.token_buyers),
+    app_upsell_buyer_user_ids: synthIds(cohortId, "au", agg.app_upsell_buyers ?? 0),
     token_pack_breakdown: [],
     currency_breakdown: [],
     currency_mix: "",
@@ -280,8 +288,10 @@ export async function loadCohortsFromClickHouse(request: CohortRequest): Promise
     filterOptions: mapFilterOptions(response.filter_options),
     filterOptionsDiagnostics: response.filter_options_diagnostics,
     fxDiagnostics: response.fx_diagnostics as FxNormalizationDiagnostics | undefined,
+    // unknown_products: the server's price-id diagnostics (materialized list,
+    // data owner only; [] elsewhere) — typed rows, never a transaction id.
     tokenDiagnostics: response.token_diagnostics
-      ? ({ ...response.token_diagnostics, unknown_products: [] } as unknown as MonetizationDiagnostics)
+      ? ({ ...response.token_diagnostics, unknown_products: response.token_diagnostics.unknown_products ?? [] } as MonetizationDiagnostics)
       : undefined,
     fbTotals: response.fb_totals,
     fbDiagnostics: response.fb_diagnostics,
@@ -380,7 +390,7 @@ const COUNT_METRICS = [
   "trial_users", "first_subscription_users", "renewal_users",
   "renewal_2_users", "renewal_3_users", "renewal_4_users", "renewal_5_users", "renewal_6_users",
   "upsell_1_users", "upsell_2_users", "upsell_3_users", "upsell_extra_users", "funnel_upsell_users",
-  "token_buyers", "token_purchases", "refund_users",
+  "token_buyers", "token_purchases", "app_upsell_buyers", "app_upsell_purchases", "refund_users",
 ] as const;
 
 const MONEY_METRICS = [
@@ -388,7 +398,7 @@ const MONEY_METRICS = [
   "revenue_d0", "revenue_d7", "revenue_d14", "revenue_d30", "revenue_d60",
   "trial_revenue", "first_subscription_revenue", "renewal_revenue",
   "upsell_1_revenue", "upsell_2_revenue", "upsell_3_revenue", "upsell_extra_revenue", "funnel_upsell_revenue",
-  "token_gross_revenue", "token_net_revenue", "addon_revenue",
+  "token_gross_revenue", "token_net_revenue", "app_upsell_gross_revenue", "app_upsell_net_revenue", "addon_revenue",
   "net_revenue_1m", "ltv_1m_per_user", "gross_ltv", "net_ltv",
 ] as const;
 

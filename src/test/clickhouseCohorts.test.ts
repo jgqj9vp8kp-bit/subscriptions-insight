@@ -4,14 +4,28 @@ import {
   CohortRequestError,
   normalizeAction,
   normalizeCohortRequest,
+  buildDynamicCohortEmailQuery,
+  buildFilterOptionsQuery,
   buildListQuery,
+  classifierSQL,
+  cohortDetailsSelects,
+  emailTokenSQL,
+  runCohortDetails,
   toAggregateRow,
   computeTotals,
   supportDataStatus,
   emailMatchedTokenPurchases,
   tokenDiagnosticsFromRows,
 } from "../../supabase/functions/_shared/clickhouse/cohorts.ts";
+import {
+  DYNAMIC_TRIAL_TEST,
+  oneOffTypingSql,
+  priceSignalSql,
+  upsellPricePointsCte,
+} from "../../supabase/functions/_shared/clickhouse/monetizationTyping.ts";
+import { ALL_SCOPE_SQL } from "../../supabase/functions/_shared/clickhouse/scopeSql.ts";
 import type { CohortAggregateRow } from "../../supabase/functions/_shared/clickhouse/cohortContract.ts";
+import type { ClickHouseClientLike } from "../../supabase/functions/_shared/clickhouse/types.ts";
 
 describe("clickhouse-cohorts request validation", () => {
   it("normalizes action names and legacy aliases", () => {
@@ -297,8 +311,9 @@ describe("email-matched token revenue in the dynamic engine (TODO_MONETIZATION i
     // The aggregate reads the union and counts the email subset for diagnostics.
     expect(sql).toContain("FROM finx");
     expect(sql).toContain("token_email_purchases");
-    // Email-matched refund rows count as token refunds even without the price signal.
-    expect(sql).toContain("(tokenAmt OR via_email = 1)");
+    // Email-matched refund rows count as token refunds even without the price
+    // signal; a member refund follows the one-off category of its payment.
+    expect(sql).toContain("(ocat = 'token_purchase' OR via_email = 1)");
   });
 
   it("wires matched_by_email diagnostics to the aggregate email count", () => {
@@ -307,5 +322,155 @@ describe("email-matched token revenue in the dynamic engine (TODO_MONETIZATION i
     expect(diag.token_purchases_total).toBe(5);
     expect(diag.token_purchases_matched).toBe(5);
     expect(diag.token_purchases_matched_by_email).toBe(3);
+  });
+});
+
+// ---- Token / in-product / funnel upsell split (monetizationTyping.ts) --------
+
+/** Top-level comma split of a SELECT list (commas inside parentheses stay). */
+function selectItems(list: string): string[] {
+  const items: string[] = [];
+  let depth = 0;
+  let current = "";
+  for (const char of list) {
+    if (char === "(") depth += 1;
+    if (char === ")") depth -= 1;
+    if (char === "," && depth === 0) {
+      items.push(current.trim());
+      current = "";
+    } else current += char;
+  }
+  if (current.trim()) items.push(current.trim());
+  return items;
+}
+
+const aliasOf = (item: string) => item.split(/\s+/).pop()!;
+
+describe("token / in-product upsell split: the dynamic classifier", () => {
+  const W = "a.auth_user_id = {auth_user_id:String}";
+
+  it("legacy is the default and carries nothing of the split (the rebuild golden's bytes)", () => {
+    const legacy = classifierSQL(W, "");
+    expect(classifierSQL(W, "", "legacy")).toBe(legacy);
+    expect(legacy).not.toContain("psig");
+    expect(legacy).not.toContain("upp AS (");
+    expect(legacy).not.toContain("ocat");
+    // The literal TABs of the cl CTE are part of the legacy text.
+    expect(legacy).toContain("\t    tr.c_campaign_id c_campaign_id, tr.c_traffic_source c_traffic_source,");
+  });
+
+  it("price_point mode: upp before base, signals through cl into fin, typed by the rule table", () => {
+    const sql = classifierSQL(W, "", "price_point");
+    expect(sql.startsWith(`\n${upsellPricePointsCte(ALL_SCOPE_SQL)},\nbase AS (`)).toBe(true);
+    expect(sql).toContain(`a.product_name pname,\n    ${priceSignalSql("a")}\n  FROM analytics_transactions AS a FINAL`);
+    expect(sql).toContain("e.lifeelig lifeelig,\n    e.pp pp, e.psig psig,");
+    expect(sql).toContain(`SELECT *, floor((ets - trial_ts) / 86400000) d,\n    ${oneOffTypingSql(DYNAMIC_TRIAL_TEST)}\n  FROM cl`);
+    expect(sql).toContain("p.pname pname, p.pp pp, p.psig psig, p.ocat ocat, p.orule orule,");
+  });
+
+  it("the anchor CTEs (elig, tr) are byte-identical in both modes", () => {
+    const legacy = classifierSQL(W, "");
+    const split = classifierSQL(W, "", "price_point");
+    const elig = "elig AS (SELECT *, (statusType = '' AND NOT upmark AND NOT tokenAmt) lifeelig FROM base),";
+    expect(legacy).toContain(elig);
+    expect(split).toContain(elig);
+    const tr = (text: string) => text.slice(text.indexOf("\ntr AS ("), text.indexOf("\nuserdim AS ("));
+    expect(tr(split)).toBe(tr(legacy));
+    expect(tr(split).length).toBeGreaterThan(100);
+  });
+
+  it("the list and details use the split; filter options and the email overlay stay legacy", async () => {
+    expect(buildListQuery(normalizeCohortRequest({}), { auth_user_id: "u" })).toContain(classifierSQL(W, "", "price_point"));
+    expect(buildFilterOptionsQuery(normalizeCohortRequest({}), {})).toContain(classifierSQL(W, ""));
+    expect(buildFilterOptionsQuery(normalizeCohortRequest({}), {})).not.toContain("upp AS (");
+    expect(buildDynamicCohortEmailQuery({})).toContain(classifierSQL(W, ""));
+    expect(buildDynamicCohortEmailQuery({})).not.toContain("upp AS (");
+
+    const queries: string[] = [];
+    const client = {
+      query: async (input: { query: string }) => {
+        queries.push(input.query);
+        return { json: async () => [] };
+      },
+      command: async () => {},
+      insert: async () => {},
+    } as unknown as ClickHouseClientLike;
+    await runCohortDetails({
+      authUserId: "u",
+      clickhouse: client,
+      request: { action: "details", cohort_key: { cohort_date: "2026-09-01", funnel: "f", campaign_path: "p" } },
+    });
+    const details = queries.filter((query) => query.includes("scoped AS ("));
+    expect(details).toHaveLength(4);
+    for (const query of details) expect(query).toContain(classifierSQL(W, "", "price_point"));
+  });
+
+  it("emailTokenSQL's finx branches stay positionally aligned (UNION ALL is positional)", () => {
+    const sql = emailTokenSQL();
+    const fin = sql.slice(sql.indexOf("finx AS (\n  SELECT ") + "finx AS (\n  SELECT ".length, sql.indexOf("\n  FROM fin AS f"));
+    const etok = sql.slice(sql.indexOf("UNION ALL\n  SELECT ") + "UNION ALL\n  SELECT ".length, sql.indexOf("\n  FROM etok"));
+    const finAliases = selectItems(fin).map(aliasOf);
+    const etokAliases = selectItems(etok).map(aliasOf);
+    expect(etokAliases).toEqual(finAliases);
+    expect(finAliases.slice(-6)).toEqual(["lt", "pp", "psig", "ocat", "orule", "via_email"]);
+    // An email-matched row is a token purchase.
+    expect(sql).toContain("b.pp pp, b.psig psig, 'token_purchase' ocat, 'email_token' orule");
+  });
+
+  it("AGGREGATE_MEASURES: in-product upsell measures, refunds attributed by ocat", () => {
+    expect(AGGREGATE_MEASURES).toContain("countIf(is_success = 1 AND lt = 'app_upsell') app_upsell_purchases");
+    expect(AGGREGATE_MEASURES).toContain("uniqExactIf(uid, is_success = 1 AND lt = 'app_upsell') app_upsell_buyers");
+    expect(AGGREGATE_MEASURES).toContain("sumIf(g, is_success = 1 AND lt = 'app_upsell') app_upsell_gross_raw");
+    expect(AGGREGATE_MEASURES).toContain(
+      "sumIf(rr, lt = 'app_upsell' OR (statusType IN ('refund','chargeback') AND ocat = 'app_upsell')) app_upsell_refund_raw",
+    );
+    expect(AGGREGATE_MEASURES).toContain(
+      "sumIf(rr, lt = 'token_purchase' OR (statusType IN ('refund','chargeback') AND (ocat = 'token_purchase' OR via_email = 1))) token_refund_raw",
+    );
+    expect(AGGREGATE_MEASURES).not.toContain("tokenAmt");
+    // Funnel upsell metrics stay funnel-only.
+    expect(AGGREGATE_MEASURES).toContain("uniqExactIf(uid, is_success = 1 AND lt = 'upsell') upsell_users");
+  });
+
+  it("maps the in-product upsell fields; addon = u1 + u2 + u3 + token net + in-product upsell net", () => {
+    const row = toAggregateRow(rawAgg({ app_upsell_purchases: 3, app_upsell_buyers: 2, app_upsell_gross_raw: 8.97, app_upsell_refund_raw: 2.99 }) as never);
+    expect(row).toMatchObject({ app_upsell_purchases: 3, app_upsell_buyers: 2, app_upsell_gross_revenue: 8.97, app_upsell_net_revenue: 5.98 });
+    expect(row.token_net_revenue).toBe(25);
+    expect(row.addon_revenue).toBe(160.98); // 120 + 10 + 0 + 25 + 5.98
+    // A row without the app fields (cached before the split) maps to zeros.
+    expect(toAggregateRow(rawAgg() as never)).toMatchObject({ app_upsell_buyers: 0, app_upsell_purchases: 0, app_upsell_net_revenue: 0, addon_revenue: 155 });
+
+    const other = toAggregateRow(rawAgg({ cohort_date: "2026-05-02", app_upsell_purchases: 1, app_upsell_buyers: 1, app_upsell_gross_raw: 2.99 }) as never);
+    const totals = computeTotals([row, other]);
+    expect(totals).toMatchObject({ app_upsell_buyers: 3, app_upsell_purchases: 4, app_upsell_gross_revenue: 11.96, app_upsell_net_revenue: 8.97 });
+    expect(totals.addon_revenue).toBe(Math.floor((row.addon_revenue + other.addon_revenue) * 100 + 0.5) / 100);
+    expect(tokenDiagnosticsFromRows([row, other]).app_upsell_purchases_total).toBe(4);
+    expect(tokenDiagnosticsFromRows([row, other]).unknown_products).toEqual([]);
+  });
+
+  it("token packs are keyed by price id and priced in their own currency", async () => {
+    const token = cohortDetailsSelects().token;
+    expect(token).toContain("SELECT if(pid != '', pid, pp) product_id, pname product, cur currency, round(amt, 2) price,");
+    expect(token).toContain("WHERE is_success = 1 AND lt = 'token_purchase' GROUP BY product_id, pname, cur, round(amt, 2)");
+
+    const client = {
+      query: async (input: { query: string }) => ({
+        json: async () => input.query.includes("lt = 'token_purchase' GROUP BY product_id")
+          ? [
+            { product_id: "price_01M0049J2NX8JWC3EK2FJHEZRN", product: "", currency: "JPY", price: 480, purchases: 2, buyers: 2, gross_revenue: 6.4 },
+            { product_id: "", product: "", currency: "", price: 4.99, purchases: 1, buyers: 1, gross_revenue: 4.99 },
+          ]
+          : [],
+      }),
+      command: async () => {},
+      insert: async () => {},
+    } as unknown as ClickHouseClientLike;
+    const response = await runCohortDetails({
+      authUserId: "u",
+      clickhouse: client,
+      request: { action: "details", cohort_key: { cohort_date: "2026-09-01", funnel: "f", campaign_path: "p" } },
+    });
+    expect(response.token_pack_breakdown[0]).toMatchObject({ product_id: "price_01M0049J2NX8JWC3EK2FJHEZRN", product: "Token JPY 480.00", currency: "JPY", price: 480 });
+    expect(response.token_pack_breakdown[1]).toMatchObject({ product: "Token 4.99", currency: "" });
   });
 });

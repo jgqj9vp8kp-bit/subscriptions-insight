@@ -513,6 +513,9 @@ describe("column lists (M15)", () => {
     expect(TX_COLS).not.toContain("raw_payload");
     expect(TX_COLS).not.toContain("normalized_payload");
     expect(TX_COLS).toContain("media_buyer");
+    // The FunnelFox price id of the token / in-product / funnel upsell split.
+    expect(TX_COLS).toContain("price_point");
+    expect(columns.has("price_point")).toBe(true);
     expect(new Set(TX_COLS).size).toBe(TX_COLS.length);
   });
 

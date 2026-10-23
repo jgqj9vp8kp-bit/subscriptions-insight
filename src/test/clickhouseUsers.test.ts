@@ -8,6 +8,14 @@ import {
   toRow,
   SORT_ALLOWLIST,
 } from "../../supabase/functions/_shared/clickhouse/users.ts";
+import { classifierSQL } from "../../supabase/functions/_shared/clickhouse/classifier.ts";
+import {
+  DYNAMIC_TRIAL_TEST,
+  oneOffTypingSql,
+  priceSignalSql,
+  upsellPricePointsCte,
+} from "../../supabase/functions/_shared/clickhouse/monetizationTyping.ts";
+import { ALL_SCOPE_SQL } from "../../supabase/functions/_shared/clickhouse/scopeSql.ts";
 
 describe("clickhouse-users request validation", () => {
   it("normalizes actions and rejects unknown ones", () => {
@@ -147,5 +155,37 @@ describe("clickhouse-users toRow mapping", () => {
     expect(row.latest_decline_date).toBeNull(); // '' -> null
     expect(row.cohort_id).toBe("soulmate_path_2026-05-01");
     expect(row.plan_name).toBe("$30.00");
+  });
+});
+
+describe("clickhouse-users: token / in-product / funnel upsell split", () => {
+  it("the shared classifier types one-offs with the split; upp reads the whole tenant, never the narrowed base", () => {
+    const sql = classifierSQL("a.auth_user_id = {auth_user_id:String} AND a.user_id = {uid:String}", "");
+    expect(sql.startsWith(`\n${upsellPricePointsCte(ALL_SCOPE_SQL)},\nbase AS (`)).toBe(true);
+    expect(sql).toContain(priceSignalSql("a"));
+    expect(sql).toContain(oneOffTypingSql(DYNAMIC_TRIAL_TEST));
+    expect(sql).toContain("p.pp pp, p.psig psig, p.ocat ocat, p.orule orule,");
+    // The anchor rule is untouched.
+    expect(sql).toContain("elig AS (SELECT *, (statusType = '' AND NOT upmark AND NOT tokenAmt) lifeelig FROM base),");
+  });
+
+  it("life: in-product upsell measures, refunds by ocat, addon adds the in-product net; has_upsell stays funnel-only", () => {
+    const sql = userAggCTE("owner-1", {}, "2026-10-23T00:00:00.000Z");
+    expect(sql).toContain("countIf(is_success = 1 AND lt = 'app_upsell') app_upsell_purchase_count");
+    expect(sql).toContain("round(sumIf(g, is_success = 1 AND lt = 'app_upsell'), 2) app_upsell_gross_revenue");
+    expect(sql).toContain("round(sumIf(rr, lt = 'app_upsell' OR (statusType IN ('refund','chargeback') AND ocat = 'app_upsell')), 2) app_upsell_refund");
+    expect(sql).toContain("round(sumIf(rr, lt = 'token_purchase' OR (statusType IN ('refund','chargeback') AND ocat = 'token_purchase')), 2) token_refund");
+    expect(sql).not.toMatch(/AND tokenAmt\)\), 2\) token_refund/);
+    expect(sql).toContain("round(ifNull(l.app_upsell_gross_revenue, 0) - ifNull(l.app_upsell_refund, 0), 2) app_upsell_net_revenue");
+    expect(sql).toContain("+ (ifNull(l.app_upsell_gross_revenue, 0) - ifNull(l.app_upsell_refund, 0)), 2) addon_revenue");
+    expect(sql).toContain("maxIf(1, is_success = 1 AND lt = 'upsell') has_upsell");
+  });
+
+  it("toRow maps the in-product upsell fields", () => {
+    const row = toRow({
+      user_id: "u1", app_upsell_purchase_count: 2, app_upsell_gross_revenue: 5.984, app_upsell_net_revenue: 2.995, addon_revenue: 10.004,
+    });
+    expect(row).toMatchObject({ app_upsell_purchase_count: 2, app_upsell_gross_revenue: 5.98, app_upsell_net_revenue: 3, addon_revenue: 10 });
+    expect(toRow({ user_id: "u2" })).toMatchObject({ app_upsell_purchase_count: 0, app_upsell_gross_revenue: 0, app_upsell_net_revenue: 0 });
   });
 });

@@ -5,6 +5,7 @@ import {
 } from "@/services/analytics";
 import { computeCohortReportTotals } from "@/services/cohortReporting";
 import { filterCohorts, filterTransactionsByTrialAttribution } from "@/services/cohortFiltering";
+import { normalizeTransactionsToUsd } from "@/services/currencyNormalization";
 import { transformPalmerRows } from "@/services/palmerTransform";
 import {
   hydrateWarehouseTransactionsForAnalytics,
@@ -406,5 +407,154 @@ describe("filters apply to monetization metrics", () => {
     expect(cohorts).toHaveLength(1);
     expect(cohorts[0].token_purchases).toBe(1);
     expect(tokenDiagnostics.token_purchases_total).toBe(1);
+  });
+});
+
+describe("in-product upsells (read-time token / in-product upsell split)", () => {
+  const APP_ID = "price_01M3P1WF72Y5FBFV1SKKCF12TX";
+  const meta = (extra: Record<string, unknown> = {}) =>
+    JSON.stringify({ ff_funnel_id: "soulmate", ff_campaign_path: "soulmate-sketch", ...extra });
+  const rawRows = [
+    { id: "q1", customerId: "u1", email: "u1@example.com", created_at: "2026-10-01T10:00:00Z", amount: "100", status: "SETTLED", metadata: meta({ ff_price_point: "price_trial" }) },
+    // The listed in-product upsell (USD 2.99) one minute after the trial.
+    { id: "q2", customerId: "u1", email: "u1@example.com", created_at: "2026-10-01T10:01:00Z", amount: "299", status: "SETTLED", metadata: meta({ ff_price_point: APP_ID }) },
+    // A token pack by its known amount, seven minutes after the trial.
+    { id: "q3", customerId: "u1", email: "u1@example.com", created_at: "2026-10-01T10:07:00Z", amount: "499", status: "SETTLED", metadata: meta({ ff_price_point: "price_unlisted_pack" }) },
+  ];
+
+  it("the import keeps the legacy typing; the warehouse hydration splits", async () => {
+    const imported = transformPalmerRows(rawRows);
+    expect(imported.find((row) => row.transaction_id === "q2")?.transaction_type).toBe("token_purchase");
+    const records = await Promise.all(imported.map((row) => normalizeForWarehouse(row, undefined, "batch", "palmer_csv")));
+    const hydrated = hydrateWarehouseTransactionsForAnalytics(
+      records.map((record) => ({ source: "palmer_csv", normalized_payload: record.normalized_payload })),
+    );
+    const byId = new Map(hydrated.map((row) => [row.transaction_id, row.transaction_type]));
+    expect(byId.get("q1")).toBe("trial");
+    expect(byId.get("q2")).toBe("app_upsell");
+    expect(byId.get("q3")).toBe("token_purchase");
+  });
+
+  const rows = [
+    tx("u1", "trial", "2026-10-01T10:00:00Z", { amount_usd: 1 }),
+    tx("u2", "trial", "2026-10-01T11:00:00Z", { amount_usd: 1 }),
+    tx("u1", "app_upsell", "2026-10-01T10:01:00Z", { amount_usd: 2.99, metadata: { ff_price_point: APP_ID } }),
+    // Typed by the 2-minute fallback: an unlisted price id.
+    tx("u2", "app_upsell", "2026-10-01T11:01:00Z", { amount_usd: 1.99, refund_amount_usd: 1.99, metadata: { ff_price_point: "price_unlisted" } }),
+    tx("u2", "token_purchase", "2026-10-01T11:08:00Z", { product: "100 Tokens", amount_usd: 4.99 }),
+  ];
+
+  it("accumulates in-product upsells apart from tokens; add-on revenue includes their net", () => {
+    const { cohorts, tokenDiagnostics } = computeCohortsWithDiagnostics(rows);
+    const cohort = cohorts[0];
+    expect(cohort).toMatchObject({ app_upsell_buyers: 2, app_upsell_purchases: 2, token_buyers: 1, token_purchases: 1 });
+    expect(cohort.app_upsell_buyer_cr).toBeCloseTo(100, 6);
+    expect(cohort.app_upsell_gross_revenue).toBeCloseTo(4.98, 2);
+    expect(cohort.app_upsell_net_revenue).toBeCloseTo(2.99, 2); // the $1.99 refund is an in-product upsell refund
+    expect(cohort.token_net_revenue).toBeCloseTo(4.99, 2);
+    expect(cohort.addon_revenue).toBeCloseTo(4.99 + 2.99, 2);
+    expect([...(cohort.app_upsell_buyer_user_ids ?? [])].sort()).toEqual(["u1", "u2"]);
+    // Never a price plan: both users' plan is their trial.
+    expect(cohort.plan_breakdown.map((plan) => plan.price)).toEqual([1]);
+    // The fallback-typed row asks for a mapping; the listed id does not.
+    expect(tokenDiagnostics.unknown_products).toEqual([
+      expect.objectContaining({ amount: 1.99, suggested_category: "app_upsell_candidate" }),
+    ]);
+    const totals = computeCohortReportTotals(cohorts).monetization;
+    expect(totals).toMatchObject({ appUpsellBuyers: 2, appUpsellPurchases: 2 });
+  });
+
+  it("a token row with a listed token price id (or the token prefix) is mapped, never an unknown product", () => {
+    const tokenRows = [
+      tx("u1", "trial", "2026-10-01T10:00:00Z", { amount_usd: 1 }),
+      // Listed token id at an amount no other rule knows (EUR 3.99).
+      tx("u1", "token_purchase", "2026-10-01T10:06:00Z", { amount_usd: 4.32, currency: "EUR", metadata: { ff_price_point: "price_01M0049J2M1HAJNJEJ0W2RK15D" } }),
+      tx("u1", "token_purchase", "2026-10-01T10:07:00Z", { amount_usd: 6.99, metadata: { ff_price_point: "price_web_tokens_100" } }),
+      // An unlisted id typed by the trial-window rule still asks for a mapping.
+      tx("u1", "token_purchase", "2026-10-01T10:08:00Z", { amount_usd: 3.49, metadata: { ff_price_point: "price_unlisted_pack" } }),
+    ];
+    const { cohorts, tokenDiagnostics } = computeCohortsWithDiagnostics(tokenRows);
+    expect(cohorts[0]).toMatchObject({ token_purchases: 3, token_buyers: 1 });
+    expect(tokenDiagnostics.unknown_products).toEqual([
+      expect.objectContaining({ amount: 3.49, suggested_category: "token_candidate" }),
+    ]);
+  });
+
+  const hydrate = async (raw: Record<string, unknown>[]) => {
+    const records = await Promise.all(
+      transformPalmerRows(raw).map((row) => normalizeForWarehouse(row, undefined, "batch", "palmer_csv")),
+    );
+    return hydrateWarehouseTransactionsForAnalytics(
+      records.map((record) => ({ source: "palmer_csv", normalized_payload: record.normalized_payload })),
+    );
+  };
+  const primer = (id: string, uid: string, createdAt: string, amount: string, pricePoint: string, extra: Record<string, unknown> = {}) => ({
+    id, customerId: uid, email: `${uid}@example.com`, created_at: createdAt, amount, status: "SETTLED",
+    metadata: meta({ ff_price_point: pricePoint }), ...extra,
+  });
+
+  it("refund rows follow the SQL ocat rule (listed id, 2-minute and 48 h fallbacks), not the amount", async () => {
+    const refunded = { status: "REFUNDED" };
+    const hydrated = await hydrate([
+      primer("r0", "u9", "2026-10-02T10:00:00Z", "100", "price_trial"),
+      // token_id: a listed token id at an amount no rule knows (EUR 3.99), +5 min.
+      primer("r1", "u9", "2026-10-02T10:05:00Z", "399", "price_01M0049J2M1HAJNJEJ0W2RK15D", { ...refunded, amountRefunded: "399", currency: "EUR" }),
+      // fallback_app_2m: an unlisted id, +1 min.
+      primer("r2", "u9", "2026-10-02T10:01:00Z", "199", "price_unlisted_a", { ...refunded, amountRefunded: "199" }),
+      // fallback_token_48h: an unlisted id, +30 min.
+      primer("r3", "u9", "2026-10-02T10:30:00Z", "649", "price_unlisted_b", { ...refunded, amountRefunded: "649" }),
+    ]);
+    const byId = new Map(hydrated.map((row) => [row.transaction_id, row]));
+    expect(byId.get("r0")?.one_off_category).toBeUndefined();
+    expect(["r1", "r2", "r3"].map((id) => [byId.get(id)?.transaction_type, byId.get(id)?.one_off_category])).toEqual([
+      ["refund", "token_purchase"],
+      ["refund", "app_upsell"],
+      ["refund", "token_purchase"],
+    ]);
+    const usdRefund = (id: string) =>
+      normalizeTransactionsToUsd(hydrated).transactions.find((row) => row.transaction_id === id)?.refund_amount_usd ?? Number.NaN;
+    const cohort = computeCohortsWithDiagnostics(hydrated).cohorts[0];
+    expect(cohort.app_upsell_net_revenue).toBeCloseTo(-1.99, 2);
+    expect(cohort.token_net_revenue).toBeCloseTo(-(usdRefund("r1") + 6.49), 2);
+    expect(cohort.token_net_revenue).toBeLessThan(-6.49);
+  });
+
+  it("the import never stores a one-off category", () => {
+    const imported = transformPalmerRows([
+      primer("i0", "u8", "2026-10-02T10:00:00Z", "100", "price_trial"),
+      primer("i1", "u8", "2026-10-02T10:01:00Z", "199", "price_unlisted_a", { status: "REFUNDED", amountRefunded: "199" }),
+    ]);
+    expect(imported.every((row) => !("one_off_category" in row))).toBe(true);
+  });
+
+  it("client unknown products keep unlisted price ids and categories apart", async () => {
+    const hydrated = await hydrate([
+      primer("k0", "u1", "2026-10-03T10:00:00Z", "100", "price_trial"),
+      primer("k1", "u1", "2026-10-03T10:01:00Z", "349", "price_unlisted_x"),
+      primer("k2", "u2", "2026-10-03T11:00:00Z", "100", "price_trial"),
+      primer("k3", "u2", "2026-10-03T11:06:00Z", "349", "price_unlisted_y"),
+    ]);
+    const { tokenDiagnostics } = computeCohortsWithDiagnostics(hydrated);
+    const unknown = [...tokenDiagnostics.unknown_products].sort((a, b) => String(a.product_id).localeCompare(String(b.product_id)));
+    expect(unknown).toEqual([
+      expect.objectContaining({
+        product_id: "price_unlisted_x",
+        amount: 3.49,
+        count: 1,
+        users: 1,
+        classified_as: "app_upsell",
+        rule: "fallback_app_2m",
+        suggested_category: "app_upsell_candidate",
+      }),
+      expect.objectContaining({
+        product_id: "price_unlisted_y",
+        amount: 3.49,
+        count: 1,
+        users: 1,
+        classified_as: "token_purchase",
+        rule: "fallback_token_48h",
+        suggested_category: "token_candidate",
+      }),
+    ]);
   });
 });

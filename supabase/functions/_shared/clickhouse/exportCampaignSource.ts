@@ -50,6 +50,9 @@ export interface ExportSourceTxn {
   source: string | null;
   import_batch_id: string | null;
   raw: Record<string, unknown>;
+  /** { ff_price_point } when the row carries a FunnelFox price id — the one
+   * metadata key the classifier reads (token / in-product upsell split). */
+  metadata?: Record<string, unknown>;
 }
 
 /** Every column the export's compute actually reads — and nothing else.
@@ -82,7 +85,8 @@ export const EXPORT_TRANSACTIONS_SELECT = `
   product_name,
   currency,
   source,
-  import_batch_id
+  import_batch_id,
+  price_point
 `.trim();
 
 /** FINAL collapses the ReplacingMergeTree duplicates a re-sync leaves behind —
@@ -149,6 +153,7 @@ export function mapExportSourceRow(row: Record<string, unknown>): ExportSourceTx
     source: str(row.source) || null,
     import_batch_id: str(row.import_batch_id) || null,
     raw: {},
+    ...(str(row.price_point) ? { metadata: { ff_price_point: str(row.price_point) } } : {}),
   };
 }
 

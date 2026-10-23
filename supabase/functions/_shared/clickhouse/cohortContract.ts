@@ -6,6 +6,7 @@
 // bounded id-hash sets where cross-cohort dedup is unavoidable, and diagnostics.
 
 import type { CohortPaymentFailureCounts } from "./cohortPaymentFailures.ts";
+import type { UnknownProductRow } from "./monetization.ts";
 
 export type CohortGroupBy = "day" | "week" | "month";
 export type CohortRefundStatus = "all" | "has" | "none";
@@ -156,6 +157,14 @@ export interface CohortAggregateRow extends Partial<CohortPaymentFailureCounts> 
   token_purchases: number;
   token_gross_revenue: number;
   token_net_revenue: number;
+  /** In-product upsells (monetizationTyping.ts: offered in the product right
+   * after the funnel checkout). Optional: absent on responses cached before
+   * the 2026-10-23 token / in-product upsell split. */
+  app_upsell_buyers?: number;
+  app_upsell_purchases?: number;
+  app_upsell_gross_revenue?: number;
+  app_upsell_net_revenue?: number;
+  /** Upsell slots 1-3 + token net + in-product upsell net. */
   addon_revenue: number;
 
   fx_missing_transactions: number;
@@ -224,6 +233,10 @@ export interface CohortTotals extends Partial<CohortPaymentFailureCounts> {
   token_buyers: number;
   token_purchases: number;
   token_net_revenue: number;
+  app_upsell_buyers?: number;
+  app_upsell_purchases?: number;
+  app_upsell_gross_revenue?: number;
+  app_upsell_net_revenue?: number;
   addon_revenue: number;
 }
 
@@ -349,6 +362,21 @@ export interface CohortFxDiagnostics {
   excluded_transactions: number;
 }
 
+/** The price-id check of the token / in-product / funnel upsell split, keyed
+ * by the price signal (monetizationTyping.ts PriceSignal). */
+export type CohortPriceSignalCounts = Record<"token_purchase" | "app_upsell" | "upsell", number>;
+
+export interface CohortPriceSignalDiagnostics {
+  /** Cohort anchors (the trial row) whose price id is listed / ever marked —
+   * what an anchor eligibility that also excluded them would move. */
+  anchors_with_listed_price: CohortPriceSignalCounts;
+  /** Lifecycle rows (beyond APP_ADDON_WINDOW_HOURS) with a listed / ever-marked
+   * id — what widening the price-id window would re-type. */
+  lifecycle_rows_with_listed_price: CohortPriceSignalCounts;
+  /** Listed app / token ids the tenant also saw with the upsell mark (must be empty). */
+  config_marked_overlap: string[];
+}
+
 // Dataset-level token attribution for the Cohorts token panel — mirrors the
 // client MonetizationDiagnostics (token attribution + unmapped products).
 export interface CohortTokenDiagnostics {
@@ -357,8 +385,17 @@ export interface CohortTokenDiagnostics {
   token_purchases_matched_by_email: number;
   token_purchases_unmatched: number;
   token_unmatched_amount: number;
-  unknown_products: unknown[];
+  /** Unlisted price ids a fallback or amount rule typed (materialized list,
+   * data owner only; [] elsewhere). Never carries a transaction id. */
+  unknown_products: UnknownProductRow[];
+  /** Materialized list (data owner only; 0 elsewhere): the gross USD of the
+   * unknown_price rows above. That revenue is already counted in the Token /
+   * In-product / Funnel upsell columns, typed by an amount or timing rule
+   * because its price id is not listed; top 500 rows only. (The client engine's
+   * value is the gross of add-on rows no rule classified.) */
   unknown_addon_revenue: number;
+  app_upsell_purchases_total?: number;
+  price_signals?: CohortPriceSignalDiagnostics;
 }
 
 export interface CohortResponse {
@@ -406,7 +443,8 @@ export interface CohortDetailsResponse {
   price_breakdown: CohortPlanBreakdownRow[];
   currency_breakdown: Array<{ currency: string; trial_users: number; transactions: number; gross_original: number; gross_usd: number; net_usd: number; refunds_usd: number }>;
   upsell: { upsell_1_users: number; upsell_2_users: number; upsell_3_users: number; upsell_extra_users: number; upsell_1_revenue: number; upsell_2_revenue: number; upsell_3_revenue: number; upsell_extra_revenue: number };
-  token_pack_breakdown: Array<{ product_id: string; product: string; price: number; purchases: number; buyers: number; gross_revenue: number; revenue_share: number }>;
+  /** price is in the pack's original `currency` (absent on cached responses). */
+  token_pack_breakdown: Array<{ product_id: string; product: string; currency?: string; price: number; purchases: number; buyers: number; gross_revenue: number; revenue_share: number }>;
   ltv_1m: { trial_users: number; net_revenue_1m: number; ltv_1m_per_user: number; age_days: number; matured: boolean; available_days: number };
   fx: { missing_transactions: number; missing_amount: number };
   meta?: RestrictedAccessMeta;

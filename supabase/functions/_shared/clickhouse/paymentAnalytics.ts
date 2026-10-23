@@ -8,6 +8,13 @@
 // insufficient_funds, top_decline_reason, decline table/charts) come straight
 // from the warehouse decline_reason column.
 //
+// One-off typing comes from the shared classifier, which since 2026-10-23 is
+// the token / in-product / funnel upsell split (monetizationTyping.ts): a
+// successful in-product upsell (lt 'app_upsell') gets stage `unknown`, exactly
+// as a token purchase does, and an unmarked payment whose price id the tenant
+// ever saw with the upsell mark moves from `unknown` to `upsell`. The SQL text
+// of this module is unchanged.
+//
 // Aggregate-only responses: no raw_payload / normalized_payload / emails / ids.
 
 import type { ClickHouseClientLike } from "./types.ts";

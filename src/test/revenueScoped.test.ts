@@ -42,6 +42,7 @@ import {
   runRevenueIntelligence,
 } from "../../supabase/functions/_shared/clickhouse/revenueIntelligence.ts";
 import { activeCohortMemberWhere } from "../../supabase/functions/_shared/clickhouse/cohortMembership.ts";
+import { upsellPricePointsCte } from "../../supabase/functions/_shared/clickhouse/monetizationTyping.ts";
 import {
   CLICKHOUSE_REVENUE_POLICY,
   restrictRevenueRequest,
@@ -222,11 +223,15 @@ describe("restricted bundle", () => {
   });
 });
 
-describe("parity (SQL level): restricted = owner text with the two FROM fragments swapped", () => {
+describe("parity (SQL level): restricted = owner text with the FROM fragments swapped", () => {
   const swap = (owner: string, scope: ScopeSql) => {
     const from = "  FROM analytics_transactions AS a FINAL\n  INNER JOIN fact_user_cohorts AS fc FINAL\n";
     expect(owner).toContain(from);
-    return owner.split(from).join(`  FROM ${txFrom(scope, "a")}\n  INNER JOIN ${cohortsFrom(scope, "fc")}\n`);
+    // The ever-marked price ids of the upsell split read the scoped users'
+    // transactions too (monetizationTyping.ts, documented divergence).
+    expect(owner).toContain(upsellPricePointsCte(ALL_SCOPE_SQL));
+    return owner.split(from).join(`  FROM ${txFrom(scope, "a")}\n  INNER JOIN ${cohortsFrom(scope, "fc")}\n`)
+      .split(upsellPricePointsCte(ALL_SCOPE_SQL)).join(upsellPricePointsCte(scope));
   };
 
   it.each([

@@ -19,8 +19,18 @@ import {
   rollupDayCohorts,
   runRevenueDayBreakdown,
   runRevenueIntelligence,
+  TYPE_SUMS,
   type AttributedDailyRow,
 } from "@/services/revenueIntelligence";
+import {
+  ONE_OFF_RULES,
+  ONE_OFF_TYPES,
+  SNAPSHOT_TRIAL_TEST,
+  oneOffTypingSql,
+  priceSignalSql,
+  upsellPricePointsCte,
+} from "../../supabase/functions/_shared/clickhouse/monetizationTyping.ts";
+import { ALL_SCOPE_SQL } from "../../supabase/functions/_shared/clickhouse/scopeSql.ts";
 import type { ClickHouseClientLike, SupabaseLikeClient } from "../../supabase/functions/_shared/clickhouse/types.ts";
 
 function attributedDay(over: Partial<AttributedDailyRow> = {}): AttributedDailyRow {
@@ -107,6 +117,38 @@ describe("SQL discipline", () => {
   it("attributed and unattributed streams count only SUCCESSFUL rows as rows_scanned", () => {
     for (const build of [buildAttributedDailySql, buildUnattributedDailySql]) {
       expect(build({}, "owner-1")).toContain("countIf(is_success = 1) rows_scanned");
+    }
+  });
+});
+
+describe("token / in-product upsell split (by_type)", () => {
+  it("types one-offs with the shared rule table, anchored on the snapshot like the materialized Cohorts chain", () => {
+    for (const sql of [buildAttributedDailySql({}, "owner-1"), buildDayBreakdownSql({}, "owner-1", "2026-09-08")]) {
+      expect(sql.startsWith(`WITH \n${upsellPricePointsCte(ALL_SCOPE_SQL)},\nbase AS (`)).toBe(true);
+      expect(sql).toContain(priceSignalSql("a"));
+      expect(sql).toContain(oneOffTypingSql(SNAPSHOT_TRIAL_TEST));
+    }
+  });
+
+  it("in-product upsells count under upsells; tokens are token packs only", () => {
+    expect(TYPE_SUMS).toContain("sumIf(g, is_success = 1 AND lt IN ('upsell','app_upsell')) type_upsells");
+    expect(TYPE_SUMS).toContain("sumIf(g, is_success = 1 AND lt = 'token_purchase') type_tokens");
+  });
+
+  it("every successful lt the typing can produce falls in exactly one TYPE_SUMS bucket (gross = Σ by_type + unattributed)", () => {
+    const buckets = TYPE_SUMS.trim().split(",\n").map((line) => {
+      const match = /sumIf\(g, is_success = 1 AND lt (= '([a-z_0-9]+)'|IN \(([^)]*)\))\) (type_[a-z_]+)/.exec(line.trim());
+      expect(match, line).not.toBeNull();
+      const values = match![2] ? [match![2]] : match![3].split(",").map((value) => value.trim().replace(/'/g, ""));
+      return { name: match![4], values };
+    });
+    expect(buckets.map((bucket) => bucket.name)).toEqual(["type_trial", "type_first_sub", "type_renewals", "type_upsells", "type_tokens"]);
+    // pretype categories (trial, the one-offs) plus the lifecycle levels fin assigns.
+    const categories = new Set(ONE_OFF_RULES.map((rule) => rule.category));
+    expect([...categories].sort()).toEqual(["app_upsell", "token_purchase", "trial", "upsell"]);
+    const produced = ["trial", ...ONE_OFF_TYPES, "first_subscription", "renewal_2", "renewal_3", "renewal"];
+    for (const lt of produced) {
+      expect(buckets.filter((bucket) => bucket.values.includes(lt)).map((bucket) => bucket.name), lt).toHaveLength(1);
     }
   });
 });

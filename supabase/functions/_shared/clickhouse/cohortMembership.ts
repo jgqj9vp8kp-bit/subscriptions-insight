@@ -42,10 +42,20 @@ import {
   toAggregateRow,
   tokenDiagnosticsFromRows,
   type CohortDetailsStatement,
+  type CohortPriceDiagnostics,
   type NormalizedCohortRequest,
   type RawCohortRow,
   type SupportDataProbe,
 } from "./cohorts.ts";
+import {
+  configListedPriceSql,
+  oneOffTypingSql,
+  priceSignalSql,
+  SNAPSHOT_TRIAL_TEST,
+  tokenAmountSql,
+  upsellPricePointsCte,
+} from "./monetizationTyping.ts";
+import type { UnknownProductRow } from "./monetization.ts";
 import { preLevelSQL } from "./cohortPaymentFailures.ts";
 import { cancellationFlagsCTE } from "./cohortCancellations.ts";
 import {
@@ -83,6 +93,7 @@ import { buildCampaignScope, FACT_CAMPAIGN_SCOPE_TABLE, type CampaignScopeBuildR
 import type {
   CohortDetailsResponse,
   CohortFilters,
+  CohortPriceSignalCounts,
   CohortRequest,
   CohortResponse,
 } from "./cohortContract.ts";
@@ -811,7 +822,13 @@ export function activeCohortMemberWhere(filters: CohortFilters, params: Record<s
  * Restricted scope: base / fcm / cemail read txFrom / cohortsFrom fragments,
  * and etok reads txEmailMatchedFrom, which itself carries the "not a snapshot
  * member" exclusion — so the fcall CTE (every snapshot member of the tenant)
- * and its NOT IN line are emitted for the all scope only (R-2). */
+ * and its NOT IN line are emitted for the all scope only (R-2).
+ *
+ * Typing: the token / in-product / funnel upsell split (monetizationTyping.ts,
+ * SNAPSHOT_TRIAL_TEST anchors on the snapshot's trial_transaction_id). The
+ * snapshot INSERT and validateCohortMembership keep the legacy typing, so the
+ * membership this chain reads is unchanged. `upp` reads txFrom(scope): for a
+ * restricted member only their scoped users' upsell marks (documented). */
 export function materializedFinxCtes(
   request: CohortRequest,
   active: { warehouse_version: string; classification_version: string },
@@ -843,19 +860,19 @@ fcall AS (
 
   return `${supportEmailsCTE(supportStatus, scope)},
 ${cancellationFlagsCTE(scope)},
+${upsellPricePointsCte(scope)},
 base AS (
   SELECT a.user_id uid, a.transaction_id tid, a.event_time et, toUnixTimestamp64Milli(a.event_time) ets,
     multiIf(a.transaction_type = 'trial', 0, a.transaction_type = 'upsell', 1, a.transaction_type = 'first_subscription', 2,
       a.transaction_type IN ('renewal_2','renewal_3','renewal'), 3, 4) tprio,
     a.status status, a.is_success is_success,
     positionCaseInsensitive(a.billing_reason, 'upsell') > 0 upmark,
-    ((a.currency = 'USD' AND (abs(toFloat64(a.original_amount) - 4.99) < 0.005 OR abs(toFloat64(a.original_amount) - 9.99) < 0.005 OR abs(toFloat64(a.original_amount) - 24.99) < 0.005))
-      OR (a.currency = 'EUR' AND abs(toFloat64(a.original_amount) - 4.99) < 0.005)
-      OR (a.currency = 'COP' AND abs(toFloat64(a.original_amount) - 17199) < 0.005)) tokenAmt,
+    ${tokenAmountSql("a")},
     abs(toFloat64(a.original_amount) - 14.98) < 0.01 commonUp,
     multiIf(a.status = 'failed', 'failed_payment', a.status = 'refunded', 'refund', a.status = 'chargeback', 'chargeback', '') statusType,
     a.gross_amount_usd g, floor(a.net_amount_usd * 100 + 0.5) / 100 nn, floor(a.refund_amount_usd * 100 + 0.5) / 100 rr,
     a.currency cur, toFloat64(a.original_amount) amt, a.product_id pid, a.product_name pname,
+    ${priceSignalSql("a")},
     if(a.status = 'failed', if(a.decline_reason = '', 'unknown', a.decline_reason), '') dr,
     toString(fc.cohort_date) c_date, fc.funnel c_funnel, fc.campaign_path c_camp,
     fc.normalized_email u_normalized_email,
@@ -874,11 +891,7 @@ base AS (
 ),
 pretyped AS (
   SELECT *, floor((ets - trial_ts) / 86400000) d,
-    multiIf(statusType != '', statusType, upmark, 'upsell', (NOT upmark) AND tokenAmt, 'token_purchase',
-      tid = trial_transaction_id, 'trial',
-      (statusType = '' AND NOT upmark AND NOT tokenAmt) AND (ets - trial_ts) <= 3600000 AND commonUp, 'upsell',
-      (statusType = '' AND NOT upmark AND NOT tokenAmt) AND (ets - trial_ts) <= 172800000, 'token_purchase',
-      (statusType = '' AND NOT upmark AND NOT tokenAmt), 'lifecycle', 'upsell') pretype
+    ${oneOffTypingSql(SNAPSHOT_TRIAL_TEST)}
   FROM base
 ),
 lifeidx AS (SELECT uid, tid, row_number() OVER (PARTITION BY uid ORDER BY ets, tprio, tid) lvl FROM pretyped WHERE pretype = 'lifecycle' AND is_success = 1),
@@ -886,7 +899,7 @@ upsidx AS (SELECT uid, tid, row_number() OVER (PARTITION BY uid ORDER BY ets, tp
 fin AS (
   SELECT p.uid uid, p.tid tid, p.et et, p.ets ets, p.tprio tprio, p.trial_ts trial_ts,
     p.is_success is_success, p.g g, p.nn nn, p.rr rr, p.d d, p.statusType statusType, p.tokenAmt tokenAmt,
-    p.cur cur, p.amt amt, p.pid pid, p.pname pname,
+    p.cur cur, p.amt amt, p.pid pid, p.pname pname, p.pp pp, p.psig psig, p.ocat ocat, p.orule orule,
     p.dr dr, ${preLevelSQL("p", "ifNull(li.lvl, 0)")} pre_lvl,
     p.c_date c_date, p.c_funnel c_funnel, p.c_camp c_camp,
     p.u_normalized_email u_normalized_email,
@@ -922,10 +935,9 @@ etok AS (
     floor(a.net_amount_usd * 100 + 0.5) / 100 nn, floor(a.refund_amount_usd * 100 + 0.5) / 100 rr,
     floor((toUnixTimestamp64Milli(a.event_time) - toUnixTimestamp64Milli(fcm.trial_event_time)) / 86400000) d,
     multiIf(a.status = 'failed', 'failed_payment', a.status = 'refunded', 'refund', a.status = 'chargeback', 'chargeback', '') statusType,
-    ((a.currency = 'USD' AND (abs(toFloat64(a.original_amount) - 4.99) < 0.005 OR abs(toFloat64(a.original_amount) - 9.99) < 0.005 OR abs(toFloat64(a.original_amount) - 24.99) < 0.005))
-      OR (a.currency = 'EUR' AND abs(toFloat64(a.original_amount) - 4.99) < 0.005)
-      OR (a.currency = 'COP' AND abs(toFloat64(a.original_amount) - 17199) < 0.005)) tokenAmt,
+    ${tokenAmountSql("a")},
     a.currency cur, toFloat64(a.original_amount) amt, a.product_id pid, a.product_name pname,
+    ${priceSignalSql("a")}, 'token_purchase' ocat, 'email_token' orule,
     '' dr, 0 pre_lvl,
     toString(fcm.cohort_date) c_date, fcm.funnel c_funnel, fcm.campaign_path c_camp,
     fcm.normalized_email u_normalized_email,
@@ -943,11 +955,11 @@ ${fcallExclusion}    AND (a.transaction_type = 'token_purchase' OR (a.status IN 
 ),
 finx AS (
   SELECT uid, tid, et, ets, tprio, trial_ts, is_success, g, nn, rr, d, statusType, tokenAmt,
-    cur, amt, pid, pname, dr, pre_lvl, c_date, c_funnel, c_camp, u_normalized_email, lvl, slot, lt, 0 via_email
+    cur, amt, pid, pname, dr, pre_lvl, c_date, c_funnel, c_camp, u_normalized_email, lvl, slot, lt, pp, psig, ocat, orule, 0 via_email
   FROM fin
   UNION ALL
   SELECT uid, tid, et, ets, tprio, trial_ts, is_success, g, nn, rr, d, statusType, tokenAmt,
-    cur, amt, pid, pname, dr, pre_lvl, c_date, c_funnel, c_camp, u_normalized_email, lvl, slot, lt, 1 via_email
+    cur, amt, pid, pname, dr, pre_lvl, c_date, c_funnel, c_camp, u_normalized_email, lvl, slot, lt, pp, psig, ocat, orule, 1 via_email
   FROM etok
 )`;
 }
@@ -974,6 +986,136 @@ ${materializedFinxCtes(request, active, params, supportStatus, scope)},
 agg AS (${aggregateSelect()})
 SELECT * FROM agg ${postSql}
 FORMAT JSONEachRow`;
+}
+
+// ---- Price-id diagnostics of the token / in-product upsell split ----------
+// One best-effort statement next to the materialized list, for the data owner
+// only (all scope): restricted members get none, the dynamic fallback keeps
+// unknown_products = []. Over the same finx chain and member filters as the
+// list, cut to the list's cohort_date window (the cohort-level refund_status
+// post-filter is not reproduced):
+//   * unknown_price — successful rows whose price id is in no list and never
+//     marked, typed by an amount or fallback rule: what to map next, with the
+//     rule each got and the median minutes after the trial;
+//   * listed_anchor / listed_lifecycle — anchors and lifecycle rows that carry
+//     a listed / ever-marked id: what an anchor rule or a wider price-id window
+//     would re-type (DEVELOPER_NOTES follow-up);
+//   * config_marked_overlap — listed app / token ids the tenant also saw with
+//     the upsell mark (must be empty).
+// The price-id check rows sort first, so LIMIT only ever trims the long tail
+// of unknown prices. No transaction id leaves the warehouse.
+
+export function buildMaterializedPriceDiagnosticsQuery(
+  request: CohortRequest,
+  active: { warehouse_version: string; classification_version: string },
+  params: Record<string, unknown>,
+  supportStatus: SupportDataProbe["support_data_status"] = "ready",
+): string {
+  const nreq = normalizeCohortRequest(request);
+  const dateConds: string[] = [];
+  if (nreq.dateFrom) {
+    params.date_from = nreq.dateFrom;
+    dateConds.push(`c_date >= {date_from:String}`);
+  }
+  if (nreq.dateTo) {
+    params.date_to = nreq.dateTo;
+    dateConds.push(`c_date <= {date_to:String}`);
+  }
+  const dates = dateConds.map((cond) => ` AND ${cond}`).join("");
+  return `WITH
+${materializedFinxCtes(request, active, params, supportStatus, ALL_SCOPE_SQL)}
+SELECT * FROM (
+  SELECT 'unknown_price' kind, toString(if(pid != '', pid, pp)) price_id, toString(pname) product_name,
+    toString(cur) currency_code, toFloat64(round(amt, 2)) amount, toString(orule) rule_name, toString(lt) classified_as,
+    toUInt64(count()) purchases, toUInt64(uniqExact(uid)) users, toFloat64(sum(g)) gross_usd,
+    toFloat64(quantileExact(0.5)((ets - trial_ts) / 60000)) median_minutes
+  FROM finx
+  WHERE via_email = 0 AND is_success = 1 AND psig = ''
+    AND orule IN ('token_amount','common_up','fallback_app_2m','fallback_token_48h')${dates}
+  GROUP BY price_id, product_name, currency_code, amount, rule_name, classified_as
+  UNION ALL
+  SELECT if(lt = 'trial', 'listed_anchor', 'listed_lifecycle') kind, toString(pp) price_id, '' product_name,
+    '' currency_code, toFloat64(0) amount, toString(psig) rule_name, toString(lt) classified_as,
+    toUInt64(count()) purchases, toUInt64(uniqExact(uid)) users, toFloat64(sum(g)) gross_usd, toFloat64(0) median_minutes
+  FROM finx
+  WHERE via_email = 0 AND is_success = 1 AND psig != '' AND (lt = 'trial' OR lvl > 0)${dates}
+  GROUP BY kind, price_id, rule_name, classified_as
+  UNION ALL
+  SELECT 'config_marked_overlap' kind, toString(price_point) price_id, '' product_name, '' currency_code, toFloat64(0) amount,
+    '' rule_name, '' classified_as, toUInt64(0) purchases, toUInt64(0) users, toFloat64(0) gross_usd, toFloat64(0) median_minutes
+  FROM upp
+  WHERE ${configListedPriceSql("price_point")}
+)
+ORDER BY kind = 'unknown_price', purchases DESC
+LIMIT 500
+FORMAT JSONEachRow`;
+}
+
+export interface PriceDiagnosticsRow {
+  kind?: string;
+  price_id?: string;
+  product_name?: string;
+  currency_code?: string;
+  amount?: number | string;
+  rule_name?: string;
+  classified_as?: string;
+  purchases?: number | string;
+  users?: number | string;
+  gross_usd?: number | string;
+  median_minutes?: number | string;
+}
+
+const PRICE_SIGNALS = ["token_purchase", "app_upsell", "upsell"] as const;
+
+function suggestedCategory(classifiedAs: string): UnknownProductRow["suggested_category"] {
+  if (classifiedAs === "app_upsell") return "app_upsell_candidate";
+  if (classifiedAs === "upsell") return "addon_candidate";
+  return "token_candidate";
+}
+
+/** Maps the diagnostics statement onto token_diagnostics (cohorts.ts
+ * tokenDiagnosticsFromRows). */
+export function priceDiagnosticsFromRows(rows: readonly PriceDiagnosticsRow[]): CohortPriceDiagnostics {
+  const counts = () => Object.fromEntries(PRICE_SIGNALS.map((signal) => [signal, 0])) as CohortPriceSignalCounts;
+  const anchors = counts();
+  const lifecycle = counts();
+  const overlap: string[] = [];
+  const unknown: UnknownProductRow[] = [];
+  let unknownGross = 0;
+  for (const row of rows) {
+    const signal = s(row.rule_name) as (typeof PRICE_SIGNALS)[number];
+    if (row.kind === "unknown_price") {
+      const classifiedAs = s(row.classified_as);
+      unknown.push({
+        product_id: s(row.price_id) || null,
+        product_name: s(row.product_name) || "—",
+        amount: Math.round(n(row.amount) * 100) / 100,
+        currency: s(row.currency_code),
+        count: n(row.purchases),
+        users: n(row.users),
+        classified_as: classifiedAs,
+        rule: s(row.rule_name),
+        median_minutes_after_trial: Math.round(n(row.median_minutes) * 10) / 10,
+        suggested_category: suggestedCategory(classifiedAs),
+      });
+      unknownGross += n(row.gross_usd);
+    } else if (row.kind === "listed_anchor" && signal in anchors) {
+      anchors[signal] += n(row.purchases);
+    } else if (row.kind === "listed_lifecycle" && signal in lifecycle) {
+      lifecycle[signal] += n(row.purchases);
+    } else if (row.kind === "config_marked_overlap" && s(row.price_id)) {
+      overlap.push(s(row.price_id));
+    }
+  }
+  return {
+    unknown_products: unknown,
+    unknown_addon_revenue: unknownGross,
+    price_signals: {
+      anchors_with_listed_price: anchors,
+      lifecycle_rows_with_listed_price: lifecycle,
+      config_marked_overlap: overlap.sort(),
+    },
+  };
 }
 
 // ---- Cascading (dependent) filter options ---------------------------------
@@ -1186,9 +1328,10 @@ export async function runMaterializedCohortList(input: {
   const nreq = normalizeCohortRequest(input.request);
   const params: Record<string, unknown> = { auth_user_id: input.authUserId };
   const optionsParams: Record<string, unknown> = { auth_user_id: input.authUserId };
+  const priceDiagParams: Record<string, unknown> = { auth_user_id: input.authUserId };
   const support = await supportDataStatus(input.clickhouse, input.authUserId, scope);
   const optionsStarted = Date.now();
-  const [rawRows, subStatus, optionRows, fx, currentWarehouse] = await Promise.all([
+  const [rawRows, subStatus, optionRows, fx, currentWarehouse, priceDiagRows] = await Promise.all([
     jsonRows<RawCohortRow>(input.clickhouse, buildMaterializedCohortListQuery(input.request, active, params, support.support_data_status, scope), params),
     subscriptionDataStatus(input.clickhouse, input.authUserId, scope),
     // Options are scoped to the SAME active filters as the list (each dimension
@@ -1212,6 +1355,18 @@ export async function runMaterializedCohortList(input: {
     restricted
       ? Promise.resolve(null)
       : getWarehouseFingerprint(input.clickhouse, input.authUserId).catch((error) => {
+        if (error instanceof ScopeViolation) throw error;
+        return null;
+      }),
+    // Price-id diagnostics of the token / in-product upsell split: the data
+    // owner only, best-effort (a failure leaves unknown_products empty).
+    restricted
+      ? Promise.resolve(null)
+      : jsonRows<PriceDiagnosticsRow>(
+        input.clickhouse,
+        buildMaterializedPriceDiagnosticsQuery(input.request, active, priceDiagParams, support.support_data_status),
+        priceDiagParams,
+      ).catch((error) => {
         if (error instanceof ScopeViolation) throw error;
         return null;
       }),
@@ -1284,7 +1439,11 @@ export async function runMaterializedCohortList(input: {
     filter_options: options.options,
     filter_options_diagnostics: optionsDiagnostics(nreq, options, optionsDurationMs),
     fx_diagnostics: fx,
-    token_diagnostics: tokenDiagnosticsFromRows(rows, emailMatchedTokenPurchases(rawRows)),
+    token_diagnostics: tokenDiagnosticsFromRows(
+      rows,
+      emailMatchedTokenPurchases(rawRows),
+      priceDiagRows ? priceDiagnosticsFromRows(priceDiagRows) : undefined,
+    ),
     ...({
       fb_totals: fbStats.totals,
       fb_diagnostics: fbStats.diagnostics,

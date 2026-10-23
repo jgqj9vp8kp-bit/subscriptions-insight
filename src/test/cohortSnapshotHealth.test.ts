@@ -196,7 +196,19 @@ describe("atomic report bundle", () => {
       fx_diagnostics: fx(29_479),
       token_diagnostics: {
         token_purchases_total: 1, token_purchases_matched: 1, token_purchases_matched_by_email: 0,
-        token_purchases_unmatched: 0, token_unmatched_amount: 0, unknown_products: [], unknown_addon_revenue: 0,
+        token_purchases_unmatched: 0, token_unmatched_amount: 0,
+        // The server price-id diagnostics (materialized list, data owner only).
+        unknown_products: [{
+          product_id: "price_01NEW", product_name: "—", amount: 3.49, currency: "EUR", count: 4, users: 3,
+          classified_as: "token_purchase", rule: "fallback_token_48h", median_minutes_after_trial: 6, suggested_category: "token_candidate",
+        }],
+        unknown_addon_revenue: 15.2,
+        app_upsell_purchases_total: 2,
+        price_signals: {
+          anchors_with_listed_price: { token_purchase: 1, app_upsell: 0, upsell: 0 },
+          lifecycle_rows_with_listed_price: { token_purchase: 0, app_upsell: 0, upsell: 0 },
+          config_marked_overlap: [],
+        },
       },
       diagnostics: snapshotDiagnostics(),
     };
@@ -210,6 +222,9 @@ describe("atomic report bundle", () => {
     expect(bundle.diagnostics).toBe(response.diagnostics);
     expect(bundle.fxDiagnostics).toBe(response.fx_diagnostics);
     expect(bundle.durationMs).toBe(42);
+    // The token panel gets the server's unknown products and price-id check unchanged.
+    expect(bundle.tokenDiagnostics).toEqual(response.token_diagnostics);
+    expect(bundle.tokenDiagnostics!.unknown_products[0].example_transaction_id).toBeUndefined();
     vi.doUnmock("@/services/clickhouse");
     vi.resetModules();
   });

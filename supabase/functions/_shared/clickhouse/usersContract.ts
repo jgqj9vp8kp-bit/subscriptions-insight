@@ -129,6 +129,12 @@ export interface UsersRow {
   token_purchase_count: number;
   token_gross_revenue: number;
   token_net_revenue: number;
+  /** In-product upsells (token / in-product upsell split, 2026-10-23). Optional:
+   * absent on responses cached before it. */
+  app_upsell_purchase_count?: number;
+  app_upsell_gross_revenue?: number;
+  app_upsell_net_revenue?: number;
+  /** Upsell slots 1-3 gross + token net + in-product upsell net. */
   addon_revenue: number;
 
   active_subscription: boolean;

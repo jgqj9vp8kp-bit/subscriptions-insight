@@ -35,6 +35,7 @@ import { activeCohortMemberWhere, activeCohortSnapshotVersion, getCohortSnapshot
 import type { CohortFilters } from "./cohortContract.ts";
 import { ANALYTICS_TRANSACTIONS_TABLE, FACT_FACEBOOK_STATS_TABLE, FACT_USER_COHORTS_TABLE } from "./schema.ts";
 import { ALL_SCOPE_SQL, cohortsFrom, ScopeSnapshotNotReadyError, txFrom, type ScopeSql } from "./scopeSql.ts";
+import { oneOffTypingSql, priceSignalSql, SNAPSHOT_TRIAL_TEST, tokenAmountSql, upsellPricePointsCte } from "./monetizationTyping.ts";
 import {
   REVENUE_AGE_BUCKETS,
   type RevenueAgeRow,
@@ -125,26 +126,28 @@ export function normalizeRevenueFilters(raw?: Partial<RevenueIntelligenceFilters
 
 // ---- Classified attributed stream (verbatim classifier CTEs) ---------------
 //
-// base/pretyped/lifeidx/upsidx/fin copied from buildMaterializedCohortListQuery
-// (cohortMembership.ts:611-661) with two additions the calendar projection
-// needs: the cohort DATE as a Date column (c_d) and the user's price_plan
-// (c_plan). The typing runs over the user's FULL history (no date window) —
-// windowing before typing would misnumber first_subscription/renewal levels.
+// base/pretyped/lifeidx/upsidx/fin copied from the materialized chain
+// (cohortMembership.ts materializedFinxCtes) with two additions the calendar
+// projection needs: the cohort DATE as a Date column (c_d) and the user's
+// price_plan (c_plan). The typing runs over the user's FULL history (no date
+// window) — windowing before typing would misnumber first_subscription/renewal
+// levels. One-off typing is the shared token / in-product / funnel upsell split
+// (monetizationTyping.ts), anchored like the materialized chain.
 
 function classifiedCTE(memberWhere = "", scope: ScopeSql = ALL_SCOPE_SQL): string {
   return `
+${upsellPricePointsCte(scope)},
 base AS (
   SELECT a.user_id uid, a.transaction_id tid, a.event_time et, toUnixTimestamp64Milli(a.event_time) ets,
     multiIf(a.transaction_type = 'trial', 0, a.transaction_type = 'upsell', 1, a.transaction_type = 'first_subscription', 2,
       a.transaction_type IN ('renewal_2','renewal_3','renewal'), 3, 4) tprio,
     a.status status, a.is_success is_success,
     positionCaseInsensitive(a.billing_reason, 'upsell') > 0 upmark,
-    ((a.currency = 'USD' AND (abs(toFloat64(a.original_amount) - 4.99) < 0.005 OR abs(toFloat64(a.original_amount) - 9.99) < 0.005 OR abs(toFloat64(a.original_amount) - 24.99) < 0.005))
-      OR (a.currency = 'EUR' AND abs(toFloat64(a.original_amount) - 4.99) < 0.005)
-      OR (a.currency = 'COP' AND abs(toFloat64(a.original_amount) - 17199) < 0.005)) tokenAmt,
+    ${tokenAmountSql("a")},
     abs(toFloat64(a.original_amount) - 14.98) < 0.01 commonUp,
     multiIf(a.status = 'failed', 'failed_payment', a.status = 'refunded', 'refund', a.status = 'chargeback', 'chargeback', '') statusType,
     a.gross_amount_usd g, floor(a.net_amount_usd * 100 + 0.5) / 100 nn, floor(a.refund_amount_usd * 100 + 0.5) / 100 rr,
+    ${priceSignalSql("a")},
     fc.cohort_date c_d, fc.campaign_path c_camp, fc.price_plan c_plan,
     fc.trial_transaction_id trial_transaction_id,
     toUnixTimestamp64Milli(fc.trial_event_time) trial_ts
@@ -161,11 +164,7 @@ base AS (
 ),
 pretyped AS (
   SELECT *, floor((ets - trial_ts) / 86400000) d,
-    multiIf(statusType != '', statusType, upmark, 'upsell', (NOT upmark) AND tokenAmt, 'token_purchase',
-      tid = trial_transaction_id, 'trial',
-      (statusType = '' AND NOT upmark AND NOT tokenAmt) AND (ets - trial_ts) <= 3600000 AND commonUp, 'upsell',
-      (statusType = '' AND NOT upmark AND NOT tokenAmt) AND (ets - trial_ts) <= 172800000, 'token_purchase',
-      (statusType = '' AND NOT upmark AND NOT tokenAmt), 'lifecycle', 'upsell') pretype
+    ${oneOffTypingSql(SNAPSHOT_TRIAL_TEST)}
   FROM base
 ),
 lifeidx AS (SELECT uid, tid, row_number() OVER (PARTITION BY uid ORDER BY ets, tprio, tid) lvl FROM pretyped WHERE pretype = 'lifecycle' AND is_success = 1),
@@ -179,11 +178,14 @@ fin AS (
 )`;
 }
 
-const TYPE_SUMS = `
+// by_type buckets: every successful lt the typing produces falls in exactly
+// one, so gross = Σ by_type + unattributed holds. In-product upsells count as
+// upsells (owner decision 2026-10-23); tokens are token packs only.
+export const TYPE_SUMS = `
   sumIf(g, is_success = 1 AND lt = 'trial') type_trial,
   sumIf(g, is_success = 1 AND lt = 'first_subscription') type_first_sub,
   sumIf(g, is_success = 1 AND lt IN ('renewal_2','renewal_3','renewal')) type_renewals,
-  sumIf(g, is_success = 1 AND lt = 'upsell') type_upsells,
+  sumIf(g, is_success = 1 AND lt IN ('upsell','app_upsell')) type_upsells,
   sumIf(g, is_success = 1 AND lt = 'token_purchase') type_tokens`;
 
 /** Attributed daily series over the FULL account history (52k rows — cheap;

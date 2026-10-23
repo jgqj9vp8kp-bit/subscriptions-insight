@@ -365,6 +365,36 @@ describe("cohorts UI settings", () => {
     expect(payload.columnVisibility.support_rate).toBe(true);
   });
 
+  it("appends the in-product upsell columns to an old saved order, hidden", () => {
+    const appIds = ["app_upsell_buyers", "app_upsell_buyer_cr", "app_upsell_purchases", "app_upsell_gross_revenue", "app_upsell_net_revenue"];
+    const appDefaults: CohortsUiSettingsDefaults = {
+      ...defaults,
+      defaultColumnOrder: ["cohort_date", "campaign_path", "trial_users", "token_buyers", ...appIds, "net_revenue"],
+      defaultColumnWidths: { ...defaults.defaultColumnWidths, token_buyers: 100, ...Object.fromEntries(appIds.map((id) => [id, 150])) },
+      // Monetization columns are hidden by default (DEFAULT_HIDDEN).
+      defaultColumnVisibility: { ...defaults.defaultColumnVisibility, token_buyers: false, ...Object.fromEntries(appIds.map((id) => [id, false])) },
+      validWidthKeys: [...defaults.validWidthKeys, "token_buyers", ...appIds],
+      validSortColumnIds: [...defaults.validSortColumnIds, "token_buyers", ...appIds],
+    };
+    const payload = buildCohortsUiSettingsPayload(
+      {
+        // A view saved before the split: token_buyers shown, no app ids at all.
+        columnOrder: ["campaign_path", "token_buyers", "trial_users"],
+        columnWidths: {},
+        columnVisibility: { campaign_path: true, token_buyers: true, trial_users: true },
+        selectedView: null,
+        savedViews: [],
+        filters: {},
+        updatedAt: "2026-10-22T12:00:00.000Z",
+      },
+      appDefaults,
+    );
+    expect(payload.columnOrder.slice(0, 3)).toEqual(["campaign_path", "token_buyers", "trial_users"]);
+    expect(payload.columnOrder.slice(-7)).toEqual(["cohort_date", ...appIds, "net_revenue"]);
+    for (const id of appIds) expect(payload.columnVisibility[id], id).toBe(false);
+    expect(payload.columnVisibility.token_buyers).toBe(true);
+  });
+
   it("removes duplicate column IDs", () => {
     expect(sanitizeColumnOrder(["net_revenue", "net_revenue", "trial_users"], defaults.defaultColumnOrder)).toEqual([
       "net_revenue",

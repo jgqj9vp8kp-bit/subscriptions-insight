@@ -11,6 +11,10 @@ export type TransactionType =
   | "renewal_3"
   | "renewal"
   | "token_purchase"
+  // In-product upsell (offered in the product right after the funnel checkout).
+  // Read-time only (classifyUserTransactions typing "price_point"): the import
+  // never stores it (transactionMapper / import.ts VALID_TYPES exclude it).
+  | "app_upsell"
   | "failed_payment"
   | "refund"
   | "chargeback"
@@ -63,6 +67,12 @@ export interface Transaction {
   campaign_id: string;
   utm_source?: string | null;
   classification_reason: string;
+  /** Read-time only (classifyUserTransactions typing "price_point"), on status
+   * rows after the trial: the one-off category their payment would have had
+   * (the SQL ocat, monetizationTyping.ts classifyOneOff), so a refund is
+   * attributed to token / in-product upsell as the ClickHouse engines do. The
+   * import never stores it. */
+  one_off_category?: import("./monetizationTyping.ts").OneOffCategory;
   billing_reason?: string;
   cohort_date?: string;
   cohort_id?: string;
@@ -186,8 +196,20 @@ export interface CohortMonetizationFields {
   token_net_revenue?: number;
   avg_token_revenue_per_trial?: number;
   avg_token_revenue_per_buyer?: number;
+  /** In-product upsells (offered in the product right after the funnel
+   * checkout; monetizationTyping.ts). The ClickHouse engines type them in SQL,
+   * the client engine at read time (classifyUserTransactions typing
+   * "price_point"); the stored import-time type never holds them. */
+  app_upsell_buyers?: number;
+  /** In-product Upsell Buyers / Trial Users × 100. */
+  app_upsell_buyer_cr?: number;
+  app_upsell_purchases?: number;
+  app_upsell_gross_revenue?: number;
+  app_upsell_net_revenue?: number;
+  /** Upsell slots 1-3 + token net + in-product upsell net. */
   addon_revenue?: number;
   token_buyer_user_ids?: string[];
+  app_upsell_buyer_user_ids?: string[];
   token_pack_breakdown?: import("./monetization.ts").TokenPackRow[];
   /** Per-currency revenue mix of the cohort (original + USD-normalized). */
   currency_breakdown?: CohortCurrencyBreakdownRow[];

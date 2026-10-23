@@ -161,6 +161,24 @@ describe("mapAggregateToCohortRow", () => {
     // synthetic ids carry no real user identity
     expect(a.refunded_user_ids.every((id) => id.startsWith(a.cohort_id))).toBe(true);
   });
+
+  it("maps the in-product upsell fields with \"au\" synthetic buyer ids; absent fields default to 0", () => {
+    const row = mapAggregateToCohortRow(agg({
+      app_upsell_buyers: 5, app_upsell_purchases: 6, app_upsell_gross_revenue: 17.94, app_upsell_net_revenue: 14.95, addon_revenue: 169.95,
+    }));
+    expect(row).toMatchObject({
+      app_upsell_buyers: 5, app_upsell_purchases: 6, app_upsell_gross_revenue: 17.94, app_upsell_net_revenue: 14.95, addon_revenue: 169.95,
+    });
+    expect(row.app_upsell_buyer_cr).toBeCloseTo(5, 6); // 5 / 100 trial users
+    expect(row.app_upsell_buyer_user_ids).toHaveLength(5);
+    expect(row.app_upsell_buyer_user_ids!.every((id) => id.startsWith(`${row.cohort_id}:au`))).toBe(true);
+    // Token buyer ids stay their own set.
+    expect(new Set([...(row.app_upsell_buyer_user_ids ?? []), ...(row.token_buyer_user_ids ?? [])]).size).toBe(9);
+
+    const cached = mapAggregateToCohortRow(agg());
+    expect(cached).toMatchObject({ app_upsell_buyers: 0, app_upsell_buyer_cr: 0, app_upsell_purchases: 0, app_upsell_gross_revenue: 0, app_upsell_net_revenue: 0 });
+    expect(cached.app_upsell_buyer_user_ids).toEqual([]);
+  });
 });
 
 describe("filtersFullyReproduced", () => {

@@ -5,6 +5,10 @@ import {
   buildCohortMembershipInsertSql,
   buildMaterializedFilterOptionsQuery,
   buildMaterializedCohortListQuery,
+  buildMaterializedPriceDiagnosticsQuery,
+  materializedFinxCtes,
+  priceDiagnosticsFromRows,
+  validateCohortMembership,
   CAMPAIGN_SCOPE_BUDGET_MS,
   COHORT_CLASSIFICATION_VERSION,
   CohortRebuildBusyError,
@@ -16,6 +20,16 @@ import {
 import { CAMPAIGN_SCOPE_VERSION } from "../../supabase/functions/_shared/clickhouse/cohortSnapshotState.ts";
 import { ScopeViolation } from "../../supabase/functions/_shared/clickhouse/scopedClient.ts";
 import { normalizeCohortRequest } from "../../supabase/functions/_shared/clickhouse/cohorts.ts";
+import { cancellationFlagsCTE } from "../../supabase/functions/_shared/clickhouse/cohortCancellations.ts";
+import { ALL_SCOPE_SQL } from "../../supabase/functions/_shared/clickhouse/scopeSql.ts";
+import {
+  SNAPSHOT_TRIAL_TEST,
+  configListedPriceSql,
+  oneOffTypingSql,
+  priceSignalSql,
+  tokenAmountSql,
+  upsellPricePointsCte,
+} from "../../supabase/functions/_shared/clickhouse/monetizationTyping.ts";
 import type { ClickHouseClientLike, SupabaseLikeClient } from "../../supabase/functions/_shared/clickhouse/types.ts";
 import type { CohortFilters, CohortRequest } from "../../supabase/functions/_shared/clickhouse/cohortContract.ts";
 
@@ -848,5 +862,154 @@ describe("snapshot rebuild for funnel-restricted freshness", () => {
       await rebuildCohortMembership({ authUserId: "user-1", supabase: h.supabase, clickhouse: h.clickhouse, mode });
       expect(names(h.rpcCalls), `${mode} ${JSON.stringify(state)}`).toContain("claim_clickhouse_cohort_snapshot_build");
     }
+  });
+});
+
+// ---- Token / in-product / funnel upsell split on the snapshot path ----------
+
+describe("token / in-product upsell split: the materialized chain", () => {
+  const ACTIVE = { warehouse_version: "wh_1", classification_version: "cv_1" };
+
+  it("base carries the price signals, pretyped the snapshot-anchored rule table", () => {
+    const sql = buildMaterializedCohortListQuery({ action: "list" }, ACTIVE, { auth_user_id: "user-1" });
+    expect(sql).toContain(`${cancellationFlagsCTE(ALL_SCOPE_SQL)},\n${upsellPricePointsCte(ALL_SCOPE_SQL)},\nbase AS (`);
+    expect(sql).toContain(`a.product_id pid, a.product_name pname,\n    ${priceSignalSql("a")},\n    if(a.status = 'failed'`);
+    expect(sql).toContain(`SELECT *, floor((ets - trial_ts) / 86400000) d,\n    ${oneOffTypingSql(SNAPSHOT_TRIAL_TEST)}\n  FROM base`);
+    expect(sql).toContain("p.pname pname, p.pp pp, p.psig psig, p.ocat ocat, p.orule orule,");
+    expect(sql).toContain(tokenAmountSql("a"));
+  });
+
+  it("etok: an email-matched row is a token purchase with its price signal; finx stays aligned", () => {
+    const sql = buildMaterializedCohortListQuery({ action: "list" }, ACTIVE, { auth_user_id: "user-1" });
+    const etok = sql.slice(sql.indexOf("etok AS ("), sql.indexOf("finx AS ("));
+    expect(etok).toContain(`${priceSignalSql("a")}, 'token_purchase' ocat, 'email_token' orule,`);
+    expect(sql).toContain("u_normalized_email, lvl, slot, lt, pp, psig, ocat, orule, 0 via_email\n  FROM fin\n");
+    expect(sql).toContain("u_normalized_email, lvl, slot, lt, pp, psig, ocat, orule, 1 via_email\n  FROM etok\n");
+  });
+
+  it("the snapshot INSERT and its validation keep the legacy typing (anchors cannot move)", async () => {
+    const insert = buildCohortMembershipInsertSql();
+    for (const marker of ["psig", "upp AS (", "ocat", "app_upsell"]) expect(insert).not.toContain(marker);
+    const queries: string[] = [];
+    await validateCohortMembership({
+      authUserId: "user-1",
+      supabase: fakeSupabase(null),
+      clickhouse: {
+        command: async () => undefined,
+        insert: async () => undefined,
+        query: async ({ query }) => {
+          queries.push(query);
+          return { json: async () => [{ dynamic_users: 0, materialized_users: 0 }] };
+        },
+      },
+      warehouseVersion: "wh_1",
+      classificationVersion: "cv_1",
+    });
+    expect(queries).toHaveLength(1);
+    for (const marker of ["psig", "upp AS (", "ocat", "app_upsell"]) expect(queries[0]).not.toContain(marker);
+  });
+
+  it("the price diagnostics statement: one UNION over finx and upp, window-cut, no transaction id", () => {
+    const params: Record<string, unknown> = { auth_user_id: "user-1" };
+    const sql = buildMaterializedPriceDiagnosticsQuery({ action: "list", date_from: "2026-09-01", date_to: "2026-09-30" }, ACTIVE, params);
+    expect(sql.startsWith(`WITH\n${materializedFinxCtes({ action: "list", date_from: "2026-09-01", date_to: "2026-09-30" }, ACTIVE, {})}\nSELECT * FROM (`)).toBe(true);
+    expect(sql).toContain("'unknown_price' kind");
+    expect(sql).toContain("AND orule IN ('token_amount','common_up','fallback_app_2m','fallback_token_48h') AND c_date >= {date_from:String} AND c_date <= {date_to:String}");
+    expect(sql).toContain("if(lt = 'trial', 'listed_anchor', 'listed_lifecycle') kind");
+    expect(sql).toContain("psig != '' AND (lt = 'trial' OR lvl > 0)");
+    expect(sql).toContain(`FROM upp\n  WHERE ${configListedPriceSql("price_point")}\n`);
+    expect(sql).toContain("ORDER BY kind = 'unknown_price', purchases DESC\nLIMIT 500");
+    expect(sql).not.toMatch(/\btid\b[^,]*\b(example|transaction_id)\b/);
+    expect(sql).not.toContain("example_transaction_id");
+    expect(params).toMatchObject({ date_from: "2026-09-01", date_to: "2026-09-30", warehouse_version: "wh_1" });
+  });
+
+  it("maps the diagnostics rows onto unknown_products and the price-id check", () => {
+    const diag = priceDiagnosticsFromRows([
+      { kind: "unknown_price", price_id: "price_01NEW", product_name: "", currency_code: "EUR", amount: 3.49, rule_name: "fallback_token_48h", classified_as: "token_purchase", purchases: "4", users: 3, gross_usd: 15.2, median_minutes: 6.25 },
+      { kind: "unknown_price", price_id: "price_01NEW2", product_name: "", currency_code: "USD", amount: 1.99, rule_name: "fallback_app_2m", classified_as: "app_upsell", purchases: 2, users: 2, gross_usd: 3.98, median_minutes: 1 },
+      { kind: "unknown_price", price_id: "", product_name: "Pack", currency_code: "USD", amount: 14.98, rule_name: "common_up", classified_as: "upsell", purchases: 1, users: 1, gross_usd: 14.98, median_minutes: 0.5 },
+      { kind: "listed_anchor", price_id: "price_01TOK", rule_name: "token_purchase", classified_as: "trial", purchases: 5, users: 5 },
+      { kind: "listed_anchor", price_id: "price_01APP", rule_name: "app_upsell", classified_as: "trial", purchases: 1, users: 1 },
+      { kind: "listed_lifecycle", price_id: "price_01TOK", rule_name: "token_purchase", classified_as: "first_subscription", purchases: 2, users: 2 },
+      { kind: "config_marked_overlap", price_id: "price_01Z" },
+      { kind: "config_marked_overlap", price_id: "price_01A" },
+    ]);
+    expect(diag.unknown_products).toEqual([
+      { product_id: "price_01NEW", product_name: "—", amount: 3.49, currency: "EUR", count: 4, users: 3, classified_as: "token_purchase", rule: "fallback_token_48h", median_minutes_after_trial: 6.3, suggested_category: "token_candidate" },
+      { product_id: "price_01NEW2", product_name: "—", amount: 1.99, currency: "USD", count: 2, users: 2, classified_as: "app_upsell", rule: "fallback_app_2m", median_minutes_after_trial: 1, suggested_category: "app_upsell_candidate" },
+      { product_id: null, product_name: "Pack", amount: 14.98, currency: "USD", count: 1, users: 1, classified_as: "upsell", rule: "common_up", median_minutes_after_trial: 0.5, suggested_category: "addon_candidate" },
+    ]);
+    expect(diag.unknown_addon_revenue).toBeCloseTo(34.16, 8);
+    expect(diag.price_signals).toEqual({
+      anchors_with_listed_price: { token_purchase: 5, app_upsell: 1, upsell: 0 },
+      lifecycle_rows_with_listed_price: { token_purchase: 2, app_upsell: 0, upsell: 0 },
+      config_marked_overlap: ["price_01A", "price_01Z"],
+    });
+    for (const row of diag.unknown_products) expect(row).not.toHaveProperty("example_transaction_id");
+  });
+
+  function diagWarehouse(diag: () => unknown[]): { client: ClickHouseClientLike; queries: string[] } {
+    const queries: string[] = [];
+    return {
+      queries,
+      client: {
+        command: async () => undefined,
+        insert: async () => undefined,
+        query: async ({ query }) => {
+          queries.push(query);
+          return {
+            json: async () => {
+              if (query.includes("'unknown_price' kind")) return diag();
+              if (query.includes("system.tables")) return [{ c: 1 }];
+              if (query.includes("AS support_requests")) return [{ support_requests: 0, support_unique_emails: 0 }];
+              if (query.includes("count() AS c")) return [{ c: 0 }];
+              return [];
+            },
+          };
+        },
+      },
+    };
+  }
+
+  const SNAPSHOT = {
+    status: "completed",
+    active_warehouse_version: "wh_1",
+    active_classification_version: COHORT_CLASSIFICATION_VERSION,
+    active_generated_at: "2026-10-22T00:00:00.000Z",
+    duplicate_users: 0,
+    diagnostics: { validation: { status: "PASS" } },
+  };
+
+  it("runs for the data owner and fills token_diagnostics", async () => {
+    const { client, queries } = diagWarehouse(() => [
+      { kind: "unknown_price", price_id: "price_01NEW", currency_code: "EUR", amount: 3.49, rule_name: "fallback_token_48h", classified_as: "token_purchase", purchases: 4, users: 3, gross_usd: 15.2, median_minutes: 6 },
+      { kind: "listed_anchor", price_id: "price_01TOK", rule_name: "token_purchase", classified_as: "trial", purchases: 5, users: 5 },
+    ]);
+    const response = await runMaterializedCohortList({ authUserId: "user-1", supabase: fakeSupabase(SNAPSHOT), clickhouse: client, request: { action: "list" } });
+    expect(queries.filter((query) => query.includes("'unknown_price' kind"))).toHaveLength(1);
+    expect(response!.token_diagnostics!.unknown_products).toHaveLength(1);
+    expect(response!.token_diagnostics!.unknown_products[0]).toMatchObject({ product_id: "price_01NEW", rule: "fallback_token_48h", suggested_category: "token_candidate" });
+    expect(response!.token_diagnostics!.unknown_addon_revenue).toBe(15.2);
+    expect(response!.token_diagnostics!.price_signals!.anchors_with_listed_price.token_purchase).toBe(5);
+    expect(response!.token_diagnostics!.app_upsell_purchases_total).toBe(0);
+  });
+
+  it("is best effort: a failing statement leaves unknown_products empty and the list ok", async () => {
+    const { client } = diagWarehouse(() => {
+      throw new Error("diagnostics exploded");
+    });
+    const response = await runMaterializedCohortList({ authUserId: "user-1", supabase: fakeSupabase(SNAPSHOT), clickhouse: client, request: { action: "list" } });
+    expect(response!.ok).toBe(true);
+    expect(response!.token_diagnostics!.unknown_products).toEqual([]);
+    expect(response!.token_diagnostics!.price_signals).toBeUndefined();
+  });
+
+  it("rethrows a ScopeViolation instead of swallowing it", async () => {
+    const { client } = diagWarehouse(() => {
+      throw new ScopeViolation("restricted_write");
+    });
+    await expect(runMaterializedCohortList({ authUserId: "user-1", supabase: fakeSupabase(SNAPSHOT), clickhouse: client, request: { action: "list" } }))
+      .rejects.toBeInstanceOf(ScopeViolation);
   });
 });

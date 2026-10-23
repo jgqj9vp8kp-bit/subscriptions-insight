@@ -25,7 +25,8 @@ import {
   isTokenPurchaseTransaction,
   type UnknownProductRow,
 } from "./monetization.ts";
-import { APP_ADDON_WINDOW_HOURS } from "./monetizationProductMap.ts";
+import { APP_ADDON_WINDOW_HOURS, knownAppUpsellPriceIds } from "./monetizationProductMap.ts";
+import { priceSignal, pricePointForTransaction } from "./monetizationTyping.ts";
 import {
   normalizeTransactionsToUsd,
   type FxNormalizationDiagnostics,
@@ -71,8 +72,8 @@ const FAILED_STATUS_TOKENS = [
 const initialPlanTransactionForUser = (txs: Transaction[]) =>
   [...txs]
     .sort((a, b) => (a.event_time < b.event_time ? -1 : 1))
-    // Token packs are add-on purchases, never a price plan.
-    .find((t) => t.status === "success" && t.transaction_type !== "upsell" && t.transaction_type !== "token_purchase");
+    // Token packs and in-product upsells are add-on purchases, never a price plan.
+    .find((t) => t.status === "success" && t.transaction_type !== "upsell" && t.transaction_type !== "token_purchase" && t.transaction_type !== "app_upsell");
 const planNameFromPrice = (price: number | null) => (price == null ? "Unknown" : formatCurrency(price));
 const normalizeEmailKey = (email: string | null | undefined) => email?.trim().toLowerCase() || "";
 const transactionDay = (t: Transaction, daysFromCohort: number) =>
@@ -668,8 +669,16 @@ export interface TokenAttributionDiagnostics {
 export interface MonetizationDiagnostics extends TokenAttributionDiagnostics {
   /** Products that need mapping in monetizationProductMap.ts (Phase 8 debug output). */
   unknown_products: UnknownProductRow[];
-  /** Gross revenue of explicit one-time/add-on rows that could not be classified. */
+  /** Client engine: gross revenue of explicit one-time/add-on rows no rule
+   * classified. Server (materialized list, data owner only): the gross of the
+   * unknown_price rows — already counted in the Token / In-product / Funnel
+   * upsell columns, typed by an amount or timing rule because their price id is
+   * not listed; top 500 rows only (CohortTokenDiagnostics). */
   unknown_addon_revenue: number;
+  /** Successful in-product upsells (ClickHouse engines; token / in-product upsell split). */
+  app_upsell_purchases_total?: number;
+  /** The price-id check of the split (materialized list, data owner only). */
+  price_signals?: import("./cohortContract.ts").CohortPriceSignalDiagnostics;
 }
 
 export interface CohortComputationResult {
@@ -686,9 +695,25 @@ export function computeCohorts(
   return computeCohortsWithDiagnostics(txs, subscriptions, options).cohorts;
 }
 
+// Refund / chargeback rows follow the ocat the hydration's price_point typing
+// gave them (one_off_category = classifyOneOff, the SQL rule), so both engines
+// split token and in-product upsell refunds alike. Checked before the token rule.
+const isRefundOrChargeback = (t: Transaction) => t.status === "refunded" || t.status === "chargeback";
+const isAppUpsellRelatedTransaction = (t: Transaction) =>
+  t.transaction_type === "app_upsell" || (isRefundOrChargeback(t) && t.one_off_category === "app_upsell");
+
+// A token row whose price id the config lists (or matches the token prefix) is
+// mapped already: it is never an unknown product.
+const NO_UPSELL_MARKS: ReadonlySet<string> = new Set();
+const hasListedTokenPricePoint = (t: Transaction) =>
+  priceSignal(pricePointForTransaction(t), NO_UPSELL_MARKS) === "token_purchase";
+
+// Rows hydrated without the typing (addCohortFields rows, tests) keep the
+// amount / product rule.
 const isTokenRelatedTransaction = (t: Transaction) =>
   t.transaction_type === "token_purchase" ||
-  ((t.status === "refunded" || t.status === "chargeback") && isTokenPurchaseTransaction(t));
+  (isRefundOrChargeback(t) &&
+    (t.one_off_category !== undefined ? t.one_off_category === "token_purchase" : isTokenPurchaseTransaction(t)));
 
 export function computeCohortsWithDiagnostics(
   txs: Transaction[],
@@ -851,6 +876,9 @@ export function computeCohortsWithDiagnostics(
     let funnel_upsell_revenue = 0;
     const tokenBuyerIds = new Set<string>();
     let token_purchases = 0, token_gross_revenue = 0, token_refund_amount = 0;
+    // In-product upsells (read-time typing "price_point", warehouseHydration).
+    const appUpsellBuyerIds = new Set<string>();
+    let app_upsell_purchases = 0, app_upsell_gross_revenue = 0, app_upsell_refund_amount = 0;
     const tokenPacks = createTokenPackAccumulator();
     // Per-currency revenue mix (original charge currency vs USD-normalized).
     type MutableCurrencyRow = {
@@ -929,7 +957,8 @@ export function computeCohortsWithDiagnostics(
         if (plan) plan.amount_refunded += refunded;
         // Token refunds: same-row amountRefunded on settled token rows plus
         // dedicated refund/chargeback rows whose product matches a token pack.
-        if (isTokenRelatedTransaction(t)) token_refund_amount += refunded;
+        if (isAppUpsellRelatedTransaction(t)) app_upsell_refund_amount += refunded;
+        else if (isTokenRelatedTransaction(t)) token_refund_amount += refunded;
         // Currency mix: refunds are USD after normalization; missing-FX rows
         // are excluded from USD metrics and reported per cohort.
         currencyRowFor(txCurrency(t)).refundsUsd += refunded;
@@ -980,7 +1009,9 @@ export function computeCohortsWithDiagnostics(
           addTokenPurchaseToPacks(tokenPacks, t, gross);
           // Auto-classified by the trial-window rule but not (yet) present in
           // monetizationProductMap — surface it so the mapping gets confirmed.
-          if (!isTokenPurchaseTransaction(t)) addUnknownProduct(unknownProducts, t, "token_candidate");
+          if (!isTokenPurchaseTransaction(t) && !hasListedTokenPricePoint(t)) {
+            addUnknownProduct(unknownProducts, t, "token_candidate", "fallback_token_48h");
+          }
         } else if (t.transaction_type === "upsell") {
           // Upsell N Gross Rev is defined on gross amounts (spec), unlike the
           // net-based generic upsell_revenue above.
@@ -993,6 +1024,15 @@ export function computeCohortsWithDiagnostics(
           } else {
             upsellExtraUserIds.add(uid);
             upsell_extra_revenue += gross;
+          }
+        } else if (t.transaction_type === "app_upsell") {
+          app_upsell_purchases += 1;
+          app_upsell_gross_revenue += gross;
+          appUpsellBuyerIds.add(uid);
+          // Typed by the 2-minute fallback (an unlisted price id): surface it
+          // so the mapping gets confirmed.
+          if (!knownAppUpsellPriceIds.includes(pricePointForTransaction(t))) {
+            addUnknownProduct(unknownProducts, t, "app_upsell_candidate", "fallback_app_2m");
           }
         } else if (t.transaction_type === "unknown" && hasAddonMarker(t)) {
           // Explicit one-time/add-on rows that no rule could classify.
@@ -1063,6 +1103,8 @@ export function computeCohortsWithDiagnostics(
     const netRevenue = gross_revenue - amount_refunded;
     const token_buyers = tokenBuyerIds.size;
     const token_net_revenue = round2(token_gross_revenue - token_refund_amount);
+    const app_upsell_buyers = appUpsellBuyerIds.size;
+    const app_upsell_net_revenue = round2(app_upsell_gross_revenue - app_upsell_refund_amount);
     const renewalUserCounts = staticRenewalCountsFromLevels(renewalUserCountsByLevel);
     planBreakdown.forEach((plan) => {
       Object.assign(plan, staticRenewalCountsFromLevels(plan.renewal_users_by_level));
@@ -1127,10 +1169,17 @@ export function computeCohortsWithDiagnostics(
       token_net_revenue,
       avg_token_revenue_per_trial: trial_users ? round2(token_net_revenue / trial_users) : 0,
       avg_token_revenue_per_buyer: token_buyers ? round2(token_net_revenue / token_buyers) : 0,
+      app_upsell_buyers,
+      app_upsell_buyer_cr: trial_users ? (app_upsell_buyers / trial_users) * 100 : 0,
+      app_upsell_purchases,
+      app_upsell_gross_revenue: round2(app_upsell_gross_revenue),
+      app_upsell_net_revenue,
       // Spec formula: Upsell 1 Rev + Upsell 2 Rev + Upsell 3 Rev + Token Net Rev
-      // (gross upsell slots; extra/4th+ upsells are reported separately).
-      addon_revenue: round2(upsellSlotRevenue[0] + upsellSlotRevenue[1] + upsellSlotRevenue[2] + token_net_revenue),
+      // + In-product Upsell Net Rev (gross upsell slots; extra/4th+ upsells are
+      // reported separately).
+      addon_revenue: round2(upsellSlotRevenue[0] + upsellSlotRevenue[1] + upsellSlotRevenue[2] + token_net_revenue + app_upsell_net_revenue),
       token_buyer_user_ids: Array.from(tokenBuyerIds),
+      app_upsell_buyer_user_ids: Array.from(appUpsellBuyerIds),
       token_pack_breakdown: finalizeTokenPacks(tokenPacks),
       currency_breakdown: Array.from(currencyRows.entries())
         .map(([currency, row]): CohortCurrencyBreakdownRow => ({
@@ -1190,6 +1239,7 @@ export function computeCohortsWithDiagnostics(
       ...tokenDiagnostics,
       unknown_products: finalizeUnknownProducts(unknownProducts),
       unknown_addon_revenue: round2(unknown_addon_revenue),
+      app_upsell_purchases_total: rows.reduce((total, row) => total + (row.app_upsell_purchases ?? 0), 0),
     },
     fxDiagnostics,
   };

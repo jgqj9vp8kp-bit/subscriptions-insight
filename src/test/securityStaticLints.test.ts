@@ -1062,6 +1062,9 @@ describe("7. restricted SQL reads only the columns its scope fragments project (
     const tx = ddlColumns(CREATE_ANALYTICS_TRANSACTIONS_SQL);
     expect(tx.length).toBeGreaterThan(50);
     expect(TX_COLS.filter((column) => !tx.includes(column))).toEqual([]);
+    // The upsell split reads price_point through every restricted base / etok / upp.
+    expect(TX_COLS).toContain("price_point");
+    expect(tx).toContain("price_point");
     expect(TX_COLS).not.toContain("raw_payload");
     expect(TX_COLS).not.toContain("normalized_payload");
     expect([...FC_COLS].sort()).toEqual(ddlColumns(CREATE_FACT_USER_COHORTS_SQL).sort());

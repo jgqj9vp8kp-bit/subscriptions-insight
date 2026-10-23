@@ -256,7 +256,12 @@ ${classifierSQL(`a.auth_user_id = {auth_user_id:String}`, "")}
     round(sumIf(g, is_success = 1 AND slot IN (1, 2, 3)), 2) upsell_slot_gross,
     countIf(is_success = 1 AND lt = 'token_purchase') token_purchase_count,
     round(sumIf(g, is_success = 1 AND lt = 'token_purchase'), 2) token_gross_revenue,
-    round(sumIf(rr, lt = 'token_purchase' OR (statusType IN ('refund','chargeback') AND tokenAmt)), 2) token_refund
+    -- A refund row follows the one-off category its payment would have had
+    -- (classifier.ts ocat), so token and in-product upsell refunds split too.
+    round(sumIf(rr, lt = 'token_purchase' OR (statusType IN ('refund','chargeback') AND ocat = 'token_purchase')), 2) token_refund,
+    countIf(is_success = 1 AND lt = 'app_upsell') app_upsell_purchase_count,
+    round(sumIf(g, is_success = 1 AND lt = 'app_upsell'), 2) app_upsell_gross_revenue,
+    round(sumIf(rr, lt = 'app_upsell' OR (statusType IN ('refund','chargeback') AND ocat = 'app_upsell')), 2) app_upsell_refund
   FROM fin GROUP BY uid
 ),
 allrows AS (
@@ -343,7 +348,11 @@ useragg AS (
     ifNull(l.token_purchase_count, 0) token_purchase_count,
     ifNull(l.token_gross_revenue, 0) token_gross_revenue,
     round(ifNull(l.token_gross_revenue, 0) - ifNull(l.token_refund, 0), 2) token_net_revenue,
-    round(ifNull(l.upsell_slot_gross, 0) + (ifNull(l.token_gross_revenue, 0) - ifNull(l.token_refund, 0)), 2) addon_revenue,
+    ifNull(l.app_upsell_purchase_count, 0) app_upsell_purchase_count,
+    ifNull(l.app_upsell_gross_revenue, 0) app_upsell_gross_revenue,
+    round(ifNull(l.app_upsell_gross_revenue, 0) - ifNull(l.app_upsell_refund, 0), 2) app_upsell_net_revenue,
+    round(ifNull(l.upsell_slot_gross, 0) + (ifNull(l.token_gross_revenue, 0) - ifNull(l.token_refund, 0))
+      + (ifNull(l.app_upsell_gross_revenue, 0) - ifNull(l.app_upsell_refund, 0)), 2) addon_revenue,
     (ifNull(sb.is_active, 0) = 1) active_subscription,
     ifNull(sb.active_count, 0) active_subscription_count,
     sb.sub_status subscription_status,
@@ -447,6 +456,9 @@ function toRow(r: Record<string, unknown>): UsersRow {
     token_purchase_count: n(r.token_purchase_count),
     token_gross_revenue: round2(n(r.token_gross_revenue)),
     token_net_revenue: round2(n(r.token_net_revenue)),
+    app_upsell_purchase_count: n(r.app_upsell_purchase_count),
+    app_upsell_gross_revenue: round2(n(r.app_upsell_gross_revenue)),
+    app_upsell_net_revenue: round2(n(r.app_upsell_net_revenue)),
     addon_revenue: round2(n(r.addon_revenue)),
     active_subscription: b(r.active_subscription),
     active_subscription_count: n(r.active_subscription_count),

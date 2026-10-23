@@ -51,12 +51,22 @@ import {
   type FilterOptionsResult,
 } from "./cohortFilterOptions.ts";
 import { splitMediaBuyerSelections } from "./mediaBuyerSelection.ts";
+import {
+  DYNAMIC_TRIAL_TEST,
+  oneOffTypingSql,
+  priceSignalSql,
+  tokenAmountSql,
+  upsellPricePointsCte,
+  type ClassifierTyping,
+} from "./monetizationTyping.ts";
+import type { UnknownProductRow } from "./monetization.ts";
 import type {
   CohortAction,
   CohortAggregateRow,
   CohortDetailsResponse,
   CohortDiagnostics,
   CohortFxDiagnostics,
+  CohortPriceSignalDiagnostics,
   CohortTokenDiagnostics,
   CohortFilters,
   CohortFiltersApplied,
@@ -245,9 +255,23 @@ keep AS (
 
 // The finalized classifier. `baseWhere` restricts the per-user scan (auth scope).
 // `joinKeep` optionally semi-joins the currency keep-set.
-export function classifierSQL(baseWhere: string, joinKeep: string): string {
+//
+// Two typings (monetizationTyping.ts), the anchor (elig / tr) identical in both:
+//   * "legacy" (default) — today's text, byte for byte (the owner REBUILD
+//     golden embeds it): the snapshot INSERT and validateCohortMembership
+//     (cohortMembership.ts), the dynamic filter options and the dynamic
+//     active-subscription email overlay. Membership, cohort_date and
+//     price_plan keep reading this typing.
+//   * "price_point" — the token / in-product upsell / funnel upsell split:
+//     prefixes `upp`, adds pp / psig to base and cl, types pretyped through
+//     oneOffTypingSql and carries pp / psig / ocat / orule into fin. Used by
+//     the dynamic list and details (with emailTokenSQL, which expects it).
+// The cl lines with literal TABs below are part of the legacy bytes: never
+// reformat this template.
+export function classifierSQL(baseWhere: string, joinKeep: string, typing: ClassifierTyping = "legacy"): string {
+  const pp = typing === "price_point";
   return `
-base AS (
+${pp ? `${upsellPricePointsCte()},\n` : ""}base AS (
   SELECT a.user_id uid, a.transaction_id tid, a.event_time et, toUnixTimestamp64Milli(a.event_time) ets,
     a.normalized_email normalized_email, ifNull(a.source_updated_at, a.clickhouse_synced_at) source_updated_at,
     a.funnel funnel, a.campaign_path campaign_path,
@@ -258,13 +282,11 @@ base AS (
       a.transaction_type IN ('renewal_2','renewal_3','renewal'), 3, 4) tprio,
     a.status status, a.is_success is_success, a.transaction_type ttype,
     positionCaseInsensitive(a.billing_reason, 'upsell') > 0 upmark,
-    ((a.currency = 'USD' AND (abs(toFloat64(a.original_amount) - 4.99) < 0.005 OR abs(toFloat64(a.original_amount) - 9.99) < 0.005 OR abs(toFloat64(a.original_amount) - 24.99) < 0.005))
-      OR (a.currency = 'EUR' AND abs(toFloat64(a.original_amount) - 4.99) < 0.005)
-      OR (a.currency = 'COP' AND abs(toFloat64(a.original_amount) - 17199) < 0.005)) tokenAmt,
+    ${tokenAmountSql("a")},
     abs(toFloat64(a.original_amount) - 14.98) < 0.01 commonUp,
     multiIf(a.status = 'failed', 'failed_payment', a.status = 'refunded', 'refund', a.status = 'chargeback', 'chargeback', '') statusType,
     a.gross_amount_usd g, floor(a.net_amount_usd * 100 + 0.5) / 100 nn, floor(a.refund_amount_usd * 100 + 0.5) / 100 rr,
-    a.currency cur, toFloat64(a.original_amount) amt, a.product_id pid, a.product_name pname
+    a.currency cur, toFloat64(a.original_amount) amt, a.product_id pid, a.product_name pname${pp ? `,\n    ${priceSignalSql("a")}` : ""}
   FROM ${CH} AS a FINAL ${joinKeep}
   WHERE ${baseWhere}
 ),
@@ -295,7 +317,7 @@ cl AS (
     e.country_code country_code, e.card_type card_type, e.media_buyer media_buyer,
     e.tprio tprio, e.status status, e.is_success is_success, e.upmark upmark, e.tokenAmt tokenAmt,
     e.commonUp commonUp, e.statusType statusType, e.g g, e.nn nn, e.rr rr,
-    e.cur cur, e.amt amt, e.pid pid, e.pname pname, e.lifeelig lifeelig,
+    e.cur cur, e.amt amt, e.pid pid, e.pname pname, e.lifeelig lifeelig,${pp ? "\n    e.pp pp, e.psig psig," : ""}
     tr.trial_ts trial_ts, tr.trial_key trial_key, tr.c_date c_date, tr.c_funnel c_funnel, tr.c_camp c_camp,
 	    tr.c_campaign_id c_campaign_id, tr.c_traffic_source c_traffic_source,
 	    userdim.u_country u_country, userdim.u_card_type u_card_type, userdim.u_platform u_platform, userdim.u_media_buyer u_media_buyer,
@@ -306,11 +328,11 @@ cl AS (
 ),
 pretyped AS (
   SELECT *, floor((ets - trial_ts) / 86400000) d,
-    multiIf(statusType != '', statusType, upmark, 'upsell', (NOT upmark) AND tokenAmt, 'token_purchase',
+    ${pp ? oneOffTypingSql(DYNAMIC_TRIAL_TEST) : `multiIf(statusType != '', statusType, upmark, 'upsell', (NOT upmark) AND tokenAmt, 'token_purchase',
       lifeelig AND (ets, tprio, tid) = trial_key, 'trial',
       lifeelig AND (ets - trial_ts) <= 3600000 AND commonUp, 'upsell',
       lifeelig AND (ets - trial_ts) <= 172800000, 'token_purchase',
-      lifeelig, 'lifecycle', 'upsell') pretype
+      lifeelig, 'lifecycle', 'upsell') pretype`}
   FROM cl
 ),
 lifeidx AS (SELECT uid, tid, row_number() OVER (PARTITION BY uid ORDER BY ets, tprio, tid) lvl FROM pretyped WHERE pretype = 'lifecycle' AND is_success = 1),
@@ -318,7 +340,7 @@ upsidx AS (SELECT uid, tid, row_number() OVER (PARTITION BY uid ORDER BY ets, tp
 fin AS (
   SELECT p.uid uid, p.tid tid, p.et et, p.ets ets, p.tprio tprio, p.trial_ts trial_ts,
     p.is_success is_success, p.g g, p.nn nn, p.rr rr, p.d d, p.statusType statusType, p.tokenAmt tokenAmt,
-    p.cur cur, p.amt amt, p.pid pid, p.pname pname,
+    p.cur cur, p.amt amt, p.pid pid, p.pname pname,${pp ? " p.pp pp, p.psig psig, p.ocat ocat, p.orule orule," : ""}
     p.c_date c_date, p.c_funnel c_funnel, p.c_camp c_camp,
     p.c_campaign_id c_campaign_id, p.c_traffic_source c_traffic_source,
     p.u_country u_country, p.u_card_type u_card_type, p.u_platform u_platform, p.u_media_buyer u_media_buyer,
@@ -345,6 +367,9 @@ fin AS (
 // Known divergence (documented): when user-level filters (country/card/media/
 // currency) are active, the client admits an email-matched row only if the
 // BUYER's own dims pass; here the row follows the cohort member it lands on.
+// Expects classifierSQL(…, "price_point"): finx carries pp / psig / ocat /
+// orule (an email-matched row is a token purchase: ocat 'token_purchase',
+// orule 'email_token').
 export function emailTokenSQL(memberWhere = ""): string {
   return `
 cemail AS (
@@ -372,7 +397,8 @@ etok AS (
     ud.u_country u_country, ud.u_card_type u_card_type, ud.u_platform u_platform, ud.u_media_buyer u_media_buyer,
     ud.u_normalized_email u_normalized_email, ud.u_source_updated_at u_source_updated_at,
     0 lvl, 0 slot,
-    if(b.statusType != '', b.statusType, 'token_purchase') lt
+    if(b.statusType != '', b.statusType, 'token_purchase') lt,
+    b.pp pp, b.psig psig, 'token_purchase' ocat, 'email_token' orule
   FROM base b
   INNER JOIN cemail ce ON ce.normalized_email = b.normalized_email
   INNER JOIN tr ON tr.uid = ce.euid
@@ -398,13 +424,13 @@ finx AS (
     f.c_date c_date, f.c_funnel c_funnel, f.c_camp c_camp, f.c_campaign_id c_campaign_id, f.c_traffic_source c_traffic_source,
     f.u_country u_country, f.u_card_type u_card_type, f.u_platform u_platform, f.u_media_buyer u_media_buyer,
     f.u_normalized_email u_normalized_email, f.u_source_updated_at u_source_updated_at,
-    f.lvl lvl, f.slot slot, f.lt lt, 0 via_email
+    f.lvl lvl, f.slot slot, f.lt lt, f.pp pp, f.psig psig, f.ocat ocat, f.orule orule, 0 via_email
   FROM fin AS f LEFT JOIN fdr ON fdr.tid = f.tid
   UNION ALL
   SELECT uid, tid, et, ets, tprio, trial_ts, is_success, g, nn, rr, d, statusType, tokenAmt,
     cur, amt, pid, pname, dr, pre_lvl, c_date, c_funnel, c_camp, c_campaign_id, c_traffic_source,
     u_country, u_card_type, u_platform, u_media_buyer, u_normalized_email, u_source_updated_at,
-    lvl, slot, lt, 1 via_email
+    lvl, slot, lt, pp, psig, ocat, orule, 1 via_email
   FROM etok
 )`;
 }
@@ -423,6 +449,7 @@ export interface RawCohortRow {
   u1_raw: number; u2_raw: number; u3_raw: number; uextra_raw: number;
   token_purchases: number; token_buyers: number; token_gross_raw: number; token_refund_raw: number;
   token_email_purchases: number;
+  app_upsell_purchases: number; app_upsell_buyers: number; app_upsell_gross_raw: number; app_upsell_refund_raw: number;
   refund_users: number;
   support_users: number;
   cancelled_users?: number; user_cancelled_users?: number; auto_cancelled_users?: number; cancelled_active_users?: number;
@@ -458,8 +485,10 @@ GROUP BY c_date, c_funnel, c_camp`;
  * the list query (grouped by cohort) and the details price-plan breakdown
  * (grouped by plan within one cohort), so a plan row can never disagree with
  * its parent about what any metric means. Expects the finx column set
- * (uid/g/nn/rr/d/lvl/slot/lt/statusType/tokenAmt/via_email/u_normalized_email)
- * plus the support_emails CTE in scope. */
+ * (uid/g/nn/rr/d/lvl/slot/lt/ocat/statusType/via_email/u_normalized_email)
+ * plus the support_emails CTE in scope. A refund row is attributed to the
+ * one-off category its payment would have had (ocat), so token and in-product
+ * upsell refunds follow the same split as their purchases. */
 export const AGGREGATE_MEASURES = `uniqExact(uid) trial_users,
   sum(if(is_success = 1, g, 0)) gross_raw, sum(rr) refund_raw,
   uniqExactIf(uid, rr > 0) refund_users,
@@ -477,8 +506,12 @@ export const AGGREGATE_MEASURES = `uniqExact(uid) trial_users,
   sumIf(g, slot = 1) u1_raw, sumIf(g, slot = 2) u2_raw, sumIf(g, slot = 3) u3_raw, sumIf(g, slot >= 4) uextra_raw,
   countIf(is_success = 1 AND lt = 'token_purchase') token_purchases, uniqExactIf(uid, is_success = 1 AND lt = 'token_purchase') token_buyers,
   sumIf(g, is_success = 1 AND lt = 'token_purchase') token_gross_raw,
-  sumIf(rr, lt = 'token_purchase' OR (statusType IN ('refund','chargeback') AND (tokenAmt OR via_email = 1))) token_refund_raw,
+  sumIf(rr, lt = 'token_purchase' OR (statusType IN ('refund','chargeback') AND (ocat = 'token_purchase' OR via_email = 1))) token_refund_raw,
   countIf(is_success = 1 AND lt = 'token_purchase' AND via_email = 1) token_email_purchases,
+  countIf(is_success = 1 AND lt = 'app_upsell') app_upsell_purchases,
+  uniqExactIf(uid, is_success = 1 AND lt = 'app_upsell') app_upsell_buyers,
+  sumIf(g, is_success = 1 AND lt = 'app_upsell') app_upsell_gross_raw,
+  sumIf(rr, lt = 'app_upsell' OR (statusType IN ('refund','chargeback') AND ocat = 'app_upsell')) app_upsell_refund_raw,
   uniqExactIf(
     uid,
     lowerUTF8(trim(BOTH ' ' FROM u_normalized_email)) != ''
@@ -561,7 +594,7 @@ function buildListQuery(nreq: NormalizedCohortRequest, params: Record<string, un
 ${withKeep}
 ${supportEmailsCTE(supportStatus)},
 ${cancellationFlagsCTE(ALL_SCOPE_SQL)},
-${classifierSQL(baseWhere, joinKeep)}
+${classifierSQL(baseWhere, joinKeep, "price_point")}
 , ${emailTokenSQL(memberWhere)}
 , agg AS (${aggregateSelect(memberWhere)})
 SELECT * FROM agg ${post}
@@ -593,6 +626,7 @@ function toAggregateRow(r: RawCohortRow): CohortAggregateRow {
   const d30 = round2(n(r.d30_raw));
   const trialUsers = n(r.trial_users);
   const tokenNet = round2(n(r.token_gross_raw) - n(r.token_refund_raw));
+  const appNet = round2(n(r.app_upsell_gross_raw) - n(r.app_upsell_refund_raw));
   const supportUsers = n(r.support_users);
   const u1 = n(r.u1_raw), u2 = n(r.u2_raw), u3 = n(r.u3_raw);
   const byLevel: Record<number, number> = {};
@@ -627,7 +661,11 @@ function toAggregateRow(r: RawCohortRow): CohortAggregateRow {
     funnel_upsell_users: n(r.funnel_upsell_users), funnel_upsell_revenue: round2(n(r.funnel_upsell_rev_raw)),
     token_buyers: n(r.token_buyers), token_purchases: n(r.token_purchases),
     token_gross_revenue: round2(n(r.token_gross_raw)), token_net_revenue: tokenNet,
-    addon_revenue: round2(u1 + u2 + u3 + tokenNet),
+    app_upsell_buyers: n(r.app_upsell_buyers), app_upsell_purchases: n(r.app_upsell_purchases),
+    app_upsell_gross_revenue: round2(n(r.app_upsell_gross_raw)), app_upsell_net_revenue: appNet,
+    // In-product upsells were inside token net before the split; they stay
+    // add-on revenue.
+    addon_revenue: round2(u1 + u2 + u3 + tokenNet + appNet),
     fx_missing_transactions: 0, fx_missing_amount: 0,
     ...paymentFailureCountsFromRaw(r as unknown as Record<string, unknown>),
     dedup: {
@@ -665,6 +703,9 @@ function computeTotals(rows: CohortAggregateRow[]): CohortTotals {
     upsell_1_users: sum((r) => r.upsell_1_users), upsell_2_users: sum((r) => r.upsell_2_users), upsell_3_users: sum((r) => r.upsell_3_users),
     token_buyers: sum((r) => r.token_buyers), token_purchases: sum((r) => r.token_purchases),
     token_net_revenue: round2(sum((r) => r.token_net_revenue)),
+    app_upsell_buyers: sum((r) => n(r.app_upsell_buyers)), app_upsell_purchases: sum((r) => n(r.app_upsell_purchases)),
+    app_upsell_gross_revenue: round2(sum((r) => n(r.app_upsell_gross_revenue))),
+    app_upsell_net_revenue: round2(sum((r) => n(r.app_upsell_net_revenue))),
     addon_revenue: round2(sum((r) => r.addon_revenue)),
     // Users sit in exactly one cohort, so per-cohort distinct counts add up.
     ...sumPaymentFailureCounts(rows as unknown as Record<string, unknown>[]),
@@ -837,7 +878,15 @@ export async function fxDiagnostics(
   };
 }
 
-export function tokenDiagnosticsFromRows(rows: CohortAggregateRow[], matchedByEmail = 0): CohortTokenDiagnostics {
+/** The price-id diagnostics of the materialized list (owner only, best-effort):
+ * unlisted price ids a fallback or amount rule typed, and the price-id check. */
+export interface CohortPriceDiagnostics {
+  unknown_products: UnknownProductRow[];
+  unknown_addon_revenue: number;
+  price_signals: CohortPriceSignalDiagnostics;
+}
+
+export function tokenDiagnosticsFromRows(rows: CohortAggregateRow[], matchedByEmail = 0, priceDiag?: CohortPriceDiagnostics): CohortTokenDiagnostics {
   const total = rows.reduce((a, r) => a + r.token_purchases, 0);
   return {
     token_purchases_total: total,
@@ -845,8 +894,10 @@ export function tokenDiagnosticsFromRows(rows: CohortAggregateRow[], matchedByEm
     token_purchases_matched_by_email: matchedByEmail,
     token_purchases_unmatched: 0,
     token_unmatched_amount: 0,
-    unknown_products: [],
-    unknown_addon_revenue: 0,
+    unknown_products: priceDiag?.unknown_products ?? [],
+    unknown_addon_revenue: priceDiag ? round2(priceDiag.unknown_addon_revenue) : 0,
+    app_upsell_purchases_total: rows.reduce((a, r) => a + n(r.app_upsell_purchases), 0),
+    ...(priceDiag ? { price_signals: priceDiag.price_signals } : {}),
   };
 }
 
@@ -1149,13 +1200,20 @@ export function cohortDetailsSelects(): { summary: string; currency: string; tok
     sumIf(nn, is_success = 1) net_usd,
     sum(rr) refunds_usd
     FROM scoped GROUP BY cur`,
-    token: `SELECT pid product_id, pname product, round(amt, 2) price,
+    // Token packs: a pack is its price id when the row carries no product id
+    // (Primer rows never do), priced in the ORIGINAL currency — `amt` alone
+    // mixed JPY 480 with USD 4.99 in one price column.
+    token: `SELECT if(pid != '', pid, pp) product_id, pname product, cur currency, round(amt, 2) price,
     count() purchases, uniqExact(uid) buyers, sum(g) gross_revenue
-    FROM scoped WHERE is_success = 1 AND lt = 'token_purchase' GROUP BY pid, pname, round(amt, 2)`,
+    FROM scoped WHERE is_success = 1 AND lt = 'token_purchase' GROUP BY product_id, pname, cur, round(amt, 2)`,
+    // The plan rule excludes every one-off type. The anchor is the earliest
+    // successful eligible row, so excluding app_upsell picks the same plan as
+    // the snapshot's legacy price_plan (an app id on a token-amount row at the
+    // anchor's own timestamp is the one row it could otherwise pick).
     plan: `, plankey AS (
       SELECT uid,
-        countIf(is_success = 1 AND lt NOT IN ('upsell','token_purchase')) plan_candidates,
-        argMinIf(round(g, 2), (ets, tprio, tid), is_success = 1 AND lt NOT IN ('upsell','token_purchase')) plan_price
+        countIf(is_success = 1 AND lt NOT IN ('upsell','token_purchase','app_upsell')) plan_candidates,
+        argMinIf(round(g, 2), (ets, tprio, tid), is_success = 1 AND lt NOT IN ('upsell','token_purchase','app_upsell')) plan_price
       FROM scoped GROUP BY uid
     )
     SELECT
@@ -1257,7 +1315,9 @@ export async function runCohortDetailsStatements(input: {
     },
     token_pack_breakdown: (tokRes as Array<Record<string, unknown>>).map((r) => ({
       product_id: s(r.product_id),
-      product: s(r.product) || (n(r.price) > 0 ? `Token $${round2(n(r.price)).toFixed(2)}` : "Token pack"),
+      // The price is in the pack's original currency (cohortDetailsSelects).
+      product: s(r.product) || (n(r.price) > 0 ? `Token ${s(r.currency) ? `${s(r.currency)} ` : ""}${round2(n(r.price)).toFixed(2)}` : "Token pack"),
+      currency: s(r.currency),
       price: round2(n(r.price)),
       purchases: n(r.purchases),
       buyers: n(r.buyers),
@@ -1311,7 +1371,7 @@ export async function runCohortDetails(input: {
     return `WITH
 ${supportEmailsCTE(supportStatus)},
 ${cancellationFlagsCTE(ALL_SCOPE_SQL)},
-${classifierSQL(`a.auth_user_id = {auth_user_id:String}`, "")}
+${classifierSQL(`a.auth_user_id = {auth_user_id:String}`, "", "price_point")}
 , ${emailTokenSQL(memberFilterWhere(nreq.filters, params))}
 , scoped AS (SELECT * FROM finx WHERE ${scopeWhere}${memberConds.length ? ` AND ${memberConds.join(" AND ")}` : ""})
 ${extra}
@@ -1339,4 +1399,4 @@ FORMAT JSONEachRow`;
   });
 }
 
-export { round2 as cohortRound2, toAggregateRow, computeTotals, buildListQuery };
+export { round2 as cohortRound2, toAggregateRow, computeTotals, buildListQuery, buildDynamicCohortEmailQuery };

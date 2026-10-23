@@ -540,6 +540,20 @@ describe("dashboard data builders", () => {
     ]);
   });
 
+  it("in-product upsells (read-time split) are cash revenue but never Token Buyers", () => {
+    const rows = [
+      transaction({ transaction_id: "u1-trial", user_id: "u1", event_time: "2026-03-18T09:00:00Z", transaction_type: "trial", gross_amount_usd: 1 }),
+      transaction({ transaction_id: "u1-app", user_id: "u1", event_time: "2026-03-18T09:01:00Z", transaction_type: "app_upsell", gross_amount_usd: 2.99 }),
+      transaction({ transaction_id: "u2-trial", user_id: "u2", event_time: "2026-03-18T10:00:00Z", transaction_type: "trial", gross_amount_usd: 1 }),
+      transaction({ transaction_id: "u2-token", user_id: "u2", event_time: "2026-03-18T10:06:00Z", transaction_type: "token_purchase", gross_amount_usd: 4.99 }),
+    ];
+    const cash = getCashRevenueByDateRange(rows);
+    expect(cash.cashRevenue).toBe(9.98);
+    expect(cash.transactionCount).toBe(4);
+    const [day] = buildTrialsUpsellsByDay(rows);
+    expect(day).toMatchObject({ date: "2026-03-18", trial_users: 2, upsell_users: 0, token_buyers: 1, token_revenue: 4.99 });
+  });
+
   it("aggregates refund events and refund amounts by real event date", () => {
     const rows = [
       transaction({ transaction_id: "refund-a", event_time: "2026-03-18T09:00:00Z", refund_amount_usd: 20.99, is_refunded: true }),

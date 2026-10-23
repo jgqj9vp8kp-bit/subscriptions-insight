@@ -274,6 +274,18 @@ describe("H. Filters and sorting", () => {
     expect(sorted.map((r) => r.fb_spend)).toEqual([300, 100]);
   });
 
+  it("H78b: sorting by In-product Upsell CR orders the full row set (generic row-field path)", () => {
+    const rows = [
+      mapAggregateToCohortRow(aggRow({ app_upsell_buyers: 1 })),
+      mapAggregateToCohortRow(aggRow({ app_upsell_buyers: 5, cohort_date: "2026-07-13" })),
+      mapAggregateToCohortRow(aggRow({ cohort_date: "2026-07-12" })),
+    ];
+    const desc = sortCohortRows(rows, { sortColumn: "app_upsell_buyer_cr", sortDirection: "desc" });
+    expect(desc.map((r) => r.app_upsell_buyers)).toEqual([5, 1, 0]);
+    const asc = sortCohortRows(rows, { sortColumn: "app_upsell_buyer_cr", sortDirection: "asc" });
+    expect(asc.map((r) => r.app_upsell_buyers)).toEqual([0, 1, 5]);
+  });
+
   it("H79: CPP ascending puts null (unavailable) rows last", () => {
     const withCpp = mapAggregateToCohortRow(aggRow({ fb_cpp: 10 }));
     const noCpp = mapAggregateToCohortRow(aggRow({ fb_cpp: null, cohort_date: "2026-07-13" }));
@@ -349,6 +361,24 @@ describe("I. UI, columns and cache", () => {
     const csv = cohortsTableToCsv(table);
     expect(csv).toContain("249.27");
     expect(csv.split("\n")[1]).toContain("2026-07-14");
+  });
+
+  it("I87b: export carries the in-product upsell columns with their labels and values", () => {
+    const appRow = mapAggregateToCohortRow(aggRow({ app_upsell_buyers: 2, app_upsell_purchases: 3, app_upsell_gross_revenue: 8.97, app_upsell_net_revenue: 5.98 }));
+    const labels: Record<string, string> = {
+      app_upsell_buyers: "In-product Upsell Buyers",
+      app_upsell_buyer_cr: "In-product Upsell CR",
+      app_upsell_purchases: "In-product Upsell Purchases",
+      app_upsell_net_revenue: "In-product Upsell Net Rev",
+    };
+    const table = buildCohortsExportTable({
+      cohorts: [appRow],
+      columnOrder: ["cohort_date", "app_upsell_buyers", "app_upsell_buyer_cr", "app_upsell_purchases", "app_upsell_net_revenue"],
+      columnLabel: (id) => labels[id] ?? id,
+    });
+    expect(table.headers).toEqual(["cohort_date", "In-product Upsell Buyers", "In-product Upsell CR", "In-product Upsell Purchases", "In-product Upsell Net Rev"]);
+    expect(table.rows[0].slice(1)).toEqual([2, appRow.app_upsell_buyer_cr, 3, 5.98]);
+    expect(cohortsTableToCsv(table)).toContain("5.98");
   });
 
   it("I88: the Cohorts query key includes the FB warehouse version as its own segment", () => {

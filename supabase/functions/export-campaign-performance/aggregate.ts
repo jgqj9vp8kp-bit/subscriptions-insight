@@ -39,6 +39,8 @@ const REVENUE_TRANSACTION_TYPES = new Set([
   "renewal_3",
   "renewal",
   "token_purchase",
+  // In-product upsells (read-time split, 2026-10-23): cash like the rest.
+  "app_upsell",
 ]);
 
 // Mirrors FAILED_STATUS_TOKENS in src/services/paymentFailures.ts.

@@ -4,6 +4,7 @@ import {
   matchesKnownTokenProduct,
   matchesKnownUpsellProduct,
 } from "./monetizationProductMap.ts";
+import { pricePointForTransaction, type OneOffRule } from "./monetizationTyping.ts";
 
 // Shared monetization classification for the Cohorts page.
 //
@@ -19,6 +20,8 @@ export type MonetizationCategory =
   | "renewal"
   | "funnel_upsell"
   | "token_purchase"
+  /** In-product upsell (read-time typing only; see monetizationTyping.ts). */
+  | "app_upsell"
   | "unknown_addon";
 
 const UPSELL_MARKER_PATTERN = /upsell/i;
@@ -108,6 +111,8 @@ export function monetizationCategoryForTransaction(tx: Transaction): Monetizatio
       return "renewal";
     case "token_purchase":
       return "token_purchase";
+    case "app_upsell":
+      return "app_upsell";
     case "upsell":
       return "funnel_upsell";
     case "unknown":
@@ -122,6 +127,9 @@ export function monetizationCategoryForTransaction(tx: Transaction): Monetizatio
 export interface TokenPackRow {
   product_id: string | null;
   product: string;
+  /** Original currency of `price` (server token packs since the 2026-10-23
+   * split; absent on the legacy client engine and on cached responses). */
+  currency?: string;
   price: number;
   purchases: number;
   buyers: number;
@@ -202,6 +210,14 @@ export function buildTokenPackBreakdown(
   return finalizeTokenPacks(packs);
 }
 
+/** A pack's merge key: product id, currency and price when the row carries a
+ * currency (server packs: a price id priced in its own currency), else the
+ * legacy product + price key. */
+function aggregatePackKey(row: TokenPackRow): string {
+  if (row.currency) return `${row.product_id || row.product}|${row.currency}|${row.price.toFixed(2)}`;
+  return tokenPackKey(row.product, row.price);
+}
+
 /**
  * Merge per-cohort pack breakdowns into one aggregate table (used for the
  * selected-cohorts summary). Buyer counts are summed: a buyer belongs to
@@ -211,7 +227,7 @@ export function aggregateTokenPackBreakdowns(breakdowns: ReadonlyArray<readonly 
   const merged = new Map<string, TokenPackRow>();
   for (const rows of breakdowns) {
     for (const row of rows) {
-      const key = tokenPackKey(row.product, row.price);
+      const key = aggregatePackKey(row);
       const current = merged.get(key);
       if (!current) {
         merged.set(key, { ...row });
@@ -233,6 +249,13 @@ export function aggregateTokenPackBreakdowns(breakdowns: ReadonlyArray<readonly 
 
 // ---- Unknown-product diagnostics (Phase 8) ----
 
+export type UnknownProductCategory = "token_candidate" | "addon_candidate" | "app_upsell_candidate";
+
+/** One unmapped product. The legacy client engine groups by price id (or
+ * product id) + product name + USD amount + currency + suggested category and
+ * keeps an example transaction id; the server (materialized Cohorts list, data
+ * owner only) groups by price id + original amount and currency, names the
+ * rule that typed it and never sends a transaction id. */
 export interface UnknownProductRow {
   product_id: string | null;
   product_name: string;
@@ -240,8 +263,14 @@ export interface UnknownProductRow {
   currency: string;
   count: number;
   users: number;
-  example_transaction_id: string;
-  suggested_category: "token_candidate" | "addon_candidate";
+  example_transaction_id?: string;
+  suggested_category: UnknownProductCategory;
+  /** The lifecycle type the row got. */
+  classified_as?: string;
+  /** The typing rule that decided it (monetizationTyping.ts OneOffRule; the
+   * client fills it for the two fallback candidates only). */
+  rule?: string;
+  median_minutes_after_trial?: number;
 }
 
 interface MutableUnknownProduct {
@@ -252,7 +281,9 @@ interface MutableUnknownProduct {
   count: number;
   userIds: Set<string>;
   example_transaction_id: string;
-  suggested_category: "token_candidate" | "addon_candidate";
+  suggested_category: UnknownProductCategory;
+  classified_as: string;
+  rule?: OneOffRule;
 }
 
 export function createUnknownProductAccumulator(): Map<string, MutableUnknownProduct> {
@@ -262,14 +293,18 @@ export function createUnknownProductAccumulator(): Map<string, MutableUnknownPro
 export function addUnknownProduct(
   acc: Map<string, MutableUnknownProduct>,
   tx: Transaction,
-  suggested: "token_candidate" | "addon_candidate",
+  suggested: UnknownProductCategory,
+  rule?: OneOffRule,
 ): void {
   const amount = round2(tx.gross_amount_usd ?? tx.amount_usd);
   const currency = String(tx.currency ?? "USD").toUpperCase();
   const productName = tx.product?.trim() || "Unknown product";
-  const key = `${productName}|${amount.toFixed(2)}|${currency}`;
+  // Hydrated Primer rows share one product name: the FunnelFox price id is what
+  // tells unlisted products apart (and what the config needs).
+  const productId = productIdForTransaction(tx) ?? (pricePointForTransaction(tx) || null);
+  const key = `${productId ?? ""}|${productName}|${amount.toFixed(2)}|${currency}|${suggested}`;
   const row = acc.get(key) ?? {
-    product_id: productIdForTransaction(tx),
+    product_id: productId,
     product_name: productName,
     amount,
     currency,
@@ -277,6 +312,8 @@ export function addUnknownProduct(
     userIds: new Set<string>(),
     example_transaction_id: tx.transaction_id,
     suggested_category: suggested,
+    classified_as: tx.transaction_type,
+    ...(rule ? { rule } : {}),
   };
   row.count += 1;
   row.userIds.add(tx.user_id);

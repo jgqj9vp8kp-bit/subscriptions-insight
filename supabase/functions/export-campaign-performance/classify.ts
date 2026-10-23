@@ -8,7 +8,9 @@
 // supabase/functions/_shared/clickhouse/, so the port is gone and the export
 // re-derives transaction_type with exactly the in-app rules over each user's
 // FULL history (the warehouse stores per-import-batch classification, which is
-// why re-deriving here is mandatory).
+// why re-deriving here is mandatory). Like the browser hydration it applies the
+// read-time token / in-product / funnel upsell split (typing "price_point"),
+// reading the price id the source maps into metadata.ff_price_point.
 
 import { addCohortFields, classifyUserTransactions } from "../_shared/clickhouse/palmerTransform.ts";
 import type { Transaction } from "../_shared/clickhouse/serviceTypes.ts";
@@ -31,6 +33,8 @@ export interface ClassifiableTxn {
   /** Token-pack detection signals (known ids / name patterns / audited prices). */
   product?: string;
   currency?: string;
+  /** metadata.ff_price_point: the FunnelFox price id of the split. */
+  metadata?: Record<string, unknown> | null;
 }
 
 export function classifyWarehouseTransactions<T extends ClassifiableTxn & { source?: string | null }>(
@@ -39,7 +43,7 @@ export function classifyWarehouseTransactions<T extends ClassifiableTxn & { sour
   const palmerRows = rows.filter((row) => row.source === "palmer_csv");
   const otherRows = rows.filter((row) => row.source !== "palmer_csv");
   return [
-    ...(classifyUserTransactions(palmerRows as unknown as Transaction[]) as unknown as T[]),
+    ...(classifyUserTransactions(palmerRows as unknown as Transaction[], { typing: "price_point" }) as unknown as T[]),
     ...(addCohortFields(otherRows as unknown as Transaction[]) as unknown as T[]),
   ];
 }

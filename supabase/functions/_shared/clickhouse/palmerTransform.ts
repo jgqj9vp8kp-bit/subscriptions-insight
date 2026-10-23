@@ -10,6 +10,14 @@ import { declineDetailsForTransaction } from "./paymentFailures.ts";
 import { buildCohortId } from "./cohortIdentity.ts";
 import { isTokenPurchaseTransaction } from "./monetization.ts";
 import { APP_ADDON_WINDOW_HOURS } from "./monetizationProductMap.ts";
+import {
+  APP_UPSELL_FALLBACK_MS,
+  classifyOneOff,
+  priceSignal,
+  pricePointForTransaction,
+  type ClassifierTyping,
+  type OneOffCategory,
+} from "./monetizationTyping.ts";
 import { normalizeTrafficSource } from "./fbSourceClassification.ts";
 import { currencyMinorUnitFactor } from "./fxRates.ts";
 
@@ -413,7 +421,32 @@ export function normalizePalmerRows(rows: RawPalmerRow[]): Transaction[] {
   });
 }
 
-export function classifyUserTransactions(rows: Transaction[]): Transaction[] {
+/**
+ * `typing`:
+ *   * "legacy" (default) — the import-time typing the warehouse stores. Import
+ *     keeps it: the stored type feeds the anchor tie-break of the ClickHouse
+ *     classifiers, and nothing may store `app_upsell`.
+ *   * "price_point" — read-time hydration (warehouseHydration, the Export API):
+ *     the token / in-product / funnel upsell split of monetizationTyping.ts.
+ *     Within APP_ADDON_WINDOW_HOURS after the trial a listed price id (or one
+ *     the rows ever carried with the upsell mark) decides first; an unknown
+ *     unmarked price id ≤ 2 min after the trial is an in-product upsell. Status
+ *     rows after the trial carry one_off_category (the SQL ocat). The
+ *     trial anchor and the lifecycle levels never change. Pre-existing
+ *     divergences from the SQL stay (commonUp on amount_usd, the token amount
+ *     matching a missing currency, the product-name patterns).
+ */
+export function classifyUserTransactions(rows: Transaction[], opts: { typing?: ClassifierTyping } = {}): Transaction[] {
+  const pricePointTyping = opts.typing === "price_point";
+  // "Ever marked": every price id any of these rows carried with the upsell mark.
+  const markedPricePoints = new Set<string>();
+  if (pricePointTyping) {
+    for (const row of rows) {
+      if (!hasUpsellBillingReason(row)) continue;
+      const pricePoint = pricePointForTransaction(row);
+      if (pricePoint) markedPricePoints.add(pricePoint);
+    }
+  }
   // Classification is user-scoped: the same amount can mean different things
   // depending on whether the user already had a trial or first subscription.
   const byUser = new Map<string, Transaction[]>();
@@ -436,12 +469,38 @@ export function classifyUserTransactions(rows: Transaction[]): Transaction[] {
       const statusType = failedType(tx.status);
       const isUpsellByMetadata = hasUpsellBillingReason(tx);
       const isUpsellByAmount = isCommonUpsellAmount(tx.amount_usd);
+      const pricePoint = pricePointTyping ? pricePointForTransaction(tx) : "";
+      const psig = pricePointTyping ? priceSignal(pricePoint, markedPricePoints) : "";
+      const age = trialTs === null ? null : eventTs - trialTs;
       let transaction_type: TransactionType = tx.transaction_type;
       let classification_reason = tx.classification_reason;
+      // price_point typing only: a status row keeps its status type but carries
+      // the SQL ocat (a status row is never the anchor; no age >= 0 guard, as
+      // `(ets - trial_ts) <= window`), so cohortAnalytics splits its refund
+      // between token and in-product upsell exactly as the ClickHouse engines.
+      const one_off_category: OneOffCategory | undefined = pricePointTyping && statusType && trialTs !== null
+        ? classifyOneOff({
+            upmark: isUpsellByMetadata,
+            isAnchor: false,
+            ageMs: eventTs - trialTs,
+            pricePoint,
+            psig,
+            tokenAmt: isTokenPurchaseTransaction(tx),
+            commonUp: isUpsellByAmount,
+          }).category
+        : undefined;
 
       if (statusType) {
         transaction_type = statusType;
         classification_reason = `${tx.status} Palmer status`;
+      } else if (age !== null && age >= 0 && age <= APP_ADDON_WINDOW_HOURS * HOUR && !isUpsellByMetadata && psig !== "") {
+        // price_point typing only (psig is '' otherwise): the price id decides.
+        transaction_type = psig;
+        classification_reason = psig === "app_upsell"
+          ? "Listed in-product upsell price id within the trial window → app_upsell"
+          : psig === "token_purchase"
+            ? "Listed token price id within the trial window → token_purchase"
+            : "Price id seen with the upsell mark → upsell";
       } else if (isTokenPurchaseTransaction(tx)) {
         // Web-app token/minute packs are add-on revenue: they must never
         // occupy a trial/first_subscription/renewal slot in the lifecycle.
@@ -466,6 +525,16 @@ export function classifyUserTransactions(rows: Transaction[]): Transaction[] {
         classification_reason = isUpsellByMetadata
           ? "Metadata ff_billing_reason contains upsell"
           : "Common upsell amount within 0–60 minutes after trial";
+      } else if (
+        pricePointTyping &&
+        trialTs !== null &&
+        eventTs >= trialTs &&
+        eventTs - trialTs <= APP_UPSELL_FALLBACK_MS &&
+        pricePoint !== "" &&
+        !isUpsellByMetadata
+      ) {
+        transaction_type = "app_upsell";
+        classification_reason = "Unknown unmarked price id within 2 minutes of the trial → app_upsell";
       } else if (
         // Subscription auto-charges never fire this early (earliest observed
         // billing horizon is 70h): an unmarked success inside the trial window
@@ -497,10 +566,13 @@ export function classifyUserTransactions(rows: Transaction[]): Transaction[] {
         classification_reason = "Metadata ff_billing_reason contains upsell";
       }
 
+      // Never pass a stale category through (the legacy typing feeds the import).
+      const { one_off_category: _stale, ...row } = tx;
       classified.push({
-        ...tx,
+        ...row,
         transaction_type,
         classification_reason,
+        ...(one_off_category ? { one_off_category } : {}),
       });
     }
   });
