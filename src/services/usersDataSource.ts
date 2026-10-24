@@ -57,7 +57,9 @@ export interface UsersQuery {
   refund?: "all" | "has" | "none";
   paymentFailed?: "all" | "has" | "none";
   failedAttempts?: "all" | "gte1" | "gte3" | "gte5";
-  campaignPath?: string | null;
+  /** Campaign paths (the cohort panel's product/funnel scope). The single-value
+   * form ("all" | path) is the pre-multi-select shape and is still accepted. */
+  campaignPath?: string | string[] | null;
   country?: string | null;
   cardTypes?: string[];
   platform?: string[];
@@ -78,6 +80,17 @@ const tri = (v: "all" | "has" | "none" | undefined): "all" | "yes" | "no" =>
   v === "has" ? "yes" : v === "none" ? "no" : "all";
 const failedMin = (v: UsersQuery["failedAttempts"]): number => (v === "gte5" ? 5 : v === "gte3" ? 3 : v === "gte1" ? 1 : 0);
 
+/** The campaign_path filter as a sorted, deduped list ("" and "all" = none). */
+export function campaignPathList(v: string | string[] | null | undefined): string[] {
+  const values = Array.isArray(v) ? v : v == null ? [] : [v];
+  const paths = new Set<string>();
+  for (const value of values) {
+    const path = String(value ?? "").trim();
+    if (path && path !== "all") paths.add(path);
+  }
+  return Array.from(paths).sort();
+}
+
 export function buildUsersRequest(q: UsersQuery): UsersRequest {
   return {
     action: "list",
@@ -89,7 +102,7 @@ export function buildUsersRequest(q: UsersQuery): UsersRequest {
       payment_failed: tri(q.paymentFailed),
       active_subscription: tri(q.activeSubscription),
       failed_attempts_min: failedMin(q.failedAttempts),
-      campaign_path: q.campaignPath && q.campaignPath !== "all" ? [q.campaignPath] : [],
+      campaign_path: campaignPathList(q.campaignPath),
       country: q.country && q.country !== "all" ? [q.country] : [],
       card_type: q.cardTypes ?? [],
       platform: q.platform ?? [],

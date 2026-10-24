@@ -36,6 +36,14 @@ describe("buildUsersRequest", () => {
     expect(req.filters?.card_type).toEqual(["debit"]);
     expect(req.filters?.search).toBe("a@b.com");
   });
+
+  it("sends the cohort panel's campaign paths as a sorted, deduped list (the single form still works)", () => {
+    expect(buildUsersRequest({ ...baseQuery, campaignPath: ["b", "a", "a", ""] }).filters?.campaign_path).toEqual(["a", "b"]);
+    expect(buildUsersRequest({ ...baseQuery, campaignPath: "all" }).filters?.campaign_path).toEqual([]);
+    expect(buildUsersRequest({ ...baseQuery, campaignPath: "x" }).filters?.campaign_path).toEqual(["x"]);
+    expect(buildUsersRequest({ ...baseQuery, campaignPath: null }).filters?.campaign_path).toEqual([]);
+    expect(buildUsersRequest({ ...baseQuery, campaignPath: ["all"] }).filters?.campaign_path).toEqual([]);
+  });
 });
 
 describe("mapUsersRow", () => {

@@ -29,6 +29,10 @@ vi.mock("@/hooks/useAccess", async () => {
   return { useAccess: () => owner, useOptionalAccess: () => owner, useCan: (key: string) => owner.can(key) };
 });
 
+// The cohort panel's product map is a separate clickhouse-cohorts call; these
+// tests run without it (the product row is hidden, nothing is held).
+vi.mock("@/hooks/useCohortProducts", () => ({ useCohortProducts: () => ({ products: null, settled: true }) }));
+
 // The warehouse version gate normally requires a live clickhouse-summary call.
 vi.mock("@/hooks/useAnalyticsCache", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/hooks/useAnalyticsCache")>();

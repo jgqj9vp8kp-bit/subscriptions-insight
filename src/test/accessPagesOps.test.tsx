@@ -94,6 +94,9 @@ vi.mock("@/services/paymentPassAnalytics", async (importOriginal) => {
   return { ...actual, buildPaymentAttempts: vi.fn(actual.buildPaymentAttempts) };
 });
 vi.mock("@/hooks/useUsersCache", () => ({ useUsersData: mocks.usersData, useUsersDeclineData: mocks.usersDecline }));
+// The Users cohort panel's product map (clickhouse-cohorts product_paths) stays
+// out of these tests: no product row, nothing held.
+vi.mock("@/hooks/useCohortProducts", () => ({ useCohortProducts: () => ({ products: null, settled: true }) }));
 vi.mock("@/services/usersDataSource", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/services/usersDataSource")>();
   return { ...actual, usersDataSourceMode: () => mocks.usersMode };
