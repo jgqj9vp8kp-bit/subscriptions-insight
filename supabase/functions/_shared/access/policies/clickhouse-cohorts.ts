@@ -10,7 +10,12 @@
 //   * product_paths — the Cohorts Product filter (cohortProducts.ts). Never
 //               scopeReady: it reads normalized_payload, which a restricted
 //               scope never exposes, so restricted members get 403 and the
-//               page hides the filter.
+//               page hides the filter;
+//   * ltv     — the Payback page (/forecasting, cohortLtv.ts): the revenue
+//               curve by trial day and path. forecasting.view, for restricted
+//               members too (restrictedAnyOf); scopeReady behind the cohort
+//               snapshot like list, while the route itself stays
+//               restrictedReady: false until the page's access Phase 2.
 //
 // The `fb_allocation_diagnostics` request block maps to its own canonical action
 // so the registry sees it. The Cohorts page sends that block only when the
@@ -21,7 +26,7 @@
 // "never R", spec R-7).
 //
 // Funnel-restricted members (access Phase 2, spec §4): list / details / options
-// are scopeReady behind the cohort-snapshot freshness gate (scopeSnapshot
+// (and ltv) are scopeReady behind the cohort-snapshot freshness gate (scopeSnapshot
 // "cohort" → 409 scope_snapshot_not_ready until it is fresh and validated);
 // list additionally needs cohorts.view itself for them (restrictedAnyOf: the
 // Reports / Forecasting pages are not open to restricted members). Their
@@ -37,7 +42,7 @@ import { CohortRequestError, normalizeCohortRequest } from "../../clickhouse/coh
 import type { CohortRequest } from "../../clickhouse/cohortContract.ts";
 import { assertKeyPathInScope, intersectIncludePaths, type ScopeSql } from "../../clickhouse/scopeSql.ts";
 
-export type ClickHouseCohortsAction = "list" | "list_fb_allocation_diagnostics" | "details" | "options" | "product_paths";
+export type ClickHouseCohortsAction = "list" | "list_fb_allocation_diagnostics" | "details" | "options" | "product_paths" | "ltv";
 
 /** Every page that renders cohort rows from `list`. */
 export const COHORT_LIST_VIEW_PERMISSIONS: readonly string[] = Object.freeze(["cohorts.view", "reports.view", "forecasting.view"]);
@@ -63,6 +68,8 @@ export function normalizeClickHouseCohortsAction({ body }: NormalizeActionInput)
       return "options";
     case "product_paths":
       return "product_paths";
+    case "ltv":
+      return "ltv";
     default:
       throw new ActionNormalizeError();
   }
@@ -81,6 +88,7 @@ export const CLICKHOUSE_COHORTS_POLICY: FunctionPolicy<ClickHouseCohortsAction> 
     details: { anyOf: ["cohorts.view"], scopeReady: true, scopeSnapshot: "cohort" },
     options: { anyOf: ["cohorts.view"], scopeReady: true, scopeSnapshot: "cohort" },
     product_paths: { anyOf: ["cohorts.view"] },
+    ltv: { anyOf: ["forecasting.view"], restrictedAnyOf: ["forecasting.view"], scopeReady: true, scopeSnapshot: "cohort" },
   },
 };
 

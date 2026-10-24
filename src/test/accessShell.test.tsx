@@ -351,7 +351,7 @@ describe("AppSidebar", () => {
   }
 
   const linkNames = () => screen.queryAllByRole("link").map((link) => link.textContent);
-  const ALL_PAGES = ["Dashboard", "Transactions", "Payment health", "Users", "Cohorts", "Funnels", "Reports", "FB-Analytics", "Integrations", "Support", "Forecasting", "Subscriptions", "Import data"];
+  const ALL_PAGES = ["Dashboard", "Transactions", "Payment health", "Users", "Cohorts", "Funnels", "Reports", "FB-Analytics", "Integrations", "Support", "Payback", "Subscriptions", "Import data"];
 
   it("owner sees every page plus the Administration group", () => {
     renderSidebar(OWNER());

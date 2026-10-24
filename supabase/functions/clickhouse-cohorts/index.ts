@@ -7,7 +7,8 @@
 //
 // Access (policies/clickhouse-cohorts.ts): list / details / options per the
 // pages that call them; product_paths (the Product filter's path -> FunnelFox
-// project map) for full-scope viewers only. Two parts of a list response are stripped, not denied:
+// project map) for full-scope viewers only; ltv (the Payback page's revenue
+// curve, cohortLtv.ts) for forecasting.view. Two parts of a list response are stripped, not denied:
 //   * fb_allocation_diagnostics — computed only with raw access or
 //     admin.diagnostics.view (and the FB_COHORT_ALLOCATION_DIAGNOSTICS_ENABLED
 //     flag, as before);
@@ -34,6 +35,7 @@ import {
   runMaterializedCohortOptions,
 } from "../_shared/clickhouse/cohortMembership.ts";
 import { runCohortProducts } from "../_shared/clickhouse/cohortProducts.ts";
+import { cohortLtvRequest, runCohortLtv } from "../_shared/clickhouse/cohortLtv.ts";
 import { ScopeSnapshotNotReadyError, type ScopeSql } from "../_shared/clickhouse/scopeSql.ts";
 import type { CohortRequest } from "../_shared/clickhouse/cohortContract.ts";
 import type { ClickHouseClientLike, SupabaseAuthClient } from "../_shared/clickhouse/types.ts";
@@ -60,7 +62,7 @@ function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
   ]);
 }
 
-/** A funnel-restricted member's list / options / details: materialized only. */
+/** A funnel-restricted member's list / options / details / ltv: materialized only. */
 async function restrictedCohorts(input: {
   action: ClickHouseCohortsAction;
   body: Record<string, unknown>;
@@ -72,6 +74,13 @@ async function restrictedCohorts(input: {
   const { authUserId, pg, ch, scope } = input;
   // The gate already refuses it (not scopeReady); never fall through to `list`.
   if (input.action === "product_paths") throw new Error("product_paths is not served to funnel-restricted members.");
+  if (input.action === "ltv") {
+    // Shaped like every restricted read (its funnel filters are dropped first:
+    // the curve covers every path of their scope); the gate's snapshot or a 409.
+    const { request, dropped } = restrictCohortRequest(scope, cohortLtvRequest(input.body));
+    const ltv = await withTimeout(runCohortLtv({ authUserId, supabase: pg, clickhouse: ch, request, scope }), QUERY_TIMEOUT_MS);
+    return projectCohortsResponseForRestricted(ltv, dropped);
+  }
   // Keys asserted and includes intersected BEFORE any SQL.
   const { request, dropped } = restrictCohortRequest(scope, input.body);
   if (input.action === "details") {
@@ -100,6 +109,9 @@ serveWithAccess(CLICKHOUSE_COHORTS_POLICY, async ({ ctx, action, body, pg, click
 
   if (action === "product_paths") {
     return await withTimeout(runCohortProducts({ authUserId, clickhouse: ch, scope }), QUERY_TIMEOUT_MS);
+  }
+  if (action === "ltv") {
+    return await withTimeout(runCohortLtv({ authUserId, supabase: pg, clickhouse: ch, request }), QUERY_TIMEOUT_MS);
   }
   if (action === "options") {
     const materialized = await withTimeout(

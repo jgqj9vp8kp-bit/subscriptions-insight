@@ -236,7 +236,7 @@ const POLICIES = [CLICKHOUSE_COHORTS_POLICY, CLICKHOUSE_COHORT_MEMBERSHIP_POLICY
 /** Phase 2 (spec §6 contract 2): the scopeReady actions of these three functions
  * and the snapshot each needs (null = scopeReady without a snapshot). */
 const SCOPE_READY: Record<string, Record<string, "cohort" | "campaign" | null>> = {
-  "clickhouse-cohorts": { list: "cohort", details: "cohort", options: "cohort" },
+  "clickhouse-cohorts": { list: "cohort", details: "cohort", options: "cohort", ltv: "cohort" },
   "clickhouse-cohort-membership": {},
   "clickhouse-summary": { summary: null },
 };
@@ -379,6 +379,18 @@ const MATRIX: Array<{ policy: FunctionPolicy<string>; label: string; body: Recor
     expect: {
       owner: OK("options"), viewer: OK("options"), forecastOnly: DENY(ACCESS_ERROR.PERMISSION_DENIED),
       restrictedViewer: OK("options"),
+    },
+  },
+  {
+    policy: CLICKHOUSE_COHORTS_POLICY as FunctionPolicy<string>,
+    label: "cohorts ltv (Payback curve)",
+    body: { action: "ltv", date_from: "2026-09-01", date_to: "2026-09-30" },
+    expect: {
+      owner: OK("ltv"), forecastOnly: OK("ltv"),
+      viewer: DENY(ACCESS_ERROR.PERMISSION_DENIED), reportsOnly: DENY(ACCESS_ERROR.PERMISSION_DENIED),
+      dashboardOnly: DENY(ACCESS_ERROR.PERMISSION_DENIED),
+      // Restricted: forecasting.view itself (restrictedAnyOf), behind the snapshot gate.
+      restrictedViewer: DENY(ACCESS_ERROR.PERMISSION_DENIED), restrictedAdmin: OK("ltv"),
     },
   },
   {

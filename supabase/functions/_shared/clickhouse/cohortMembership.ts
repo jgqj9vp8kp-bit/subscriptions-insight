@@ -156,7 +156,7 @@ export interface CohortMembershipValidationResult {
   duration_ms: number;
 }
 
-interface WarehouseFingerprint {
+export interface WarehouseFingerprint {
   warehouse_version: string;
   transaction_count: number;
   unique_users: number;
@@ -182,7 +182,10 @@ export async function ensureCohortMembershipSchema(client: ClickHouseClientLike)
   await client.command({ query: CREATE_FACT_USER_COHORTS_SQL });
 }
 
-async function getWarehouseFingerprint(client: ClickHouseClientLike, authUserId: string): Promise<WarehouseFingerprint> {
+/** The live warehouse version (a hash of the tenant's transactions): a snapshot
+ * built on another version is stale. Tenant-wide — never for a restricted
+ * member. Also the Payback curve's freshness check (cohortLtv.ts). */
+export async function getWarehouseFingerprint(client: ClickHouseClientLike, authUserId: string): Promise<WarehouseFingerprint> {
   const [row] = await jsonRows<Record<string, unknown>>(
     client,
     `

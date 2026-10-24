@@ -15,6 +15,8 @@ export interface ProjectSpendLedgerResponse extends ProjectSpendLedgerResult {
   ok: boolean;
   action: "spend_ledger";
   window: DateWindow;
+  /** The last day with any Facebook spend in the warehouse (not window-bound); null when none is loaded. */
+  spendThrough: string | null;
   error?: string;
 }
 

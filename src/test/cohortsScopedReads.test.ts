@@ -729,6 +729,11 @@ describe("clickhouse-cohorts/index.ts restricted branch", () => {
     expect(branch).toMatch(/runMaterializedCohortList\(\{[^}]*scope[^}]*allocationDiagnosticsEnabled: false[^}]*\}\)/);
     expect(branch).toContain('if (!result) throw new ScopeSnapshotNotReadyError("snapshot_missing");');
     expect(branch).toContain("pseudonymizeActiveIdentities(result.rows, hasher)");
-    expect(branch.match(/projectCohortsResponseForRestricted\(/g)).toHaveLength(2);
+    // The Payback curve: shaped first, its scoped runner (a missing snapshot is
+    // its own 409), projected like every restricted body.
+    expect(branch).toMatch(/restrictCohortRequest\(scope, cohortLtvRequest\(input\.body\)\)/);
+    expect(branch.indexOf("cohortLtvRequest(input.body)")).toBeLessThan(branch.indexOf("runCohortLtv("));
+    expect(branch).toMatch(/runCohortLtv\(\{[^}]*scope[^}]*\}\)/);
+    expect(branch.match(/projectCohortsResponseForRestricted\(/g)).toHaveLength(3);
   });
 });

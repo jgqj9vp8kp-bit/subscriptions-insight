@@ -62,7 +62,11 @@ export const ROUTE_ACCESS: readonly RouteAccessRule[] = Object.freeze<RouteAcces
   { path: "/fb-analytics", anyOf: ["facebook_analytics.view"], restrictedReady: true },
   { path: "/integrations", anyOf: ["admin.integrations.view"], restrictedReady: false },
   { path: "/support", anyOf: ["support.view"], restrictedReady: false },
+  // Payback by funnel (spec 2026-10-24 §6): unchanged in Phase 1.
   { path: "/forecasting", anyOf: ["forecasting.view"], restrictedReady: false },
+  // The old planner (spec §5): the authors of saved plans and projects
+  // (forecasting.create; their rows are own-row RLS), for a few weeks.
+  { path: "/forecasting/legacy", anyOf: ["forecasting.create"], restrictedReady: false },
   { path: "/subscriptions", anyOf: ["subscriptions.view"], rawOnly: true, restrictedReady: false },
   { path: "/import", anyOf: ["admin.data.import"], rawOnly: true, restrictedReady: false },
   { path: "/admin/members", anyOf: ["admin.users.view"], restrictedReady: false },

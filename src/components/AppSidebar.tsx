@@ -37,7 +37,7 @@ const items: NavItem[] = [
   { title: "FB-Analytics", url: "/fb-analytics", icon: BarChart3, end: false },
   { title: "Integrations", url: "/integrations", icon: Plug, end: false },
   { title: "Support", url: "/support", icon: Headphones, end: false },
-  { title: "Forecasting", url: "/forecasting", icon: Calculator, end: false },
+  { title: "Payback", url: "/forecasting", icon: Calculator, end: false },
   { title: "Subscriptions", url: "/subscriptions", icon: Repeat, end: false },
   { title: "Import data", url: "/import", icon: Upload, end: false },
 ];

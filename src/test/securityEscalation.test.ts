@@ -94,6 +94,7 @@ import {
   probeHandler,
   readResult,
   readThroughRouter,
+  scopeReadyPersona,
   scopedUserPathsOf,
   svc,
   userToken,
@@ -160,7 +161,7 @@ describe("H1 / H2 — crafted filters and options never reach a restricted membe
       "clickhouse-cohorts.list", "clickhouse-cohorts.options", "clickhouse-users.list", "clickhouse-users.options",
       "clickhouse-support.bundle", "clickhouse-support.options", "clickhouse-facebook.report", "clickhouse-facebook.filters",
       "clickhouse-payment-analytics.bundle", "clickhouse-payment-analytics.banks", "clickhouse-revenue.bundle", "clickhouse-revenue.day_breakdown",
-      "clickhouse-revenue.trials_daily",
+      "clickhouse-revenue.trials_daily", "clickhouse-cohorts.ltv",
     ].includes(`${entry.fn}.${entry.action}`),
   );
   const CRAFTED: Array<Record<string, unknown>> = [
@@ -176,9 +177,9 @@ describe("H1 / H2 — crafted filters and options never reach a restricted membe
   const REFUSED_FILTER_READS = FILTER_READS.filter((entry) => entry.rule.scopeReady !== true);
 
   it("has the filter-taking reads (sanity)", () => {
-    expect(FILTER_READS).toHaveLength(13);
-    // Phase 2: cohorts list/options, FB report/filters and RI bundle/day/trials are scopeReady.
-    expect(READY_FILTER_READS).toHaveLength(7);
+    expect(FILTER_READS).toHaveLength(14);
+    // Phase 2: cohorts list/options/ltv, FB report/filters and RI bundle/day/trials are scopeReady.
+    expect(READY_FILTER_READS).toHaveLength(8);
   });
 
   it.each(READY_FILTER_READS.map((entry) => [`${entry.fn}.${entry.action}`, entry] as const))("%s (scopeReady): every crafted body reaches the handler bound to paths(A) only", async (_label, entry) => {
@@ -263,6 +264,30 @@ describe("H1 / H2 — crafted filters and options never reach a restricted membe
         if (exclude) expect(exclude, label).toEqual(entry.exclude);
       }
       expect(result.clickhouse.statements.some((statement) => boundList(statement.params, entry.include ? "mcp" : "mcpx")), label).toBe(true);
+      expect(scanForLeaks(result.text, { funnelB: true }), label).toEqual([]);
+    }
+  });
+
+  it("Phase 2: H1 — cohorts.ltv: the funnel filters are dropped, never intersected or widened: always paths(A), nothing of B", async () => {
+    // The Media Buyer template lacks forecasting.view in Phase 1: without it, a 403 before any SQL.
+    const refused = await readThroughRouter(PERSONAS.buyerA, "clickhouse-cohorts", { action: "ltv", date_from: DAY_1, date_to: DAY_2 });
+    expect(refused.status).toBe(403);
+    expect(refused.json?.error_code).toBe(ACCESS_ERROR.PERMISSION_DENIED);
+    expect(refused.clickhouse.statements).toEqual([]);
+    const buyer = scopeReadyPersona(PERSONAS.buyerA, "clickhouse-cohorts.ltv");
+    for (const filters of [{}, { campaign_path: [B] }, { campaign_path: [A, B] }, { campaign_path_exclude: [A] }, { funnel: ["past_life"] }]) {
+      const label = JSON.stringify(filters);
+      const result = await readThroughRouter(buyer, "clickhouse-cohorts", { action: "ltv", date_from: DAY_1, date_to: DAY_2, filters });
+      expect(result.status, `${label}: ${result.text.slice(0, 200)}`).toBe(200);
+      expect(pathsOfRows(result, "rows"), label).toEqual([A]);
+      expect(droppedOf(result), label).toBe(0);
+      // data_through, members_through (both scoped; no tenant-wide fingerprint) and the curve.
+      expect(result.clickhouse.statements, label).toHaveLength(3);
+      for (const statement of result.clickhouse.statements) {
+        expect([...(scopedUserPathsOf(statement.query) ?? [])], label).toEqual([A]);
+        expect(boundList(statement.params, "mcp"), label).toBeNull();
+        expect(boundList(statement.params, "mcpx"), label).toBeNull();
+      }
       expect(scanForLeaks(result.text, { funnelB: true }), label).toEqual([]);
     }
   });
@@ -459,7 +484,7 @@ describe("H4 — side channels in the member views", () => {
 
   it.each(Object.entries(SCOPE_READY_REQUESTS))("Phase 2: H4 — %s for buyer-{A}: no tenant-wide counter, spend, error text, raw e-mail, data key or funnel B in the body", async (key, body) => {
     const fn = key.slice(0, key.lastIndexOf("."));
-    const result = await readThroughRouter(PERSONAS.buyerA, fn, body);
+    const result = await readThroughRouter(scopeReadyPersona(PERSONAS.buyerA, key), fn, body);
     expect(result.status, result.text.slice(0, 300)).toBe(200);
     expect(scanForLeaks(result.text, { funnelB: true, extra: [DATA_KEY, ...A_EMAILS, String(TENANT_COUNT_SENTINEL)] })).toEqual([]);
     expect(result.pg.violations).toEqual([]);

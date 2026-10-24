@@ -8,6 +8,7 @@ import { ChevronDown } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { cn } from "@/lib/utils";
 
 export interface FunnelMultiSelectOption {
   id: string;
@@ -16,13 +17,15 @@ export interface FunnelMultiSelectOption {
   hint?: string;
 }
 
-export function FunnelMultiSelect({ label, options, selected, onToggle, onSelectAll, onClear }: {
+export function FunnelMultiSelect({ label, options, selected, onToggle, onSelectAll, onClear, triggerClassName }: {
   label: string;
   options: FunnelMultiSelectOption[];
   selected: ReadonlySet<string>;
   onToggle: (id: string) => void;
   onSelectAll: () => void;
   onClear: () => void;
+  /** Extra trigger classes (e.g. a compact h-8 toolbar). */
+  triggerClassName?: string;
 }) {
   const summary = selected.size === options.length
     ? `All (${options.length})`
@@ -30,7 +33,7 @@ export function FunnelMultiSelect({ label, options, selected, onToggle, onSelect
   return (
     <Popover>
       <PopoverTrigger asChild>
-        <Button variant="outline" className="h-9 justify-between gap-2 font-normal">
+        <Button variant="outline" className={cn("h-9 justify-between gap-2 font-normal", triggerClassName)}>
           <span className="text-muted-foreground">{label}</span>
           <span className="truncate">{summary}</span>
           <ChevronDown className="h-4 w-4 shrink-0 opacity-60" />

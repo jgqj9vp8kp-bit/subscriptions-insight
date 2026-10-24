@@ -450,3 +450,72 @@ export interface CohortDetailsResponse {
   meta?: RestrictedAccessMeta;
   error?: string;
 }
+
+// ---- action "ltv": the Payback page's revenue curve (cohortLtv.ts) ----------------------
+// Request: a CohortRequest with action "ltv". date_from / date_to are the page's
+// display window; the funnel / campaign_path filters are ignored on purpose (the
+// response always carries every path in the caller's scope, which the browser
+// needs for its fallback pools, and the page filters funnels itself).
+
+/** One trial day of one funnel. */
+export interface CohortLtvRow {
+  /** UTC date of the trial payment (YYYY-MM-DD), as in the Cohorts list. */
+  cohort_date: string;
+  campaign_path: string;
+  /** Distinct cohort users, exactly the list's trial_users. */
+  trial_users: number;
+  /** rev[i]: cumulative net USD (after refunds recorded on the payment, before
+   * processor fees) of the users' successful payments with d <= checkpoints[i],
+   * d = whole days after the trial payment. rev at 30 / 60 is the list's
+   * revenue_d30 / revenue_d60. Raw, whatever the row's age: the browser
+   * decides which checkpoints are mature. */
+  rev: number[];
+}
+
+/** The cohort-date range the server read: the display window widened back to
+ * data_through − 271 days (the reference pools), capped at 13 months before `to`. */
+export interface CohortLtvRange {
+  from: string;
+  to: string;
+  requested_from: string | null;
+  requested_to: string | null;
+  /** The display window itself started more than 13 months before `to` and was cut. */
+  capped: boolean;
+}
+
+export interface CohortLtvResponse {
+  ok: boolean;
+  source: "clickhouse";
+  action: "ltv";
+  generated_at: string;
+  query_duration_ms: number;
+  /** Day checkpoints, ascending; every row's rev is aligned to them. */
+  checkpoints: number[];
+  /** Newest event_time of the caller's transactions (ISO UTC; for a
+   * funnel-restricted member, of their scoped users'); null without data. */
+  data_through: string | null;
+  /** Newest trial_event_time of the snapshot's members in scope (ISO UTC): how
+   * far the trials go. Payments are live and members are the snapshot's, so
+   * while the snapshot is stale the trials end here even when data_through is
+   * later. null for an empty snapshot (or before the snapshot is ready). */
+  members_through: string | null;
+  /** The snapshot was built on another warehouse version than the live one (all
+   * scope: the live fingerprint of this request; restricted: the gate's
+   * verdict); null when the live fingerprint could not be read. */
+  snapshot_stale: boolean | null;
+  /** null without data, or when a lone date_from is after data_through's day
+   * (nothing to read: rows is empty). */
+  range: CohortLtvRange | null;
+  rows: CohortLtvRow[];
+  diagnostics: {
+    active_snapshot_version: string;
+    snapshot_generated_at: string | null;
+    /** The live warehouse version of this request (all scope only; null otherwise). */
+    current_warehouse_version: string | null;
+    rows: number;
+    trial_users: number;
+  };
+  meta?: RestrictedAccessMeta;
+  /** "cohort_snapshot_not_ready" when the data owner has no validated snapshot yet. */
+  error?: string;
+}

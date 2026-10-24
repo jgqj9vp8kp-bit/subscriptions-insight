@@ -1,7 +1,7 @@
 // Security regression suite — the 20 mandatory tests of plan §29, in their
 // Milestone-A form (plan D9 / §30 Phase 1: employees exist only with funnel scope
 // `all`; every funnel-restricted context is refused everywhere), narrowed by
-// access Phase 2: exactly the 13 media-buyer actions (SCOPE_READY_ACTIONS)
+// access Phase 2: exactly the 14 scopeReady actions (SCOPE_READY_ACTIONS)
 // serve a restricted context behind the snapshot freshness gate (409 until it
 // is ready) and a restricted ScopedReader; every other action still refuses it.
 //
@@ -104,6 +104,7 @@ import {
   readThroughRouter,
   readySnapshotState,
   restrictedStatementCorpus,
+  scopeReadyPersona,
   scopeSnapshotState,
   scopedUserPathsOf,
   svc,
@@ -215,13 +216,13 @@ describe("#1-#9, #11-#13 (Milestone A): every data action of every policy refuse
     expect(CASES.length).toBeGreaterThanOrEqual(114);
   });
 
-  it("exactly the 13 media-buyer actions are scopeReady (Phase 2 allowlist)", () => {
+  it("exactly the 14 allowlisted actions are scopeReady (Phase 2 allowlist)", () => {
     const ready: string[] = [];
     for (const policy of ALL_POLICIES) {
       for (const [action, rule] of Object.entries(policy.actions)) if (rule.scopeReady === true) ready.push(`${policy.fn}.${action}`);
     }
     expect(ready.sort()).toEqual([...SCOPE_READY_ACTIONS].sort());
-    expect(READY_ROWS).toHaveLength(13);
+    expect(READY_ROWS).toHaveLength(14);
   });
 
   it("the data-action classification is not vacuous (reads of every analytics page are in it)", () => {
@@ -794,7 +795,7 @@ describe("#1-#6 (access Phase 2): a funnel-restricted media buyer reads only its
     expect(Object.keys(SCOPE_READY_REQUESTS).sort()).toEqual([...SCOPE_READY_ACTIONS].sort());
     for (const [key, body] of Object.entries(SCOPE_READY_REQUESTS)) {
       const fn = key.slice(0, key.lastIndexOf("."));
-      const result = await readThroughRouter(BUYER_A, fn, body);
+      const result = await readThroughRouter(scopeReadyPersona(BUYER_A, key), fn, body);
       expect(result.status, `${key}: ${result.text.slice(0, 300)}`).toBe(200);
       if (fn === "clickhouse-summary") expect(result.clickhouse.statements, key).toEqual([]);
       else expectScopedTo(result.clickhouse.statements, [A]);
@@ -825,6 +826,10 @@ describe("#1-#6 (access Phase 2): a funnel-restricted media buyer reads only its
     expect(cohorts).toMatch(/if \(ctx\.restricted\) return await restrictedCohorts\(/);
     expect(cohorts).toContain("const { request, dropped } = restrictCohortRequest(scope, input.body);");
     expect(cohorts).toContain('if (!result) throw new ScopeSnapshotNotReadyError("snapshot_missing");');
+    // The Payback curve: shaped (funnel filters dropped first), scoped runner, projected body.
+    expect(cohorts).toContain("const { request, dropped } = restrictCohortRequest(scope, cohortLtvRequest(input.body));");
+    expect(cohorts).toContain("runCohortLtv({ authUserId, supabase: pg, clickhouse: ch, request, scope })");
+    expect(cohorts).toContain("return projectCohortsResponseForRestricted(ltv, dropped);");
     const revenue = source("clickhouse-revenue");
     expect(revenue).toContain("const shaped = ctx.restricted ? restrictRevenueRequest(scope, body)");
     expect(revenue).toContain("return ctx.restricted ? withRestrictedMeta(result, shaped.dropped) : result;");

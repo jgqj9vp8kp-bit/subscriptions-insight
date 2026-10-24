@@ -35,6 +35,7 @@ const FunnelsPage = lazy(() => import("./pages/Funnels.tsx"));
 const Reports = lazy(() => import("./pages/Reports.tsx"));
 const FBAnalyticsPage = lazy(() => import("./pages/FBAnalytics.tsx"));
 const ForecastingPage = lazy(() => import("./pages/Forecasting.tsx"));
+const ForecastingLegacyPage = lazy(() => import("./pages/ForecastingLegacy.tsx"));
 const IntegrationsPage = lazy(() => import("./pages/Integrations.tsx"));
 const ImportPage = lazy(() => import("./pages/Import.tsx"));
 const SubscriptionsPage = lazy(() => import("./pages/Subscriptions.tsx"));
@@ -118,6 +119,8 @@ const App = () => (
                     <Route path="/integrations" element={<RequirePermission route="/integrations"><IntegrationsPage /></RequirePermission>} />
                     <Route path="/support" element={<RequirePermission route="/support"><SupportPage /></RequirePermission>} />
                     <Route path="/forecasting" element={<RequirePermission route="/forecasting"><ForecastingPage /></RequirePermission>} />
+                    {/* The old planner (Plan / Compare / Project / Actuals) for a few weeks after Payback replaced it. */}
+                    <Route path="/forecasting/legacy" element={<RequirePermission route="/forecasting/legacy"><ForecastingLegacyPage /></RequirePermission>} />
                     <Route path="/subscriptions" element={<RequirePermission route="/subscriptions"><SubscriptionsPage /></RequirePermission>} />
                     <Route path="/import" element={<RequirePermission route="/import"><ImportPage /></RequirePermission>} />
                     <Route path="/admin/members" element={<RequirePermission route="/admin/members"><AdminMembersPage /></RequirePermission>} />

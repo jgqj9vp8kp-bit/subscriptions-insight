@@ -32,6 +32,7 @@ import {
 } from "./recordingClickHouse.ts";
 import { runMaterializedCohortList, runMaterializedCohortOptions } from "../../../supabase/functions/_shared/clickhouse/cohortMembership.ts";
 import { runCohortDetails, runCohortList, runCohortOptions } from "../../../supabase/functions/_shared/clickhouse/cohorts.ts";
+import { runCohortLtv } from "../../../supabase/functions/_shared/clickhouse/cohortLtv.ts";
 import { runRevenueDayBreakdown, runRevenueIntelligence } from "../../../supabase/functions/_shared/clickhouse/revenueIntelligence.ts";
 import {
   FB_SYNC_NAME,
@@ -69,13 +70,16 @@ export const OWNER_SQL_CLASSIFICATION_VERSION = "cohort_classifier_v3_platform";
 const FB_V2_READS_ENV = "FB_WAREHOUSE_V2_READS";
 
 /** Every public runner the owner's Phase-2 surfaces reach (spec §6 Step 0),
- * plus the dynamic Cohorts fallback the owner still gets without a snapshot. */
+ * plus the dynamic Cohorts fallback the owner still gets without a snapshot,
+ * plus the Payback curve (clickhouse-cohorts ltv, added 2026-10-24 with the
+ * owner's approval; every earlier scenario stayed byte-identical). */
 export const OWNER_SQL_RUNNERS = [
   "runMaterializedCohortList",
   "runMaterializedCohortOptions",
   "runCohortList",
   "runCohortOptions",
   "runCohortDetails",
+  "runCohortLtv",
   "runRevenueIntelligence",
   "runRevenueDayBreakdown",
   "runFbReport",
@@ -202,6 +206,8 @@ export function ownerSqlResponder(profile: OwnerSqlResponderProfile): ClickHouse
     if (query.includes("AS support_unique_emails")) return [{ support_requests: 5, support_unique_emails: 4 }];
     if (query.includes("FROM fact_subscriptions FINAL")) return [{ c: 3 }];
     if (query.includes("snapshot_unique_users")) return [{ snapshot_rows: 10, snapshot_unique_users: 10, snapshot_duplicate_users: 0 }];
+    // The Payback curve's import cut-off, so its curve statement is issued.
+    if (query.includes("toString(max(a.event_time)) data_through")) return [{ data_through: "2026-10-05 22:30:00.000", n: 500 }];
     if (query.includes("agg AS (")) return COHORT_ROWS.map((row) => ({ ...row }));
     return [];
   };
@@ -493,6 +499,15 @@ function buildScenarios(): OwnerSqlScenario[] {
   add("cohorts.details/cohort_key@support_unavailable", "runCohortDetails", (io) =>
     runCohortDetails({ authUserId: io.authUserId, clickhouse: io.clickhouse, request: { cohort_key: COHORT_KEY, action: "details" } }),
   { responder: "support_unavailable" });
+
+  // Payback curve (clickhouse-cohorts ltv): the list's request matrix — its
+  // funnel / path / refund filters must leave no trace in the statement.
+  for (const [name, request] of COHORT_REQUEST_CASES) {
+    add(`cohorts.ltv/${name}`, "runCohortLtv", (io) =>
+      runCohortLtv({ ...io, request: { ...request, action: "ltv" } }));
+  }
+  add("cohorts.ltv/none@empty", "runCohortLtv", (io) =>
+    runCohortLtv({ ...io, request: { action: "ltv" } }), { responder: "empty" });
 
   // Revenue Intelligence — every bucket × window without filters (unattributed
   // and spend streams included), every filter dimension, day breakdown.

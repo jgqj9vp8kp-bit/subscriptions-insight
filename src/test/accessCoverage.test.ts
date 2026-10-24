@@ -8,7 +8,7 @@
 //     its API-key path builds the context itself) and none uses the deprecated
 //     "any signed-in user" helpers or the caller's id as the data tenant;
 //   * every permission key a policy names exists in the catalog and is enforced;
-//   * Phase 2: exactly the 13 media-buyer actions are scopeReady, so a
+//   * Phase 2: exactly the 14 allowlisted actions are scopeReady, so a
 //     funnel-restricted context is refused (403 scope_not_supported) everywhere
 //     else;
 //   * no action is open to every member by accident;
@@ -34,7 +34,7 @@ const NOT_GATED: Record<string, string> = {
  * funnel-restricted context. Kept literal here so a policy edit cannot move
  * the allowlist and its check together. */
 const SCOPE_READY_ACTIONS: readonly string[] = [
-  "clickhouse-cohorts.details", "clickhouse-cohorts.list", "clickhouse-cohorts.options",
+  "clickhouse-cohorts.details", "clickhouse-cohorts.list", "clickhouse-cohorts.ltv", "clickhouse-cohorts.options",
   "clickhouse-facebook.charts", "clickhouse-facebook.filters", "clickhouse-facebook.list", "clickhouse-facebook.report",
   "clickhouse-facebook.status", "clickhouse-facebook.summary",
   "clickhouse-revenue.bundle", "clickhouse-revenue.day_breakdown", "clickhouse-revenue.trials_daily",
@@ -120,14 +120,14 @@ describe("Edge access coverage", () => {
     }
   });
 
-  it("Phase 2 — the scopeReady allowlist is exactly the 13 media-buyer actions, each in a real policy", () => {
+  it("Phase 2 — the scopeReady allowlist is exactly the 14 allowlisted actions, each in a real policy", () => {
     const ready = FOLDERS.flatMap((fn) =>
       Object.entries((policyFor(fn) as FunctionPolicy<string>).actions)
         .filter(([, rule]) => rule.scopeReady === true)
         .map(([action]) => `${fn}.${action}`),
     );
     expect(ready.sort()).toEqual([...SCOPE_READY_ACTIONS].sort());
-    expect(SCOPE_READY_ACTIONS).toHaveLength(13);
+    expect(SCOPE_READY_ACTIONS).toHaveLength(14);
   });
 
   it.each(FOLDERS)("%s: no action is open to every member", (fn) => {

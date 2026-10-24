@@ -4,10 +4,12 @@
 // timeline with per-period extrapolation badges, and the export mirrors the
 // Cohorts-page pattern (BOM for Excel, dynamic xlsx import). Shared by Plan and
 // the Project tab's expanded funnel rows — one definition, never a second copy.
+// The download itself is the shared src/lib/tableExport.ts (Payback uses it too).
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { cn } from "@/lib/utils";
+import { downloadTable, type ExportFormat } from "@/lib/tableExport";
 import { ProvenanceBadge } from "@/components/forecasting/ProvenanceBadge";
 import { fmtInt, fmtMoney, fmtPctValue } from "@/components/forecasting/forecastFormat";
 import type { ForecastResult, ProvenanceMap } from "@/services/funnelEconomics";
@@ -32,29 +34,8 @@ export function buildPlanExportTable(result: ForecastResult): { headers: string[
   return { headers, rows };
 }
 
-export async function exportPlanTable(result: ForecastResult, format: "csv" | "xlsx"): Promise<void> {
-  const table = buildPlanExportTable(result);
-  const stamp = new Date().toISOString().slice(0, 10);
-  if (format === "csv") {
-    const escape = (value: string | number) => {
-      const text = String(value);
-      return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
-    };
-    const csv = [table.headers, ...table.rows].map((row) => row.map(escape).join(",")).join("\n");
-    const blob = new Blob(["﻿", csv], { type: "text/csv;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `forecast-plan-${stamp}.csv`;
-    link.click();
-    URL.revokeObjectURL(url);
-    return;
-  }
-  const XLSX = await import("xlsx");
-  const sheet = XLSX.utils.aoa_to_sheet([table.headers, ...table.rows]);
-  const book = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(book, sheet, "Forecast");
-  XLSX.writeFile(book, `forecast-plan-${stamp}.xlsx`);
+export async function exportPlanTable(result: ForecastResult, format: ExportFormat): Promise<void> {
+  await downloadTable(buildPlanExportTable(result), format, "forecast-plan", "Forecast");
 }
 
 export function ForecastPeriodTable({ result, provenance }: { result: ForecastResult; provenance: ProvenanceMap }) {

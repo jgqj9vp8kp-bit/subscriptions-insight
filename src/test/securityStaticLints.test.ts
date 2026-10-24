@@ -539,6 +539,8 @@ const CATCH_LINT_FILES = [
     "cohortSubscriptions", "campaignScope", "pathCoverage", "cohortSnapshotState", "scopeSql",
     // Payment health P2: the runner (its registry / snapshot / state reads are best effort).
     "paymentHealth",
+    // Payback curve (clickhouse-cohorts ltv, restricted-reachable) and the spend ledger it pairs with.
+    "cohortLtv", "projectSpendLedger",
   ].map((name) => resolve(CLICKHOUSE_DIR, `${name}.ts`)),
   // The routers of the restricted-reachable functions (their catches wrap scoped runners).
   ...["clickhouse-cohorts", "clickhouse-revenue", "clickhouse-facebook", "clickhouse-cohort-membership"].map((fn) => resolve(FUNCTIONS_DIR, fn, "index.ts")),

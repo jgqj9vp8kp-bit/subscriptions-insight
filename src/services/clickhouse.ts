@@ -4,6 +4,7 @@ import type {
   CohortRequest,
   CohortResponse,
   CohortDetailsResponse,
+  CohortLtvResponse,
 } from "../../supabase/functions/_shared/clickhouse/cohortContract";
 import type { CohortProductsResponse } from "../../supabase/functions/_shared/clickhouse/cohortProducts";
 import type {
@@ -839,6 +840,12 @@ export async function runClickHouseCohorts(request: CohortRequest): Promise<Coho
 /** The Cohorts Product filter's path -> FunnelFox project map (full scope only). */
 export async function runClickHouseCohortProducts(): Promise<CohortProductsResponse> {
   return clickHouseRequest<CohortProductsResponse>(CLICKHOUSE_COHORTS_FUNCTION, { action: "product_paths" }, { breakerGated: true });
+}
+
+/** The Payback page's revenue curve by trial day and path (action "ltv",
+ * forecasting.view). Every path in scope comes back; the funnel filter is the page's. */
+export async function runClickHouseCohortLtv(request: { date_from: string; date_to: string }): Promise<CohortLtvResponse> {
+  return clickHouseRequest<CohortLtvResponse>(CLICKHOUSE_COHORTS_FUNCTION, { action: "ltv", ...request }, { breakerGated: true });
 }
 
 export async function runClickHouseCohortDetails(request: CohortRequest): Promise<CohortDetailsResponse> {

@@ -89,6 +89,7 @@ import {
 } from "../../../supabase/functions/_shared/clickhouse/cohortMembership.ts";
 import { runCohortDetails, runCohortList, runCohortOptions } from "../../../supabase/functions/_shared/clickhouse/cohorts.ts";
 import { runCohortProducts } from "../../../supabase/functions/_shared/clickhouse/cohortProducts.ts";
+import { cohortLtvRequest, runCohortLtv } from "../../../supabase/functions/_shared/clickhouse/cohortLtv.ts";
 import { createKeyedHasher, pseudonymizeActiveIdentities } from "../../../supabase/functions/_shared/clickhouse/cohortSubscriptions.ts";
 import {
   RevenueRequestError,
@@ -506,7 +507,7 @@ export const CRON_ONLY_ACTIONS: Readonly<Record<string, readonly string[]>> = Ob
  * (spec §6 contract 2). Every other action of every policy stays refused with
  * 403 scope_not_supported. */
 export const SCOPE_READY_ACTIONS: readonly string[] = Object.freeze([
-  "clickhouse-cohorts.details", "clickhouse-cohorts.list", "clickhouse-cohorts.options",
+  "clickhouse-cohorts.details", "clickhouse-cohorts.list", "clickhouse-cohorts.ltv", "clickhouse-cohorts.options",
   "clickhouse-facebook.charts", "clickhouse-facebook.filters", "clickhouse-facebook.list", "clickhouse-facebook.report",
   "clickhouse-facebook.status", "clickhouse-facebook.summary",
   "clickhouse-revenue.bundle", "clickhouse-revenue.day_breakdown", "clickhouse-revenue.trials_daily",
@@ -552,6 +553,7 @@ export const ACTION_REQUESTS: Readonly<Record<string, Readonly<Record<string, Ac
     details: post({ action: "details", cohort_key: { cohort_date: "2026-09-01", funnel: FUNNELS.A.path, campaign_path: FUNNELS.A.path } }),
     options: post({ action: "options" }),
     product_paths: post({ action: "product_paths" }),
+    ltv: post({ action: "ltv", date_from: "2026-09-01", date_to: "2026-09-30", filters: {} }),
   },
   "clickhouse-facebook": {
     ...named(
@@ -1205,7 +1207,14 @@ export function scopeWarehouse(statement: RecordedStatement): unknown[] {
     }));
   }
 
-  // ---- Cohorts (cohortMembership.ts / cohorts.ts)
+  // ---- Cohorts (cohortMembership.ts / cohorts.ts / cohortLtv.ts)
+  if (sql.includes("toString(max(a.event_time)) data_through")) return [{ data_through: "2026-09-02 12:00:00.000", n: customersOf(statement, false).length }];
+  if (sql.includes("SELECT * FROM ltv")) {
+    return [...groupBy(customersOf(statement), (entry) => `${entry.cohortDate}|${entry.path}`)].map(([, list]) => {
+      const net = sumOf(list, (entry) => entry.gross - entry.refund);
+      return { cohort_date: list[0].cohortDate, campaign_path: list[0].path, trial_users: list.length, rev_0: net, rev_30: net, rev_90: net };
+    });
+  }
   if (sql.includes("scoped AS (SELECT * FROM finx WHERE")) return [];
   if (sql.includes("FROM agg")) {
     return [...groupBy(customersOf(statement), (entry) => `${entry.cohortDate}|${entry.funnel}|${entry.path}`)].map(([, list]) => ({
@@ -1388,6 +1397,10 @@ const cohortsRouter: AccessHandler<string> = async ({ ctx, action, body, pg, cli
   const supabase = asSupabase(pg);
   if (ctx.restricted) {
     if (action === "product_paths") throw new Error("product_paths is not served to funnel-restricted members.");
+    if (action === "ltv") {
+      const { request, dropped } = restrictCohortRequest(scope, cohortLtvRequest(body));
+      return projectCohortsResponseForRestricted(await runCohortLtv({ authUserId, supabase, clickhouse: ch, request, scope }), dropped);
+    }
     const { request, dropped } = restrictCohortRequest(scope, body);
     if (action === "details") {
       return projectCohortsResponseForRestricted(await runMaterializedCohortDetails({ authUserId, clickhouse: ch, request, scope, detailedErrors: false }), dropped);
@@ -1401,6 +1414,7 @@ const cohortsRouter: AccessHandler<string> = async ({ ctx, action, body, pg, cli
   }
   const request = body as CohortRequest;
   if (action === "product_paths") return runCohortProducts({ authUserId, clickhouse: ch, scope });
+  if (action === "ltv") return runCohortLtv({ authUserId, supabase, clickhouse: ch, request });
   if (action === "options") {
     return (await runMaterializedCohortOptions({ authUserId, supabase, clickhouse: ch, request })) ?? await runCohortOptions({ authUserId, clickhouse: ch, request });
   }
@@ -1506,6 +1520,8 @@ export const SCOPE_READY_REQUESTS: Readonly<Record<string, Record<string, unknow
   },
   "clickhouse-cohorts.options": { action: "options", date_from: DAY_1, date_to: DAY_2, filters: { country: ["US"] } },
   "clickhouse-cohorts.details": { action: "details", cohort_key: { cohort_date: DAY_1, funnel: FUNNEL_OF[FUNNELS.A.path], campaign_path: FUNNELS.A.path } },
+  // The page's funnel picker is client-side: an explicit path list is ignored.
+  "clickhouse-cohorts.ltv": { action: "ltv", date_from: DAY_1, date_to: DAY_2, filters: { campaign_path: [FUNNELS.A.path], country: ["US"] } },
   "clickhouse-revenue.bundle": { action: "bundle", date_from: DAY_1, date_to: "2026-09-30", filters: { media_buyer: ["utm:facebook"] } },
   "clickhouse-revenue.day_breakdown": { action: "day_breakdown", date: DAY_1 },
   "clickhouse-revenue.trials_daily": { action: "trials_daily", date_from: DAY_1, date_to: DAY_2, filters: { campaign_path: [FUNNELS.A.path] } },
@@ -1517,6 +1533,21 @@ export const SCOPE_READY_REQUESTS: Readonly<Record<string, Record<string, unknow
   "clickhouse-facebook.summary": { action: "summary", level: "campaign" },
   "clickhouse-facebook.status": { action: "status", level: "campaign" },
 });
+
+/** Permissions a scopeReady action needs beyond the Media Buyer template: the
+ * Payback curve is forecasting.view, which the template gains only with the
+ * page's own access Phase 2 (payback spec §6). Until then it is exercised by
+ * the same restricted member with that key granted. */
+export const SCOPE_READY_EXTRA_PERMISSIONS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  "clickhouse-cohorts.ltv": Object.freeze(["forecasting.view"]),
+});
+
+/** `persona` as it must be to call the scopeReady action `key` (fn.action). */
+export function scopeReadyPersona(persona: Persona, key: string): Persona {
+  const extra = SCOPE_READY_EXTRA_PERMISSIONS[key] ?? [];
+  if (!extra.length || extra.every((permission) => persona.role.permissions.includes(permission))) return persona;
+  return withGrant(persona, [...new Set([...persona.role.permissions, ...extra])], { isOwner: persona.role.isOwner, name: `${persona.name}+${extra.join("+")}` });
+}
 
 export interface RouterRead extends GateCallResult {
   clickhouse: RecordingClickHouse;
@@ -1552,7 +1583,7 @@ export async function restrictedStatementCorpus(persona: Persona = PERSONAS.buye
   const statements: RecordedStatement[] = [];
   for (const [key, body] of Object.entries(SCOPE_READY_REQUESTS)) {
     const fn = key.slice(0, key.lastIndexOf("."));
-    const result = await readThroughRouter(persona, fn, body);
+    const result = await readThroughRouter(scopeReadyPersona(persona, key), fn, body);
     if (result.status !== 200) throw new Error(`${key} for ${persona.name}: ${result.status} ${result.text.slice(0, 300)}`);
     statements.push(...result.clickhouse.statements);
   }

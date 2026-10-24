@@ -212,6 +212,21 @@ describe("funnel-restricted routes (Phase 2)", () => {
     expect(accessRuleDenial(findRouteAccess("/payment-health")!, valueFor(okAccess({ permissions: ["payment_health.view"], mode: "selected" })))).toBe("scope");
   });
 
+  it("pins Payback and the old planner (forecasting.create, right after /forecasting, closed to restricted members)", () => {
+    const paths = ROUTE_ACCESS.map((rule) => rule.path);
+    expect(paths.indexOf("/forecasting/legacy")).toBe(paths.indexOf("/forecasting") + 1);
+    expect(findRouteAccess("/forecasting")).toEqual({ path: "/forecasting", anyOf: ["forecasting.view"], restrictedReady: false });
+    expect(findRouteAccess("/forecasting/legacy")).toEqual({ path: "/forecasting/legacy", anyOf: ["forecasting.create"], restrictedReady: false });
+    // Payback alone does not open the old planner; the authors of saved plans do.
+    expect(canAccessRoute("/forecasting", valueFor(okAccess({ permissions: ["forecasting.view"] })))).toBe(true);
+    expect(canAccessRoute("/forecasting/legacy", valueFor(okAccess({ permissions: ["forecasting.view"] })))).toBe(false);
+    expect(canAccessRoute("/forecasting/legacy", valueFor(okAccess({ permissions: ["forecasting.view", "forecasting.create"] })))).toBe(true);
+    expect(canAccessRoute("/forecasting/legacy", owner)).toBe(true);
+    const restricted = valueFor(okAccess({ permissions: ["forecasting.view", "forecasting.create"], mode: "selected" }));
+    expect(accessRuleDenial(findRouteAccess("/forecasting/legacy")!, restricted)).toBe("scope");
+    expect(accessRuleDenial(findRouteAccess("/forecasting")!, restricted)).toBe("scope");
+  });
+
   it("pins the /admin/funnels rule (after the audit log, closed to restricted members)", () => {
     const paths = ROUTE_ACCESS.map((rule) => rule.path);
     expect(paths.indexOf("/admin/funnels")).toBe(paths.indexOf("/admin/audit") + 1);

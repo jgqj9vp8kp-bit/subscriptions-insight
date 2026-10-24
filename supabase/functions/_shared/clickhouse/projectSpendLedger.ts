@@ -54,6 +54,30 @@ export function projectCampaignSpendSql(): string {
     `;
 }
 
+/** spend_through (Payback page, P0 facts 2026-10-24): the newest campaign-level
+ * stat_date that carries spend, over the tenant's WHOLE history — not the
+ * window, so a window that lies entirely after it still learns the date. Same
+ * table, level and FINAL as the window spend above, so "no spend after this
+ * day" is exactly what this ledger would sum. Chosen over the FB sync state:
+ * its cursor / fb_stats_to say which window the last run asked for, and a run
+ * that fails validation (daily since 2026-09-15: "Spend mismatch between
+ * entity and day levels") writes no rows. A day after spend_through has no
+ * Facebook spend at all, so the page must never read it as $0. */
+export function lastSpendDaySql(): string {
+  return `
+      SELECT toString(max(stat_date)) AS spend_through, count() AS spend_rows
+      FROM ${FACT_FACEBOOK_STATS_TABLE} FINAL
+      WHERE auth_user_id = {auth_user_id:String} AND level = 'campaign' AND spend > 0
+    `;
+}
+
+/** YYYY-MM-DD; null without a spend row (max() of nothing is the Date zero value). */
+export function parseSpendThrough(row: { spend_through?: unknown; spend_rows?: unknown } | null | undefined): string | null {
+  if (!row || !(Number(row.spend_rows ?? 0) > 0)) return null;
+  const text = typeof row.spend_through === "string" ? row.spend_through.trim() : "";
+  return /^\d{4}-\d{2}-\d{2}$/.test(text) && text !== "1970-01-01" ? text : null;
+}
+
 /** campaign_id → campaign_path evidence from authoritative trial users. The same
  * statement serves rung 1 (window-scoped) and rung 2 (all history) — the caller
  * flips `windowed`. Dominance is decided in TS (deterministically) so the tie
@@ -304,7 +328,15 @@ export function assembleProjectSpendLedger(input: {
 
 // ---- Edge orchestration ----------------------------------------------------------
 
-/** One call = the whole ledger: three ClickHouse reads + the known-gap overlap.
+/** What the spend_ledger action returns. */
+export type ProjectSpendLedgerRun = ProjectSpendLedgerResult & {
+  window: DateWindow;
+  /** The last day with any Facebook spend (lastSpendDaySql); null when none is loaded. */
+  spendThrough: string | null;
+};
+
+/** One call = the whole ledger: four ClickHouse reads (window spend, the two
+ * path-evidence rungs, spend_through) + the known-gap overlap.
  * Wired as clickhouse-facebook action "spend_ledger". The edge reads with the
  * service role (RLS bypassed), so the known-gap read is owner-filtered here, the
  * same way the recon snapshot reads them. */
@@ -314,7 +346,7 @@ export async function runProjectSpendLedger(input: {
   authUserId: string;
   dateFrom: string | null;
   dateTo: string | null;
-}): Promise<ProjectSpendLedgerResult & { window: DateWindow }> {
+}): Promise<ProjectSpendLedgerRun> {
   if (!input.dateFrom || !input.dateTo) {
     throw new Error("spend_ledger requires date_from and date_to.");
   }
@@ -326,10 +358,11 @@ export async function runProjectSpendLedger(input: {
     return (await result.json()) as T[];
   };
 
-  const [spendRows, windowPathRows, historicalPathRows, gapsResult] = await Promise.all([
+  const [spendRows, windowPathRows, historicalPathRows, spendThroughRows, gapsResult] = await Promise.all([
     json<RawCampaignSpendRow>(projectCampaignSpendSql(), params),
     json<RawCampaignPathRow>(campaignPathEvidenceSql(true), params),
     json<RawCampaignPathRow>(campaignPathEvidenceSql(false), { auth_user_id: input.authUserId }),
+    json<{ spend_through?: unknown; spend_rows?: unknown }>(lastSpendDaySql(), { auth_user_id: input.authUserId }),
     input.supabase
       .from("facebook_known_gaps")
       .select("gap_id,gap_from,gap_to,reason")
@@ -347,5 +380,5 @@ export async function runProjectSpendLedger(input: {
     knownGaps: (gapsResult.data ?? []) as KnownGapRecord[],
     window,
   });
-  return { ...assembled, window };
+  return { ...assembled, window, spendThrough: parseSpendThrough(spendThroughRows[0]) };
 }

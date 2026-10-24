@@ -48,6 +48,7 @@ const PAGE_ICONS: Readonly<Record<string, LucideIcon>> = {
   "/integrations": Plug,
   "/support": Headphones,
   "/forecasting": Calculator,
+  "/forecasting/legacy": Calculator,
   "/subscriptions": Repeat,
   "/import": Upload,
   "/admin/members": UserCog,

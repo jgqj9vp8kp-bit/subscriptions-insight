@@ -422,6 +422,44 @@ tab first.
 - IndexedDB is the fast local cache, while Supabase `data_snapshots` is the cross-device source of truth for imported Palmer data, FunnelFox subscription snapshots, Facebook traffic data, and forecasting default settings.
 - localStorage is only for small UI state such as filters, column settings, selected views, and forecast assumptions.
 
+## Payback page, Phase 1 server + model (2026-10-24)
+
+Spec: `.rollout/payback_spec.md` (owner decisions 2026-10-24). Three parts.
+
+`clickhouse-cohorts` action `ltv` (`cohortLtv.ts`) is the revenue curve.
+- Rows: (cohort_date, campaign_path) with `trial_users` and `rev[]`, the cumulative net USD through each checkpoint 0/3/7/14/21/30/37/45/60/67/75/90 (`LTV_CHECKPOINTS`).
+- It continues the list's materialized `finx` chain byte for byte (`materializedFinxCtes`). `rev_30` / `rev_60` are the list's `d30_raw` / `d60_raw` expressions, so scope, member filters, email tokens and the upsell typing match the list. `support_emails` is built empty, so no support probe runs.
+- The funnel / path filters are dropped: every path in scope is returned, because the page needs other paths for its fallback pools. `refund_status` does not apply.
+- Range: the display window widened back to `data_through − 271` days, capped at 13 months before `to`. `data_through` is `max(event_time)` of the caller's transactions; for a funnel-restricted member it covers their scoped users only.
+- Access: `forecasting.view` (restrictedAnyOf too), scopeReady behind the cohort snapshot. The route `/forecasting` stays `restrictedReady: false`. The Media Buyer template has no `forecasting.view` yet, so the security suites call it with the key granted (`SCOPE_READY_EXTRA_PERMISSIONS`).
+- No dynamic fallback: without a validated snapshot the owner gets `ok: false, error: "cohort_snapshot_not_ready"`, and a restricted member gets 409. The owner's snapshot state is read directly: a failed read throws (a 5xx the client retries), only a missing snapshot is "not ready".
+- Freshness: payments are live, members are the snapshot's. The response also carries `members_through` (the snapshot's newest `trial_event_time` in scope) and `snapshot_stale` (owner: the live warehouse fingerprint of the same request, as the list compares it; restricted: the gate's `staleSince`; null when the fingerprint could not be read). Statements: `data_through`, `members_through`, the fingerprint (owner only), then the curve.
+- Dates: a reversed `date_from` / `date_to` is a 400 before any read; a lone `date_from` after the newest payment returns `range: null` and no rows.
+- Owner SQL golden: 24 `cohorts.ltv/*` scenarios (owner-approved). They were regenerated once more for the freshness statements; every other scenario stayed byte-identical.
+
+`spend_ledger` now returns `spendThrough`: the newest campaign-level `stat_date` with `spend > 0` over the whole history (`lastSpendDaySql`), never the window.
+- The FB sync state is not the source: its cursor / `fb_stats_to` describe the requested window, and the daily sync has failed validation since 2026-09-15 without writing rows (P0 facts).
+- There is no Facebook spend after `spendThrough`. A window read up to `data_through` therefore sums the same spend as one cut at `spendThrough`.
+
+`src/services/ltvPayback.ts` is the pure model (no I/O): maturity +2 days, the chain ladder with the fallback funnel → product → all, clamp, rough marker, small-funnel fold, TOTAL, verdict precedence, payback day, what-if, trend months and the backtest helper.
+- Trials are paired with spend only up to `min(to, data_through, spend_through)`. Later trials are counted in `trialsAfterSpendThrough`. A funnel with nothing but later trials is "No spend data" (`after_spend_through`).
+- One meaning per count: on an evaluated row `trialsAfterSpendThrough` is the later trials NOT in `trials` ("+N newer"); on a row that is not evaluated they are its trials. TOTAL sums every member funnel's later trials once, and `excludedTrials` counts only left-out trials up to spend_through.
+- While the snapshot is stale, the trials and the ledger window end at `members_through` (`paybackTrialsThrough`); `trialsCutAt` says so on the page. Maturity always reads `data_through`.
+- Percentages are threshold-safe (`paybackFormat.ts`): ROAS never prints 100 % / 80 % below those marks, the observed share never 50 % / 95 % / 100 %.
+- `spendBanner` is set when spend ends 2+ days before the payments. A 1-day Facebook lag is normal and shows no banner.
+- One addition to the spec: a projected checkpoint never drops below the row's previous one. The pools differ per checkpoint, so two factors can disagree.
+- Not detectable: the 2026-05-08..06-14 Facebook gap is not in `facebook_known_gaps` (the table is empty), so that window's CPT is understated until it is recorded.
+
+The page (`src/pages/Forecasting.tsx`, nav label "Payback") renders that model; the components are in `src/components/payback/`.
+- It reads the server only: `usePaybackLtv` (action `ltv`) and one `spend_ledger` call per window (`usePaybackLedger`, plus six lazy ones for the drilldown trend while it is open). No `useTransactions`, `computeCohorts` or traffic metrics; `paybackPage.test.tsx` checks the sources for them.
+- The ltv request starts at the first of the six trend months (`paybackLtvRange`), so the trend reads the same rows. The ledger window is `paybackLedgerWindow` (cut at the trials' last day: the newest payment, or `members_through` while the snapshot is stale).
+- Query keys sit under the `payback` root with the access partition (and the warehouse version where the member may read the probe; `forecasting.view` alone keys on `whv_unknown`). The root is not warehouse-dependent on purpose, so an ltv answer (every path's day rows) is never persisted to session storage. `usePaybackLtv` refetches it on the warehouse-invalidated event instead.
+- A stale snapshot starts the Cohorts page's single-flight background rebuild (`ensureCohortSnapshotRebuild`), for `admin.warehouse.manage` only.
+- The payback day is shown in the drilldown only (spec §1): not in the KPIs, not in the export. The export's spend headers say whether the 4% fee is in, and its file name carries the period.
+- All state is in the URL (`paybackState.ts`): `product`, `funnel` (repeated; one empty value = none), `period` (`30d` / `90d` default / `180d` / `custom` with `from` / `to` months), `sort`, `open`, `show=ltv`, `fee=off`. The agency fee switch is per link, not a stored workspace setting.
+- Every word is in `paybackCopy.ts`; the pure view rules (sort, cell text, chart split, export rows) are in `paybackView.ts`.
+- The old page moved unchanged to `src/pages/ForecastingLegacy.tsx` at `/forecasting/legacy` (`forecasting.create`, closed to restricted members), linked as "Old planner". Its Actuals compute runs only there. The CSV / XLSX download both pages use is `src/lib/tableExport.ts`.
+
 ## Token / in-product / funnel upsell split (2026-10-23)
 
 Owner-approved. Before it, every successful unmarked payment within 48 h of the trial was a token purchase. The in-product upsells (offered in the product right after the funnel checkout, never marked) therefore inflated Token Buyers / Token Buyer CR. Post-trial one-off payments now have three types:

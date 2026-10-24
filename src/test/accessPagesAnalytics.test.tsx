@@ -183,7 +183,9 @@ import CohortsPage from "@/pages/Cohorts";
 import FBAnalyticsPage from "@/pages/FBAnalytics";
 import FunnelsPage from "@/pages/Funnels";
 import ForecastingPage from "@/pages/Forecasting";
+import ForecastingLegacyPage from "@/pages/ForecastingLegacy";
 import ReportsPage from "@/pages/Reports";
+import { RequirePermission } from "@/components/RequirePermission";
 import { ScenarioActions } from "@/components/forecasting/PlanMode";
 import { ProjectMode } from "@/components/forecasting/ProjectMode";
 import { BlockEditor } from "@/components/reports/BlockEditor";
@@ -616,14 +618,45 @@ describe("Funnels", () => {
 // ---- Forecasting ---------------------------------------------------------------
 
 describe("Forecasting", () => {
-  it("the Actuals tab (client compute) is the owner's only", async () => {
+  it("/forecasting is Payback by funnel: server reads only, no tabs, no client cohort compute", async () => {
     renderWith(<ForecastingPage />, OWNER());
+    expect(screen.getByRole("heading", { name: "Payback by funnel" })).toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "Actuals" })).toBeNull();
+    expect(screen.queryByRole("tab", { name: "Plan" })).toBeNull();
+    // No Edge Function in this harness: the ltv read fails and says so.
+    expect(await screen.findByText("Payments could not be loaded.")).toBeInTheDocument();
+    expect(fns.loadCohortsFromClickHouse).not.toHaveBeenCalled();
+    expect(screen.getByRole("link", { name: "Old planner" })).toHaveAttribute("href", "/forecasting/legacy");
+    cleanup();
+
+    // forecasting.view alone: the page, but no link to the old planner.
+    renderWith(<ForecastingPage />, member(["forecasting.view"]));
+    expect(screen.getByRole("heading", { name: "Payback by funnel" })).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "Old planner" })).toBeNull();
+  });
+
+  it("the old planner route needs forecasting.create", async () => {
+    const legacy = <RequirePermission route="/forecasting/legacy"><div>old planner body</div></RequirePermission>;
+    renderWith(legacy, member(["forecasting.view"]));
+    expect(await screen.findByTestId("no-access")).toHaveAttribute("data-reason", "permission");
+    expect(screen.queryByText("old planner body")).toBeNull();
+    cleanup();
+    for (const access of [member(["forecasting.view", "forecasting.create"]), OWNER(), LEGACY()]) {
+      renderWith(legacy, access);
+      expect(screen.getByText("old planner body")).toBeInTheDocument();
+      cleanup();
+    }
+  });
+
+  it("the old planner: the Actuals tab (client compute) is the owner's only", async () => {
+    renderWith(<ForecastingLegacyPage />, OWNER());
     expect(screen.getByRole("tab", { name: "Actuals" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Back to Payback" })).toHaveAttribute("href", "/forecasting");
     // Plan seeds from the in-memory cohorts when the warehouse returns none.
     expect(await screen.findByText("in-memory cohorts")).toBeInTheDocument();
     cleanup();
 
-    renderWith(<ForecastingPage />, member(["forecasting.view"]));
+    renderWith(<ForecastingLegacyPage />, member(["forecasting.view"]));
     expect(screen.queryByRole("tab", { name: "Actuals" })).toBeNull();
     for (const name of ["Plan", "Compare", "Project"]) {
       expect(screen.getByRole("tab", { name })).toBeInTheDocument();
