@@ -56,7 +56,9 @@ export function useRequireRawTransactions(enabled: boolean): void {
 
 export function shouldAutoLoadTransactionsForPath(pathname: string, storage: Storage | null = safeLocalStorage()): boolean {
   const normalized = pathname.replace(/\/+$/, "") || "/";
-  if (normalized === "/cohorts" || normalized === "/users" || normalized === "/reports") return false;
+  // /forecasting is the server-driven Payback page; the old planner at
+  // /forecasting/legacy still computes from the raw warehouse.
+  if (normalized === "/cohorts" || normalized === "/users" || normalized === "/reports" || normalized === "/forecasting") return false;
   if (normalized === "/transactions") return readPersistedTransactionsMode(storage) !== "pass";
   return true;
 }

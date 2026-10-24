@@ -16,6 +16,12 @@ describe("protected route transaction warehouse autoload policy", () => {
   it("does not autoload the full transaction warehouse on migrated aggregate routes", () => {
     expect(shouldAutoLoadTransactionsForPath("/cohorts", storageWith(null))).toBe(false);
     expect(shouldAutoLoadTransactionsForPath("/users", storageWith(null))).toBe(false);
+    expect(shouldAutoLoadTransactionsForPath("/forecasting", storageWith(null))).toBe(false);
+    expect(shouldAutoLoadTransactionsForPath("/forecasting/", storageWith(null))).toBe(false);
+  });
+
+  it("still loads for the old planner, which computes from raw transactions", () => {
+    expect(shouldAutoLoadTransactionsForPath("/forecasting/legacy", storageWith(null))).toBe(true);
   });
 
   it("keeps Payment Pass fast when the persisted Transactions tab is pass", () => {
@@ -33,6 +39,7 @@ describe("sample-data banner policy", () => {
   it("suppresses the banner on hydration-deferred routes — they render real ClickHouse data", () => {
     expect(shouldShowSampleDataBanner("mock", "/cohorts", storageWith(null))).toBe(false);
     expect(shouldShowSampleDataBanner("mock", "/users", storageWith(null))).toBe(false);
+    expect(shouldShowSampleDataBanner("mock", "/forecasting", storageWith(null))).toBe(false);
     expect(shouldShowSampleDataBanner("mock", "/transactions", storageWith(JSON.stringify({ mode: "pass" })))).toBe(false);
   });
 
