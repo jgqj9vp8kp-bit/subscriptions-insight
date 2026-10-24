@@ -230,6 +230,7 @@ describe("append-only history: successful sync", () => {
     const validated = batchOps[1].values as Record<string, unknown>;
     expect(validated.status).toBe("validated");
     expect(validated.checksum).toMatch(/^fbck_/);
+    expect(validated).not.toHaveProperty("notes"); // a coherent batch carries no gate warning
     const published = batchOps[2].values as Record<string, unknown>;
     expect(published.status).toBe("published");
     // Updates are scoped to this batch + user.
@@ -287,6 +288,46 @@ describe("append-only history: successful sync", () => {
     expect(first.history_batch_id).not.toBe(second.history_batch_id);
     expect(byTable(ops, FB_SYNC_RUNS_TABLE)).toHaveLength(2);
     expect(byTable(ops, FB_IMPORT_BATCHES_TABLE).filter((o) => o.op === "insert")).toHaveLength(2);
+  });
+
+  it("tolerated adset / ad drift → published batch noted with the warning, run metadata carries the deltas", async () => {
+    const { client, ops } = fakeSupabaseV2();
+    const base = mergingFetcher();
+    // Day = campaign; adset +$0.40 and ad +$0.60 on 2026-07-15 (band: max($1, 0.5% of 150)).
+    const drifting: CapsuledFetcher = async (from, to, level) => {
+      const result = await base(from, to, level);
+      const extra = from === "2026-07-15" ? ({ adset: 0.4, ad: 0.6 } as Record<string, number>)[level] ?? 0 : 0;
+      if (!extra) return result;
+      const rows = (result.envelope.rows as Array<Record<string, unknown>>).map((row) => ({ ...row, spend: Number(row.spend) + extra }));
+      return { ...result, envelope: { ...result.envelope, rows } };
+    };
+    const result = await runFacebookStatsSync(syncInput({
+      supabase: client,
+      clickhouse: fakeClickHouse({ countSequence: [0, 8] }),
+      fetcher: drifting,
+      request: { mode: "incremental" as const, last_days: 2, levels: ["campaign", "adset", "ad", "day"] },
+    }));
+
+    expect(result.status).toBe("completed");
+    const batchOps = byTable(ops, FB_IMPORT_BATCHES_TABLE);
+    expect(batchOps.map((o) => (o.values as Record<string, unknown>).status)).toEqual(["staged", "validated", "published"]);
+    const notes = String((batchOps[1].values as Record<string, unknown>).notes);
+    expect(notes).toContain("FB_SPEND_MISMATCH_TOLERATED");
+    expect(notes).toContain("adset +0.40 (tolerance 1.00)");
+    expect(notes).toContain("ad +0.60 (tolerance 1.00)");
+    expect(byTable(ops, FB_BATCH_DQ_TABLE)).toHaveLength(1);
+
+    const run = byTable(ops, FB_SYNC_RUNS_TABLE)[0].values as Record<string, unknown>;
+    expect(run.status).toBe("completed");
+    expect(run.raw_response_metadata).toMatchObject({
+      spend_mismatch_tolerated: true,
+      validation_warnings: ["FB_SPEND_MISMATCH_TOLERATED"],
+      spend_delta_by_level: { campaign: 0, adset: 0.4, ad: 0.6 },
+      spend_mismatch_by_day: [
+        { date: "2026-07-15", level: "adset", delta: 0.4 },
+        { date: "2026-07-15", level: "ad", delta: 0.6 },
+      ],
+    });
   });
 });
 

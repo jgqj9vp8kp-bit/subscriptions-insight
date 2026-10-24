@@ -392,6 +392,218 @@ async function warehouseCount(client: ClickHouseClientLike, authUserId: string):
   return n(rows[0]?.c);
 }
 
+// ---- Spend completeness gate ------------------------------------------------
+//
+// Every synced entity level is compared with the day-level ground truth over
+// the synced window before anything is written.
+//
+// Strict band: account and campaign. The campaign level feeds every spend
+// total downstream (spend ledger projectSpendLedger.ts, the Cohorts FB columns
+// in fbCohortStats.ts, revenueIntelligence.ts, fbReconSnapshot.ts and
+// fbCampaignResolution.ts all read `level = 'campaign'`), and the account level
+// is the plain roll-up of the same spend. Both must match the day total to
+// within FB_SPEND_STRICT_TOLERANCE_USD or the batch is rejected.
+//
+// Tolerant band: adset and ad. Only the FB Analytics adset / ad drill-down and
+// the V2 adset / ad facts + dims read them; no spend total is built from them.
+// Incident 2026-10-24: since 2026-09-14 the source's adset and ad levels carried
+// +$36.88 / +$37.08 (0.09%) more spend than day = account = campaign
+// (41384.39 vs 41421.27 / 41421.47 over 40 active days). The strict band
+// rejected every daily sync, so 40 days of spend were never published and the
+// cursor never moved. Drift up to max(FB_SPEND_DRIFT_MIN_USD,
+// FB_SPEND_DRIFT_RATIO x window day spend) is now published with a warning in
+// the sync diagnostics, the run metadata, the batch notes and the V2
+// spend_cross_level DQ check; anything above it still fails as before.
+//
+// A level whose single-day response hit the API row cap may be TRUNCATED (the
+// entity fetch does not split), so it never gets the tolerant band.
+//
+// The tolerant band scales with the window's spend (a full sync over ~$400k
+// allows ~$2000), so on its own it would let an adset / ad export that is
+// missing whole days through. An EMPTY DAY — an active day whose ground truth
+// carries more than FB_SPEND_DRIFT_MIN_USD while the level's response carried
+// no spend for it — is a missing response, not drift: that level loses the
+// tolerant band and always blocks the batch.
+
+/** Strict band (USD) for the account and campaign levels (and any level whose
+ * response may be truncated or is missing a day). */
+export const FB_SPEND_STRICT_TOLERANCE_USD = 0.05;
+/** Entity levels allowed to drift from the day total within the tolerant band
+ * (incident 2026-10-24, see above). */
+export const FB_SPEND_DRIFT_TOLERANT_LEVELS: readonly FbLevel[] = ["adset", "ad"];
+/** Floor (USD) of the adset / ad tolerance for the synced window. */
+export const FB_SPEND_DRIFT_MIN_USD = 1;
+/** Share of the window's day-level spend the adset / ad totals may drift by (0.5%). */
+export const FB_SPEND_DRIFT_RATIO = 0.005;
+/** At most this many (day, level) rows are kept in the per-day breakdown. */
+export const FB_SPEND_MISMATCH_DAY_LIMIT = 100;
+/** Warning code recorded when a mismatch is published within the tolerant band. */
+export const FB_SPEND_MISMATCH_TOLERATED = "FB_SPEND_MISMATCH_TOLERATED";
+
+/** One synced entity level outside the strict band over the whole window, or
+ * with an empty day. */
+export interface FbSpendMismatch {
+  level: FbLevel;
+  level_spend: number;
+  day_spend: number;
+  /** level_spend - day_spend. */
+  delta: number;
+  /** The band this level is held to. */
+  tolerance: number;
+  /** Within its band: published with a warning instead of failing the sync. */
+  tolerated: boolean;
+  /** Empty days of this level (only when there is one): never tolerated. */
+  empty_days?: number;
+}
+
+/** An active day whose ground truth has spend while an adset / ad response
+ * carried none for it (a missing response, not drift). */
+export interface FbSpendEmptyDay {
+  date: string;
+  level: FbLevel;
+  day_spend: number;
+}
+
+/** One (day, entity level) pair whose spend differs from that day's ground truth. */
+export interface FbSpendMismatchDay {
+  date: string;
+  level: FbLevel;
+  level_spend: number;
+  day_spend: number;
+  delta: number;
+}
+
+export interface FbSpendGateResult {
+  /** Every synced entity level outside the strict band, tolerated or not. */
+  mismatches: FbSpendMismatch[];
+  /** The mismatches above their band — any of them rejects the batch. */
+  blocking: FbSpendMismatch[];
+  /** There is a mismatch and every mismatching level is within its band. */
+  tolerated: boolean;
+  /** level_spend - day_spend for every synced entity level. */
+  deltaByLevel: Record<string, number>;
+  /** The band each synced entity level is held to. */
+  toleranceByLevel: Record<string, number>;
+  /** (day, level) pairs outside the strict band, by date then level; capped. */
+  byDay: FbSpendMismatchDay[];
+  /** Number of (day, level) pairs outside the strict band before the cap. */
+  byDayCount: number;
+  /** Empty days of the adset / ad levels, by date then level; capped. */
+  emptyDays: FbSpendEmptyDay[];
+  /** Number of empty days before the cap. */
+  emptyDayCount: number;
+}
+
+/** Pure spend completeness gate (see the section comment above). */
+export function evaluateFbSpendGate(input: {
+  entityLevels: readonly FbLevel[];
+  daySpendTotal: number;
+  spendByLevel: Readonly<Record<string, number>>;
+  daySpendByDate: ReadonlyMap<string, number>;
+  levelSpendByDate: Readonly<Partial<Record<FbLevel, ReadonlyMap<string, number>>>>;
+  /** Levels with a single-day response at the API row cap (possibly truncated). */
+  cappedLevels?: ReadonlySet<FbLevel>;
+}): FbSpendGateResult {
+  // Cents, with -0 (a tiny negative float residue) folded into 0.
+  const cents = (x: number): number => round2(x) + 0;
+  const driftTolerance = Math.max(FB_SPEND_DRIFT_MIN_USD, FB_SPEND_DRIFT_RATIO * Math.abs(input.daySpendTotal));
+  const driftEligible = (level: FbLevel): boolean =>
+    FB_SPEND_DRIFT_TOLERANT_LEVELS.includes(level) && !input.cappedLevels?.has(level);
+
+  // Empty days (see the section comment): a missing adset / ad response must not
+  // hide inside a band that grows with the window.
+  const emptyDaysAll: FbSpendEmptyDay[] = [];
+  for (const date of Array.from(input.daySpendByDate.keys()).sort()) {
+    const daySpend = input.daySpendByDate.get(date) ?? 0;
+    if (daySpend <= FB_SPEND_DRIFT_MIN_USD) continue;
+    for (const level of input.entityLevels) {
+      if (!driftEligible(level) || (input.levelSpendByDate[level]?.get(date) ?? 0) > 0) continue;
+      emptyDaysAll.push({ date, level, day_spend: cents(daySpend) });
+    }
+  }
+  const emptyDaysByLevel = new Map<FbLevel, number>();
+  for (const empty of emptyDaysAll) emptyDaysByLevel.set(empty.level, (emptyDaysByLevel.get(empty.level) ?? 0) + 1);
+  const toleranceFor = (level: FbLevel): number =>
+    driftEligible(level) && !emptyDaysByLevel.has(level) ? driftTolerance : FB_SPEND_STRICT_TOLERANCE_USD;
+
+  const deltaByLevel: Record<string, number> = {};
+  const toleranceByLevel: Record<string, number> = {};
+  const mismatches: FbSpendMismatch[] = [];
+  for (const level of input.entityLevels) {
+    const levelSpend = input.spendByLevel[level] ?? 0;
+    const delta = levelSpend - input.daySpendTotal;
+    const tolerance = toleranceFor(level);
+    const emptyDays = emptyDaysByLevel.get(level) ?? 0;
+    deltaByLevel[level] = cents(delta);
+    toleranceByLevel[level] = cents(tolerance);
+    // An empty day blocks even when other days happen to offset it in the total.
+    if (Math.abs(delta) <= FB_SPEND_STRICT_TOLERANCE_USD && emptyDays === 0) continue;
+    mismatches.push({
+      level,
+      level_spend: cents(levelSpend),
+      day_spend: cents(input.daySpendTotal),
+      delta: cents(delta),
+      tolerance: cents(tolerance),
+      tolerated: emptyDays === 0 && Math.abs(delta) <= tolerance,
+      ...(emptyDays > 0 ? { empty_days: emptyDays } : {}),
+    });
+  }
+  const blocking = mismatches.filter((m) => !m.tolerated);
+
+  // Per-day breakdown: which days carry the difference (the owner's lead into
+  // the source). Days are the union of the ground truth and every entity level.
+  const dates = new Set<string>(input.daySpendByDate.keys());
+  for (const level of input.entityLevels) for (const date of input.levelSpendByDate[level]?.keys() ?? []) dates.add(date);
+  const byDayAll: FbSpendMismatchDay[] = [];
+  for (const date of Array.from(dates).sort()) {
+    const daySpend = input.daySpendByDate.get(date) ?? 0;
+    for (const level of input.entityLevels) {
+      const levelSpend = input.levelSpendByDate[level]?.get(date) ?? 0;
+      const delta = levelSpend - daySpend;
+      if (Math.abs(delta) <= FB_SPEND_STRICT_TOLERANCE_USD) continue;
+      byDayAll.push({ date, level, level_spend: cents(levelSpend), day_spend: cents(daySpend), delta: cents(delta) });
+    }
+  }
+
+  return {
+    mismatches,
+    blocking,
+    tolerated: mismatches.length > 0 && blocking.length === 0,
+    deltaByLevel,
+    toleranceByLevel,
+    byDay: byDayAll.slice(0, FB_SPEND_MISMATCH_DAY_LIMIT),
+    byDayCount: byDayAll.length,
+    emptyDays: emptyDaysAll.slice(0, FB_SPEND_MISMATCH_DAY_LIMIT),
+    emptyDayCount: emptyDaysAll.length,
+  };
+}
+
+/** The gate's diagnostics fields (sync state, run metadata, validation error).
+ * Tenant-wide spend: the viewer projection (access policy allowlist) drops
+ * every one of them. */
+function fbSpendGateDiagnostics(gate: FbSpendGateResult, cappedResponses: ReadonlyArray<{ date: string; level: FbLevel }>): Record<string, unknown> {
+  return {
+    spend_mismatch: gate.mismatches,
+    spend_mismatch_tolerated: gate.tolerated,
+    spend_delta_by_level: gate.deltaByLevel,
+    spend_tolerance_by_level: gate.toleranceByLevel,
+    spend_mismatch_day_count: gate.byDayCount,
+    spend_mismatch_by_day: gate.byDay,
+    spend_empty_day_count: gate.emptyDayCount,
+    spend_empty_days: gate.emptyDays,
+    capped_entity_responses: cappedResponses.slice(0, FB_SPEND_MISMATCH_DAY_LIMIT),
+  };
+}
+
+/** Batch-registry note for a batch published within the tolerant band. */
+function fbSpendToleratedNote(gate: FbSpendGateResult): string {
+  const levels = gate.mismatches
+    .map((m) => `${m.level} ${m.delta >= 0 ? "+" : ""}${m.delta.toFixed(2)} (tolerance ${m.tolerance.toFixed(2)})`)
+    .join(", ");
+  const daySpend = gate.mismatches[0]?.day_spend ?? 0;
+  return `${FB_SPEND_MISMATCH_TOLERATED}: ${levels} vs day ${daySpend.toFixed(2)}; ${gate.byDayCount} day/level pair(s) differ.`;
+}
+
 // ---- Sync -------------------------------------------------------------------
 
 export interface FbSyncRequest {
@@ -541,6 +753,7 @@ export async function runFacebookStatsSync(input: {
     let apiLastImportAt: string | null = null;
     const mapped: FbWarehouseRow[] = [];
     const spendByLevel: Record<string, number> = {};
+    const spendByLevelDate: Partial<Record<FbLevel, Map<string, number>>> = {};
     const addMapped = (rows: unknown[], level: FbLevel, envelope: CapsuledEnvelope) => {
       apiRows += rows.length;
       fbStatsTo = s(envelope.dataFreshness?.fbStatsTo) || fbStatsTo;
@@ -554,6 +767,8 @@ export async function runFacebookStatsSync(input: {
         if (wh) {
           mapped.push(wh);
           spendByLevel[level] = (spendByLevel[level] ?? 0) + wh.spend;
+          const byDate = spendByLevelDate[level] ?? (spendByLevelDate[level] = new Map<string, number>());
+          byDate.set(wh.stat_date, (byDate.get(wh.stat_date) ?? 0) + wh.spend);
         } else skipped += 1;
       }
     };
@@ -579,6 +794,9 @@ export async function runFacebookStatsSync(input: {
     const entityLevels = levels.filter((l): l is FbLevel => l !== "day");
     const tasks: Array<{ day: string; level: FbLevel }> = [];
     for (const day of activeDays) for (const level of entityLevels) tasks.push({ day, level });
+    // Single-day responses are not split on the row cap; one that hits it may be
+    // truncated, which keeps its level on the strict spend band below.
+    const cappedEntityResponses: Array<{ date: string; level: FbLevel }> = [];
     for (let i = 0; i < tasks.length; i += FB_DAY_FETCH_CONCURRENCY) {
       const batch = tasks.slice(i, i + FB_DAY_FETCH_CONCURRENCY);
       const settled = await Promise.all(
@@ -590,20 +808,39 @@ export async function runFacebookStatsSync(input: {
           return { task, rows: Array.isArray(envelope.rows) ? envelope.rows : [], envelope };
         }),
       );
-      for (const { task, rows, envelope } of settled) addMapped(rows, task.level, envelope);
+      for (const { task, rows, envelope } of settled) {
+        if (rows.length >= FB_API_ROW_CAP) cappedEntityResponses.push({ date: task.day, level: task.level });
+        addMapped(rows, task.level, envelope);
+      }
     }
 
     // Completeness proof: every fully-synced entity level must carry the same
-    // total spend as the day-level ground truth over the same range.
-    const daySpend = dayScan.rows.filter(isRecord).reduce((a, r) => a + n(r.spend), 0);
-    const spendMismatch = entityLevels
-      .filter((level) => Math.abs((spendByLevel[level] ?? 0) - daySpend) > 0.05)
-      .map((level) => ({ level, level_spend: round2(spendByLevel[level] ?? 0), day_spend: round2(daySpend) }));
+    // total spend as the day-level ground truth over the same range — to the
+    // strict band for account / campaign, within the drift band for adset / ad
+    // unless one of their days came back empty (evaluateFbSpendGate; incident
+    // 2026-10-24).
+    let daySpend = 0;
+    const daySpendByDate = new Map<string, number>();
+    for (const r of dayScan.rows.filter(isRecord)) {
+      daySpend += n(r.spend);
+      const date = s(r.date || r.dateFrom).slice(0, 10);
+      daySpendByDate.set(date, (daySpendByDate.get(date) ?? 0) + n(r.spend));
+    }
+    const spendGate = evaluateFbSpendGate({
+      entityLevels,
+      daySpendTotal: daySpend,
+      spendByLevel,
+      daySpendByDate,
+      levelSpendByDate: spendByLevelDate,
+      cappedLevels: new Set(cappedEntityResponses.map((c) => c.level)),
+    });
+    const spendMismatch = spendGate.mismatches;
+    const spendDiagnostics = fbSpendGateDiagnostics(spendGate, cappedEntityResponses);
 
     // The day level is the source-of-truth total. Never write a partial entity
     // export: fact_facebook_stats is a ReplacingMergeTree, so even a failed sync
     // would otherwise make its newer row_version visible through FINAL.
-    if (spendMismatch.length > 0) {
+    if (spendGate.blocking.length > 0) {
       throw new FacebookStatsValidationError({
         mode,
         date_from: dateFrom,
@@ -614,12 +851,13 @@ export async function runFacebookStatsSync(input: {
         merged_rows_detected: mergedRowsDetected,
         spend_by_level: Object.fromEntries(Object.entries(spendByLevel).map(([key, value]) => [key, round2(value)])),
         day_spend_total: round2(daySpend),
-        spend_mismatch: spendMismatch,
+        ...spendDiagnostics,
       });
     }
 
-    // Validation gate passed → the batch is coherent (staged → validated).
-    await history.markValidated(computeFbBatchChecksum(mapped));
+    // Validation gate passed → the batch is coherent (staged → validated). A
+    // tolerated adset / ad drift is noted on the batch row.
+    await history.markValidated(computeFbBatchChecksum(mapped), spendGate.tolerated ? fbSpendToleratedNote(spendGate) : null);
     await v2.mirrorBatch("validated");
 
     if (mapped.length) {
@@ -642,6 +880,13 @@ export async function runFacebookStatsSync(input: {
         dqReport: dqReport as unknown as Record<string, unknown>,
         mergedRowsDetected,
         spendMismatchCount: spendMismatch.length,
+        spendMismatchTolerated: spendGate.tolerated,
+        spendMismatchDetails: {
+          mismatches: spendMismatch,
+          delta_by_level: spendGate.deltaByLevel,
+          tolerance_by_level: spendGate.toleranceByLevel,
+          mismatch_day_count: spendGate.byDayCount,
+        },
       }),
       mergedRowsDetected,
     });
@@ -682,7 +927,9 @@ export async function runFacebookStatsSync(input: {
         merged_rows_detected: mergedRowsDetected,
         spend_by_level: Object.fromEntries(Object.entries(spendByLevel).map(([k, v]) => [k, round2(v)])),
         day_spend_total: round2(daySpend),
-        spend_mismatch: spendMismatch,
+        ...spendDiagnostics,
+        validation_status: spendGate.tolerated ? "PASSED_WITH_WARNINGS" : "PASSED",
+        validation_warnings: spendGate.tolerated ? [FB_SPEND_MISMATCH_TOLERATED] : [],
       },
     });
 
@@ -708,6 +955,8 @@ export async function runFacebookStatsSync(input: {
         day_spend_total: round2(daySpend),
         active_days: activeDays.length,
         strategy: "per_day_entity_fetch",
+        ...spendDiagnostics,
+        validation_warnings: spendGate.tolerated ? [FB_SPEND_MISMATCH_TOLERATED] : [],
       },
       finishedAtIso: new Date().toISOString(),
     });

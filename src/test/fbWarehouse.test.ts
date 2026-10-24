@@ -8,7 +8,15 @@ import {
   buildFbDiagnostics,
   dayDiff,
   deriveMetricTotals,
+  evaluateFbSpendGate,
   fbScopeWhere,
+  FB_API_ROW_CAP,
+  FB_SPEND_DRIFT_MIN_USD,
+  FB_SPEND_DRIFT_RATIO,
+  FB_SPEND_DRIFT_TOLERANT_LEVELS,
+  FB_SPEND_MISMATCH_DAY_LIMIT,
+  FB_SPEND_MISMATCH_TOLERATED,
+  FB_SPEND_STRICT_TOLERANCE_USD,
   fetchLevelRows,
   mapCapsuledRow,
   normalizeFbFilters,
@@ -351,6 +359,320 @@ describe("runFacebookStatsSync (per-day entity fetch — merge-proof)", () => {
     expect(failedPatch).toContain('"status":"failed"');
     // stopped_reason must stay inside the table's CHECK vocabulary.
     expect(failedPatch).toContain('"stopped_reason":"unknown"');
+  });
+});
+
+// ---- spend completeness gate (incident 2026-10-24) ---------------------------
+
+describe("spend gate: strict account / campaign, tolerant adset / ad", () => {
+  const ALL_ENTITY = ["account", "campaign", "adset", "ad"] as const;
+
+  it("pins the bands: $0.05 strict; adset / ad max($1, 0.5% of the window's day spend)", () => {
+    expect(FB_SPEND_STRICT_TOLERANCE_USD).toBe(0.05);
+    expect(FB_SPEND_DRIFT_TOLERANT_LEVELS).toEqual(["adset", "ad"]);
+    expect(FB_SPEND_DRIFT_MIN_USD).toBe(1);
+    expect(FB_SPEND_DRIFT_RATIO).toBe(0.005);
+  });
+
+  it("the production incident (adset +36.88 / ad +37.08 on 41384.39) is tolerated, with per-level deltas", () => {
+    const gate = evaluateFbSpendGate({
+      entityLevels: ALL_ENTITY,
+      daySpendTotal: 41384.39,
+      spendByLevel: { account: 41384.39, campaign: 41384.39, adset: 41421.27, ad: 41421.47 },
+      daySpendByDate: new Map(),
+      levelSpendByDate: {},
+    });
+    expect(gate.blocking).toEqual([]);
+    expect(gate.tolerated).toBe(true);
+    expect(gate.deltaByLevel).toEqual({ account: 0, campaign: 0, adset: 36.88, ad: 37.08 });
+    expect(gate.toleranceByLevel).toEqual({ account: 0.05, campaign: 0.05, adset: 206.92, ad: 206.92 });
+    expect(gate.mismatches).toEqual([
+      { level: "adset", level_spend: 41421.27, day_spend: 41384.39, delta: 36.88, tolerance: 206.92, tolerated: true },
+      { level: "ad", level_spend: 41421.47, day_spend: 41384.39, delta: 37.08, tolerance: 206.92, tolerated: true },
+    ]);
+  });
+
+  it("campaign and account stay on the strict band — 6 cents off blocks, 4 cents does not", () => {
+    const base = { entityLevels: ALL_ENTITY, daySpendTotal: 1000, daySpendByDate: new Map<string, number>(), levelSpendByDate: {} };
+    const campaign = evaluateFbSpendGate({ ...base, spendByLevel: { account: 1000, campaign: 1000.06, adset: 1000, ad: 1000 } });
+    expect(campaign.tolerated).toBe(false);
+    expect(campaign.blocking).toEqual([{ level: "campaign", level_spend: 1000.06, day_spend: 1000, delta: 0.06, tolerance: 0.05, tolerated: false }]);
+    const account = evaluateFbSpendGate({ ...base, spendByLevel: { account: 999.9, campaign: 1000, adset: 1000, ad: 1000 } });
+    expect(account.blocking.map((m) => m.level)).toEqual(["account"]);
+    const clean = evaluateFbSpendGate({ ...base, spendByLevel: { account: 1000.04, campaign: 999.96, adset: 1000, ad: 1000 } });
+    expect(clean.mismatches).toEqual([]);
+    expect(clean.tolerated).toBe(false);
+  });
+
+  it("adset / ad above their band block; the $1 floor applies to small windows", () => {
+    const base = { entityLevels: ALL_ENTITY, daySpendByDate: new Map<string, number>(), levelSpendByDate: {} };
+    const above = evaluateFbSpendGate({ ...base, daySpendTotal: 10_000, spendByLevel: { account: 10_000, campaign: 10_000, adset: 10_050.01, ad: 10_000 } });
+    expect(above.blocking).toEqual([{ level: "adset", level_spend: 10_050.01, day_spend: 10_000, delta: 50.01, tolerance: 50, tolerated: false }]);
+    expect(above.tolerated).toBe(false);
+    const floorOk = evaluateFbSpendGate({ ...base, daySpendTotal: 100, spendByLevel: { account: 100, campaign: 100, adset: 100.9, ad: 99.1 } });
+    expect(floorOk.toleranceByLevel.adset).toBe(1);
+    expect(floorOk.tolerated).toBe(true);
+    const floorBlocked = evaluateFbSpendGate({ ...base, daySpendTotal: 100, spendByLevel: { account: 100, campaign: 100, adset: 101.5, ad: 100 } });
+    expect(floorBlocked.blocking.map((m) => m.level)).toEqual(["adset"]);
+  });
+
+  it("a level with a response at the row cap (possibly truncated) loses the tolerant band", () => {
+    const gate = evaluateFbSpendGate({
+      entityLevels: ALL_ENTITY,
+      daySpendTotal: 10_000,
+      spendByLevel: { account: 10_000, campaign: 10_000, adset: 10_000, ad: 9_990 },
+      daySpendByDate: new Map(),
+      levelSpendByDate: {},
+      cappedLevels: new Set(["ad"]),
+    });
+    expect(gate.toleranceByLevel).toMatchObject({ adset: 50, ad: 0.05 });
+    expect(gate.blocking.map((m) => m.level)).toEqual(["ad"]);
+  });
+
+  it("lists the (day, level) pairs that differ, by date then level, capped", () => {
+    const gate = evaluateFbSpendGate({
+      entityLevels: ALL_ENTITY,
+      daySpendTotal: 300,
+      spendByLevel: { account: 300, campaign: 300, adset: 300.5, ad: 300.5 },
+      daySpendByDate: new Map([["2026-09-14", 100], ["2026-09-15", 100], ["2026-09-16", 100]]),
+      levelSpendByDate: {
+        account: new Map([["2026-09-14", 100], ["2026-09-15", 100], ["2026-09-16", 100]]),
+        campaign: new Map([["2026-09-14", 100], ["2026-09-15", 100], ["2026-09-16", 100]]),
+        adset: new Map([["2026-09-14", 100], ["2026-09-15", 100.5], ["2026-09-16", 100]]),
+        ad: new Map([["2026-09-14", 100.2], ["2026-09-15", 100.3], ["2026-09-16", 100.03]]),
+      },
+    });
+    expect(gate.byDay).toEqual([
+      { date: "2026-09-14", level: "ad", level_spend: 100.2, day_spend: 100, delta: 0.2 },
+      { date: "2026-09-15", level: "adset", level_spend: 100.5, day_spend: 100, delta: 0.5 },
+      { date: "2026-09-15", level: "ad", level_spend: 100.3, day_spend: 100, delta: 0.3 },
+    ]);
+    expect(gate.byDayCount).toBe(3);
+
+    const many = new Map(Array.from({ length: 150 }, (_unused, i) => [addDays("2026-01-01", i), 10] as [string, number]));
+    const capped = evaluateFbSpendGate({
+      entityLevels: ["adset"],
+      daySpendTotal: 1500,
+      spendByLevel: { adset: 1500 },
+      daySpendByDate: many,
+      levelSpendByDate: { adset: new Map() },
+    });
+    expect(capped.byDayCount).toBe(150);
+    expect(capped.byDay).toHaveLength(FB_SPEND_MISMATCH_DAY_LIMIT);
+    expect(capped.byDay[0]).toEqual({ date: "2026-01-01", level: "adset", level_spend: 0, day_spend: 10, delta: -10 });
+    expect(capped.emptyDayCount).toBe(150);
+    expect(capped.emptyDays).toHaveLength(FB_SPEND_MISMATCH_DAY_LIMIT);
+  });
+
+  it("an empty adset day is a missing response, not drift: it blocks even when the window's band would cover it", () => {
+    // Full-sync sized window: the band (0.5% of $400k = $2000) is wider than the
+    // whole $1035 day the adset response came back empty for.
+    const days = new Map([["2026-09-14", 398_965], ["2026-09-15", 1035]]);
+    const gate = evaluateFbSpendGate({
+      entityLevels: ALL_ENTITY,
+      daySpendTotal: 400_000,
+      spendByLevel: { account: 400_000, campaign: 400_000, adset: 398_965, ad: 400_036.88 },
+      daySpendByDate: days,
+      levelSpendByDate: {
+        account: new Map(days),
+        campaign: new Map(days),
+        adset: new Map([["2026-09-14", 398_965]]),
+        ad: new Map([["2026-09-14", 398_965], ["2026-09-15", 1071.88]]),
+      },
+    });
+    expect(gate.toleranceByLevel).toEqual({ account: 0.05, campaign: 0.05, adset: 0.05, ad: 2000 });
+    expect(gate.mismatches).toEqual([
+      { level: "adset", level_spend: 398_965, day_spend: 400_000, delta: -1035, tolerance: 0.05, tolerated: false, empty_days: 1 },
+      { level: "ad", level_spend: 400_036.88, day_spend: 400_000, delta: 36.88, tolerance: 2000, tolerated: true },
+    ]);
+    expect(gate.blocking.map((m) => m.level)).toEqual(["adset"]);
+    expect(gate.tolerated).toBe(false);
+    expect(gate.emptyDays).toEqual([{ date: "2026-09-15", level: "adset", day_spend: 1035 }]);
+    expect(gate.emptyDayCount).toBe(1);
+  });
+
+  it("empty-day rules: zero spend is empty even when the total matches; a ground-truth day at the $1 floor is not", () => {
+    const gate = evaluateFbSpendGate({
+      entityLevels: ["campaign", "adset", "ad"],
+      daySpendTotal: 1000,
+      spendByLevel: { campaign: 1000, adset: 1000, ad: 999 },
+      daySpendByDate: new Map([["2026-09-14", 500], ["2026-09-15", 1], ["2026-09-16", 499]]),
+      levelSpendByDate: {
+        campaign: new Map([["2026-09-14", 500], ["2026-09-15", 1], ["2026-09-16", 499]]),
+        // 09-16 carries $0 and its spend sits on 09-14: the total matches, the day is still empty.
+        adset: new Map([["2026-09-14", 999], ["2026-09-15", 1], ["2026-09-16", 0]]),
+        // Nothing on the $1 day: within the floor, plain drift.
+        ad: new Map([["2026-09-14", 500], ["2026-09-16", 499]]),
+      },
+    });
+    expect(gate.emptyDays).toEqual([{ date: "2026-09-16", level: "adset", day_spend: 499 }]);
+    expect(gate.mismatches).toEqual([
+      { level: "adset", level_spend: 1000, day_spend: 1000, delta: 0, tolerance: 0.05, tolerated: false, empty_days: 1 },
+      { level: "ad", level_spend: 999, day_spend: 1000, delta: -1, tolerance: 5, tolerated: true },
+    ]);
+    expect(gate.blocking.map((m) => m.level)).toEqual(["adset"]);
+  });
+});
+
+describe("runFacebookStatsSync: spend gate outcomes", () => {
+  const DAY_SPEND: Record<string, number> = { "2026-07-14": 10_000, "2026-07-15": 5_000 };
+  const ALL_LEVELS = ["account", "campaign", "adset", "ad", "day"];
+
+  /** Honest per-day fetcher; `drift[level][date]` adds spend on top of the day truth. */
+  function driftFetcher(drift: Partial<Record<string, Record<string, number>>> = {}, daySpend: Record<string, number> = DAY_SPEND): CapsuledFetcher {
+    return async (from, to, level) => {
+      if (level === "day") {
+        const rows = Object.entries(daySpend)
+          .filter(([date]) => date >= from && date <= to)
+          .map(([date, spend]) => ({ date, spend, fbPurchases: 1 }));
+        return { envelope: { ...ENVELOPE, rows }, bytes: 100, latencyMs: 1 };
+      }
+      const spend = daySpend[from] + (drift[level]?.[from] ?? 0);
+      const row = { ...SAMPLE_ROW, dateFrom: from, dateTo: from, adsetId: level === "adset" || level === "ad" ? "as_1" : "", adId: level === "ad" ? "ad_1" : "", spend };
+      return { envelope: { ...ENVELOPE, rows: [row] }, bytes: 100, latencyMs: 1 };
+    };
+  }
+
+  async function sync(fetcher: CapsuledFetcher) {
+    const upserts: Array<Record<string, unknown>> = [];
+    const inserts: Array<{ table?: string }> = [];
+    const outcome = await runFacebookStatsSync({
+      authUserId: "user-1",
+      supabase: fakeSupabase(null, upserts),
+      clickhouse: fakeFbClickHouse({ countSequence: [0, 10], inserts }),
+      fetcher,
+      request: { mode: "incremental", last_days: 2, levels: ALL_LEVELS },
+      now: new Date("2026-07-15T10:00:00.000Z"),
+    }).then((result) => ({ result, error: null }), (error: unknown) => ({ result: null, error }));
+    const finalPatch = upserts.at(-1) as Record<string, unknown>;
+    return { ...outcome, finalPatch, diagnostics: finalPatch.diagnostics as Record<string, unknown>, inserts };
+  }
+
+  it("adset / ad drift within tolerance publishes the batch with a WARNING and the deltas", async () => {
+    const { result, error, finalPatch, diagnostics, inserts } = await sync(driftFetcher({
+      adset: { "2026-07-15": 36.88 },
+      ad: { "2026-07-15": 37.08 },
+    }));
+    expect(error).toBeNull();
+    expect(result?.status).toBe("completed");
+    // Published: V1 facts written and the cursor moves on.
+    expect(inserts.filter((entry) => entry.table === "fact_facebook_stats")).toHaveLength(1);
+    expect(finalPatch.status).toBe("completed");
+    expect(finalPatch.cursor_transaction_id).toBe("2026-07-15");
+    expect(diagnostics).toMatchObject({
+      validation_status: "PASSED_WITH_WARNINGS",
+      validation_warnings: [FB_SPEND_MISMATCH_TOLERATED],
+      spend_mismatch_tolerated: true,
+      spend_delta_by_level: { account: 0, campaign: 0, adset: 36.88, ad: 37.08 },
+      spend_tolerance_by_level: { account: 0.05, campaign: 0.05, adset: 75, ad: 75 },
+      spend_mismatch: [
+        { level: "adset", level_spend: 15_036.88, day_spend: 15_000, delta: 36.88, tolerance: 75, tolerated: true },
+        { level: "ad", level_spend: 15_037.08, day_spend: 15_000, delta: 37.08, tolerance: 75, tolerated: true },
+      ],
+      spend_mismatch_day_count: 2,
+      spend_mismatch_by_day: [
+        { date: "2026-07-15", level: "adset", level_spend: 5_036.88, day_spend: 5_000, delta: 36.88 },
+        { date: "2026-07-15", level: "ad", level_spend: 5_037.08, day_spend: 5_000, delta: 37.08 },
+      ],
+      capped_entity_responses: [],
+    });
+  });
+
+  it("a coherent sync is PASSED with no warnings", async () => {
+    const { error, diagnostics } = await sync(driftFetcher());
+    expect(error).toBeNull();
+    expect(diagnostics).toMatchObject({
+      validation_status: "PASSED",
+      validation_warnings: [],
+      spend_mismatch: [],
+      spend_mismatch_tolerated: false,
+      spend_mismatch_day_count: 0,
+      spend_mismatch_by_day: [],
+    });
+  });
+
+  it("a campaign mismatch still fails, even when it is small enough for the adset / ad band", async () => {
+    const { error, finalPatch, diagnostics, inserts } = await sync(driftFetcher({
+      campaign: { "2026-07-14": 1 },
+      adset: { "2026-07-14": 1 },
+    }));
+    expect(error).toBeInstanceOf(FacebookStatsValidationError);
+    expect(inserts.filter((entry) => entry.table === "fact_facebook_stats")).toHaveLength(0);
+    expect(finalPatch.status).toBe("failed");
+    expect(finalPatch).not.toHaveProperty("cursor_transaction_id");
+    expect(diagnostics).toMatchObject({
+      validation_status: "FAILED",
+      error_code: "FB_SPEND_MISMATCH",
+      spend_mismatch_tolerated: false,
+      spend_delta_by_level: { account: 0, campaign: 1, adset: 1, ad: 0 },
+      spend_mismatch: [
+        { level: "campaign", delta: 1, tolerance: 0.05, tolerated: false },
+        { level: "adset", delta: 1, tolerance: 75, tolerated: true },
+      ],
+      spend_mismatch_by_day: [
+        { date: "2026-07-14", level: "campaign", delta: 1 },
+        { date: "2026-07-14", level: "adset", delta: 1 },
+      ],
+    });
+  });
+
+  it("adset / ad drift above tolerance fails as before, with the deltas in the diagnostics", async () => {
+    const { error, finalPatch, diagnostics, inserts } = await sync(driftFetcher({ ad: { "2026-07-14": -80 } }));
+    expect(error).toBeInstanceOf(FacebookStatsValidationError);
+    expect((error as FacebookStatsValidationError).validationDiagnostics).toMatchObject({
+      spend_mismatch: [{ level: "ad", level_spend: 14_920, day_spend: 15_000, delta: -80, tolerance: 75, tolerated: false }],
+    });
+    expect(inserts.filter((entry) => entry.table === "fact_facebook_stats")).toHaveLength(0);
+    expect(finalPatch.status).toBe("failed");
+    expect(diagnostics).toMatchObject({
+      validation_status: "FAILED",
+      spend_mismatch_tolerated: false,
+      spend_delta_by_level: { account: 0, campaign: 0, adset: 0, ad: -80 },
+      spend_tolerance_by_level: { adset: 75, ad: 75 },
+      spend_mismatch_by_day: [{ date: "2026-07-14", level: "ad", level_spend: 9_920, day_spend: 10_000, delta: -80 }],
+    });
+  });
+
+  it("an adset day that comes back empty blocks the batch even when the window's band would cover it", async () => {
+    // A $2M day next to a $5k day: the adset / ad band (0.5% = $10,025) is wider
+    // than the whole second day, whose adset response is empty.
+    const honest = driftFetcher({}, { "2026-07-14": 2_000_000, "2026-07-15": 5_000 });
+    const emptyAdsetDay: CapsuledFetcher = async (from, to, level) =>
+      level === "adset" && from === "2026-07-15" ? { envelope: { ...ENVELOPE, rows: [] }, bytes: 10, latencyMs: 1 } : honest(from, to, level);
+    const { error, finalPatch, diagnostics, inserts } = await sync(emptyAdsetDay);
+    expect(error).toBeInstanceOf(FacebookStatsValidationError);
+    expect(inserts.filter((entry) => entry.table === "fact_facebook_stats")).toHaveLength(0);
+    expect(finalPatch.status).toBe("failed");
+    expect(finalPatch).not.toHaveProperty("cursor_transaction_id");
+    expect(diagnostics).toMatchObject({
+      validation_status: "FAILED",
+      error_code: "FB_SPEND_MISMATCH",
+      spend_mismatch_tolerated: false,
+      spend_tolerance_by_level: { account: 0.05, campaign: 0.05, adset: 0.05, ad: 10_025 },
+      spend_mismatch: [{ level: "adset", level_spend: 2_000_000, day_spend: 2_005_000, delta: -5_000, tolerance: 0.05, tolerated: false, empty_days: 1 }],
+      spend_empty_day_count: 1,
+      spend_empty_days: [{ date: "2026-07-15", level: "adset", day_spend: 5_000 }],
+    });
+  });
+
+  it("an ad response at the row cap keeps the ad level strict — a small drift then fails", async () => {
+    const honest = driftFetcher();
+    const capped: CapsuledFetcher = async (from, to, level) => {
+      if (level !== "ad" || from !== "2026-07-14") return honest(from, to, level);
+      // FB_API_ROW_CAP rows summing to the day total + $0.50: within the drift
+      // band, but the response may be truncated, so it must not be trusted.
+      const rows = Array.from({ length: FB_API_ROW_CAP }, (_unused, i) => ({
+        ...SAMPLE_ROW, dateFrom: from, dateTo: from, adsetId: "as_1", adId: `ad_${i}`, spend: i === 0 ? 10.5 : 10,
+      }));
+      return { envelope: { ...ENVELOPE, rows }, bytes: 100, latencyMs: 1 };
+    };
+    const { error, diagnostics } = await sync(capped);
+    expect(error).toBeInstanceOf(FacebookStatsValidationError);
+    expect(diagnostics).toMatchObject({
+      spend_tolerance_by_level: { adset: 75, ad: 0.05 },
+      spend_mismatch: [{ level: "ad", delta: 0.5, tolerance: 0.05, tolerated: false }],
+      capped_entity_responses: [{ date: "2026-07-14", level: "ad" }],
+    });
   });
 });
 

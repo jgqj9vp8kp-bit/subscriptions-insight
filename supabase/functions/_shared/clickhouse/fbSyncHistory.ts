@@ -179,8 +179,9 @@ export interface FbSyncHistoryRecorder {
   stageBatch(): Promise<void>;
   /** Wrap the Capsuled fetcher so every API response (and failure) is recorded verbatim. */
   wrapFetcher(fetcher: CapsuledFetcher): CapsuledFetcher;
-  /** staged → validated (validation gate passed). Write-once checksum. */
-  markValidated(checksum: string): Promise<void>;
+  /** staged → validated (validation gate passed). Write-once checksum; `notes`
+   * carries a gate warning (e.g. a tolerated adset / ad spend drift). */
+  markValidated(checksum: string, notes?: string | null): Promise<void>;
   /** validated → published (warehouse insert succeeded). */
   markPublished(): Promise<void>;
   /** any → rolled_back (validation/fetch/insert failed; data stays, status changes). */
@@ -347,8 +348,12 @@ export function createFbSyncHistoryRecorder(input: {
       };
     },
 
-    async markValidated(checksum: string): Promise<void> {
-      await transition("validated", { validated_at: new Date().toISOString(), checksum });
+    async markValidated(checksum: string, notes?: string | null): Promise<void> {
+      await transition("validated", {
+        validated_at: new Date().toISOString(),
+        checksum,
+        ...(notes ? { notes: notes.slice(0, 2000) } : {}),
+      });
     },
 
     async markPublished(): Promise<void> {
