@@ -683,6 +683,53 @@ describe("status: tenant-wide spend diagnostics are stripped for viewers", () =>
     expect(projectFbSyncStateForViewer({ status: "running" })).toEqual({ status: "running" });
   });
 
+  it("a tolerated spend drift: the per-level / per-day spend fields are stripped, the warning status survives", () => {
+    // Shape of the diagnostics a sync published within the adset / ad band writes.
+    const tolerated = {
+      ...STATE,
+      diagnostics: {
+        ...STATE.diagnostics,
+        spend_mismatch: [{ level: "adset", level_spend: SENTINEL_SPEND, day_spend: SENTINEL_SPEND, delta: SENTINEL_SPEND, tolerance: SENTINEL_SPEND, tolerated: true }],
+        spend_mismatch_tolerated: true,
+        spend_delta_by_level: { adset: SENTINEL_SPEND },
+        spend_tolerance_by_level: { adset: SENTINEL_SPEND },
+        spend_mismatch_day_count: 1,
+        spend_mismatch_by_day: [{ date: "2026-09-14", level: "adset", level_spend: SENTINEL_SPEND, day_spend: SENTINEL_SPEND, delta: SENTINEL_SPEND }],
+        capped_entity_responses: [],
+        validation_status: "PASSED_WITH_WARNINGS",
+        validation_warnings: ["FB_SPEND_MISMATCH_TOLERATED"],
+      },
+    };
+    for (const projected of [projectFbSyncStateForViewer(tolerated)!, projectFbSyncStateForRestricted(tolerated)!]) {
+      expect(JSON.stringify(projected)).not.toContain(String(SENTINEL_SPEND));
+      expect(projected.diagnostics).toMatchObject({ validation_status: "PASSED_WITH_WARNINGS" });
+      expect(projected.diagnostics).not.toHaveProperty("spend_delta_by_level");
+      expect(projected.diagnostics).not.toHaveProperty("spend_mismatch_by_day");
+    }
+  });
+
+  it("an empty-day rejection: the per-day empty spend list is stripped, the failure code survives", () => {
+    // Shape of the diagnostics a sync rejected for an empty adset / ad day writes.
+    const rejected = {
+      ...STATE,
+      status: "failed",
+      diagnostics: {
+        ...STATE.diagnostics,
+        validation_status: "FAILED",
+        error_code: "FB_SPEND_MISMATCH",
+        spend_mismatch: [{ level: "adset", level_spend: SENTINEL_SPEND, day_spend: SENTINEL_SPEND, delta: SENTINEL_SPEND, tolerance: 0.05, tolerated: false, empty_days: 1 }],
+        spend_empty_day_count: 1,
+        spend_empty_days: [{ date: "2026-09-14", level: "adset", day_spend: SENTINEL_SPEND }],
+      },
+    };
+    for (const projected of [projectFbSyncStateForViewer(rejected)!, projectFbSyncStateForRestricted(rejected)!]) {
+      expect(JSON.stringify(projected)).not.toContain(String(SENTINEL_SPEND));
+      expect(projected.diagnostics).toMatchObject({ validation_status: "FAILED", error_code: "FB_SPEND_MISMATCH" });
+      expect(projected.diagnostics).not.toHaveProperty("spend_empty_days");
+      expect(projected.diagnostics).not.toHaveProperty("spend_empty_day_count");
+    }
+  });
+
   it("the browser's FB warehouse version is unchanged by the projection (Cohorts / FB caches keep keying)", () => {
     const diagnostics = { warehouse_rows: 3000 } as FbStatusResponse["diagnostics"];
     const full = fbWarehouseVersionFromStatus({ ok: true, state: STATE, diagnostics });

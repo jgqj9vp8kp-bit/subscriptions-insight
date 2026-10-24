@@ -202,6 +202,45 @@ describe("Warehouse V2 dual-write (Phase 1)", () => {
     const registry = inserts.filter((entry) => entry.table === FB_BATCH_REGISTRY_TABLE);
     expect(registry.map((entry) => entry.values[0].status)).toEqual(["staged", "rolled_back"]);
   });
+
+  it("tolerated adset drift → batch published, spend_cross_level WARNS with the per-level deltas", async () => {
+    const inserts: CapturedInsert[] = [];
+    const drifting: CapsuledFetcher = async (from, to, level) => {
+      if (level === "day") {
+        return { envelope: { ...ENVELOPE, rows: [{ date: "2026-07-14", spend: 100, fbPurchases: 5 }] }, bytes: 200, latencyMs: 4 };
+      }
+      // Adset carries $0.50 more than day = campaign: within max($1, 0.5%).
+      const row = level === "adset"
+        ? { ...CAMPAIGN_ROW, dateFrom: from, dateTo: to, adsetId: "as_1", adsetName: "Set", spend: 100.5 }
+        : { ...CAMPAIGN_ROW, dateFrom: from, dateTo: to };
+      return { envelope: { ...ENVELOPE, rows: [row] }, bytes: 300, latencyMs: 6 };
+    };
+    const result = await runFacebookStatsSync({
+      authUserId: "user-1",
+      supabase: fakeSupabase(),
+      clickhouse: fakeClickHouse({ inserts, countSequence: [0, 3] }),
+      fetcher: drifting,
+      request: { mode: "incremental", last_days: 2, levels: ["campaign", "adset", "day"] },
+      now: new Date("2026-07-15T10:00:00.000Z"),
+    });
+
+    expect(result.status).toBe("completed");
+    expect(inserts.filter((entry) => entry.table === "fact_facebook_stats")).toHaveLength(1);
+    const registry = inserts.filter((entry) => entry.table === FB_BATCH_REGISTRY_TABLE);
+    expect(registry.map((entry) => entry.values[0].status)).toEqual(["staged", "validated", "published"]);
+    const dq = inserts.filter((entry) => entry.table === FB_DQ_RESULTS_TABLE);
+    expect(dq).toHaveLength(1);
+    const spendCheck = dq[0].values.find((row) => row.check_name === "spend_cross_level")!;
+    expect(spendCheck.status).toBe("warn");
+    expect(JSON.parse(String(spendCheck.details))).toMatchObject({
+      mismatched_levels: 1,
+      tolerated: true,
+      delta_by_level: { campaign: 0, adset: 0.5 },
+      tolerance_by_level: { campaign: 0.05, adset: 1 },
+      mismatches: [{ level: "adset", delta: 0.5, tolerance: 1, tolerated: true }],
+      mismatch_day_count: 1,
+    });
+  });
 });
 
 describe("V2 writer helpers", () => {
@@ -224,5 +263,27 @@ describe("V2 writer helpers", () => {
       "grain_single_day:fail",
       "spend_cross_level:fail",
     ]);
+  });
+
+  it("buildFbV2DqChecks: a tolerated spend mismatch warns, an untolerated one still fails", () => {
+    const report = { coverage_pct: 100, duplicate_keys: 0, spend_total: 41384.39 };
+    const spendCheck = (input: Partial<Parameters<typeof buildFbV2DqChecks>[0]>) =>
+      buildFbV2DqChecks({ dqReport: report, mergedRowsDetected: 0, spendMismatchCount: 0, ...input })
+        .find((check) => check.check_name === "spend_cross_level")!;
+    expect(spendCheck({}).status).toBe("pass");
+    expect(spendCheck({}).details).toEqual({ mismatched_levels: 0, spend_total: 41384.39 });
+    const tolerated = spendCheck({
+      spendMismatchCount: 2,
+      spendMismatchTolerated: true,
+      spendMismatchDetails: { delta_by_level: { adset: 36.88, ad: 37.08 } },
+    });
+    expect(tolerated.status).toBe("warn");
+    expect(tolerated.details).toEqual({
+      mismatched_levels: 2,
+      spend_total: 41384.39,
+      tolerated: true,
+      delta_by_level: { adset: 36.88, ad: 37.08 },
+    });
+    expect(spendCheck({ spendMismatchCount: 1, spendMismatchTolerated: false }).status).toBe("fail");
   });
 });

@@ -376,6 +376,11 @@ export function buildFbV2DqChecks(input: {
   dqReport: Record<string, unknown>;
   mergedRowsDetected: number;
   spendMismatchCount: number;
+  /** Every mismatching level is within its band (adset / ad drift, facebookStats.ts
+   * evaluateFbSpendGate): the batch was published, so the check warns, not fails. */
+  spendMismatchTolerated?: boolean;
+  /** Extra spend_cross_level details (per-level deltas and bands). */
+  spendMismatchDetails?: Record<string, unknown>;
 }): FbV2DqCheck[] {
   const coveragePct = Number(input.dqReport.coverage_pct ?? 0);
   const duplicateKeys = Number(input.dqReport.duplicate_keys ?? 0);
@@ -402,8 +407,13 @@ export function buildFbV2DqChecks(input: {
     },
     {
       check_name: "spend_cross_level",
-      status: input.spendMismatchCount === 0 ? "pass" : "fail",
-      details: { mismatched_levels: input.spendMismatchCount, spend_total: input.dqReport.spend_total ?? null },
+      status: input.spendMismatchCount === 0 ? "pass" : input.spendMismatchTolerated ? "warn" : "fail",
+      details: {
+        mismatched_levels: input.spendMismatchCount,
+        spend_total: input.dqReport.spend_total ?? null,
+        ...(input.spendMismatchCount > 0 ? { tolerated: input.spendMismatchTolerated === true } : {}),
+        ...(input.spendMismatchDetails ?? {}),
+      },
     },
   ];
 }
