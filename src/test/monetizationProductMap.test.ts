@@ -17,9 +17,9 @@ import {
 const JPY_2400_FUNNEL_UPSELL = "price_01M3BW7TT3TXZRHCRY4BFGS8M7";
 
 describe("price-id lists", () => {
-  it("holds 90 token ids, 7 in-product upsell ids and no funnel-upsell id", () => {
-    expect(knownTokenPriceIds).toHaveLength(90);
-    expect(knownAppUpsellPriceIds).toHaveLength(7);
+  it("holds 74 token ids, 87 in-product ids (7 upsell + 80 paid reports) and no funnel-upsell id", () => {
+    expect(knownTokenPriceIds).toHaveLength(74);
+    expect(knownAppUpsellPriceIds).toHaveLength(87);
     expect(knownFunnelUpsellPriceIds).toHaveLength(0);
     expect(knownTokenPricePointPrefixes).toEqual(["price_web_tokens"]);
   });
@@ -34,6 +34,25 @@ describe("price-id lists", () => {
   it("no listed id matches the token prefix (the prefix rule is for future web-app packs)", () => {
     const all = [...knownTokenPriceIds, ...knownAppUpsellPriceIds];
     expect(all.filter((id) => knownTokenPricePointPrefixes.some((prefix) => id.startsWith(prefix)))).toEqual([]);
+  });
+
+  it("the paid reports of the 09-10 / 09-18 batches are in-product purchases, not tokens (FunnelFox, 2026-10-25)", () => {
+    const reports = {
+      wealthLineJpy799: "price_01M2SSJP60614ZNS4FXBE277J5",
+      mysteriousSignJpy480: "price_01M2SSMGQPM0D80Q5WHQZAEG4H",
+      secondHandJpy1499: "price_01M2SSM9YEY6KFKCPPF6Q8AZ51",
+      yearByHandJpy1559: "price_01M2SSM2ZTFYCXT1EH2KQ20XN7",
+      unlockAllDaysJpy480: "price_01M2632WE6284ZZJWFZ5EPG6BT",
+      unlockAllDaysUsd299: "price_01M260883ZSH31PKMB75KD3QJH",
+    };
+    for (const [name, id] of Object.entries(reports)) {
+      expect(knownAppUpsellPriceIds, name).toContain(id);
+      expect(knownTokenPriceIds, name).not.toContain(id);
+    }
+    // No price of the two batches is left among the tokens.
+    expect(knownTokenPriceIds.filter((id) => id.startsWith("price_01M2SS") || id.startsWith("price_01M26"))).toEqual([]);
+    // The real JPY token pack (200+50 Web tokens, ¥649) is untouched by the move.
+    expect(knownAppUpsellPriceIds).not.toContain("price_01M3YB4RGX9KMNWCSRHQXK2NHT");
   });
 
   it("the unmarked JPY 2400 funnel upsell is in no list", () => {

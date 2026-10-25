@@ -469,7 +469,26 @@ Owner-approved. Before it, every successful unmarked payment within 48 h of the 
 
 Signals:
 - The FunnelFox price id every Primer row carries: `metadata.ff_price_point`, ClickHouse `analytics_transactions.price_point`.
-- The config in `monetizationProductMap.ts`: `knownTokenPriceIds` (90 ids), `knownAppUpsellPriceIds` (7 ids, batch 2026-09-29), `knownFunnelUpsellPriceIds` (empty) and the `price_web_tokens*` prefix. Each id is validated at module load (`PRICE_ID_RE`, no id in two lists), which keeps the inline SQL literals safe.
+- The config in `monetizationProductMap.ts`: `knownTokenPriceIds` (74 ids), `knownAppUpsellPriceIds` (87 ids: the 2026-09-29 upsell batch and the paid reports, see below), `knownFunnelUpsellPriceIds` (empty) and the `price_web_tokens*` prefix. Each id is validated at module load (`PRICE_ID_RE`, no id in two lists), which keeps the inline SQL literals safe.
+
+Paid reports (owner, 2026-10-25). The token batches of 2026-09-10 (3 ids) and 2026-09-18 (13 ids) were inferred from creation dates. In FunnelFox (project Azora New) they belong to paid one-off reports, not token packs. They were moved, with every other price of the same products (80 ids, read from the products' price pages), to `knownAppUpsellPriceIds`, so Cohorts shows them under "In-product upsell". The products:
+- Palmistry - Wealth Line: $4.99, ¥799;
+- Palmistry - Mysterious Sign: $2.99, ¥480;
+- Palmistry - Second Hand: Fate and Choice: $8.99, ¥1,499;
+- Palmistry - Year by Hand: $9.99, ¥1,559;
+- Pastlife - Unlock All Days: $2.99, ¥480.
+
+How it was found: the owner's JP token screen shows packs at ¥649 / ¥1,649 / ¥2,459 / ¥4,039 and the token subscription at ¥799 / ¥1,599 / ¥4,890. No JPY payment was ever made at those prices except ¥799, and that one is Wealth Line. The real JPY token prices are on the token products, e.g. 200+50 Web tokens ¥649 and 120+20 Web tokens ¥1,649.
+
+Still open: the 2026-08-14 token batch (26 ids, e.g. ¥640 / ¥480 and $1 / $2.99 / $3.99) is in no Azora New one-off product. Its products are unknown.
+
+As with any id change: anchors do not move (the id rules only re-type one-offs inside 48 h), so no snapshot rebuild is needed. A report bought more than 48 h after the trial stays lifecycle, like an unlisted one-off. The owner SQL golden was regenerated (owner-requested change): 126 of 339 scenarios changed, only in the inlined price-id literals.
+
+Effect, replayed offline with the live classifier rules on the source rows to 2026-10-21. In the owner's view (palm-reading-month-web, JP, cohorts from 10-01, 120 trials):
+- token buyers 11 → 3 and purchases 17 → 5;
+- in-product buyers 25 → 29 and purchases 25 → 37.
+
+Across all report buyers (34 members in 14 funnel / country / month groups): token buyers 25 → 3 and purchases 34 → 3; in-product buyers 10 → 26 and purchases 10 → 41.
 - "Ever marked" (`upp`): every price id the tenant has ever seen with the upsell mark. It is read from the table, never from the filtered `base`.
 
 `monetizationTyping.ts` holds ONE rule table. The SQL (`oneOffTypingSql`) and the TS evaluator (`classifyOneOff`) are both built from it. Precedence:
