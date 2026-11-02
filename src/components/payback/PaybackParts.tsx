@@ -39,7 +39,7 @@ export function VerdictBadge({ status, className }: { status: PaybackStatus; cla
         data-testid="payback-verdict"
         data-tone={tone}
         // rounded-lg, not a pill: a long verdict wraps to two lines in the narrow column.
-        className={cn("inline-flex max-w-full items-center rounded-lg px-2 py-0.5 text-[11px] font-medium leading-tight", TONE_CLASS[tone], className)}
+        className={cn("inline-flex max-w-full items-center rounded-lg px-2 py-0.5 text-[11px] font-medium leading-tight min-[1800px]:text-xs", TONE_CLASS[tone], className)}
       >
         {paybackStatusLabel(status)}
       </span>

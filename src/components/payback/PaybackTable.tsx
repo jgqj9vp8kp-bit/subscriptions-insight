@@ -31,7 +31,7 @@ function SortHead({ label, k, sort, onSort, info, align = "right" }: {
   const Icon = !active ? ArrowUpDown : sort.dir === "asc" ? ArrowUp : ArrowDown;
   return (
     <TableHead
-      className={cn("h-auto px-2 py-1.5 text-[11px] font-medium leading-tight", align === "right" ? "text-right" : "text-left")}
+      className={cn("h-auto px-2 py-1.5 text-[11px] font-medium leading-tight min-[1800px]:px-3 min-[1800px]:py-2 min-[1800px]:text-xs", align === "right" ? "text-right" : "text-left")}
       aria-sort={active ? (sort.dir === "asc" ? "ascending" : "descending") : "none"}
     >
       {/* Narrow columns wrap their label to two lines instead of widening the table. */}
@@ -76,7 +76,7 @@ export function PaybackTable({ result, show, sort, onSort, names, openKey, onOpe
           <button type="button" className="truncate text-left font-semibold hover:underline" aria-label={COPY.openDetails(label)} onClick={(event) => { event.stopPropagation(); onOpen(row.key); }}>
             {label}
           </button>
-          <span className="shrink-0 text-[11px] text-muted-foreground">{COPY.totalFunnels(total.paths.length)}</span>
+          <span className="shrink-0 text-[11px] text-muted-foreground min-[1800px]:text-xs">{COPY.totalFunnels(total.paths.length)}</span>
           {total.excludedFunnels > 0 && <InfoTip label={PAYBACK_COPY.aria.excluded}>{COPY.totalExcluded(total.excludedFunnels, total.excludedTrials)}</InfoTip>}
         </span>
       );
@@ -97,7 +97,7 @@ export function PaybackTable({ result, show, sort, onSort, names, openKey, onOpe
           <button type="button" className="truncate text-left font-medium hover:underline" aria-label={COPY.openDetails(label)} onClick={(event) => { event.stopPropagation(); onOpen(row.key); }}>
             {label}
           </button>
-          <span className="shrink-0 text-[11px] text-muted-foreground">{COPY.smallHint(result.small?.rows.length ?? 0)}</span>
+          <span className="shrink-0 text-[11px] text-muted-foreground min-[1800px]:text-xs">{COPY.smallHint(result.small?.rows.length ?? 0)}</span>
         </span>
       );
     }
@@ -107,7 +107,7 @@ export function PaybackTable({ result, show, sort, onSort, names, openKey, onOpe
         <button type="button" className="block max-w-full truncate text-left font-medium hover:underline" title={named ? `${label} · ${row.key}` : row.key} aria-label={COPY.openDetails(label)} onClick={(event) => { event.stopPropagation(); onOpen(row.key); }}>
           {label}
         </button>
-        {named && <span className="block truncate text-[10px] leading-tight text-muted-foreground">{row.key}</span>}
+        {named && <span className="block truncate text-[10px] leading-tight text-muted-foreground min-[1800px]:text-xs">{row.key}</span>}
       </span>
     );
   };
@@ -121,18 +121,18 @@ export function PaybackTable({ result, show, sort, onSort, names, openKey, onOpe
       className={cn("cursor-pointer", kind === "total" && "bg-muted/40 hover:bg-muted/60", kind === "member" && "bg-muted/10")}
       onClick={() => onOpen(row.key)}
     >
-      <TableCell className="overflow-hidden px-2 py-1.5">{nameCell(row, kind)}</TableCell>
+      <TableCell className="overflow-hidden px-2 py-1.5 min-[1800px]:px-3 min-[1800px]:py-2">{nameCell(row, kind)}</TableCell>
       {/* Trials after the last day of Facebook spend are one line under the
           table and in the drilldown, not a second line in every row. */}
-      <TableCell className="px-2 py-1.5 text-right tabular-nums">{fmtInt(row.trials)}</TableCell>
-      <TableCell className="px-2 py-1.5 text-right tabular-nums">{fmtMoney(row.spend)}</TableCell>
-      <TableCell className="px-2 py-1.5 text-right tabular-nums">{fmtMoneyCents(row.cpt)}</TableCell>
+      <TableCell className="px-2 py-1.5 text-right tabular-nums min-[1800px]:px-3 min-[1800px]:py-2">{fmtInt(row.trials)}</TableCell>
+      <TableCell className="px-2 py-1.5 text-right tabular-nums min-[1800px]:px-3 min-[1800px]:py-2">{fmtMoney(row.spend)}</TableCell>
+      <TableCell className="px-2 py-1.5 text-right tabular-nums min-[1800px]:px-3 min-[1800px]:py-2">{fmtMoneyCents(row.cpt)}</TableCell>
       {row.months.map((month) => (
-        <TableCell key={month.month} className={cn("px-2 py-1.5 text-right tabular-nums", monthTintClass(month))} data-testid={`payback-m${month.month}`} data-tint={paybackRoasTint(month.roas) ?? "none"}>
+        <TableCell key={month.month} className={cn("px-2 py-1.5 text-right tabular-nums min-[1800px]:px-3 min-[1800px]:py-2", monthTintClass(month))} data-testid={`payback-m${month.month}`} data-tint={paybackRoasTint(month.roas) ?? "none"}>
           <MonthCellValue month={month} show={show} />
         </TableCell>
       ))}
-      <TableCell className="px-2 py-1.5">
+      <TableCell className="px-2 py-1.5 min-[1800px]:px-3 min-[1800px]:py-2">
         <VerdictBadge status={row.status} />
       </TableCell>
     </TableRow>
@@ -141,16 +141,17 @@ export function PaybackTable({ result, show, sort, onSort, names, openKey, onOpe
   return (
     <TooltipProvider delayDuration={150}>
       <div className="min-w-0">
-        <Table className="table-fixed text-xs" data-testid="payback-table">
+        <Table className="table-fixed text-xs min-[1800px]:text-sm" data-testid="payback-table">
           <colgroup>
-            <col />
-            <col className="w-[64px] xl:w-[72px]" />
-            <col className="w-[76px] xl:w-[88px]" />
-            <col className="w-[72px] xl:w-[92px]" />
-            <col className="w-[66px] xl:w-[84px]" />
-            <col className="w-[66px] xl:w-[84px]" />
-            <col className="w-[66px] xl:w-[84px]" />
-            <col className="w-[128px] xl:w-[176px]" />
+            {/* Wide screens: percentages spread the numbers instead of parking them far right of the names. */}
+            <col className="min-[1800px]:w-[26%]" />
+            <col className="w-[64px] xl:w-[72px] min-[1800px]:w-[7%]" />
+            <col className="w-[76px] xl:w-[88px] min-[1800px]:w-[9%]" />
+            <col className="w-[72px] xl:w-[92px] min-[1800px]:w-[9%]" />
+            <col className="w-[66px] xl:w-[84px] min-[1800px]:w-[10%]" />
+            <col className="w-[66px] xl:w-[84px] min-[1800px]:w-[10%]" />
+            <col className="w-[66px] xl:w-[84px] min-[1800px]:w-[10%]" />
+            <col className="w-[128px] xl:w-[176px] min-[1800px]:w-[19%]" />
           </colgroup>
           <TableHeader>
             <TableRow className="hover:bg-transparent">

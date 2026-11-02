@@ -16,9 +16,12 @@ interface AppLayoutProps {
   description?: string;
   actions?: ReactNode;
   children: ReactNode;
+  /** Let the page use the whole screen width instead of the 1600px cap
+   * (wide tables on large monitors). */
+  fullWidth?: boolean;
 }
 
-export function AppLayout({ title, description, actions, children }: AppLayoutProps) {
+export function AppLayout({ title, description, actions, children, fullWidth = false }: AppLayoutProps) {
   const { signOut, user } = useAuth();
   const access = useAccess();
   const location = useLocation();
@@ -88,7 +91,7 @@ export function AppLayout({ title, description, actions, children }: AppLayoutPr
               </Button>
             </div>
           </header>
-          <main className="flex-1 p-4 md:p-6 max-w-[1600px] w-full">
+          <main className={`flex-1 p-4 md:p-6 w-full ${fullWidth ? "max-w-none" : "max-w-[1600px]"}`}>
             {isSampleData && (
               <div
                 role="status"

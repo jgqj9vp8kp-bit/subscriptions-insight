@@ -360,7 +360,7 @@ export default function ForecastingPage() {
   }
 
   return (
-    <AppLayout title={COPY.page.title} description={COPY.page.description} actions={legacyLink}>
+    <AppLayout title={COPY.page.title} description={COPY.page.description} actions={legacyLink} fullWidth>
       <TooltipProvider delayDuration={150}>
         <div className="min-w-0 space-y-3">
           <Card className="min-w-0 p-3 shadow-card">
