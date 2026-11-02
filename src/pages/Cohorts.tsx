@@ -3903,6 +3903,7 @@ export default function CohortsPage() {
     <AppLayout
       title="Cohorts"
       description={isFunnelsView ? "Grouped by campaign path over the selected period" : "Grouped by trial date"}
+      fullWidth
     >
       {access.restricted && (
         <div className="mb-3">
