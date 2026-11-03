@@ -166,6 +166,8 @@ export interface PlanBreakdownRow extends Partial<CohortPaymentFailureCounts> {
   revenue_d7: number;
   revenue_d30: number;
   revenue_d60: number;
+  /** Optional: absent on rows cached before the Gross LTV 3M column. */
+  revenue_d90?: number;
   net_ltv: number;
 }
 
@@ -341,6 +343,9 @@ export interface CohortRow extends CohortMonetizationFields, CohortFbFields, Par
   revenue_d14: number;
   revenue_d30: number;
   revenue_d60: number;
+  /** Net revenue with d <= 90. Optional: absent on rows cached before the
+   * Gross LTV 3M column (2026-11-02); the UI then shows "—", never 0. */
+  revenue_d90?: number;
   revenue_d37: number;
   revenue_d67: number;
   revenue_total: number;

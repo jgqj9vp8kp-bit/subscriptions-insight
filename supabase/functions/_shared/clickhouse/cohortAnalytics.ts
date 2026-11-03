@@ -132,6 +132,7 @@ interface MutablePlanBreakdown {
   revenue_d7: number;
   revenue_d30: number;
   revenue_d60: number;
+  revenue_d90: number;
   first_subscription_revenue: number;
 }
 
@@ -161,6 +162,7 @@ function createPlanBreakdown(price: number): MutablePlanBreakdown {
     revenue_d7: 0,
     revenue_d30: 0,
     revenue_d60: 0,
+    revenue_d90: 0,
     first_subscription_revenue: 0,
   };
 }
@@ -206,6 +208,7 @@ function finalizePlanBreakdown(row: MutablePlanBreakdown): PlanBreakdownRow {
     revenue_d7: round2(row.revenue_d7),
     revenue_d30: round2(row.revenue_d30),
     revenue_d60: round2(row.revenue_d60),
+    revenue_d90: round2(row.revenue_d90),
     net_ltv: row.trial_users ? round2(netRevenue / row.trial_users) : 0,
   };
 }
@@ -864,7 +867,7 @@ export function computeCohortsWithDiagnostics(
     const planBreakdown = new Map<number, MutablePlanBreakdown>();
     let trial_revenue = 0, upsell_revenue = 0, first_subscription_revenue = 0, renewal_revenue = 0;
     let amount_refunded = 0, gross_revenue = 0;
-    let revenue_d0 = 0, revenue_d7 = 0, revenue_d14 = 0, revenue_d30 = 0, revenue_d60 = 0, revenue_d37 = 0, revenue_d67 = 0, revenue_total = 0;
+    let revenue_d0 = 0, revenue_d7 = 0, revenue_d14 = 0, revenue_d30 = 0, revenue_d60 = 0, revenue_d90 = 0, revenue_d37 = 0, revenue_d67 = 0, revenue_total = 0;
     // Monetization: multi-upsell slots + token pack purchases. Slots are
     // assigned by the ORDER of the user's successful upsell purchases (the
     // audit showed no ordinal signal on the payments themselves).
@@ -975,6 +978,7 @@ export function computeCohortsWithDiagnostics(
         if (day <= 14) revenue_d14 += net;
         if (day <= 30) revenue_d30 += net;
         if (day <= 60) revenue_d60 += net;
+        if (day <= 90) revenue_d90 += net;
         if (day <= 37) revenue_d37 += net;
         if (day <= 67) revenue_d67 += net;
         revenue_total += net;
@@ -986,6 +990,7 @@ export function computeCohortsWithDiagnostics(
           if (day <= 7) plan.revenue_d7 += net;
           if (day <= 30) plan.revenue_d30 += net;
           if (day <= 60) plan.revenue_d60 += net;
+          if (day <= 90) plan.revenue_d90 += net;
         }
         {
           const currencyRow = currencyRowFor(txCurrency(t));
@@ -1219,6 +1224,7 @@ export function computeCohortsWithDiagnostics(
       revenue_d14: round2(revenue_d14),
       revenue_d30: round2(revenue_d30),
       revenue_d60: round2(revenue_d60),
+      revenue_d90: round2(revenue_d90),
       revenue_d37: round2(revenue_d37),
       revenue_d67: round2(revenue_d67),
       revenue_total: round2(revenue_total),

@@ -139,6 +139,8 @@ export interface CohortAggregateRow extends Partial<CohortPaymentFailureCounts> 
   revenue_d14: number;
   revenue_d30: number;
   revenue_d60: number;
+  /** Optional: absent on responses cached before the Gross LTV 3M column (2026-11-02). */
+  revenue_d90?: number;
   net_revenue_1m: number;
   ltv_1m_per_user: number;
 
@@ -226,6 +228,7 @@ export interface CohortTotals extends Partial<CohortPaymentFailureCounts> {
   revenue_d7: number;
   revenue_d30: number;
   revenue_d60: number;
+  revenue_d90?: number;
   ltv_1m_per_user: number;
   upsell_1_users: number;
   upsell_2_users: number;

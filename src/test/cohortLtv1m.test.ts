@@ -188,3 +188,17 @@ describe("sorting by LTV 1M / User", () => {
     expect(asc.map((c) => c.campaign_path)).toEqual(["lo", "hi"]);
   });
 });
+
+describe("legacy engine revenue_d90 (Gross LTV 3M)", () => {
+  it("counts net revenue with d <= 90 only; later payments stay in Net Rev", () => {
+    const [cohort] = computeCohorts([
+      tx("u1", "trial", "2026-01-01T00:00:00Z", { amount_usd: 1 }),
+      tx("u1", "first_subscription", "2026-01-31T00:00:00Z", { amount_usd: 10 }), // d30
+      tx("u1", "renewal", "2026-03-17T00:00:00Z", { amount_usd: 10 }), // d75
+      tx("u1", "renewal", "2026-04-11T00:00:00Z", { amount_usd: 10 }), // d100
+    ]);
+    expect(cohort.revenue_d60).toBe(11);
+    expect(cohort.revenue_d90).toBe(21);
+    expect(cohort.net_revenue).toBe(31);
+  });
+});

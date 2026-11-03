@@ -51,6 +51,15 @@ export type CohortsUiSettingsMergeResult = {
   source: "local" | "cloud" | "none";
 };
 
+/** New columns that belong beside an existing one: a saved order that lacks the
+ * key but has the anchor gets the key right after the anchor, not at the end.
+ * Keys are listed in default order, so a chain lands in sequence. */
+const COLUMN_INSERT_AFTER: Readonly<Record<string, string>> = {
+  ltv_2m_per_user: "ltv_1m_per_user",
+  ltv_3m_per_user: "ltv_2m_per_user",
+  ltv_all_time_per_user: "ltv_3m_per_user",
+};
+
 export function sanitizeColumnOrder(input: unknown, defaultOrder: readonly string[]): string[] {
   const valid = new Set(defaultOrder);
   const seen = new Set<string>();
@@ -66,7 +75,11 @@ export function sanitizeColumnOrder(input: unknown, defaultOrder: readonly strin
   }
 
   for (const id of defaultOrder) {
-    if (!seen.has(id)) next.push(id);
+    if (seen.has(id)) continue;
+    const anchor = COLUMN_INSERT_AFTER[id];
+    const anchorIndex = anchor ? next.indexOf(anchor) : -1;
+    if (anchorIndex >= 0) next.splice(anchorIndex + 1, 0, id);
+    else next.push(id);
   }
 
   return next;

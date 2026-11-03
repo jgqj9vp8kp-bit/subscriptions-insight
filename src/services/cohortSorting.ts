@@ -1,5 +1,5 @@
 import type { CohortRow } from "@/services/types";
-import { renewalUsersForColumn, trialCostForCohort } from "@/services/cohortReporting";
+import { cohortLtvPerUser, isCohortLtvColumn, renewalUsersForColumn, trialCostForCohort } from "@/services/cohortReporting";
 import { normalizeCohortDateKey } from "@/services/cohortFiltering";
 
 export type CohortSortDirection = "asc" | "desc";
@@ -61,6 +61,7 @@ export function getCohortSortValue(
 ): string | number | null {
   const renewalUsers = renewalUsersForColumn(cohort, columnId);
   if (renewalUsers != null) return renewalUsers;
+  if (isCohortLtvColumn(columnId)) return cohortLtvPerUser(cohort, columnId);
 
   switch (columnId) {
     case "__cohort__":
