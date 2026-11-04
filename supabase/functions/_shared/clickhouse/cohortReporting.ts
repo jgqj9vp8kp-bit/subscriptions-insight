@@ -70,6 +70,13 @@ export function cohortLtvPerUser(
   return row.trial_users ? Math.round((revenue / row.trial_users) * 100) / 100 : 0;
 }
 
+/** Age a cohort needs before its Gross LTV 2M / 3M window has closed; until then
+ * the number can still grow. All Time has no window. */
+export const COHORT_LTV_WINDOW_DAYS: Partial<Record<CohortLtvColumnId, number>> = {
+  ltv_2m_per_user: 60,
+  ltv_3m_per_user: 90,
+};
+
 export interface CohortReportTotals {
   totalTrialUsers: number;
   totalSupportUsers: number;
@@ -118,6 +125,9 @@ export interface CohortReportTotals {
   ltv2mPerUser: number;
   ltv3mPerUser: number | null;
   ltvAllTimePerUser: number;
+  /** "" when there are no rows. A window's total is final only once even this
+   * cohort has matured. */
+  newestCohortDate: string;
   trafficSpend: number;
   hasTrafficSpend: boolean;
   hasCompleteTrafficSpend: boolean;
@@ -435,6 +445,10 @@ export function computeCohortReportTotals(
     ltv2mPerUser: totalTrialUsers ? totalRevenueD60 / totalTrialUsers : 0,
     ltv3mPerUser: totalRevenueD90 == null ? null : totalTrialUsers ? totalRevenueD90 / totalTrialUsers : 0,
     ltvAllTimePerUser: totalTrialUsers ? netRevenue / totalTrialUsers : 0,
+    newestCohortDate: cohorts.reduce((newest, c) => {
+      const date = String(c.cohort_date ?? "").slice(0, 10);
+      return date > newest ? date : newest;
+    }, ""),
     trafficSpend: totalTrafficSpend,
     hasTrafficSpend,
     hasCompleteTrafficSpend,
@@ -468,17 +482,18 @@ export const LTV_1M_MATURITY_DAYS = 30;
 export interface CohortMaturity {
   /** Whole days between the cohort start date and `nowMs`. */
   age_days: number;
-  /** True once the cohort has at least 30 days of realized revenue. */
+  /** True once the cohort has realized revenue for the whole window. */
   matured: boolean;
-  /** Days of revenue actually available so far (capped at 30). */
+  /** Days of revenue actually available so far (capped at the window). */
   available_days: number;
 }
 
 /**
- * 1M-LTV maturity for a cohort. `nowMs` is injected (never read from the clock
- * here) so callers stay deterministic and analytics stays clock-free.
+ * LTV maturity for a cohort against a revenue window (1M unless given). `nowMs`
+ * is injected (never read from the clock here) so callers stay deterministic and
+ * analytics stays clock-free.
  */
-export function cohortMaturity(cohortDate: string, nowMs: number): CohortMaturity {
+export function cohortMaturity(cohortDate: string, nowMs: number, windowDays = LTV_1M_MATURITY_DAYS): CohortMaturity {
   const startMs = Date.parse(`${String(cohortDate ?? "").slice(0, 10)}T00:00:00.000Z`);
   if (!Number.isFinite(startMs) || !Number.isFinite(nowMs)) {
     return { age_days: 0, matured: false, available_days: 0 };
@@ -486,7 +501,7 @@ export function cohortMaturity(cohortDate: string, nowMs: number): CohortMaturit
   const ageDays = Math.max(0, Math.floor((nowMs - startMs) / (24 * 60 * 60 * 1000)));
   return {
     age_days: ageDays,
-    matured: ageDays >= LTV_1M_MATURITY_DAYS,
-    available_days: Math.min(ageDays, LTV_1M_MATURITY_DAYS),
+    matured: ageDays >= windowDays,
+    available_days: Math.min(ageDays, windowDays),
   };
 }

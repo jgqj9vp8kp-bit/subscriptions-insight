@@ -36,7 +36,7 @@ import {
   formatPct,
 } from "@/services/analytics";
 import { aggregateTokenPackBreakdowns, type TokenPackRow } from "@/services/monetization";
-import { cohortLtvPerUser, computeCohortMonetizationTotals, cohortMaturity, LTV_1M_MATURITY_DAYS } from "@/services/cohortReporting";
+import { COHORT_LTV_WINDOW_DAYS, cohortLtvPerUser, computeCohortMonetizationTotals, cohortMaturity, LTV_1M_MATURITY_DAYS, type CohortLtvColumnId } from "@/services/cohortReporting";
 import { SUPPORTED_CURRENCIES } from "@/services/fxRates";
 import {
   getFunnelFoxSubscriptionsSyncState,
@@ -692,8 +692,8 @@ const COLUMN_HELP: Partial<Record<CohortColumnId, string>> = {
   revenue_d30: USD_CONVERTED_NOTE,
   revenue_d60: USD_CONVERTED_NOTE,
   ltv_1m_per_user: "Net revenue generated within the first 30 days after cohort start divided by trial users. Converted to USD.",
-  ltv_2m_per_user: "Net revenue generated within the first 60 days after cohort start divided by trial users. Cohorts younger than 60 days are still accumulating. Converted to USD.",
-  ltv_3m_per_user: "Net revenue generated within the first 90 days after cohort start divided by trial users. Cohorts younger than 90 days are still accumulating. Converted to USD.",
+  ltv_2m_per_user: "Net revenue generated within the first 60 days after cohort start divided by trial users. Grey until the cohort is 60 days old (funnel and Total rows: their newest cohort), because the number can still grow. Converted to USD.",
+  ltv_3m_per_user: "Net revenue generated within the first 90 days after cohort start divided by trial users. Grey until the cohort is 90 days old (funnel and Total rows: their newest cohort), because the number can still grow. Converted to USD.",
   ltv_all_time_per_user: "All net revenue of the cohort so far (Net Rev) divided by trial users. Converted to USD.",
   support_users: "Unique trial users in this cohort whose normalized email appears in ClickHouse Support Analytics.",
   support_rate: "Support Users / Trial Users.",
@@ -3104,6 +3104,28 @@ export default function CohortsPage() {
     return `${base} ${SECTION_DIVIDER_COLUMNS.has(id) ? SECTION_DIVIDER : ""}`;
   };
   const dash = <span className="text-muted-foreground/40">—</span>;
+  // Gross LTV 2M / 3M stay grey until the window has closed for the row's
+  // cohort: on funnel and Total rows, for the newest cohort in them.
+  const renderLtvCell = (
+    id: CohortLtvColumnId,
+    value: number | null,
+    cohortDate: string,
+    className: string,
+    pendingClass = "text-muted-foreground",
+  ) => {
+    const windowDays = COHORT_LTV_WINDOW_DAYS[id];
+    const maturity = windowDays != null ? cohortMaturity(cohortDate, nowMs, windowDays) : null;
+    const pending = maturity != null && !maturity.matured;
+    return (
+      <TableCell
+        key={id}
+        className={pending ? `${className} ${pendingClass}` : className}
+        title={pending ? `Not final yet: ${maturity.age_days} of ${windowDays} days passed. ${COLUMN_HELP[id]}` : COLUMN_HELP[id]}
+      >
+        {value != null ? formatCurrency(value) : dash}
+      </TableCell>
+    );
+  };
   const formatRoas = (value: number) => `${value.toFixed(2)}x`;
   const sortState = useMemo(() => ({ sortColumn, sortDirection }), [sortColumn, sortDirection]);
   const onSortColumn = (id: string) => {
@@ -3430,10 +3452,8 @@ export default function CohortsPage() {
         return <TableCell key={id} className={className} title={COLUMN_HELP.ltv_1m_per_user}>{formatCurrency(c.ltv_1m_per_user ?? 0)}</TableCell>;
       case "ltv_2m_per_user":
       case "ltv_3m_per_user":
-      case "ltv_all_time_per_user": {
-        const ltv = cohortLtvPerUser(c, id);
-        return <TableCell key={id} className={className} title={COLUMN_HELP[id]}>{ltv != null ? formatCurrency(ltv) : dash}</TableCell>;
-      }
+      case "ltv_all_time_per_user":
+        return renderLtvCell(id, cohortLtvPerUser(c, id), c.cohort_date, className);
       case "trial_revenue":
         return <TableCell key={id} className={className}>{formatCurrency(c.trial_revenue)}</TableCell>;
       case "upsell_1_users":
@@ -3617,10 +3637,9 @@ export default function CohortsPage() {
         return <TableCell key={id} className={className}>{formatCurrency(plan.trial_users ? plan.revenue_d30 / plan.trial_users : 0)}</TableCell>;
       case "ltv_2m_per_user":
       case "ltv_3m_per_user":
-      case "ltv_all_time_per_user": {
-        const ltv = cohortLtvPerUser(plan, id);
-        return <TableCell key={id} className={className}>{ltv != null ? formatCurrency(ltv) : dash}</TableCell>;
-      }
+      case "ltv_all_time_per_user":
+        // Plan rows are already muted, so pending goes one step lighter.
+        return renderLtvCell(id, cohortLtvPerUser(plan, id), cohort.cohort_date, className, "text-muted-foreground/60");
       case "trial_cost": {
         const trialCost = trialCostFromSpend(traffic?.spend, plan.trial_users);
         return <TableCell key={id} className={className} title={trafficCellTitle}>{trialCost != null ? formatCurrency(trialCost) : dash}</TableCell>;
@@ -3834,11 +3853,11 @@ export default function CohortsPage() {
       case "ltv_1m_per_user":
         return <TableCell key={id} className={className} title={COLUMN_HELP.ltv_1m_per_user}>{formatCurrency(totals.ltv1mPerUser)}</TableCell>;
       case "ltv_2m_per_user":
-        return <TableCell key={id} className={className} title={COLUMN_HELP.ltv_2m_per_user}>{formatCurrency(totals.ltv2mPerUser)}</TableCell>;
+        return renderLtvCell(id, totals.ltv2mPerUser, totals.newestCohortDate, className);
       case "ltv_3m_per_user":
-        return <TableCell key={id} className={className} title={COLUMN_HELP.ltv_3m_per_user}>{totals.ltv3mPerUser != null ? formatCurrency(totals.ltv3mPerUser) : dash}</TableCell>;
+        return renderLtvCell(id, totals.ltv3mPerUser, totals.newestCohortDate, className);
       case "ltv_all_time_per_user":
-        return <TableCell key={id} className={className} title={COLUMN_HELP.ltv_all_time_per_user}>{formatCurrency(totals.ltvAllTimePerUser)}</TableCell>;
+        return renderLtvCell(id, totals.ltvAllTimePerUser, totals.newestCohortDate, className);
       case "trial_revenue":
         return <TableCell key={id} className={className}>{formatCurrency(totals.trialRevenue)}</TableCell>;
       case "upsell_1_users":

@@ -397,4 +397,61 @@ describe("Cohorts: Gross LTV 2M / 3M / All Time columns", () => {
     expect(cells.length).toBeGreaterThan(0);
     expect(cells.every((text) => text === "—")).toBe(true);
   }, 30_000);
+
+  describe("grey until the window has closed", () => {
+    beforeEach(() => {
+      // Only Date is faked, so waitFor keeps its real timers. On this day the
+      // 2026-10-02 cohort is 64 days old and the 2026-09-01 cohort is 95.
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date("2026-12-05T12:00:00.000Z"));
+      h.cohortsQuery = {
+        ...cohortsQuery(),
+        chResult: {
+          ...RESULT,
+          cohorts: [
+            mapAggregateToCohortRow(agg({ cohort_date: "2026-10-02", revenue_d90: 930 })),
+            mapAggregateToCohortRow(agg({ cohort_date: "2026-09-01", trial_users: 50, revenue_d90: 960 })),
+          ],
+        },
+      };
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    /** The money cells of one column. */
+    function moneyCells(header: string): HTMLElement[] {
+      const headers = screen.getAllByRole("columnheader");
+      const index = headers.findIndex((cell) => (cell.textContent ?? "").includes(header));
+      expect(index, header).toBeGreaterThanOrEqual(0);
+      return [...headers[index].closest("table")!.querySelectorAll("tbody tr")]
+        .map((row) => row.children[index] as HTMLElement)
+        .filter((cell) => cell?.textContent?.startsWith("$"));
+    }
+
+    const greyByValue = (header: string) =>
+      Object.fromEntries(moneyCells(header).map((cell) => [cell.textContent, cell.classList.contains("text-muted-foreground")]));
+
+    it("greys a cohort younger than the window and a Total whose newest cohort is", async () => {
+      renderWith(<CohortsPage />, OWNER());
+      expect(greyByValue("Gross LTV 2M")).toEqual({ "$9.00": false, "$18.00": false, "$12.00": false });
+      expect(greyByValue("Gross LTV 3M")).toEqual({ "$9.30": true, "$19.20": false, "$12.60": true });
+      expect(greyByValue("Gross LTV All Time")).toEqual({ "$9.50": false, "$19.00": false, "$12.67": false });
+
+      const cells = moneyCells("Gross LTV 3M");
+      expect(cells.find((cell) => cell.textContent === "$9.30")?.title).toContain("Not final yet: 64 of 90 days passed.");
+      expect(cells.find((cell) => cell.textContent === "$19.20")?.title).not.toContain("Not final yet");
+    }, 30_000);
+
+    it("greys a funnel row while its newest cohort is younger than the window", async () => {
+      renderWith(<CohortsPage />, OWNER());
+      fireEvent.mouseDown(screen.getByRole("tab", { name: "Funnels" }), { button: 0 });
+      await waitFor(() => expect(screen.getByRole("tab", { name: "Funnels" })).toHaveAttribute("data-state", "active"));
+      // The funnel row and the Total row hold the same value here.
+      await waitFor(() => expect(moneyCells("Gross LTV 3M").filter((cell) => cell.textContent === "$12.60")).toHaveLength(2));
+      expect(greyByValue("Gross LTV 2M")).toEqual({ "$12.00": false });
+      expect(greyByValue("Gross LTV 3M")).toEqual({ "$12.60": true });
+    }, 30_000);
+  });
 });

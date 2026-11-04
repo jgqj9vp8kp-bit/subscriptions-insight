@@ -135,6 +135,21 @@ describe("cohort maturity", () => {
     expect(maturity.age_days).toBe(12);
     expect(maturity.available_days).toBe(12);
   });
+
+  it("measures a longer window when given one", () => {
+    expect(cohortMaturity("2026-05-01", may1 + 45 * 24 * 3600e3, 60)).toEqual({ age_days: 45, matured: false, available_days: 45 });
+    expect(cohortMaturity("2026-05-01", may1 + 60 * 24 * 3600e3, 60)).toEqual({ age_days: 60, matured: true, available_days: 60 });
+    expect(cohortMaturity("2026-05-01", may1 + 89 * 24 * 3600e3, 90).matured).toBe(false);
+  });
+
+  it("totals carry the newest cohort date, the one a window's total waits for", () => {
+    const cohorts = computeCohorts([
+      tx("a", "trial", "2026-05-01T00:00:00Z", { campaign_path: "a" }),
+      tx("b", "trial", "2026-05-05T00:00:00Z", { campaign_path: "b" }),
+    ]);
+    expect(computeCohortReportTotals(cohorts).newestCohortDate).toBe("2026-05-05");
+    expect(computeCohortReportTotals([]).newestCohortDate).toBe("");
+  });
 });
 
 describe("total row weighted LTV 1M", () => {
