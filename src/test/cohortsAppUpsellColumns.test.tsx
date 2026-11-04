@@ -345,3 +345,56 @@ describe("Cohorts: in-product upsell columns", () => {
     for (const header of APP_HEADERS) expect(texts.some((text) => text.includes(header)), header).toBe(false);
   }, 30_000);
 });
+
+// Gross LTV 2M / 3M / All Time (2026-11-02): visible by default right after
+// Gross LTV 1M, in the Cohorts and the Funnels table alike.
+describe("Cohorts: Gross LTV 2M / 3M / All Time columns", () => {
+  const LTV_HEADERS = ["Gross LTV 1M", "Gross LTV 2M", "Gross LTV 3M", "Gross LTV All Time"];
+
+  function withD90() {
+    h.cohortsQuery = {
+      ...cohortsQuery(),
+      chResult: {
+        ...RESULT,
+        cohorts: [
+          mapAggregateToCohortRow(agg({ cohort_date: "2026-10-02", revenue_d90: 930 })),
+          mapAggregateToCohortRow(agg({ cohort_date: "2026-10-01", trial_users: 50, revenue_d90: 960 })),
+        ],
+      },
+    };
+  }
+
+  it("sit right after Gross LTV 1M with per-cohort values and a trial-weighted Total", async () => {
+    withD90();
+    renderWith(<CohortsPage />, OWNER());
+    const texts = headerTexts();
+    const positions = LTV_HEADERS.map((label) => texts.findIndex((text) => text.includes(label)));
+    expect(positions[0]).toBeGreaterThanOrEqual(0);
+    expect(positions).toEqual([positions[0], positions[0] + 1, positions[0] + 2, positions[0] + 3]);
+
+    // d60 900 / 100 and / 50 trials; Total 1800 / 150.
+    expect(columnTexts("Gross LTV 2M")).toEqual(expect.arrayContaining(["$9.00", "$18.00", "$12.00"]));
+    // d90 930 / 100 and 960 / 50; Total 1890 / 150.
+    expect(columnTexts("Gross LTV 3M")).toEqual(expect.arrayContaining(["$9.30", "$19.20", "$12.60"]));
+    // Net Rev 950 / 100 and / 50; Total 1900 / 150.
+    expect(columnTexts("Gross LTV All Time")).toEqual(expect.arrayContaining(["$9.50", "$19.00", "$12.67"]));
+  }, 30_000);
+
+  it("show the same weighted values on the Funnels table", async () => {
+    withD90();
+    renderWith(<CohortsPage />, OWNER());
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Funnels" }), { button: 0 });
+    await waitFor(() => expect(screen.getByRole("tab", { name: "Funnels" })).toHaveAttribute("data-state", "active"));
+    // One funnel row (both cohorts share the path) + the Total row.
+    await waitFor(() => expect(columnTexts("Gross LTV 2M").filter((text) => text === "$12.00")).toHaveLength(2));
+    expect(columnTexts("Gross LTV 3M").filter((text) => text === "$12.60")).toHaveLength(2);
+    expect(columnTexts("Gross LTV All Time").filter((text) => text === "$12.67")).toHaveLength(2);
+  }, 30_000);
+
+  it("Gross LTV 3M shows a dash, never $0, on rows cached before revenue_d90", async () => {
+    renderWith(<CohortsPage />, OWNER());
+    const cells = columnTexts("Gross LTV 3M");
+    expect(cells.length).toBeGreaterThan(0);
+    expect(cells.every((text) => text === "—")).toBe(true);
+  }, 30_000);
+});

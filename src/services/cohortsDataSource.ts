@@ -209,6 +209,7 @@ export function mapAggregateToCohortRow(agg: CohortAggregateRow): CohortRow {
     revenue_d14: agg.revenue_d14,
     revenue_d30: agg.revenue_d30,
     revenue_d60: agg.revenue_d60,
+    revenue_d90: agg.revenue_d90,
     revenue_d37: 0,
     revenue_d67: 0,
     revenue_total: net,
@@ -369,6 +370,7 @@ export function mapDetailsPlanBreakdown(details: CohortDetailsResponse): PlanBre
       revenue_d7: full.revenue_d7,
       revenue_d30: full.revenue_d30,
       revenue_d60: full.revenue_d60,
+      revenue_d90: full.revenue_d90,
       net_ltv: full.net_ltv,
     };
   });

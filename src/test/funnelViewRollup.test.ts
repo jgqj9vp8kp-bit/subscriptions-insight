@@ -5,12 +5,13 @@ import { describe, expect, it } from "vitest";
 import type { CohortRow } from "@/services/types";
 import {
   aggregateTrafficMetrics,
+  cohortLtvPerUser,
   computeCohortReportTotals,
   funnelTrafficForGroup,
 } from "@/services/cohortReporting";
 import { buildFunnelViewRows, isFunnelViewRow, FUNNEL_ROW_ID_PREFIX } from "@/services/funnelView";
 import { buildCohortsExportTable } from "@/services/cohortsExport";
-import { sortCohortRows } from "@/services/cohortSorting";
+import { getCohortSortValue, sortCohortRows } from "@/services/cohortSorting";
 import type { TrafficMetric } from "@/services/trafficImport";
 
 let seq = 0;
@@ -330,6 +331,53 @@ describe("aggregation semantics", () => {
     expect(row.ltv_1m_per_user).toBe(0);
     expect(row.fb_cpp).toBeNull();
     expect(Object.values(row).every((v) => typeof v !== "number" || Number.isFinite(v))).toBe(true);
+  });
+});
+
+describe("Gross LTV 2M / 3M / All Time", () => {
+  const ltvColumns = ["ltv_2m_per_user", "ltv_3m_per_user", "ltv_all_time_per_user"];
+
+  it("funnel and Total rows weight by trial users over d60 / d90 / all net revenue", () => {
+    const rows = [
+      cohort({ campaign_path: "path-l", trial_users: 1, revenue_d30: 100, revenue_d60: 150, revenue_d90: 180, net_revenue: 200 }),
+      cohort({ campaign_path: "path-l", trial_users: 9, revenue_d30: 0, revenue_d60: 0, revenue_d90: 0, net_revenue: 0 }),
+    ];
+    const t = computeCohortReportTotals(rows);
+    // Weighted (sum / sum), not the average of per-cohort LTVs (150 / 2 = 75).
+    expect(t.ltv2mPerUser).toBeCloseTo(15, 8);
+    expect(t.ltv3mPerUser).toBeCloseTo(18, 8);
+    expect(t.ltvAllTimePerUser).toBeCloseTo(20, 8);
+
+    const [funnelRow] = buildFunnelViewRows({ cohorts: rows, trafficByKey: new Map() });
+    expect(funnelRow.revenue_d90).toBe(180);
+    expect(ltvColumns.map((id) => getCohortSortValue(funnelRow, id))).toEqual([15, 18, 20]);
+    const table = buildCohortsExportTable({ cohorts: [funnelRow], columnOrder: ltvColumns, columnLabel: (id) => id });
+    expect(table.rows[0]).toEqual([15, 18, 20]);
+  });
+
+  it("rounds a row's LTV to cents and gives 0 for a zero-trial row", () => {
+    const row = cohort({ trial_users: 3, revenue_d60: 10, revenue_d90: 20, net_revenue: 25 });
+    expect(cohortLtvPerUser(row, "ltv_2m_per_user")).toBe(3.33);
+    expect(cohortLtvPerUser(row, "ltv_3m_per_user")).toBe(6.67);
+    expect(cohortLtvPerUser(row, "ltv_all_time_per_user")).toBe(8.33);
+    expect(cohortLtvPerUser(cohort({ trial_users: 0, revenue_d90: 5 }), "ltv_3m_per_user")).toBe(0);
+  });
+
+  it("3M is unknown (never 0) while any row comes from a response cached before revenue_d90", () => {
+    const rows = [
+      cohort({ campaign_path: "path-c", trial_users: 10, revenue_d60: 50, revenue_d90: 70, net_revenue: 90 }),
+      cohort({ campaign_path: "path-c", trial_users: 10, revenue_d60: 30, net_revenue: 40 }), // no revenue_d90
+    ];
+    const t = computeCohortReportTotals(rows);
+    expect(t.revenueD90).toBeNull();
+    expect(t.ltv3mPerUser).toBeNull();
+    expect(t.ltv2mPerUser).toBeCloseTo(4, 8);
+
+    const [funnelRow] = buildFunnelViewRows({ cohorts: rows, trafficByKey: new Map() });
+    expect(funnelRow.revenue_d90).toBeUndefined();
+    expect(getCohortSortValue(funnelRow, "ltv_3m_per_user")).toBeNull();
+    const table = buildCohortsExportTable({ cohorts: [funnelRow], columnOrder: ltvColumns, columnLabel: (id) => id });
+    expect(table.rows[0]).toEqual([4, "", 6.5]);
   });
 });
 

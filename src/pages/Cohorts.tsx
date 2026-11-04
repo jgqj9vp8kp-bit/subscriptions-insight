@@ -36,7 +36,7 @@ import {
   formatPct,
 } from "@/services/analytics";
 import { aggregateTokenPackBreakdowns, type TokenPackRow } from "@/services/monetization";
-import { computeCohortMonetizationTotals, cohortMaturity, LTV_1M_MATURITY_DAYS } from "@/services/cohortReporting";
+import { cohortLtvPerUser, computeCohortMonetizationTotals, cohortMaturity, LTV_1M_MATURITY_DAYS } from "@/services/cohortReporting";
 import { SUPPORTED_CURRENCIES } from "@/services/fxRates";
 import {
   getFunnelFoxSubscriptionsSyncState,
@@ -337,6 +337,9 @@ const COLUMN_ORDER_AFTER_RENEWALS = [
   "revenue_d30",
   "revenue_d60",
   "ltv_1m_per_user",
+  "ltv_2m_per_user",
+  "ltv_3m_per_user",
+  "ltv_all_time_per_user",
   ...MONETIZATION_COLUMNS,
   ...FX_COLUMNS,
   ...FB_COHORT_OPTIONAL_COLUMNS,
@@ -421,6 +424,9 @@ const STATIC_COLUMN_LABELS: Record<string, string> = {
   revenue_d30: "Rev 1M",
   revenue_d60: "Rev 2M",
   ltv_1m_per_user: "Gross LTV 1M",
+  ltv_2m_per_user: "Gross LTV 2M",
+  ltv_3m_per_user: "Gross LTV 3M",
+  ltv_all_time_per_user: "Gross LTV All Time",
   trial_revenue: "Trial Revenue",
   upsell_1_users: "Upsell 1 Users",
   upsell_1_cr: "Upsell 1 CR",
@@ -528,6 +534,9 @@ const COLUMN_MIN_WIDTHS: Record<string, number> = {
   revenue_d30: 90,
   revenue_d60: 90,
   ltv_1m_per_user: 120,
+  ltv_2m_per_user: 120,
+  ltv_3m_per_user: 120,
+  ltv_all_time_per_user: 120,
   trial_revenue: 110,
   upsell_1_users: 100,
   upsell_1_cr: 90,
@@ -683,6 +692,9 @@ const COLUMN_HELP: Partial<Record<CohortColumnId, string>> = {
   revenue_d30: USD_CONVERTED_NOTE,
   revenue_d60: USD_CONVERTED_NOTE,
   ltv_1m_per_user: "Net revenue generated within the first 30 days after cohort start divided by trial users. Converted to USD.",
+  ltv_2m_per_user: "Net revenue generated within the first 60 days after cohort start divided by trial users. Cohorts younger than 60 days are still accumulating. Converted to USD.",
+  ltv_3m_per_user: "Net revenue generated within the first 90 days after cohort start divided by trial users. Cohorts younger than 90 days are still accumulating. Converted to USD.",
+  ltv_all_time_per_user: "All net revenue of the cohort so far (Net Rev) divided by trial users. Converted to USD.",
   support_users: "Unique trial users in this cohort whose normalized email appears in ClickHouse Support Analytics.",
   support_rate: "Support Users / Trial Users.",
   currency_mix: "Trial users per original charge currency (e.g. USD 50 · MXN 120).",
@@ -866,7 +878,7 @@ function buildBuiltinViews(defaultColumnOrder: readonly string[]): SavedView[] {
       id: "revenue",
       name: "Revenue",
       order: [...defaultColumnOrder],
-      visibility: buildVisibility(["gross_revenue", "net_revenue", "revenue_d0", "revenue_d7", "revenue_d30", "revenue_d60", "ltv_1m_per_user", "traffic_spend", "trial_cost", "profit", "profit_d7", "profit_1m", "profit_2m"], defaultColumnOrder),
+      visibility: buildVisibility(["gross_revenue", "net_revenue", "revenue_d0", "revenue_d7", "revenue_d30", "revenue_d60", "ltv_1m_per_user", "ltv_2m_per_user", "ltv_3m_per_user", "ltv_all_time_per_user", "traffic_spend", "trial_cost", "profit", "profit_d7", "profit_1m", "profit_2m"], defaultColumnOrder),
       builtin: true,
     },
     {
@@ -898,6 +910,9 @@ function buildBuiltinViews(defaultColumnOrder: readonly string[]): SavedView[] {
           "gross_revenue",
           "net_revenue",
           "ltv_1m_per_user",
+          "ltv_2m_per_user",
+          "ltv_3m_per_user",
+          "ltv_all_time_per_user",
         ],
         defaultColumnOrder,
       ),
@@ -3413,6 +3428,12 @@ export default function CohortsPage() {
         return <TableCell key={id} className={className}>{formatCurrency(c.revenue_d60)}</TableCell>;
       case "ltv_1m_per_user":
         return <TableCell key={id} className={className} title={COLUMN_HELP.ltv_1m_per_user}>{formatCurrency(c.ltv_1m_per_user ?? 0)}</TableCell>;
+      case "ltv_2m_per_user":
+      case "ltv_3m_per_user":
+      case "ltv_all_time_per_user": {
+        const ltv = cohortLtvPerUser(c, id);
+        return <TableCell key={id} className={className} title={COLUMN_HELP[id]}>{ltv != null ? formatCurrency(ltv) : dash}</TableCell>;
+      }
       case "trial_revenue":
         return <TableCell key={id} className={className}>{formatCurrency(c.trial_revenue)}</TableCell>;
       case "upsell_1_users":
@@ -3594,6 +3615,12 @@ export default function CohortsPage() {
         return <TableCell key={id} className={className}>{formatCurrency(plan.revenue_d60)}</TableCell>;
       case "ltv_1m_per_user":
         return <TableCell key={id} className={className}>{formatCurrency(plan.trial_users ? plan.revenue_d30 / plan.trial_users : 0)}</TableCell>;
+      case "ltv_2m_per_user":
+      case "ltv_3m_per_user":
+      case "ltv_all_time_per_user": {
+        const ltv = cohortLtvPerUser(plan, id);
+        return <TableCell key={id} className={className}>{ltv != null ? formatCurrency(ltv) : dash}</TableCell>;
+      }
       case "trial_cost": {
         const trialCost = trialCostFromSpend(traffic?.spend, plan.trial_users);
         return <TableCell key={id} className={className} title={trafficCellTitle}>{trialCost != null ? formatCurrency(trialCost) : dash}</TableCell>;
@@ -3806,6 +3833,12 @@ export default function CohortsPage() {
         return <TableCell key={id} className={className}>{formatCurrency(totals.revenueD60)}</TableCell>;
       case "ltv_1m_per_user":
         return <TableCell key={id} className={className} title={COLUMN_HELP.ltv_1m_per_user}>{formatCurrency(totals.ltv1mPerUser)}</TableCell>;
+      case "ltv_2m_per_user":
+        return <TableCell key={id} className={className} title={COLUMN_HELP.ltv_2m_per_user}>{formatCurrency(totals.ltv2mPerUser)}</TableCell>;
+      case "ltv_3m_per_user":
+        return <TableCell key={id} className={className} title={COLUMN_HELP.ltv_3m_per_user}>{totals.ltv3mPerUser != null ? formatCurrency(totals.ltv3mPerUser) : dash}</TableCell>;
+      case "ltv_all_time_per_user":
+        return <TableCell key={id} className={className} title={COLUMN_HELP.ltv_all_time_per_user}>{formatCurrency(totals.ltvAllTimePerUser)}</TableCell>;
       case "trial_revenue":
         return <TableCell key={id} className={className}>{formatCurrency(totals.trialRevenue)}</TableCell>;
       case "upsell_1_users":

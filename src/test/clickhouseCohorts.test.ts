@@ -189,7 +189,7 @@ describe("clickhouse-cohorts SQL safety and scoping", () => {
 function rawAgg(over: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     cohort_date: "2026-05-01", funnel: "soulmate", campaign_path: "unknown", trial_users: 100,
-    gross_raw: 1000.005, refund_raw: 50, d0_raw: 200, d7_raw: 600, d14_raw: 700, d30_raw: 800, d60_raw: 900,
+    gross_raw: 1000.005, refund_raw: 50, d0_raw: 200, d7_raw: 600, d14_raw: 700, d30_raw: 800, d60_raw: 900, d90_raw: 930,
     trial_rev_raw: 80, first_sub_rev_raw: 500, renewal_rev_raw: 250, upsell_rev_raw: 120,
     first_subscription_users: 40, renewal_users: 12, r2: 8, r3: 3, r4: 1, r5: 0, r6: 0,
     upsell_users: 20, funnel_upsell_users: 20, funnel_upsell_rev_raw: 130,
@@ -234,6 +234,14 @@ describe("clickhouse-cohorts aggregate mapping + totals", () => {
     expect(totals.gross_revenue).toBe(2000.02);
     // Weighted LTV = sum(d30) / sum(trial_users), not an average of per-row LTVs.
     expect(totals.ltv_1m_per_user).toBe(Math.floor((1600 / 150) * 100 + 0.5) / 100);
+    expect(totals.revenue_d90).toBe(1860);
+  });
+
+  it("measures net revenue with d <= 90 for Gross LTV 3M", () => {
+    expect(AGGREGATE_MEASURES).toContain("sum(if(is_success = 1 AND d <= 90, nn, 0)) d90_raw");
+    const row = toAggregateRow(rawAgg() as never);
+    expect(row.revenue_d60).toBe(900);
+    expect(row.revenue_d90).toBe(930);
   });
 
   it("handles Support Users = 0 and Trial Users = 0 safely", () => {

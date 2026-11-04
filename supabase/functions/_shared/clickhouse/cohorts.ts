@@ -440,7 +440,7 @@ export interface RawCohortRow {
   cohort_date: string; funnel: string; campaign_path: string;
   trial_users: number;
   gross_raw: number; refund_raw: number;
-  d0_raw: number; d7_raw: number; d14_raw: number; d30_raw: number; d60_raw: number;
+  d0_raw: number; d7_raw: number; d14_raw: number; d30_raw: number; d60_raw: number; d90_raw: number;
   trial_rev_raw: number; first_sub_rev_raw: number; renewal_rev_raw: number; upsell_rev_raw: number;
   first_subscription_users: number; renewal_users: number;
   r2: number; r3: number; r4: number; r5: number; r6: number;
@@ -494,7 +494,7 @@ export const AGGREGATE_MEASURES = `uniqExact(uid) trial_users,
   uniqExactIf(uid, rr > 0) refund_users,
   sum(if(is_success = 1 AND d = 0, nn, 0)) d0_raw, sum(if(is_success = 1 AND d <= 7, nn, 0)) d7_raw,
   sum(if(is_success = 1 AND d <= 14, nn, 0)) d14_raw, sum(if(is_success = 1 AND d <= 30, nn, 0)) d30_raw,
-  sum(if(is_success = 1 AND d <= 60, nn, 0)) d60_raw,
+  sum(if(is_success = 1 AND d <= 60, nn, 0)) d60_raw, sum(if(is_success = 1 AND d <= 90, nn, 0)) d90_raw,
   sumIf(nn, is_success = 1 AND lt = 'trial') trial_rev_raw,
   sumIf(nn, is_success = 1 AND lvl = 1) first_sub_rev_raw, sumIf(nn, is_success = 1 AND lvl >= 2) renewal_rev_raw,
   sumIf(nn, is_success = 1 AND lt = 'upsell') upsell_rev_raw,
@@ -654,7 +654,7 @@ function toAggregateRow(r: RawCohortRow): CohortAggregateRow {
     renewal_revenue: round2(n(r.renewal_rev_raw)),
     gross_revenue: gross, net_revenue: net, amount_refunded: refunds,
     revenue_d0: round2(n(r.d0_raw)), revenue_d7: round2(n(r.d7_raw)), revenue_d14: round2(n(r.d14_raw)),
-    revenue_d30: d30, revenue_d60: round2(n(r.d60_raw)),
+    revenue_d30: d30, revenue_d60: round2(n(r.d60_raw)), revenue_d90: round2(n(r.d90_raw)),
     net_revenue_1m: d30, ltv_1m_per_user: trialUsers ? round2(d30 / trialUsers) : 0,
     upsell_1_users: n(r.upsell_1_users), upsell_2_users: n(r.upsell_2_users), upsell_3_users: n(r.upsell_3_users), upsell_extra_users: n(r.upsell_extra_users),
     upsell_1_revenue: round2(u1), upsell_2_revenue: round2(u2), upsell_3_revenue: round2(u3), upsell_extra_revenue: round2(n(r.uextra_raw)),
@@ -698,7 +698,7 @@ function computeTotals(rows: CohortAggregateRow[]): CohortTotals {
     net_revenue: round2(sum((r) => r.net_revenue)),
     amount_refunded: round2(sum((r) => r.amount_refunded)),
     revenue_d0: round2(sum((r) => r.revenue_d0)), revenue_d7: round2(sum((r) => r.revenue_d7)),
-    revenue_d30: d30, revenue_d60: round2(sum((r) => r.revenue_d60)),
+    revenue_d30: d30, revenue_d60: round2(sum((r) => r.revenue_d60)), revenue_d90: round2(sum((r) => n(r.revenue_d90))),
     ltv_1m_per_user: trialUsers ? round2(d30 / trialUsers) : 0,
     upsell_1_users: sum((r) => r.upsell_1_users), upsell_2_users: sum((r) => r.upsell_2_users), upsell_3_users: sum((r) => r.upsell_3_users),
     token_buyers: sum((r) => r.token_buyers), token_purchases: sum((r) => r.token_purchases),

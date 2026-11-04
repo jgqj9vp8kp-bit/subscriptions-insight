@@ -167,6 +167,7 @@ export function buildFunnelViewRows(input: {
       revenue_d14: revenueD14,
       revenue_d30: t.revenueD30,
       revenue_d60: t.revenueD60,
+      revenue_d90: t.revenueD90 ?? undefined,
       revenue_d37: 0,
       revenue_d67: 0,
       revenue_total: t.netRevenue,

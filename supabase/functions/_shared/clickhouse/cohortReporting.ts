@@ -43,6 +43,33 @@ export function renewalUsersForColumn(row: Parameters<typeof renewalUsersForLeve
   return level == null ? null : renewalUsersForLevel(row, level);
 }
 
+/** The "Gross LTV 2M / 3M / All Time" columns and the revenue each divides by
+ * trial users: net revenue (after refunds, before processor fees) with
+ * d <= 60 / d <= 90, or all of it — the same money as Gross LTV 1M (d <= 30).
+ * Raw, whatever the cohort's age, exactly like Gross LTV 1M. */
+export const COHORT_LTV_REVENUE_FIELDS = {
+  ltv_2m_per_user: "revenue_d60",
+  ltv_3m_per_user: "revenue_d90",
+  ltv_all_time_per_user: "net_revenue",
+} as const;
+
+export type CohortLtvColumnId = keyof typeof COHORT_LTV_REVENUE_FIELDS;
+
+export function isCohortLtvColumn(columnId: string): columnId is CohortLtvColumnId {
+  return Object.prototype.hasOwnProperty.call(COHORT_LTV_REVENUE_FIELDS, columnId);
+}
+
+/** Per-trial-user LTV of one row (cohort, funnel or price plan), in cents. null
+ * when the row lacks the window: revenue_d90 on a response cached before it. */
+export function cohortLtvPerUser(
+  row: { trial_users: number; revenue_d60: number; revenue_d90?: number; net_revenue: number },
+  columnId: CohortLtvColumnId,
+): number | null {
+  const revenue = row[COHORT_LTV_REVENUE_FIELDS[columnId]];
+  if (revenue == null) return null;
+  return row.trial_users ? Math.round((revenue / row.trial_users) * 100) / 100 : 0;
+}
+
 export interface CohortReportTotals {
   totalTrialUsers: number;
   totalSupportUsers: number;
@@ -83,8 +110,14 @@ export interface CohortReportTotals {
   revenueD7: number;
   revenueD30: number;
   revenueD60: number;
+  /** null when any row lacks revenue_d90 (a response cached before it). */
+  revenueD90: number | null;
   /** Weighted realized 1-month LTV: sum(net_revenue_1m) / sum(trial_users). */
   ltv1mPerUser: number;
+  /** Weighted like ltv1mPerUser over d <= 60 / d <= 90 / all net revenue. */
+  ltv2mPerUser: number;
+  ltv3mPerUser: number | null;
+  ltvAllTimePerUser: number;
   trafficSpend: number;
   hasTrafficSpend: boolean;
   hasCompleteTrafficSpend: boolean;
@@ -356,6 +389,7 @@ export function computeCohortReportTotals(
   const totalRevenueD7 = sum((c) => c.revenue_d7);
   const totalRevenueD30 = sum((c) => c.revenue_d30);
   const totalRevenueD60 = sum((c) => c.revenue_d60);
+  const totalRevenueD90 = cohorts.every((c) => c.revenue_d90 != null) ? sum((c) => c.revenue_d90 ?? 0) : null;
 
   return {
     totalTrialUsers,
@@ -395,8 +429,12 @@ export function computeCohortReportTotals(
     revenueD7: totalRevenueD7,
     revenueD30: totalRevenueD30,
     revenueD60: totalRevenueD60,
+    revenueD90: totalRevenueD90,
     // Weighted, NOT the average of per-cohort ltv_1m_per_user.
     ltv1mPerUser: totalTrialUsers ? totalRevenueD30 / totalTrialUsers : 0,
+    ltv2mPerUser: totalTrialUsers ? totalRevenueD60 / totalTrialUsers : 0,
+    ltv3mPerUser: totalRevenueD90 == null ? null : totalTrialUsers ? totalRevenueD90 / totalTrialUsers : 0,
+    ltvAllTimePerUser: totalTrialUsers ? netRevenue / totalTrialUsers : 0,
     trafficSpend: totalTrafficSpend,
     hasTrafficSpend,
     hasCompleteTrafficSpend,

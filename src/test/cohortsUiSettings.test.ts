@@ -320,6 +320,29 @@ describe("cohorts UI settings", () => {
     ]);
   });
 
+  it("puts the new Gross LTV columns right after Gross LTV 1M in an old saved order", () => {
+    const order = ["cohort_date", "ltv_1m_per_user", "ltv_2m_per_user", "ltv_3m_per_user", "ltv_all_time_per_user", "trial_users", "net_revenue"];
+    expect(sanitizeColumnOrder(["ltv_1m_per_user", "net_revenue", "trial_users"], order)).toEqual([
+      "ltv_1m_per_user",
+      "ltv_2m_per_user",
+      "ltv_3m_per_user",
+      "ltv_all_time_per_user",
+      "net_revenue",
+      "trial_users",
+      "cohort_date",
+    ]);
+    // Without the anchor they are appended like any other new column.
+    expect(sanitizeColumnOrder(["net_revenue"], order)).toEqual([
+      "net_revenue",
+      "cohort_date",
+      "ltv_1m_per_user",
+      "ltv_2m_per_user",
+      "ltv_3m_per_user",
+      "ltv_all_time_per_user",
+      "trial_users",
+    ]);
+  });
+
   it("appends Support columns to old saved views", () => {
     const supportDefaults: CohortsUiSettingsDefaults = {
       ...defaults,
