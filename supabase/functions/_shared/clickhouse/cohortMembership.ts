@@ -76,8 +76,11 @@ import {
   CAMPAIGN_SCOPE_VERSION,
   COHORT_CLASSIFICATION_VERSION,
   getCohortSnapshotState,
+  tickWarehouseUnchanged,
+  TRANSACTIONS_SYNC_NAME,
   type CohortSnapshotState,
   type ScopeSnapshot,
+  type TransactionsSyncMarker,
 } from "./cohortSnapshotState.ts";
 import {
   ALL_SCOPE_SQL,
@@ -110,8 +113,10 @@ export {
 } from "./cohortSnapshotState.ts";
 export type { CohortSnapshotState, CohortSnapshotStatus } from "./cohortSnapshotState.ts";
 
-/** What a cron tick did (rebuildCohortMembership mode "tick"). */
-export type CohortTickStatus = "current" | "campaign_scope_rebuilt" | "rebuilt" | "backoff" | "in_progress";
+/** What a cron tick did (rebuildCohortMembership mode "tick"). "unchanged":
+ * Postgres showed no transactions write since the last verification, so the
+ * snapshot was re-confirmed without querying ClickHouse (tickWarehouseUnchanged). */
+export type CohortTickStatus = "current" | "unchanged" | "campaign_scope_rebuilt" | "rebuilt" | "backoff" | "in_progress";
 
 export interface CohortMembershipRebuildResult {
   status: "completed" | "failed";
@@ -513,6 +518,65 @@ async function compareVersions(input: {
   };
 }
 
+/** The transactions backfill's sync-state row (Postgres; null when unreadable). */
+async function getTransactionsSyncMarker(supabase: SupabaseLikeClient, authUserId: string): Promise<TransactionsSyncMarker | null> {
+  try {
+    const { data, error } = await supabase
+      .from("clickhouse_transaction_sync_state")
+      .select("updated_at,current_stage")
+      .eq("auth_user_id", authUserId)
+      .eq("sync_name", TRANSACTIONS_SYNC_NAME)
+      .maybeSingle();
+    if (error) throw new Error(error.message);
+    return (data as TransactionsSyncMarker | null) ?? null;
+  } catch (error) {
+    if (error instanceof ScopeViolation) throw error;
+    console.warn("[cohort-membership] transactions sync state read failed:", error instanceof Error ? error.message : error);
+    return null;
+  }
+}
+
+/** The tick's answer without ClickHouse (cohortSnapshotState.ts
+ * tickWarehouseUnchanged), or null when the tick must check ClickHouse. The
+ * active versions are observed as the fingerprint, which moves
+ * fresh_verified_at for funnel-restricted reads like a real check would; when
+ * that RPC fails or a newer build won meanwhile, the real check runs. */
+async function quietTick(
+  supabase: SupabaseLikeClient,
+  authUserId: string,
+  state: CohortSnapshotState | null,
+  now: Date,
+  started: number,
+): Promise<CohortMembershipRebuildResult | null> {
+  if (!state) return null;
+  const sync = await getTransactionsSyncMarker(supabase, authUserId);
+  if (!tickWarehouseUnchanged(state, sync, now)) return null;
+  const confirmed = await snapshotStateRpc(supabase, "observe_clickhouse_cohort_snapshot_fingerprint", {
+    p_auth_user_id: authUserId,
+    p_warehouse_version: state.active_warehouse_version,
+    p_classification_version: state.active_classification_version,
+  });
+  if (confirmed !== true) return null;
+  return {
+    status: "completed",
+    warehouse_version: s(state.active_warehouse_version),
+    classification_version: s(state.active_classification_version),
+    generated_at: state.active_generated_at ?? now.toISOString(),
+    users_classified: n(state.users_classified),
+    rows_inserted: 0,
+    inserted_users: 0,
+    updated_users: 0,
+    unchanged_users: n(state.users_classified),
+    removed_or_invalidated: 0,
+    duplicate_users: n(state.duplicate_users),
+    source_transactions: n(state.source_transactions),
+    source_unique_users: n(state.source_unique_users),
+    duration_ms: Date.now() - started,
+    state,
+    tick_status: "unchanged",
+  };
+}
+
 export async function rebuildCohortMembership(input: {
   authUserId: string;
   supabase: SupabaseLikeClient;
@@ -521,14 +585,22 @@ export async function rebuildCohortMembership(input: {
   /** "tick" = the freshness cron (cron_tick): backs off after a recent failed
    * build of the same versions and reports tick_status. Default "user". */
   mode?: "user" | "tick";
+  /** Clock of the tick's daily-check window (tests). */
+  now?: Date;
 }): Promise<CohortMembershipRebuildResult> {
   const started = Date.now();
   const tick = input.mode === "tick";
-  await ensureCohortMembershipSchema(input.clickhouse);
   const previousState = await getCohortSnapshotState(input.supabase, input.authUserId).catch((error) => {
     if (error instanceof ScopeViolation) throw error;
     return null;
   });
+  // A tick with no new warehouse data answers from Postgres: ClickHouse stays
+  // asleep (no schema DDL, no fingerprint scan).
+  if (tick && !input.force) {
+    const quiet = await quietTick(input.supabase, input.authUserId, previousState, input.now ?? new Date(), started);
+    if (quiet) return quiet;
+  }
+  await ensureCohortMembershipSchema(input.clickhouse);
   const fingerprint = await getWarehouseFingerprint(input.clickhouse, input.authUserId);
   const classificationVersion = COHORT_CLASSIFICATION_VERSION;
   const generatedAt = new Date().toISOString();

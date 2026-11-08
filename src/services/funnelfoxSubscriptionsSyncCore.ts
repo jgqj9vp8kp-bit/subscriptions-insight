@@ -47,6 +47,25 @@ export function nextIncompleteStage(flags: SubscriptionStageCompletion): Subscri
   return null;
 }
 
+// Whether a finalize run rewrites ClickHouse fact_subscriptions (2026-11-08).
+// Once every stage is done, each 15-minute tick lands on finalize again with
+// nothing new in Postgres (the list is crawled once per daily cycle), and
+// re-sending all ~17k rows each time kept ClickHouse Cloud awake around the
+// clock. The fact is refreshed on the first finalize of a cycle, on a finalize
+// asked for explicitly (stage=finalize), and as a retry while the last refresh
+// failed or never ran.
+export function shouldRefreshFactSubscriptions(input: {
+  finalizeAlreadyCompleted: boolean;
+  finalizeRequested: boolean;
+  lastRefresh: unknown;
+}): boolean {
+  if (!input.finalizeAlreadyCompleted || input.finalizeRequested) return true;
+  const last = input.lastRefresh;
+  if (!last || typeof last !== "object" || Array.isArray(last)) return true;
+  const record = last as Record<string, unknown>;
+  return record.error != null || typeof record.run_version !== "number";
+}
+
 // api_error and timeout win even when the page also reported more.
 export function determineStopReason(input: {
   pages: number;

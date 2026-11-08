@@ -395,7 +395,10 @@ The SQL comes first: the frontend embeds `funnel_paths`, and the functions read 
 5. **Build the campaign scope and the freshness stamp**: `select public.invoke_cohort_membership_tick(true);`,
    then
    - `select status_code, left(content, 400) from net._http_response order by id desc limit 1;` → 200 with
-     `tick_status` `campaign_scope_rebuilt` or `rebuilt` (`current` when the scope was already built).
+     `tick_status` `campaign_scope_rebuilt` or `rebuilt` (`current` when the scope was already built;
+     `unchanged` when the tick found no transactions backfill write since the last verification and
+     re-confirmed the snapshot from Postgres without querying ClickHouse; the owner's rebuild always
+     checks ClickHouse).
      `backoff` means a build of the same warehouse version failed or was abandoned recently: the tick
      waits 1 h after the first attempt, doubling per attempt up to 6 h. The owner's own rebuild has no
      backoff: read `last_error` in `clickhouse_cohort_snapshot_state`, then open Cohorts as the data owner

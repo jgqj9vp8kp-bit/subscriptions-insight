@@ -204,3 +204,52 @@ export function activeSnapshotCurrent(
   const validation = state.active_validation ?? (state.status === "completed" ? state.diagnostics?.validation : null);
   return validationPassed(validation) && isZero(state.duplicate_users);
 }
+
+// ---- the freshness tick without ClickHouse (2026-11-08) -----------------------------
+//
+// The tick runs every 15 minutes, and its warehouse fingerprint (a FINAL scan
+// of analytics_transactions) woke ClickHouse Cloud every time: the service
+// never reached its idle timeout and billed compute around the clock, almost
+// always to learn that nothing had changed. analytics_transactions is written
+// only by the transactions backfill (backfill.ts), and that run writes its
+// sync-state row when it claims the run, after every batch it inserts and when
+// it ends. So while that row is not newer than the last verification of the
+// active snapshot, the warehouse still is the one the snapshot was verified
+// against, and the tick can re-confirm it from Postgres alone.
+
+/** clickhouse_transaction_sync_state row of the transactions backfill (backfill.ts SYNC_NAME). */
+export const TRANSACTIONS_SYNC_NAME = "analytics_transactions_backfill";
+/** current_stage values of a backfill run in progress (backfill.ts BACKFILL_RUN_STAGES). */
+export const TRANSACTIONS_BACKFILL_RUN_STAGES: readonly string[] = ["backfilling", "dry_run", "validate_only"];
+/** One real ClickHouse check a day all the same (a write the sync-state row did
+ * not record: a manual Init rebuild, a run killed between insert and state
+ * write): the 15-minute UTC window from this minute of the day, 05:30, right
+ * after the daily FB warehouse sync has woken ClickHouse anyway. A 15-minute
+ * cron schedule has exactly one tick in it. */
+export const TICK_DAILY_CHECK_UTC_MINUTE = 5 * 60 + 30;
+
+export interface TransactionsSyncMarker {
+  updated_at?: string | null;
+  current_stage?: string | null;
+}
+
+/** Whether the tick may skip ClickHouse: the active snapshot is complete,
+ * validated, of today's classifier and campaign scope, its last observation
+ * found it current, no backfill run is in progress and none wrote after that
+ * observation — outside the daily check window. Anything unknown → false. */
+export function tickWarehouseUnchanged(
+  state: CohortSnapshotState | null | undefined,
+  sync: TransactionsSyncMarker | null | undefined,
+  now: Date,
+): boolean {
+  if (!state || state.status !== "completed" || !state.active_warehouse_version) return false;
+  if (!activeSnapshotCurrent(state, { warehouse_version: state.active_warehouse_version, classification_version: COHORT_CLASSIFICATION_VERSION })) return false;
+  if (state.active_campaign_scope_version !== CAMPAIGN_SCOPE_VERSION) return false;
+  if (state.stale_since) return false;
+  if (!sync || (sync.current_stage && TRANSACTIONS_BACKFILL_RUN_STAGES.includes(sync.current_stage))) return false;
+  const verified = Date.parse(state.fresh_verified_at ?? "");
+  const written = Date.parse(sync.updated_at ?? "");
+  if (!Number.isFinite(verified) || !Number.isFinite(written) || written > verified) return false;
+  const minute = now.getUTCHours() * 60 + now.getUTCMinutes();
+  return !(minute >= TICK_DAILY_CHECK_UTC_MINUTE && minute < TICK_DAILY_CHECK_UTC_MINUTE + 15);
+}

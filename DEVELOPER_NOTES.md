@@ -15,6 +15,41 @@
 - Views never take `FINAL`; ReplacingMergeTree tables read through views must
   apply `FINAL` inside the view definition (or use argMax-per-key views).
 
+## ClickHouse Cloud must be able to sleep: no background wake-ups without new data (2026-11-08)
+
+ClickHouse Cloud bills compute for every minute the service is awake, and it
+only sleeps after an idle timeout. Two crons touched it every 15 minutes, at
+interleaved minutes, so it never slept (a ~$600 monthly bill for a few
+hundred thousand rows):
+
+- `cohort-membership-freshness` (`7,22,37,52`): every tick ran the
+  `fact_user_cohorts` DDL and the warehouse fingerprint (a FINAL scan) and
+  almost always answered `current`. Now a tick first reads
+  `clickhouse_transaction_sync_state` (`analytics_transactions_backfill`): when
+  no backfill run is in progress and none wrote after the snapshot's
+  `fresh_verified_at`, it observes the ACTIVE versions as the fingerprint
+  (moving `fresh_verified_at` for restricted reads) and answers
+  `tick_status: "unchanged"` without ClickHouse
+  (`tickWarehouseUnchanged`, `cohortSnapshotState.ts`). One real check a day
+  still runs in the 05:30–05:45 UTC window (right after the FB daily sync has
+  woken ClickHouse anyway); the owner's rebuild (`rebuild` / `rebuild_force`)
+  always checks. `invoke_cohort_membership_tick(true)` only skips the
+  restricted-member check in SQL; the tick itself still decides as above.
+  Rule: anything new that writes `analytics_transactions` must write that
+  sync-state row after its inserts, or the tick will not notice it until the
+  daily check.
+- `funnelfox-subscriptions-advance` (`*/15`): once every stage is complete each
+  tick lands on `finalize` again, and finalize rewrote all ~17k
+  `fact_subscriptions` rows (plus a DELETE) every time. Now only the first
+  finalize of a cycle, an explicit `stage: "finalize"`, or a retry after a
+  failed / missing refresh writes ClickHouse (`shouldRefreshFactSubscriptions`,
+  mirrored in `funnelfoxSubscriptionsSyncCore.ts`); the response says
+  `fact_subscriptions_sync_skipped: true` otherwise.
+
+Still waking it on a schedule, by design: the hourly support mail sync (`:07`,
+syncs the new mails and their classification) and the daily FB / FunnelFox
+syncs. Opening any analytics page wakes it on demand.
+
 ## ClickHouse transactions: sorting-key drift makes duplicates (2026-09-29)
 
 `analytics_transactions` is ReplacingMergeTree keyed by

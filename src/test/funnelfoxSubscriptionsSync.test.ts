@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   FULL_RESET_DETAIL_REOPEN_FILTER,
@@ -23,6 +24,7 @@ import {
   nextIncompleteStage,
   resolveStartCursor,
   shouldContinueSubscriptionSync,
+  shouldRefreshFactSubscriptions,
   statusFromStopReason,
   subscriptionListColumns,
   uniqueProfileIds,
@@ -285,6 +287,37 @@ describe("driver control", () => {
     expect(shouldContinueSubscriptionSync({ status: "ok", all_stages_completed: true, made_progress: true })).toBe(false);
     expect(shouldContinueSubscriptionSync({ status: "error", all_stages_completed: false, made_progress: true })).toBe(false);
     expect(shouldContinueSubscriptionSync({ status: "partial", all_stages_completed: false, made_progress: false })).toBe(false);
+  });
+});
+
+describe("fact_subscriptions is not rewritten by an idle finalize (2026-11-08)", () => {
+  const done = { run_version: 1794156317123, inserted: 16564 };
+
+  it("the first finalize of a cycle, an explicit finalize, and a retry after a failure refresh it", () => {
+    expect(shouldRefreshFactSubscriptions({ finalizeAlreadyCompleted: false, finalizeRequested: false, lastRefresh: done })).toBe(true);
+    expect(shouldRefreshFactSubscriptions({ finalizeAlreadyCompleted: true, finalizeRequested: true, lastRefresh: done })).toBe(true);
+    expect(shouldRefreshFactSubscriptions({ finalizeAlreadyCompleted: true, finalizeRequested: false, lastRefresh: { error: "ClickHouse 503" } })).toBe(true);
+    for (const never of [undefined, null, {}, [], "x", { run_version: "1794156317123" }]) {
+      expect(shouldRefreshFactSubscriptions({ finalizeAlreadyCompleted: true, finalizeRequested: false, lastRefresh: never }), JSON.stringify(never)).toBe(true);
+    }
+  });
+
+  it("the 15-minute tick repeating a completed finalize leaves ClickHouse alone", () => {
+    expect(shouldRefreshFactSubscriptions({ finalizeAlreadyCompleted: true, finalizeRequested: false, lastRefresh: done })).toBe(false);
+  });
+
+  it("the Edge function carries the same rule and gates the ClickHouse refresh on it", () => {
+    const edge = readFileSync("supabase/functions/funnelfox-subscriptions-sync/index.ts", "utf8");
+    const core = readFileSync("src/services/funnelfoxSubscriptionsSyncCore.ts", "utf8");
+    const body = (raw: string) => {
+      const source = raw.replace(/\r\n/g, "\n");
+      const start = source.indexOf("function shouldRefreshFactSubscriptions(");
+      return source.slice(start, source.indexOf("\n}\n", start) + 2);
+    };
+    expect(body(edge)).not.toBe("");
+    expect(body(edge)).toBe(body(core));
+    expect(edge).toContain("factSubscriptionsSkipped = !shouldRefreshFactSubscriptions({");
+    expect(edge).toContain("if (!factSubscriptionsSkipped) {");
   });
 });
 

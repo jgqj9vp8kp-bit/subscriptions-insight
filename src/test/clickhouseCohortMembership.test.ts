@@ -17,7 +17,12 @@ import {
   snapshotRetentionSql,
   TICK_FAILURE_BACKOFF_MAX_MS,
 } from "../../supabase/functions/_shared/clickhouse/cohortMembership.ts";
-import { CAMPAIGN_SCOPE_VERSION } from "../../supabase/functions/_shared/clickhouse/cohortSnapshotState.ts";
+import {
+  CAMPAIGN_SCOPE_VERSION,
+  TRANSACTIONS_BACKFILL_RUN_STAGES,
+  TRANSACTIONS_SYNC_NAME,
+} from "../../supabase/functions/_shared/clickhouse/cohortSnapshotState.ts";
+import { BACKFILL_RUN_STAGES } from "../../supabase/functions/_shared/clickhouse/backfill.ts";
 import { ScopeViolation } from "../../supabase/functions/_shared/clickhouse/scopedClient.ts";
 import { normalizeCohortRequest } from "../../supabase/functions/_shared/clickhouse/cohorts.ts";
 import { cancellationFlagsCTE } from "../../supabase/functions/_shared/clickhouse/cohortCancellations.ts";
@@ -512,6 +517,8 @@ describe("snapshot rebuild for funnel-restricted freshness", () => {
   /** One ordered event log over both clients, plus every RPC / command / insert. */
   function rebuildHarness(options: {
     state?: Record<string, unknown> | null;
+    /** clickhouse_transaction_sync_state row of the transactions backfill. */
+    syncState?: Record<string, unknown> | null;
     rpcResult?: Partial<Record<string, boolean>>;
     rpcError?: Partial<Record<string, string>>;
     campaignScopeFails?: boolean;
@@ -523,12 +530,16 @@ describe("snapshot rebuild for funnel-restricted freshness", () => {
     const rpcCalls: SnapshotRpcCall[] = [];
     const commands: Array<{ query: string; params: Record<string, unknown> }> = [];
     const inserts: Array<{ table: string; values: Record<string, unknown>[] }> = [];
+    const queries: string[] = [];
     const supabase: SupabaseLikeClient = {
-      from() {
+      from(table: string) {
         const builder = {
           select: () => builder,
           eq: () => builder,
-          maybeSingle: async () => ({ data: options.state ?? null, error: null }),
+          maybeSingle: async () => ({
+            data: table === "clickhouse_transaction_sync_state" ? options.syncState ?? null : options.state ?? null,
+            error: null,
+          }),
         };
         return builder as never;
       },
@@ -554,6 +565,7 @@ describe("snapshot rebuild for funnel-restricted freshness", () => {
       },
       query: async ({ query }) => ({
         json: async () => {
+          queries.push(query);
           if (query.includes("warehouse_hash")) {
             return [{ transaction_count: 10, unique_users: 4, max_row_version: "99", max_source_updated_at: "2026-10-06 00:00:00", warehouse_hash: "abc123" }];
           }
@@ -572,7 +584,7 @@ describe("snapshot rebuild for funnel-restricted freshness", () => {
         },
       }),
     };
-    return { supabase, clickhouse, events, rpcCalls, commands, inserts };
+    return { supabase, clickhouse, events, rpcCalls, commands, inserts, queries };
   }
 
   const CURRENT = {
@@ -862,6 +874,82 @@ describe("snapshot rebuild for funnel-restricted freshness", () => {
       await rebuildCohortMembership({ authUserId: "user-1", supabase: h.supabase, clickhouse: h.clickhouse, mode });
       expect(names(h.rpcCalls), `${mode} ${JSON.stringify(state)}`).toContain("claim_clickhouse_cohort_snapshot_build");
     }
+  });
+
+  // ---- the tick without ClickHouse (2026-11-08) ----------------------------------
+  const VERIFIED = { ...CURRENT, fresh_verified_at: "2026-11-08T11:52:00Z", stale_since: null, source_transactions: 10, source_unique_users: 4 };
+  const SYNC_IDLE = { updated_at: "2026-11-06T11:32:04Z", current_stage: "idle" };
+  const NOON = new Date("2026-11-08T12:07:00Z");
+  const touchedClickHouse = (h: ReturnType<typeof rebuildHarness>) => h.queries.length + h.commands.length + h.inserts.length;
+
+  it("no transactions write since the last verification: the tick re-confirms from Postgres, ClickHouse stays asleep", async () => {
+    const h = rebuildHarness({ state: VERIFIED, syncState: SYNC_IDLE });
+    const result = await rebuildCohortMembership({ authUserId: "user-1", supabase: h.supabase, clickhouse: h.clickhouse, mode: "tick", now: NOON });
+    expect(touchedClickHouse(h)).toBe(0);
+    expect(result).toMatchObject({
+      status: "completed",
+      tick_status: "unchanged",
+      warehouse_version: "wh_abc123",
+      classification_version: COHORT_CLASSIFICATION_VERSION,
+      rows_inserted: 0,
+      source_transactions: 10,
+      source_unique_users: 4,
+    });
+    // The active versions are observed as the fingerprint: fresh_verified_at moves for restricted reads.
+    expect(h.rpcCalls).toEqual([{
+      functionName: "observe_clickhouse_cohort_snapshot_fingerprint",
+      params: { p_auth_user_id: "user-1", p_warehouse_version: "wh_abc123", p_classification_version: COHORT_CLASSIFICATION_VERSION },
+    }]);
+  });
+
+  it("the tick still checks ClickHouse when anything says the warehouse may have moved", async () => {
+    const cases: Array<[string, Record<string, unknown>, Record<string, unknown> | null, Date]> = [
+      ["a backfill wrote after the verification", VERIFIED, { ...SYNC_IDLE, updated_at: "2026-11-08T11:55:00Z" }, NOON],
+      ["a backfill run is in progress", VERIFIED, { ...SYNC_IDLE, current_stage: "backfilling" }, NOON],
+      ["no sync-state row", VERIFIED, null, NOON],
+      ["never verified", { ...VERIFIED, fresh_verified_at: null }, SYNC_IDLE, NOON],
+      ["the last observation found it stale", { ...VERIFIED, stale_since: "2026-11-08T11:52:00Z" }, SYNC_IDLE, NOON],
+      ["the campaign scope is missing", { ...VERIFIED, active_campaign_scope_version: null }, SYNC_IDLE, NOON],
+      ["another classifier version", { ...VERIFIED, active_classification_version: "cohort_classifier_v2" }, SYNC_IDLE, NOON],
+      ["the last build failed", { ...VERIFIED, status: "failed" }, SYNC_IDLE, NOON],
+      ["the daily check window (05:37 UTC)", VERIFIED, SYNC_IDLE, new Date("2026-11-08T05:37:00Z")],
+    ];
+    for (const [label, state, syncState, now] of cases) {
+      const h = rebuildHarness({ state, syncState });
+      const result = await rebuildCohortMembership({ authUserId: "user-1", supabase: h.supabase, clickhouse: h.clickhouse, mode: "tick", now })
+        .catch((error) => ({ tick_status: `error: ${error}` }));
+      expect(h.queries.some((query) => query.includes("warehouse_hash")), label).toBe(true);
+      expect(result.tick_status, label).not.toBe("unchanged");
+    }
+  });
+
+  it("a user rebuild, a forced tick, and an unconfirmed observe never take the Postgres-only path", async () => {
+    const user = rebuildHarness({ state: VERIFIED, syncState: SYNC_IDLE });
+    await rebuildCohortMembership({ authUserId: "user-1", supabase: user.supabase, clickhouse: user.clickhouse, now: NOON });
+    expect(user.queries.some((query) => query.includes("warehouse_hash"))).toBe(true);
+
+    const forced = rebuildHarness({ state: VERIFIED, syncState: SYNC_IDLE });
+    await rebuildCohortMembership({ authUserId: "user-1", supabase: forced.supabase, clickhouse: forced.clickhouse, mode: "tick", force: true, now: NOON });
+    expect(forced.queries.some((query) => query.includes("warehouse_hash"))).toBe(true);
+
+    // A newer build won between the state read and the observe (false), or the RPC failed (null).
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    for (const options of [
+      { rpcResult: { observe_clickhouse_cohort_snapshot_fingerprint: false } },
+      { rpcError: { observe_clickhouse_cohort_snapshot_fingerprint: "function does not exist" } },
+    ]) {
+      const h = rebuildHarness({ state: VERIFIED, syncState: SYNC_IDLE, ...options });
+      const result = await rebuildCohortMembership({ authUserId: "user-1", supabase: h.supabase, clickhouse: h.clickhouse, mode: "tick", now: NOON });
+      expect(h.queries.some((query) => query.includes("warehouse_hash"))).toBe(true);
+      expect(result.tick_status).toBe("current");
+    }
+    warn.mockRestore();
+  });
+
+  it("the Postgres-only tick reads the same sync-state row the backfill writes", () => {
+    const source = readFileSync("supabase/functions/_shared/clickhouse/backfill.ts", "utf8");
+    expect(source).toContain(`const SYNC_NAME = "${TRANSACTIONS_SYNC_NAME}";`);
+    expect([...TRANSACTIONS_BACKFILL_RUN_STAGES]).toEqual([...BACKFILL_RUN_STAGES]);
   });
 });
 

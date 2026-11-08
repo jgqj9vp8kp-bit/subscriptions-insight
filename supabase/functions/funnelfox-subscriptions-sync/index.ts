@@ -68,6 +68,26 @@ interface StageCompletion {
 function readRecord(value: unknown): JsonRecord {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : {};
 }
+
+// Whether a finalize run rewrites ClickHouse fact_subscriptions (2026-11-08).
+// Once every stage is done, each 15-minute tick lands on finalize again with
+// nothing new in Postgres (the list is crawled once per daily cycle), and
+// re-sending all ~17k rows each time kept ClickHouse Cloud awake around the
+// clock. The fact is refreshed on the first finalize of a cycle, on a finalize
+// asked for explicitly (stage=finalize), and as a retry while the last refresh
+// failed or never ran.
+function shouldRefreshFactSubscriptions(input: {
+  finalizeAlreadyCompleted: boolean;
+  finalizeRequested: boolean;
+  lastRefresh: unknown;
+}): boolean {
+  if (!input.finalizeAlreadyCompleted || input.finalizeRequested) return true;
+  const last = input.lastRefresh;
+  if (!last || typeof last !== "object" || Array.isArray(last)) return true;
+  const record = last as Record<string, unknown>;
+  return record.error != null || typeof record.run_version !== "number";
+}
+
 function str(value: unknown): string {
   return typeof value === "string" ? value.trim() : value == null ? "" : String(value);
 }
@@ -454,6 +474,7 @@ serveWithAccess(FUNNELFOX_SUBSCRIPTIONS_SYNC_POLICY, async ({ ctx, action, body,
 
     let stoppedReason: SyncStoppedReason = "completed";
     let madeProgress = true;
+    let factSubscriptionsSkipped = false;
     let listApiError: string | null = null;
     const runStats: JsonRecord = {};
     const cursorUpdate: JsonRecord = {};
@@ -675,16 +696,25 @@ serveWithAccess(FUNNELFOX_SUBSCRIPTIONS_SYNC_POLICY, async ({ ctx, action, body,
       cursorUpdate.last_full_sync_at = new Date().toISOString();
       // Refresh the ClickHouse subscription fact (Cohorts cancellations, the
       // Users page subscription status). Best-effort: a ClickHouse outage must
-      // not fail the FunnelFox sync — the next finalize retries.
-      try {
-        runStats.fact_subscriptions_sync = { ...(await syncFactSubscriptions({
-          pg: db as unknown as SubscriptionSourceClient,
-          clickhouse: clickhouse(),
-          authUserId: tenantKey,
-        })) };
-      } catch (error) {
-        runStats.fact_subscriptions_sync = { error: error instanceof Error ? error.message : String(error) };
-        console.error("funnelfox-subscriptions-sync: fact_subscriptions refresh failed", error instanceof Error ? error.message : error);
+      // not fail the FunnelFox sync — the next finalize retries. A repeat
+      // finalize with nothing new leaves ClickHouse alone (the previous
+      // refresh stays in stats through priorStats).
+      factSubscriptionsSkipped = !shouldRefreshFactSubscriptions({
+        finalizeAlreadyCompleted: flags.finalize_completed,
+        finalizeRequested: requestedStage === "finalize",
+        lastRefresh: priorStats.fact_subscriptions_sync,
+      });
+      if (!factSubscriptionsSkipped) {
+        try {
+          runStats.fact_subscriptions_sync = { ...(await syncFactSubscriptions({
+            pg: db as unknown as SubscriptionSourceClient,
+            clickhouse: clickhouse(),
+            authUserId: tenantKey,
+          })) };
+        } catch (error) {
+          runStats.fact_subscriptions_sync = { error: error instanceof Error ? error.message : String(error) };
+          console.error("funnelfox-subscriptions-sync: fact_subscriptions refresh failed", error instanceof Error ? error.message : error);
+        }
       }
     }
 
@@ -807,6 +837,7 @@ serveWithAccess(FUNNELFOX_SUBSCRIPTIONS_SYNC_POLICY, async ({ ctx, action, body,
       all_stages_completed: allStagesCompleted,
       made_progress: madeProgress,
       fact_subscriptions_sync: runStats.fact_subscriptions_sync ?? null,
+      fact_subscriptions_sync_skipped: factSubscriptionsSkipped,
       stopped_reason: stoppedReason,
       persisted_status: persistedStatus,
       parity_check: parity,
